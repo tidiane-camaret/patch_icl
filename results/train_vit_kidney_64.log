@@ -1,0 +1,13 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/ndirt/.netrc.
+wandb: Currently logged in as: tidiane to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run 5kerfpvt
+wandb: Tracking run with wandb version 0.26.0
+wandb: Run data is saved locally in /work/dlclarge2/ndirt-SegFM3D/patch_icl/wandb/run-20260420_234522-5kerfpvt
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run ethereal-snowflake-1
+wandb: ⭐️ View project at https://wandb.ai/tidiane/vit-kidney-seg
+wandb: 🚀 View run at https://wandb.ai/tidiane/vit-kidney-seg/runs/5kerfpvt
+Device: cuda
+TotalSegDataset: 1082 subjects
+TotalSegDataset: 57 subjects
+Parameters: 5.9M
