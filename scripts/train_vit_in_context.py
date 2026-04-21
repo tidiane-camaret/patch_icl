@@ -134,7 +134,8 @@ def log_predictions(model, samples: dict[str, dict], device, phase: str, epoch: 
         K      = s["context_in"].shape[0]
 
         # Forward pass
-        with torch.autocast(device_type=device.type, dtype=torch.float16):
+        amp_dtype = torch.bfloat16 if device.type == "xla" else torch.float16
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
             logits = model(
                 s["image"].unsqueeze(0).to(device),
                 s["context_in"].unsqueeze(0).to(device),
@@ -187,15 +188,24 @@ def run_epoch(model, loader, optimizer, loss_fn, scaler, device, train: bool):
             context_out = batch["context_out"].to(device, non_blocking=True)
             label_names = batch["label_names"]
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            use_xla = device.type == "xla"
+            amp_dtype = torch.bfloat16 if use_xla else torch.float16
+            with torch.autocast(device_type=device.type, dtype=amp_dtype):
                 logits = model(images, context_in, context_out)
                 loss   = loss_fn(logits, labels)
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+                    if use_xla:
+                        import torch_xla
+                        torch_xla.sync()
 
             total_loss += loss.item()
             total_dice += dice_score(logits, labels)
@@ -223,8 +233,12 @@ def main(cfg: DictConfig) -> None:
     patch_size = tuple(cfg.model.patch_size)
     classes    = list(cfg.data.classes)
 
-    torch.backends.cudnn.benchmark = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if cfg.train.tpu:
+        import torch_xla.core.xla_model as xm
+        device = xm.xla_device()
+    else:
+        torch.backends.cudnn.benchmark = True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(OmegaConf.to_yaml(cfg))
 
@@ -281,8 +295,18 @@ def main(cfg: DictConfig) -> None:
         dropout=cfg.model.dropout,
     ).to(device)
 
+    if cfg.train.checkpoint:
+        ckpt_path = Path(cfg.train.checkpoint)
+        print(f"Loading checkpoint: {ckpt_path}", flush=True)
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+
     print("Compiling model...", flush=True)
-    model = torch.compile(model)
+    if cfg.train.tpu:
+        import torch_xla
+        model = torch_xla.compile(model)
+    else:
+        model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params / 1e6:.1f}M")
@@ -294,7 +318,7 @@ def main(cfg: DictConfig) -> None:
         optimizer, T_max=cfg.train.epochs
     )
     loss_fn = DiceCELoss()
-    scaler  = torch.amp.GradScaler("cuda")
+    scaler  = None if cfg.train.tpu else torch.amp.GradScaler("cuda")
 
     results_dir = Path(cfg.paths.results)
     results_dir.mkdir(exist_ok=True)
@@ -318,6 +342,9 @@ def main(cfg: DictConfig) -> None:
         is_best = va_dice > best_val_dice
         if is_best:
             best_val_dice = va_dice
+            if cfg.train.tpu:
+                import torch_xla
+                torch_xla.sync()
             torch.save(model.state_dict(), best_ckpt)
 
         epoch_bar.set_postfix(
@@ -331,8 +358,11 @@ def main(cfg: DictConfig) -> None:
         log_predictions(model, train_viz, device, "train", epoch)
         log_predictions(model, val_viz,   device, "val",   epoch)
 
-        mem = torch.cuda.max_memory_allocated() / 1e9
-        torch.cuda.reset_peak_memory_stats()
+        if cfg.train.tpu:
+            mem = 0.0
+        else:
+            mem = torch.cuda.max_memory_allocated() / 1e9
+            torch.cuda.reset_peak_memory_stats()
 
         # Per-class table: one row per class, train + val dice side by side
         table = wandb.Table(

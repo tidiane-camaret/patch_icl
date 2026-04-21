@@ -34,5 +34,7 @@ train:
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 10
-  wandb_project: vit-incontext-seg
+  wandb_project: patch_icl
   run_name: null
+  checkpoint: null  # path to a .pt checkpoint to resume from, e.g. results/vit_incontext_best.pt
+  tpu: false        # set to true to run on Google Cloud TPU (requires torch_xla)
