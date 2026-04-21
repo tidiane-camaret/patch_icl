@@ -1,5 +1,7 @@
 *.egg-info
-.claude/.nfs0000000f8548dc5800000002
+.claude/
 results/sample_pairs.png
 *.pyc
 wandb/
+tea_debug.log
+results/convert_to_npy.log

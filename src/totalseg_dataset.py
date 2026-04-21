@@ -67,19 +67,41 @@ HU_MIN, HU_MAX = -150, 250
 # -------------------------------------------------------------------------
 
 def _load_ct(path: Path) -> np.ndarray:
-    """Load CT, clip HU window, normalise to [0, 1].  Returns float32 (D,H,W)."""
+    """Load CT, clip HU window, normalise to [0, 1].  Returns float32 (D,H,W).
+    Prefers a pre-converted ct.npy next to the .nii.gz for fast loading."""
+    npy = path.with_suffix("").with_suffix(".npy")  # ct.nii.gz → ct.npy
+    if npy.exists():
+        return np.load(npy, mmap_mode="r").astype(np.float32)
     vol = nib.load(str(path)).get_fdata(dtype=np.float32)
     vol = np.clip(vol, HU_MIN, HU_MAX)
     vol = (vol - HU_MIN) / (HU_MAX - HU_MIN)
     return vol  # (D, H, W)
 
 
+# Maps ALL_CLASSES name → 1-based index used in label.npy
+_ALL_CLASSES_IDX: dict[str, int] = {cls: i + 1 for i, cls in enumerate(ALL_CLASSES)}
+
+
 def _build_label_volume(seg_dir: Path, classes: list[str]) -> np.ndarray:
     """
     Merge per-class binary masks into one integer label volume.
     Label value = class index + 1  (0 = background).
-    Later classes overwrite earlier ones where masks overlap.
+
+    Fast path: if label.npy exists in the subject dir (written by convert_to_npy.py),
+    remap from the all-classes encoding to the requested subset in one vectorised pass.
+    Slow path: load individual .nii.gz masks.
     """
+    label_npy = seg_dir.parent / "label.npy"
+    if label_npy.exists():
+        full = np.load(label_npy, mmap_mode="r")   # (D,H,W) uint8, ALL_CLASSES encoding
+        out = np.zeros(full.shape, dtype=np.uint8)
+        for new_idx, cls in enumerate(classes, start=1):
+            orig_idx = _ALL_CLASSES_IDX.get(cls)
+            if orig_idx is not None:
+                out[full == orig_idx] = new_idx
+        return out
+
+    # Slow path — individual .nii.gz masks
     label: Optional[np.ndarray] = None
     for cls_idx, cls in enumerate(classes, start=1):
         mask_path = seg_dir / f"{cls}.nii.gz"
