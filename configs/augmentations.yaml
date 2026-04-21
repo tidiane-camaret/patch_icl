@@ -1,0 +1,44 @@
+augmentations:
+  enabled: true   # set false at eval time
+
+  # -----------------------------------------------------------------------
+  # Task augmentations  —  same random params applied to query + all context
+  # -----------------------------------------------------------------------
+  task:
+    flip:
+      p_d: 0.5    # flip along depth  (axial)
+      p_h: 0.5    # flip along height (coronal)
+      p_w: 0.5    # flip along width  (sagittal)
+
+    affine:
+      p: 0.8
+      max_angle_deg: 15.0         # per-axis rotation range  ±15°
+      scale_min: 0.85
+      scale_max: 1.15
+      max_translate: 0.10         # fraction of volume size in normalised [-1,1] coords
+
+    elastic:
+      p: 0.3
+      alpha: 0.12                 # displacement magnitude (normalised coords)
+      grid_scale: 8               # small-grid downscale factor before upsampling
+
+  # -----------------------------------------------------------------------
+  # Intensity augmentations  —  independently sampled per volume
+  # -----------------------------------------------------------------------
+  intensity:
+    brightness_contrast:
+      p: 0.5
+      brightness: 0.10            # uniform ±brightness added
+      contrast_range: [0.80, 1.20]
+
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]         # CT-range gamma correction
+
+    gaussian_noise:
+      p: 0.50
+      max_std: 0.05               # noise std ~ Uniform(0, max_std)
+
+    gaussian_blur:
+      p: 0.50
+      sigma_range: [0.50, 1.50]   # Gaussian sigma in voxels

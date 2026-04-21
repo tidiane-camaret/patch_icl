@@ -42,6 +42,7 @@ from src.totalseg_dataset import (
     _build_label_volume,
     _resize_volume,
 )
+from src.augmentations import apply_task_aug, apply_intensity_aug
 
 # Inverse map: orig label index → class name (covers all 117 classes)
 _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
@@ -85,11 +86,13 @@ class TotalSegInContextDataset(Dataset):
         meta_csv: Optional[str | Path] = None,
         context_size: int = 3,
         max_subjects: Optional[int] = None,
+        aug_cfg=None,
     ):
         self.root = Path(root)
         self.classes = list(classes)
         self.image_size = image_size
         self.context_size = context_size
+        self.aug_cfg = aug_cfg  # None → no augmentation
 
         subjects = self._get_subjects(split, meta_csv, max_subjects)
 
@@ -209,6 +212,23 @@ class TotalSegInContextDataset(Dataset):
             context_in.append(context_in[i].clone())
             context_out.append(context_out[i].clone())
 
+        if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0:
+            # Stack query + context: (K+1, 1, D, H, W) and (K+1, D, H, W)
+            all_images = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)],  dim=0)
+            all_masks  = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
+
+            # Task aug: one set of geometric params for all volumes
+            all_images, all_masks = apply_task_aug(all_images, all_masks, self.aug_cfg.task)
+
+            # Intensity aug: independent params per volume (image only)
+            for i in range(all_images.shape[0]):
+                all_images[i] = apply_intensity_aug(all_images[i], self.aug_cfg.intensity)
+
+            image_t    = all_images[0]          # (1, D, H, W)
+            label_t    = all_masks[0]           # (D, H, W)
+            context_in  = list(all_images[1:])  # K × (1, D, H, W)
+            context_out = list(all_masks[1:])   # K × (D, H, W)
+
         return {
             "image":       image_t,                    # (1, D, H, W)
             "label":       label_t,                    # (D, H, W)  int64
@@ -270,6 +290,7 @@ def get_incontext_loader(
     shuffle: bool = True,
     num_workers: int = 4,
     max_subjects: Optional[int] = None,
+    aug_cfg=None,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -278,6 +299,7 @@ def get_incontext_loader(
         split=split,
         context_size=context_size,
         max_subjects=max_subjects,
+        aug_cfg=aug_cfg,
     )
     return DataLoader(
         ds,

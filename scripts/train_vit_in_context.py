@@ -14,12 +14,16 @@ from collections import defaultdict
 from pathlib import Path
 
 import hydra
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.totalseg_dataloader_incontext import (
@@ -72,6 +76,93 @@ def dice_score(logits: torch.Tensor, targets: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+def _best_z(mask: torch.Tensor) -> int:
+    """Axial slice index with the most foreground pixels."""
+    return int(mask.float().sum(dim=(-2, -1)).argmax())
+
+
+def _overlay(ax, img_slice, mask_slice, cmap, title):
+    ax.imshow(img_slice, cmap="gray", interpolation="nearest")
+    ax.imshow(mask_slice, cmap=cmap, alpha=0.45, vmin=0, vmax=1,
+              interpolation="nearest")
+    ax.set_title(title, fontsize=7)
+    ax.axis("off")
+
+
+def collect_viz_samples(loader, classes: list[str]) -> dict[str, dict]:
+    """
+    Iterate the loader once and collect one CPU-tensor sample per class.
+    Call this once before the training loop — never inside it — to avoid
+    abandoning persistent-worker iterators mid-flight (which stalls workers).
+    """
+    samples: dict[str, dict] = {}
+    for batch in loader:
+        for i, cls in enumerate(batch["label_names"]):
+            if cls not in samples:
+                samples[cls] = {
+                    "image":       batch["image"][i].clone(),
+                    "label":       batch["label"][i].clone(),
+                    "context_in":  batch["context_in"][i].clone(),
+                    "context_out": batch["context_out"][i].clone(),
+                }
+        if samples.keys() >= set(classes):
+            break
+    return samples
+
+
+@torch.no_grad()
+def log_predictions(model, samples: dict[str, dict], device, phase: str, epoch: int):
+    """
+    Run the model on pre-collected samples and log one figure per class to W&B.
+    Each figure: tgt+GT  |  ctx1+GT  |  …  |  ctxK+GT  |  tgt+Pred
+    """
+    model.eval()
+
+    wandb_images: dict[str, wandb.Image] = {}
+
+    for cls, s in samples.items():
+        img    = s["image"].squeeze(0)   # (D, H, W)
+        label  = s["label"]              # (D, H, W)
+        K      = s["context_in"].shape[0]
+
+        # Forward pass
+        with torch.autocast(device_type=device.type, dtype=torch.float16):
+            logits = model(
+                s["image"].unsqueeze(0).to(device),
+                s["context_in"].unsqueeze(0).to(device),
+                s["context_out"].unsqueeze(0).to(device),
+            )
+        pred = logits.argmax(1).squeeze(0).cpu()   # (D, H, W)
+
+        # Best slice for target (by GT coverage)
+        z_tgt = _best_z(label)
+
+        n_cols = 2 + K   # tgt+GT, K×ctx+GT, tgt+Pred
+        fig, axes = plt.subplots(1, n_cols, figsize=(2.5 * n_cols, 3))
+
+        _overlay(axes[0], img[z_tgt], label[z_tgt].float(), "Reds",  "tgt + GT")
+
+        for k in range(K):
+            ctx_img  = s["context_in"][k].squeeze(0)  # (D, H, W)
+            ctx_mask = s["context_out"][k].float()     # (D, H, W)
+            z_ctx = _best_z(ctx_mask)
+            _overlay(axes[1 + k], ctx_img[z_ctx], ctx_mask[z_ctx], "Reds",
+                     f"ctx {k+1} + GT")
+
+        _overlay(axes[-1], img[z_tgt], pred[z_tgt].float(), "Blues", "tgt + Pred")
+
+        fig.suptitle(f"{phase} | {cls}", fontsize=9, y=1.02)
+        fig.tight_layout()
+        wandb_images[f"{phase}/pred/{cls}"] = wandb.Image(fig)
+        plt.close(fig)
+
+    wandb.log(wandb_images, step=epoch)
+
+
+# ---------------------------------------------------------------------------
 # Train / eval loops
 # ---------------------------------------------------------------------------
 
@@ -80,9 +171,11 @@ def run_epoch(model, loader, optimizer, loss_fn, scaler, device, train: bool):
     total_loss = total_dice = n = 0
     per_class_dice: dict[str, list[float]] = defaultdict(list)
 
+    phase = "train" if train else "val"
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for batch in loader:
+        pbar = tqdm(loader, desc=phase, leave=False, unit="batch")
+        for batch in pbar:
             images      = batch["image"].to(device, non_blocking=True)
             labels      = batch["label"].to(device, non_blocking=True)
             context_in  = batch["context_in"].to(device, non_blocking=True)
@@ -102,12 +195,15 @@ def run_epoch(model, loader, optimizer, loss_fn, scaler, device, train: bool):
             total_loss += loss.item()
             total_dice += dice_score(logits, labels)
             n += 1
+            pbar.set_postfix(loss=f"{total_loss/n:.4f}", dice=f"{total_dice/n:.4f}")
 
             with torch.no_grad():
                 for i, lname in enumerate(label_names):
                     per_class_dice[lname].append(dice_score(logits[i:i+1], labels[i:i+1]))
 
     mean_per_class = {cls: sum(v) / len(v) for cls, v in per_class_dice.items()}
+    if n == 0:
+        return float("nan"), float("nan"), mean_per_class
     return total_loss / n, total_dice / n, mean_per_class
 
 
@@ -160,6 +256,12 @@ def main(cfg: DictConfig) -> None:
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_ds,   batch_size=cfg.train.batch_size, shuffle=False, **loader_kw)
 
+    # Collect viz samples once — iterating loaders inside the epoch loop would
+    # abandon persistent-worker iterators mid-flight and stall workers.
+    print("Collecting visualisation samples...", flush=True)
+    train_viz = collect_viz_samples(train_loader, classes)
+    val_viz   = collect_viz_samples(val_loader,   classes)
+
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
@@ -197,8 +299,9 @@ def main(cfg: DictConfig) -> None:
     # Training loop
     # ------------------------------------------------------------------
     best_val_dice = 0.0
+    epoch_bar = tqdm(range(1, cfg.train.epochs + 1), desc="epochs", unit="ep")
 
-    for epoch in range(1, cfg.train.epochs + 1):
+    for epoch in epoch_bar:
         tr_loss, tr_dice, tr_cls = run_epoch(
             model, train_loader, optimizer, loss_fn, scaler, device, train=True
         )
@@ -207,18 +310,21 @@ def main(cfg: DictConfig) -> None:
         )
         scheduler.step()
 
-        tag = " *" if va_dice > best_val_dice else ""
-        if va_dice > best_val_dice:
+        is_best = va_dice > best_val_dice
+        if is_best:
             best_val_dice = va_dice
             torch.save(model.state_dict(), best_ckpt)
 
-        print(
-            f"[{epoch:3d}/{cfg.train.epochs}] "
-            f"train loss={tr_loss:.4f} dice={tr_dice:.4f}  "
-            f"val loss={va_loss:.4f} dice={va_dice:.4f}{tag}"
+        epoch_bar.set_postfix(
+            tr_loss=f"{tr_loss:.4f}", tr_dice=f"{tr_dice:.4f}",
+            va_loss=f"{va_loss:.4f}", va_dice=f"{va_dice:.4f}",
+            best=f"{best_val_dice:.4f}",
         )
         cls_str = "  ".join(f"{c}={v:.3f}" for c, v in sorted(va_cls.items()))
-        print(f"  val per-class: {cls_str}")
+        tqdm.write(f"  [{epoch:3d}] val per-class: {cls_str}" + (" *" if is_best else ""))
+
+        log_predictions(model, train_viz, device, "train", epoch)
+        log_predictions(model, val_viz,   device, "val",   epoch)
 
         mem = torch.cuda.max_memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
