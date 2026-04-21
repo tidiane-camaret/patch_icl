@@ -33,6 +33,6 @@ train:
   batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  workers: 16
+  workers: 10
   wandb_project: vit-incontext-seg
   run_name: null
