@@ -22,15 +22,15 @@ data:
 model:
   patch_size: [8, 8, 8]
   embed_dim: 256
-  depth_stage1: 6
-  depth_stage2: 6
+  depth_stage1: 3
+  depth_stage2: 3
   num_heads: 8
   mlp_ratio: 4
   dropout: 0.1
 
 train:
   epochs: 50
-  batch_size: 12
+  batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 16

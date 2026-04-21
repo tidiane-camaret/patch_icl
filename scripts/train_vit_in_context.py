@@ -92,24 +92,29 @@ def _overlay(ax, img_slice, mask_slice, cmap, title):
     ax.axis("off")
 
 
-def collect_viz_samples(loader, classes: list[str]) -> dict[str, dict]:
+def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
     """
-    Iterate the loader once and collect one CPU-tensor sample per class.
-    Call this once before the training loop — never inside it — to avoid
-    abandoning persistent-worker iterators mid-flight (which stalls workers).
+    Call dataset[idx] directly in the main process — no DataLoader workers.
+    Avoids abandoning mid-flight iterators (which deadlocks persistent workers).
+    Only loads one sample per class (~10 items), so latency is negligible.
     """
-    samples: dict[str, dict] = {}
-    for batch in loader:
-        for i, cls in enumerate(batch["label_names"]):
-            if cls not in samples:
-                samples[cls] = {
-                    "image":       batch["image"][i].clone(),
-                    "label":       batch["label"][i].clone(),
-                    "context_in":  batch["context_in"][i].clone(),
-                    "context_out": batch["context_out"][i].clone(),
-                }
-        if samples.keys() >= set(classes):
+    # Find the first sample index for each class from the flat sample list
+    class_to_idx: dict[str, int] = {}
+    for i, (_, cls) in enumerate(dataset.samples):
+        if cls not in class_to_idx:
+            class_to_idx[cls] = i
+        if len(class_to_idx) == len(classes):
             break
+
+    samples: dict[str, dict] = {}
+    for cls, idx in class_to_idx.items():
+        item = dataset[idx]
+        samples[cls] = {
+            "image":       item["image"],
+            "label":       item["label"],
+            "context_in":  item["context_in"],
+            "context_out": item["context_out"],
+        }
     return samples
 
 
@@ -256,11 +261,11 @@ def main(cfg: DictConfig) -> None:
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_ds,   batch_size=cfg.train.batch_size, shuffle=False, **loader_kw)
 
-    # Collect viz samples once — iterating loaders inside the epoch loop would
-    # abandon persistent-worker iterators mid-flight and stall workers.
+    # Collect viz samples once — direct dataset[idx] calls, no DataLoader workers.
     print("Collecting visualisation samples...", flush=True)
-    train_viz = collect_viz_samples(train_loader, classes)
-    val_viz   = collect_viz_samples(val_loader,   classes)
+    train_viz = collect_viz_samples(train_ds, classes)
+    val_viz   = collect_viz_samples(val_ds,   classes)
+    print(f"  train: {len(train_viz)} classes  |  val: {len(val_viz)} classes", flush=True)
 
     # ------------------------------------------------------------------
     # Model
