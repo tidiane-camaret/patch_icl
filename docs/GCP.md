@@ -39,26 +39,34 @@ cd patch_icl
 
 ## 4. Get the dataset
 
-The TotalSegmentator dataset (~450 GB raw) needs to be downloaded once. Store the preprocessed files on a GCS bucket to avoid re-downloading on each VM.
-
-**First time — download and preprocess:**
+**Download and extract (first time):**
 
 ```bash
-mkdir -p /data/totalseg
-totalseg_download_dataset -o /data/totalseg
+mkdir -p ~/data/totalseg
+cd ~/data
 
-# Convert .nii.gz to .npy (runs once, in-place)
-python scripts/convert_to_npy.py --data /data/totalseg --workers 8
+wget -O totalseg.zip "https://zenodo.org/records/10047292/files/Totalsegmentator_dataset_v201.zip?download=1"
+unzip -q totalseg.zip -d totalseg
+rm totalseg.zip
 
-# Upload preprocessed files to GCS (skip raw .nii.gz to save space)
-gsutil -m rsync -r -x '.*\.nii\.gz$' /data/totalseg gs://your-bucket/totalseg
+cd ~/patch_icl
 ```
 
-**Subsequent VMs — sync from GCS:**
+**Preprocess to `.npy` (runs once, in-place):**
 
 ```bash
-mkdir -p /data/totalseg
-gsutil -m rsync -r gs://your-bucket/totalseg /data/totalseg
+python scripts/convert_to_npy.py --data ~/data/totalseg --workers 8
+```
+
+**Optional — cache on GCS to avoid re-downloading on future VMs:**
+
+```bash
+# Upload only .npy files (skip raw .nii.gz to save space)
+gsutil -m rsync -r -x '.*\.nii\.gz$' ~/data/totalseg gs://atomic-acrobat-totalseg/totalseg
+
+# On a new VM, restore with:
+mkdir -p ~/data/totalseg
+gsutil -m rsync -r gs://atomic-acrobat-totalseg/totalseg ~/data/totalseg
 ```
 
 ## 5. Configure W&B
@@ -73,7 +81,7 @@ wandb login   # paste your API key
 PJRT_DEVICE=TPU python scripts/train_vit_in_context.py \
     train.tpu=true \
     train.workers=4 \
-    paths.totalseg=/data/totalseg
+    paths.totalseg=~/data/totalseg
 ```
 
 Any config value can be overridden on the command line:
@@ -85,7 +93,7 @@ PJRT_DEVICE=TPU python scripts/train_vit_in_context.py \
     train.epochs=100 \
     train.batch_size=16 \
     train.run_name=my-run \
-    paths.totalseg=/data/totalseg
+    paths.totalseg=~/data/totalseg
 ```
 
 To resume from a checkpoint:
@@ -94,7 +102,7 @@ To resume from a checkpoint:
 PJRT_DEVICE=TPU python scripts/train_vit_in_context.py \
     train.tpu=true \
     train.checkpoint=results/vit_incontext_best.pt \
-    paths.totalseg=/data/totalseg
+    paths.totalseg=~/data/totalseg
 ```
 
 ## 7. Delete the VM when done
