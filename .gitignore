@@ -4,4 +4,6 @@ results/sample_pairs.png
 *.pyc
 wandb/
 tea_debug.log
-results/convert_to_npy.log
+results/*.log
+results/*.pt
+outputs/

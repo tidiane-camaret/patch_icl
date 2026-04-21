@@ -1,2 +1,38 @@
-paths
+paths:
   totalseg: /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  results:  results
+
+data:
+  classes:
+    - liver
+    - lung_upper_lobe_left
+    - lung_lower_lobe_right
+    - lung_lower_lobe_left
+    - lung_upper_lobe_right
+    - small_bowel
+    - colon
+    - heart
+    - autochthon_left
+    - autochthon_right
+  image_size: [64, 64, 64]
+  context_size: 3
+  max_train_subjects: null   # int to limit for debugging, e.g. 50
+  max_val_subjects: null
+
+model:
+  patch_size: [8, 8, 8]
+  embed_dim: 256
+  depth_stage1: 3
+  depth_stage2: 3
+  num_heads: 8
+  mlp_ratio: 4
+  dropout: 0.1
+
+train:
+  epochs: 50
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  workers: 8
+  wandb_project: vit-incontext-seg
+  run_name: null
