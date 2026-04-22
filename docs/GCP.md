@@ -126,7 +126,7 @@ Run all overrides on a single line — multiline pastes can break in some shells
 Common overrides:
 
 ```bash
-PJRT_DEVICE=TPU python scripts/train_vit_in_context.py train.tpu=true train.workers=4 train.epochs=100 train.batch_size=16 train.run_name=my-run paths.totalseg=$HOME/data/totalseg
+PJRT_DEVICE=TPU python scripts/train_vit_in_context.py train.tpu=true train.workers=4 train.epochs=100 train.batch_size=4 train.run_name=my-run paths.totalseg=$HOME/data/totalseg
 ```
 
 Resume from a checkpoint:
@@ -166,6 +166,9 @@ The VM has no TPU hardware. This happens when using `gcloud compute instances cr
 
 **`No space left on device` during preprocessing**
 See the disk-freeing step in section 4.
+
+**`RESOURCE_EXHAUSTED: Ran out of memory in memory space hbm`**
+Stage-1 self-attention runs on a batch of `B + B×context_size` sequences, so the 512² attention intermediates scale with batch size. With the default `batch_size=8` and `context_size=3` the model requires ~16.03GB, just over the v4-8 limit of 15.75GB. Use `train.batch_size=4` (or reduce `model.embed_dim=128` for a larger model-size reduction).
 
 **`Broken pipe` / SSH disconnect during startup**
 The scan cache build on first run takes several minutes of near-idle SSH output, which causes most SSH clients to drop the connection. Always launch training inside `tmux` (see section 6). If you get disconnected mid-run, reconnect with `gcloud compute tpus tpu-vm ssh $TPU ...` then `tmux attach -t train`.

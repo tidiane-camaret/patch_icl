@@ -119,12 +119,12 @@ def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
 
 
 @torch.no_grad()
-def log_predictions(model, samples: dict[str, dict], device, phase: str, epoch: int):
+def log_predictions(model, model_module, samples: dict[str, dict], device, phase: str, epoch: int):
     """
     Run the model on pre-collected samples and log one figure per class to W&B.
     Each figure: tgt+GT  |  ctx1+GT  |  …  |  ctxK+GT  |  tgt+Pred
     """
-    model.eval()
+    model_module.eval()
 
     wandb_images: dict[str, wandb.Image] = {}
 
@@ -359,8 +359,8 @@ def main(cfg: DictConfig) -> None:
         cls_str = "  ".join(f"{c}={v:.3f}" for c, v in sorted(va_cls.items()))
         tqdm.write(f"  [{epoch:3d}] val per-class: {cls_str}" + (" *" if is_best else ""))
 
-        log_predictions(model, train_viz, device, "train", epoch)
-        log_predictions(model, val_viz,   device, "val",   epoch)
+        log_predictions(model, model_module, train_viz, device, "train", epoch)
+        log_predictions(model, model_module, val_viz,   device, "val",   epoch)
 
         if cfg.train.tpu:
             mem = 0.0
