@@ -152,8 +152,12 @@ class TotalSegInContextDataset(Dataset):
             label_npy = self.root / subj / "label.npy"
             if not label_npy.exists():
                 continue
-            arr = np.load(label_npy, mmap_mode="r")
-            present_indices = set(np.unique(arr))
+            try:
+                arr = np.load(label_npy, mmap_mode="r")
+                present_indices = set(np.unique(arr))
+            except (EOFError, ValueError, OSError):
+                print(f"  Skipping corrupt file: {label_npy}", flush=True)
+                continue
             cache[subj] = frozenset(
                 _IDX_TO_CLASS[i] for i in present_indices if i in _IDX_TO_CLASS
             )

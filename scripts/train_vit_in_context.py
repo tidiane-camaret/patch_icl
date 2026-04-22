@@ -299,6 +299,7 @@ def main(cfg: DictConfig) -> None:
         ckpt_path = Path(cfg.train.checkpoint)
         print(f"Loading checkpoint: {ckpt_path}", flush=True)
         state = torch.load(ckpt_path, map_location=device)
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         model.load_state_dict(state)
 
     print("Compiling model...", flush=True)
@@ -322,7 +323,9 @@ def main(cfg: DictConfig) -> None:
 
     results_dir = Path(cfg.paths.results)
     results_dir.mkdir(exist_ok=True)
-    best_ckpt = results_dir / "vit_incontext_best.pt"
+    ckpt_dir = Path(cfg.paths.checkpoints)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt = ckpt_dir / "vit_incontext_best.pt"
 
     # ------------------------------------------------------------------
     # Training loop

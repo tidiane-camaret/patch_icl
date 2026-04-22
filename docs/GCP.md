@@ -112,11 +112,16 @@ wandb login   # paste your API key
 
 ## 6. Run training
 
-Run all overrides on a single line — multiline pastes can break in some shells, and Hydra does not expand `~` (use `$HOME` instead):
+**Always run inside `tmux`** — the first run builds a scan cache (~1228 subjects) which takes several minutes. Without `tmux`, an SSH broken pipe will kill the process before training starts.
 
 ```bash
+tmux new -s train
+# inside tmux:
 PJRT_DEVICE=TPU python scripts/train_vit_in_context.py train.tpu=true train.workers=4 paths.totalseg=$HOME/data/totalseg
+# detach with Ctrl-B D, reattach later with: tmux attach -t train
 ```
+
+Run all overrides on a single line — multiline pastes can break in some shells, and Hydra does not expand `~` (use `$HOME` instead).
 
 Common overrides:
 
@@ -161,6 +166,9 @@ The VM has no TPU hardware. This happens when using `gcloud compute instances cr
 
 **`No space left on device` during preprocessing**
 See the disk-freeing step in section 4.
+
+**`Broken pipe` / SSH disconnect during startup**
+The scan cache build on first run takes several minutes of near-idle SSH output, which causes most SSH clients to drop the connection. Always launch training inside `tmux` (see section 6). If you get disconnected mid-run, reconnect with `gcloud compute tpus tpu-vm ssh $TPU ...` then `tmux attach -t train`.
 
 **`LexerNoViableAltException` from Hydra**
 Hydra does not expand `~` in override values. Use `$HOME` instead of `~`, and pass all overrides on a single line.

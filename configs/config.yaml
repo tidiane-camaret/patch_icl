@@ -1,6 +1,7 @@
 paths:
-  totalseg: /work/dlclarge2/ndirt-SegFM3D/data/totalseg
-  results:  results
+  totalseg:     /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  results:      results
+  checkpoints:  results/checkpoints
 
 data:
   classes:
