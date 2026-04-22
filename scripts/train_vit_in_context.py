@@ -172,8 +172,8 @@ def log_predictions(model, samples: dict[str, dict], device, phase: str, epoch: 
 # Train / eval loops
 # ---------------------------------------------------------------------------
 
-def run_epoch(model, loader, optimizer, loss_fn, scaler, device, train: bool):
-    model.train(train)
+def run_epoch(model, model_module, loader, optimizer, loss_fn, scaler, device, train: bool):
+    model_module.train(train)
     total_loss = total_dice = n = 0
     per_class_dice: dict[str, list[float]] = defaultdict(list)
 
@@ -313,6 +313,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     print("Compiling model...", flush=True)
+    model_module = model  # keep nn.Module reference for .train()/.eval() and state_dict()
     if cfg.train.tpu:
         import torch_xla
         model = torch_xla.compile(model)
@@ -335,10 +336,10 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in epoch_bar:
         tr_loss, tr_dice, tr_cls = run_epoch(
-            model, train_loader, optimizer, loss_fn, scaler, device, train=True
+            model, model_module, train_loader, optimizer, loss_fn, scaler, device, train=True
         )
         va_loss, va_dice, va_cls = run_epoch(
-            model, val_loader, optimizer, loss_fn, scaler, device, train=False
+            model, model_module, val_loader, optimizer, loss_fn, scaler, device, train=False
         )
         scheduler.step()
 
@@ -348,7 +349,7 @@ def main(cfg: DictConfig) -> None:
             if cfg.train.tpu:
                 import torch_xla
                 torch_xla.sync()
-            torch.save(model.state_dict(), best_ckpt)
+            torch.save(model_module.state_dict(), best_ckpt)
 
         epoch_bar.set_postfix(
             tr_loss=f"{tr_loss:.4f}", tr_dice=f"{tr_dice:.4f}",
