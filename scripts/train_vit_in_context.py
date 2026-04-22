@@ -302,13 +302,6 @@ def main(cfg: DictConfig) -> None:
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         model.load_state_dict(state)
 
-    print("Compiling model...", flush=True)
-    if cfg.train.tpu:
-        import torch_xla
-        model = torch_xla.compile(model)
-    else:
-        model = torch.compile(model)
-
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params / 1e6:.1f}M")
 
@@ -318,6 +311,13 @@ def main(cfg: DictConfig) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.train.epochs
     )
+
+    print("Compiling model...", flush=True)
+    if cfg.train.tpu:
+        import torch_xla
+        model = torch_xla.compile(model)
+    else:
+        model = torch.compile(model)
     loss_fn = DiceCELoss()
     scaler  = None if cfg.train.tpu else torch.amp.GradScaler("cuda")
 
