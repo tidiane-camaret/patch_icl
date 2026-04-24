@@ -7,3 +7,5 @@ tea_debug.log
 results/*.log
 results/*.pt
 outputs/
+results/checkpoints/vit_incontext_best.pt
+results/checkpoints/

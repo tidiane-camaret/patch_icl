@@ -1,24 +1,21 @@
+defaults:
+  - augmentations
+  - _self_
+
 paths:
-  totalseg:     /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  totalseg:     /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
   results:      results
   checkpoints:  results/checkpoints
 
 data:
-  classes:
-    - liver
-    - lung_upper_lobe_left
-    - lung_lower_lobe_right
-    - lung_lower_lobe_left
-    - lung_upper_lobe_right
-    - small_bowel
-    - colon
-    - heart
-    - autochthon_left
-    - autochthon_right
+  # train_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]   
+  train_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull]
+  # val_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]
+  val_classes: [colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
   image_size: [64, 64, 64]
   context_size: 3
-  max_train_subjects: 200   # int to limit for debugging, e.g. 50
-  max_val_subjects: 50   # int to limit for debugging, e.g. 50
+  max_train_subjects: null   # int to limit for debugging, e.g. 50
+  max_val_subjects: null   # int to limit for debugging, e.g. 50
 
 model:
   patch_size: [8, 8, 8]
@@ -30,12 +27,12 @@ model:
   dropout: 0.1
 
 train:
-  epochs: 50
+  epochs: 100
   batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 10
-  wandb_project: patch_icl
+  wandb_project: patch_icl # patch_icl  # set to null to disable W&B (offline-safe)
   run_name: null
   checkpoint: null  # path to a .pt checkpoint to resume from, e.g. results/vit_incontext_best.pt
   tpu: false        # set to true to run on Google Cloud TPU (requires torch_xla)

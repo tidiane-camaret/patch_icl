@@ -1,5 +1,5 @@
 augmentations:
-  enabled: true   # set false at eval time
+  enabled: false   # set false at eval time
 
   # -----------------------------------------------------------------------
   # Task augmentations  —  same random params applied to query + all context

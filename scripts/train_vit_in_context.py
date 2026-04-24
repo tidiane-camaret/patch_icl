@@ -119,12 +119,22 @@ def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
 
 
 @torch.no_grad()
-def log_predictions(model, model_module, samples: dict[str, dict], device, phase: str, epoch: int):
+def log_predictions(model, model_module, samples: dict[str, dict], device,
+                    phase: str, epoch: int,
+                    save_dir: Path | None = None,
+                    use_wandb: bool = True):
     """
-    Run the model on pre-collected samples and log one figure per class to W&B.
+    Run the model on pre-collected samples and save one figure per class to
+    *save_dir* (always) and optionally log to W&B.
     Each figure: tgt+GT  |  ctx1+GT  |  …  |  ctxK+GT  |  tgt+Pred
     """
+    if not use_wandb and save_dir is None:
+        return
     model_module.eval()
+
+    if save_dir is not None:
+        plot_dir = save_dir / "plots" / phase
+        plot_dir.mkdir(parents=True, exist_ok=True)
 
     wandb_images: dict[str, wandb.Image] = {}
 
@@ -162,10 +172,19 @@ def log_predictions(model, model_module, samples: dict[str, dict], device, phase
 
         fig.suptitle(f"{phase} | {cls}", fontsize=9, y=1.02)
         fig.tight_layout()
-        wandb_images[f"{phase}/pred/{cls}"] = wandb.Image(fig)
+
+        # Always save to disk when save_dir is provided
+        if save_dir is not None:
+            fname = f"epoch{epoch:03d}_{cls}.png"
+            fig.savefig(plot_dir / fname, dpi=150, bbox_inches="tight")
+
+        if use_wandb:
+            wandb_images[f"{phase}/pred/{cls}"] = wandb.Image(fig)
+
         plt.close(fig)
 
-    wandb.log(wandb_images, step=epoch)
+    if use_wandb:
+        wandb.log(wandb_images, step=epoch)
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +250,8 @@ def main(cfg: DictConfig) -> None:
     # Resolve to plain Python types where needed
     image_size = tuple(cfg.data.image_size)
     patch_size = tuple(cfg.model.patch_size)
-    classes    = list(cfg.data.classes)
+    train_classes = list(cfg.data.train_classes)
+    val_classes   = list(cfg.data.val_classes)
 
     if cfg.train.tpu:
         import torch_xla.core.xla_model as xm
@@ -239,14 +259,16 @@ def main(cfg: DictConfig) -> None:
     else:
         torch.backends.cudnn.benchmark = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_wandb = bool(cfg.train.wandb_project)
     print(f"Device: {device}")
     print(OmegaConf.to_yaml(cfg))
 
-    wandb.init(
-        project=cfg.train.wandb_project,
-        name=cfg.train.run_name or None,
-        config=OmegaConf.to_container(cfg, resolve=True),
-    )
+    if use_wandb:
+        wandb.init(
+            project=cfg.train.wandb_project,
+            name=cfg.train.run_name or None,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
 
     # ------------------------------------------------------------------
     # Datasets & loaders
@@ -260,13 +282,14 @@ def main(cfg: DictConfig) -> None:
     )
 
     train_ds = TotalSegInContextDataset(
-        root=cfg.paths.totalseg, classes=classes,
+        root=cfg.paths.totalseg, classes=train_classes,
         image_size=image_size, split="train",
         context_size=cfg.data.context_size,
         max_subjects=cfg.data.max_train_subjects,
+        aug_cfg=cfg.augmentations
     )
     val_ds = TotalSegInContextDataset(
-        root=cfg.paths.totalseg, classes=classes,
+        root=cfg.paths.totalseg, classes=val_classes,
         image_size=image_size, split="val",
         context_size=cfg.data.context_size,
         max_subjects=cfg.data.max_val_subjects,
@@ -277,8 +300,8 @@ def main(cfg: DictConfig) -> None:
 
     # Collect viz samples once — direct dataset[idx] calls, no DataLoader workers.
     print("Collecting visualisation samples...", flush=True)
-    train_viz = collect_viz_samples(train_ds, classes)
-    val_viz   = collect_viz_samples(val_ds,   classes)
+    train_viz = collect_viz_samples(train_ds, train_classes)
+    val_viz   = collect_viz_samples(val_ds,   val_classes)
     print(f"  train: {len(train_viz)} classes  |  val: {len(val_viz)} classes", flush=True)
 
     # ------------------------------------------------------------------
@@ -359,8 +382,10 @@ def main(cfg: DictConfig) -> None:
         cls_str = "  ".join(f"{c}={v:.3f}" for c, v in sorted(va_cls.items()))
         tqdm.write(f"  [{epoch:3d}] val per-class: {cls_str}" + (" *" if is_best else ""))
 
-        log_predictions(model, model_module, train_viz, device, "train", epoch)
-        log_predictions(model, model_module, val_viz,   device, "val",   epoch)
+        log_predictions(model, model_module, train_viz, device, "train", epoch,
+                        save_dir=ckpt_dir, use_wandb=use_wandb)
+        log_predictions(model, model_module, val_viz,   device, "val",   epoch,
+                        save_dir=ckpt_dir, use_wandb=use_wandb)
 
         if cfg.train.tpu:
             mem = 0.0
@@ -368,29 +393,29 @@ def main(cfg: DictConfig) -> None:
             mem = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
 
-        # Per-class table: one row per class, train + val dice side by side
-        table = wandb.Table(
-            columns=["class", "train_dice", "val_dice"],
-            data=[
-                [cls, tr_cls.get(cls, float("nan")), va_cls.get(cls, float("nan"))]
-                for cls in sorted(classes)
-            ],
-        )
+        if use_wandb:
+            all_classes = sorted(set(train_classes + val_classes))
+            table = wandb.Table(
+                columns=["class", "train_dice", "val_dice"],
+                data=[
+                    [cls, tr_cls.get(cls, float("nan")), va_cls.get(cls, float("nan"))]
+                    for cls in sorted(all_classes)
+                ],
+            )
+            log = {
+                "train/loss": tr_loss, "train/dice": tr_dice,
+                "val/loss":   va_loss, "val/dice":   va_dice,
+                "lr": scheduler.get_last_lr()[0],
+                "gpu/vram_peak_gb": mem,
+                "dice_by_class": table,
+            }
+            log.update({f"val/dice/{c}":   v for c, v in va_cls.items()})
+            log.update({f"train/dice/{c}": v for c, v in tr_cls.items()})
+            wandb.log(log, step=epoch)
 
-        log = {
-            "train/loss": tr_loss, "train/dice": tr_dice,
-            "val/loss":   va_loss, "val/dice":   va_dice,
-            "lr": scheduler.get_last_lr()[0],
-            "gpu/vram_peak_gb": mem,
-            "dice_by_class": table,
-        }
-        # Slash-separated keys → W&B groups them under val/dice/ and train/dice/
-        log.update({f"val/dice/{c}":   v for c, v in va_cls.items()})
-        log.update({f"train/dice/{c}": v for c, v in tr_cls.items()})
-        wandb.log(log, step=epoch)
-
-    wandb.summary["best_val_dice"] = best_val_dice
-    wandb.finish()
+    if use_wandb:
+        wandb.summary["best_val_dice"] = best_val_dice
+        wandb.finish()
     print(f"\nBest val Dice: {best_val_dice:.4f}  →  {best_ckpt}")
 
 
