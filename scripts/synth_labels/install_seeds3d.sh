@@ -23,8 +23,14 @@ fi
 
 # ---- OpenCV headers + libs ---------------------------------------------------
 if [ ! -f "$CONDA_PREFIX/include/opencv4/opencv2/core.hpp" ]; then
-    echo "OpenCV   : not found, installing via conda ..."
-    conda install -y -c conda-forge "opencv>=4" --quiet 2>&1 | tail -3
+    echo "OpenCV   : not found, installing libopencv ..."
+    # libopencv = C++ library only (no Python bindings), much faster to solve
+    # Prefer mamba (fast solver) over conda
+    if command -v mamba &>/dev/null; then
+        mamba install -y -c conda-forge libopencv 2>&1 | tail -5
+    else
+        conda install -y -c conda-forge libopencv 2>&1 | tail -5
+    fi
 fi
 
 if [ ! -f "$CONDA_PREFIX/include/opencv4/opencv2/core.hpp" ]; then
