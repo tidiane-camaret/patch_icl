@@ -86,7 +86,13 @@ def _slic(vol: np.ndarray, n_segments: int) -> np.ndarray:
 
 
 def _seeds3d(vol: np.ndarray, n_segments: int) -> np.ndarray:
-    import python_3d_seeds
+    try:
+        import python_3d_seeds
+    except ImportError:
+        raise ImportError(
+            "python_3d_seeds is not installed.\n"
+            "Run:  bash scripts/synth_labels/install_seeds3d.sh"
+        )
     D, H, W = vol.shape
     data = np.ascontiguousarray(vol, dtype=np.float32)
     sv = python_3d_seeds.createSupervoxelSEEDS(
