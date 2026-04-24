@@ -120,13 +120,19 @@ def _process(args: tuple) -> dict:
         return dict(subject=subj_dir.name, status="skip", n_actual=int(arr.max()),
                     elapsed_s=0.0, n_req=n_segments)
 
-    ct_path = subj_dir / "ct.npy"
-    if not ct_path.exists():
+    ct_npy = subj_dir / "ct.npy"
+    ct_nii = subj_dir / "ct.nii.gz"
+    if not ct_npy.exists() and not ct_nii.exists():
         return dict(subject=subj_dir.name, status="error",
-                    error="ct.npy not found", elapsed_s=0.0, n_req=n_segments)
+                    error="neither ct.npy nor ct.nii.gz found", elapsed_s=0.0, n_req=n_segments)
 
     try:
-        vol = np.load(ct_path, mmap_mode="r").astype(np.float32)
+        if ct_npy.exists():
+            vol = np.load(ct_npy, mmap_mode="r").astype(np.float32)
+        else:
+            import nibabel as nib
+            raw = nib.load(str(ct_nii)).get_fdata(dtype=np.float32)
+            vol = (np.clip(raw, -150, 250) + 150) / 400.0
         fn  = ALGORITHMS[method]
         t0  = time.perf_counter()
         labels = fn(vol, n_segments)
@@ -212,7 +218,9 @@ def main():
             print(f"  -  {subj:<12}  skip (exists, n_actual={r['n_actual']})")
         else:
             errors += 1
-            print(f"  ✗  {subj:<12}  ERROR: {r.get('error', '')[:120]}")
+            # Print full traceback so the root cause is visible
+            err = r.get("error", "unknown error")
+            print(f"  ✗  {subj:<12}  ERROR:\n{err}")
 
     if args.workers <= 1:
         for task in tasks:
