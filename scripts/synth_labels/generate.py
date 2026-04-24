@@ -8,12 +8,17 @@ alongside ct.npy and label.npy in the same subject directory.
 n_segments is drawn from U[50, 500] per subject (MultiverSeg protocol) unless
 --n-segments is given.
 
+Optionally precompute union labels (--union) which merge each supervoxel with
+up to --n-union adjacent neighbors, producing larger organ-sized blobs stored
+as label_synth_<method>_union.npy.  Fast at train time: just a numpy mmap load.
+
 Usage
 -----
   uv run scripts/synth_labels/generate.py --method grid
   uv run scripts/synth_labels/generate.py --method watershed --workers 4
   uv run scripts/synth_labels/generate.py --method slic --n-segments 200
   uv run scripts/synth_labels/generate.py --method seeds3d --overwrite
+  uv run scripts/synth_labels/generate.py --method seeds3d --union --n-union 4
 """
 
 import argparse
@@ -113,43 +118,127 @@ ALGORITHMS = {
 
 
 # ---------------------------------------------------------------------------
+# Union labels
+# ---------------------------------------------------------------------------
+
+def _build_union_labels(label: np.ndarray, n_union: int, seed: int = 0) -> np.ndarray:
+    """
+    Merge adjacent supervoxels into groups of up to n_union, producing fewer,
+    larger regions that mimic organ-scale structures.
+
+    Adjacency is face-touching (6-connectivity).  A greedy random-walk over
+    the adjacency graph assigns each SV to exactly one group; background (0)
+    is preserved.  Uses purely vectorised numpy for the adjacency build so
+    it's fast even on high-resolution volumes.
+    """
+    n_sv = int(label.max())
+    if n_sv == 0:
+        return label.copy()
+
+    # --- Build adjacency via face-pair extraction (vectorised) -----------
+    pairs_list = []
+    for axis in range(3):
+        sl_a = [slice(None)] * 3; sl_a[axis] = slice(None, -1)
+        sl_b = [slice(None)] * 3; sl_b[axis] = slice(1, None)
+        a = label[tuple(sl_a)].ravel()
+        b = label[tuple(sl_b)].ravel()
+        diff  = a != b
+        ab    = np.stack([a[diff], b[diff]], axis=1)
+        valid = (ab[:, 0] > 0) & (ab[:, 1] > 0)
+        if valid.any():
+            pairs_list.append(np.sort(ab[valid], axis=1))
+
+    adj: list[list[int]] = [[] for _ in range(n_sv + 1)]
+    if pairs_list:
+        all_pairs = np.unique(np.concatenate(pairs_list, axis=0), axis=0)
+        ii = all_pairs[:, 0].tolist()
+        jj = all_pairs[:, 1].tolist()
+        for i, j in zip(ii, jj):
+            adj[i].append(j)
+            adj[j].append(i)
+
+    # --- Greedy random-walk merge ----------------------------------------
+    rng     = np.random.default_rng(seed)
+    mapping = np.arange(n_sv + 1, dtype=np.int32)
+    visited = np.zeros(n_sv + 1, dtype=bool)
+    visited[0] = True
+    new_id  = 1
+    for sv in rng.permutation(np.arange(1, n_sv + 1)):
+        if visited[sv]:
+            continue
+        group = [sv]
+        visited[sv] = True
+        nbrs = [n for n in adj[sv] if not visited[n]]
+        if nbrs:
+            nbrs = rng.choice(nbrs, size=min(len(nbrs), n_union - 1),
+                              replace=False).tolist()
+            for nbr in nbrs:
+                if not visited[nbr]:
+                    group.append(nbr)
+                    visited[nbr] = True
+        for g in group:
+            mapping[g] = new_id
+        new_id += 1
+
+    return mapping[label].astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
 # Per-subject worker
 # ---------------------------------------------------------------------------
 
 def _process(args: tuple) -> dict:
-    subj_dir, method, n_segments, overwrite = args
+    subj_dir, method, n_segments, overwrite, union_n = args
     subj_dir = Path(subj_dir)
     out_path = subj_dir / f"label_synth_{method}.npy"
 
+    result: dict = dict(subject=subj_dir.name, n_req=n_segments, elapsed_s=0.0)
+
+    # --- Step 1: base supervoxel labels ----------------------------------
     if out_path.exists() and not overwrite:
         arr = np.load(out_path, mmap_mode="r")
-        return dict(subject=subj_dir.name, status="skip", n_actual=int(arr.max()),
-                    elapsed_s=0.0, n_req=n_segments)
+        result.update(status="skip", n_actual=int(arr.max()))
+    else:
+        ct_npy = subj_dir / "ct.npy"
+        ct_nii = subj_dir / "ct.nii.gz"
+        if not ct_npy.exists() and not ct_nii.exists():
+            return dict(subject=subj_dir.name, status="error",
+                        error="neither ct.npy nor ct.nii.gz found",
+                        elapsed_s=0.0, n_req=n_segments)
+        try:
+            if ct_npy.exists():
+                vol = np.load(ct_npy, mmap_mode="r").astype(np.float32)
+            else:
+                import nibabel as nib
+                raw = nib.load(str(ct_nii)).get_fdata(dtype=np.float32)
+                vol = (np.clip(raw, -150, 250) + 150) / 400.0
+            fn      = ALGORITHMS[method]
+            t0      = time.perf_counter()
+            labels  = fn(vol, n_segments)
+            elapsed = time.perf_counter() - t0
+            np.save(out_path, labels)
+            result.update(status="ok", n_actual=int(labels.max()),
+                          elapsed_s=round(elapsed, 3), shape=list(vol.shape))
+        except Exception:
+            return dict(subject=subj_dir.name, status="error",
+                        error=traceback.format_exc(), elapsed_s=0.0, n_req=n_segments)
 
-    ct_npy = subj_dir / "ct.npy"
-    ct_nii = subj_dir / "ct.nii.gz"
-    if not ct_npy.exists() and not ct_nii.exists():
-        return dict(subject=subj_dir.name, status="error",
-                    error="neither ct.npy nor ct.nii.gz found", elapsed_s=0.0, n_req=n_segments)
-
-    try:
-        if ct_npy.exists():
-            vol = np.load(ct_npy, mmap_mode="r").astype(np.float32)
+    # --- Step 2: union labels (optional) ---------------------------------
+    if union_n > 0:
+        union_path = subj_dir / f"label_synth_{method}_union.npy"
+        if union_path.exists() and not overwrite:
+            u_arr = np.load(union_path, mmap_mode="r")
+            result.update(union_status="skip", union_n_actual=int(u_arr.max()))
         else:
-            import nibabel as nib
-            raw = nib.load(str(ct_nii)).get_fdata(dtype=np.float32)
-            vol = (np.clip(raw, -150, 250) + 150) / 400.0
-        fn  = ALGORITHMS[method]
-        t0  = time.perf_counter()
-        labels = fn(vol, n_segments)
-        elapsed = time.perf_counter() - t0
-        np.save(out_path, labels)
-        return dict(subject=subj_dir.name, status="ok", n_req=n_segments,
-                    n_actual=int(labels.max()), elapsed_s=round(elapsed, 3),
-                    shape=list(vol.shape))
-    except Exception:
-        return dict(subject=subj_dir.name, status="error",
-                    error=traceback.format_exc(), elapsed_s=0.0, n_req=n_segments)
+            try:
+                base         = np.load(out_path, mmap_mode="r")
+                union_labels = _build_union_labels(base, union_n, seed=0)
+                np.save(union_path, union_labels)
+                result.update(union_status="ok", union_n_actual=int(union_labels.max()))
+            except Exception:
+                result.update(union_status="error", union_error=traceback.format_exc())
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +269,14 @@ def main():
         "--overwrite", action="store_true",
         help="Recompute even if label_synth_<method>.npy already exists",
     )
+    parser.add_argument(
+        "--union", action="store_true",
+        help="Also precompute label_synth_<method>_union.npy (adjacent SV merges)",
+    )
+    parser.add_argument(
+        "--n-union", type=int, default=4,
+        help="Max supervoxels per union group (default: 4)",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data) if args.data else load_totalseg_path()
@@ -195,8 +292,9 @@ def main():
         else rng.integers(50, 501, size=len(subjects)).tolist()
     )
 
+    union_n = args.n_union if args.union else 0
     tasks = [
-        (str(subj), args.method, int(n), args.overwrite)
+        (str(subj), args.method, int(n), args.overwrite, union_n)
         for subj, n in zip(subjects, n_segs)
     ]
 
@@ -205,6 +303,8 @@ def main():
     print(f"Subjects : {len(subjects)}")
     print(f"Workers  : {args.workers}")
     print(f"Output   : label_synth_{args.method}.npy  (saved next to ct.npy)")
+    if union_n:
+        print(f"Union    : label_synth_{args.method}_union.npy  (n_union={union_n})")
     print()
 
     total = len(tasks)
@@ -213,20 +313,29 @@ def main():
 
     def _report(r: dict):
         nonlocal ok, skipped, errors
-        subj = r["subject"]
+        subj   = r["subject"]
         status = r["status"]
         if status == "ok":
             ok += 1
-            print(f"  ✓  {subj:<12}  n_req={r['n_req']:>4}  n_actual={r['n_actual']:>5}"
-                  f"  shape={r.get('shape', '?')}  {r['elapsed_s']:.1f}s")
+            line = (f"  ✓  {subj:<12}  n_req={r['n_req']:>4}  n_actual={r['n_actual']:>5}"
+                    f"  shape={r.get('shape', '?')}  {r['elapsed_s']:.1f}s")
         elif status == "skip":
             skipped += 1
-            print(f"  -  {subj:<12}  skip (exists, n_actual={r['n_actual']})")
+            line = f"  -  {subj:<12}  skip (exists, n_actual={r['n_actual']})"
         else:
             errors += 1
-            # Print full traceback so the root cause is visible
-            err = r.get("error", "unknown error")
-            print(f"  ✗  {subj:<12}  ERROR:\n{err}")
+            err  = r.get("error", "unknown error")
+            line = f"  ✗  {subj:<12}  ERROR:\n{err}"
+
+        if "union_status" in r:
+            u = r["union_status"]
+            if u == "ok":
+                line += f"  →  union n={r['union_n_actual']}"
+            elif u == "skip":
+                line += f"  →  union skip (n={r['union_n_actual']})"
+            else:
+                line += f"  →  union ERROR\n{r.get('union_error', '')}"
+        print(line)
 
     if args.workers <= 1:
         for task in tasks:

@@ -15,7 +15,10 @@ data:
   image_size: [64, 64, 64]
   context_size: 3
   max_train_subjects: null   # int to limit for debugging, e.g. 50
-  max_val_subjects: null   # int to limit for debugging, e.g. 50
+  max_val_subjects: null     # int to limit for debugging, e.g. 50
+  synth_method: null         # grid | watershed | slic | seeds3d | null = disabled
+  synth_unions: false        # use label_synth_<method>_union.npy instead
+  p_synth: 0.5               # fraction of train items from synth path; 1.0 = synth-only
 
 model:
   patch_size: [8, 8, 8]

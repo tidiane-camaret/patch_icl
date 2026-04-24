@@ -97,24 +97,33 @@ def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
     Call dataset[idx] directly in the main process — no DataLoader workers.
     Avoids abandoning mid-flight iterators (which deadlocks persistent workers).
     Only loads one sample per class (~10 items), so latency is negligible.
+
+    When synth is active:
+      - p_synth < 1: one synth item + one real item per class
+      - p_synth = 1: one synth item only
     """
-    # Find the first sample index for each class from the flat sample list
-    class_to_idx: dict[str, int] = {}
-    for i, (_, cls) in enumerate(dataset.samples):
-        if cls not in class_to_idx:
-            class_to_idx[cls] = i
-        if len(class_to_idx) == len(classes):
-            break
+    def _extract(item: dict) -> dict:
+        return {k: item[k] for k in ("image", "label", "context_in", "context_out")}
 
     samples: dict[str, dict] = {}
-    for cls, idx in class_to_idx.items():
-        item = dataset[idx]
-        samples[cls] = {
-            "image":       item["image"],
-            "label":       item["label"],
-            "context_in":  item["context_in"],
-            "context_out": item["context_out"],
-        }
+
+    if dataset.synth_method is not None:
+        item = dataset._get_synth_item()
+        samples[item["label_name"]] = _extract(item)
+
+    if dataset.synth_method is None or dataset.p_synth < 1.0:
+        # Temporarily disable the synth path so we always get one real item per class
+        saved_p, dataset.p_synth = dataset.p_synth, 0.0
+        class_to_idx: dict[str, int] = {}
+        for i, (_, cls) in enumerate(dataset.samples):
+            if cls not in class_to_idx:
+                class_to_idx[cls] = i
+            if len(class_to_idx) == len(classes):
+                break
+        for cls, idx in class_to_idx.items():
+            samples[cls] = _extract(dataset[idx])
+        dataset.p_synth = saved_p
+
     return samples
 
 
@@ -281,12 +290,16 @@ def main(cfg: DictConfig) -> None:
         collate_fn=incontext_collate_fn,
     )
 
+    synth_method = cfg.data.synth_method or None
     train_ds = TotalSegInContextDataset(
         root=cfg.paths.totalseg, classes=train_classes,
         image_size=image_size, split="train",
         context_size=cfg.data.context_size,
         max_subjects=cfg.data.max_train_subjects,
-        aug_cfg=cfg.augmentations
+        aug_cfg=cfg.augmentations,
+        synth_method=synth_method,
+        synth_unions=cfg.data.synth_unions,
+        p_synth=cfg.data.p_synth,
     )
     val_ds = TotalSegInContextDataset(
         root=cfg.paths.totalseg, classes=val_classes,

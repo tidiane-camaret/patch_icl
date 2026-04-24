@@ -1,11 +1,13 @@
 """
 3D data augmentations for in-context segmentation.
 
-Two augmentation modes (from MultiverSeg):
+Three augmentation modes:
   - Task augmentation: geometric, same random params applied to ALL volumes in a
     task (query + every context entry) so the task stays consistent.
   - Within-task (intensity): independently sampled per volume to add intra-task
     visual diversity.
+  - Synth augmentation: heavy geometric + intensity, independently sampled per
+    copy so K+1 views of the same supervoxel diverge as much as possible.
 
 All ops work on CPU tensors inside DataLoader workers.
 Geometric ops batch the K+1 volumes into one grid_sample call for speed.
@@ -17,7 +19,7 @@ Shapes
 
 Usage
 -----
-  from src.augmentations import apply_task_aug, apply_intensity_aug
+  from src.augmentations import apply_task_aug, apply_intensity_aug, apply_synth_aug
 
   # task aug: query + all context batched together
   images, masks = apply_task_aug(images, masks, cfg.augmentations.task)
@@ -25,6 +27,9 @@ Usage
   # intensity aug: one volume at a time
   for i in range(N):
       images[i] = apply_intensity_aug(images[i], cfg.augmentations.intensity)
+
+  # synth aug: call independently per copy
+  image, mask = apply_synth_aug(image, mask, cfg.augmentations.synth)
 """
 
 import math
@@ -188,3 +193,111 @@ def _separable_gaussian_blur_3d(image: torch.Tensor, sigma: float) -> torch.Tens
     x = F.conv3d(x, kh, padding=(0, radius, 0))
     x = F.conv3d(x, kw, padding=(0, 0, radius))
     return x.squeeze(0)                 # (1, D, H, W)
+
+
+def _gaussian_smooth_3d_field(field: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Depthwise separable Gaussian blur for a (C, D, H, W) displacement field."""
+    radius = max(1, int(math.ceil(2.0 * sigma)))
+    size   = 2 * radius + 1
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    k1d    = torch.exp(-0.5 * (coords / sigma) ** 2)
+    k1d    = k1d / k1d.sum()
+    C = field.shape[0]
+    x  = field.unsqueeze(0)                                          # (1, C, D, H, W)
+    kd = k1d.view(1, 1, size, 1, 1).expand(C, 1, size, 1, 1).clone()
+    kh = k1d.view(1, 1, 1, size, 1).expand(C, 1, 1, size, 1).clone()
+    kw = k1d.view(1, 1, 1, 1, size).expand(C, 1, 1, 1, size).clone()
+    x  = F.conv3d(x, kd, padding=(radius, 0, 0), groups=C)
+    x  = F.conv3d(x, kh, padding=(0, radius, 0), groups=C)
+    x  = F.conv3d(x, kw, padding=(0, 0, radius), groups=C)
+    return x.squeeze(0)                                              # (C, D, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Synth augmentation (independent per copy)
+# ---------------------------------------------------------------------------
+
+def apply_synth_aug(
+    image: torch.Tensor,   # (1, D, H, W) float32
+    mask:  torch.Tensor,   # (D, H, W)    int64
+    cfg,                   # augmentations.synth config section
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Heavy geometric + intensity augmentation sampled independently.
+    Call once per copy so K+1 views of the same supervoxel diverge.
+    """
+    _, D, H, W = image.shape
+
+    # --- Flips (all 3 axes) ----------------------------------------------
+    for img_dim, msk_dim, p in [
+        (1, 0, cfg.flip_d),
+        (2, 1, cfg.flip_h),
+        (3, 2, cfg.flip_w),
+    ]:
+        if random.random() < p:
+            image = image.flip(img_dim)
+            mask  = mask.flip(msk_dim)
+
+    # --- Affine ----------------------------------------------------------
+    acfg = cfg.affine
+    if random.random() < acfg.p:
+        max_rad = acfg.max_angle_deg * math.pi / 180.0
+        rx = random.uniform(-max_rad, max_rad)
+        ry = random.uniform(-max_rad, max_rad)
+        rz = random.uniform(-max_rad, max_rad)
+        scale = random.uniform(acfg.scale_min, acfg.scale_max)
+        tx = random.uniform(-acfg.max_translate, acfg.max_translate)
+        ty = random.uniform(-acfg.max_translate, acfg.max_translate)
+        tz = random.uniform(-acfg.max_translate, acfg.max_translate)
+        theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)   # (1, 3, 4)
+        grid  = F.affine_grid(theta, (1, 1, D, H, W), align_corners=False)
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
+        image = image.squeeze(0)   # (1, D, H, W)
+        mask  = mask.squeeze(0)    # (D, H, W)
+
+    # --- Elastic: Gaussian-smoothed displacement field -------------------
+    ecfg = cfg.elastic
+    if random.random() < ecfg.p:
+        alpha = random.uniform(*ecfg.alpha_range)   # voxels
+        sigma = random.uniform(*ecfg.sigma_range)   # voxels
+        disp  = torch.randn(3, D, H, W)
+        disp  = _gaussian_smooth_3d_field(disp, sigma)
+        # normalise to peak=alpha voxels then convert to [-1,1] grid coords
+        mx    = disp.abs().amax().clamp(min=1e-6)
+        disp  = disp / mx * alpha
+        scale_n = torch.tensor([2.0 / D, 2.0 / H, 2.0 / W]).view(3, 1, 1, 1)
+        disp_n  = (disp * scale_n).permute(1, 2, 3, 0).unsqueeze(0)  # (1,D,H,W,3)
+        theta_id = torch.eye(3, 4).unsqueeze(0)
+        base  = F.affine_grid(theta_id, (1, 1, D, H, W), align_corners=False)
+        grid  = (base + disp_n).clamp(-1.0, 1.0)
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
+        image = image.squeeze(0)
+        mask  = mask.squeeze(0)
+
+    # --- Intensity: brightness / contrast --------------------------------
+    bccfg = cfg.brightness_contrast
+    if random.random() < bccfg.p:
+        brightness = random.uniform(-bccfg.brightness, bccfg.brightness)
+        contrast   = random.uniform(bccfg.contrast_range[0], bccfg.contrast_range[1])
+        image = (image * contrast + brightness).clamp_(0.0, 1.0)
+
+    # --- Intensity: sharpness (unsharp masking) --------------------------
+    scfg = cfg.sharpness
+    if random.random() < scfg.p:
+        blurred = _separable_gaussian_blur_3d(image, sigma=1.0)
+        image   = (image + scfg.factor * (image - blurred)).clamp_(0.0, 1.0)
+
+    # --- Intensity: Gaussian blur ----------------------------------------
+    blcfg = cfg.gaussian_blur
+    if random.random() < blcfg.p:
+        sigma = random.uniform(blcfg.sigma_range[0], blcfg.sigma_range[1])
+        image = _separable_gaussian_blur_3d(image, sigma)
+
+    # --- Intensity: Gaussian noise ---------------------------------------
+    ncfg = cfg.gaussian_noise
+    if random.random() < ncfg.p:
+        mean = random.uniform(ncfg.mean_range[0], ncfg.mean_range[1])
+        std  = random.uniform(ncfg.std_range[0],  ncfg.std_range[1])
+        image = (image + mean + torch.randn_like(image) * std).clamp_(0.0, 1.0)
+
+    return image, mask

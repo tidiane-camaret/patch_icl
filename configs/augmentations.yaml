@@ -42,3 +42,43 @@ augmentations:
     gaussian_blur:
       p: 0.50
       sigma_range: [0.50, 1.50]   # Gaussian sigma in voxels
+
+  # -----------------------------------------------------------------------
+  # Synth augmentations  —  applied independently to each of the K+1 copies
+  # so that views of the same supervoxel diverge geometrically and in
+  # intensity.  Heavier than the real-data aug by design.
+  # -----------------------------------------------------------------------
+  synth:
+    flip_d: 0.5
+    flip_h: 0.5
+    flip_w: 0.5
+
+    affine:
+      p: 0.8
+      max_angle_deg: 25.0
+      scale_min: 0.90
+      scale_max: 1.50
+      max_translate: 0.20
+
+    elastic:
+      p: 0.8
+      alpha_range: [1, 10]    # peak displacement (voxels)
+      sigma_range: [8, 15]    # Gaussian smoothing of disp field (voxels)
+
+    brightness_contrast:
+      p: 0.5
+      brightness: 0.10
+      contrast_range: [0.5, 1.5]
+
+    sharpness:
+      p: 0.5
+      factor: 5.0             # unsharp-mask weight
+
+    gaussian_blur:
+      p: 0.5
+      sigma_range: [0.1, 1.5]
+
+    gaussian_noise:
+      p: 0.5
+      mean_range: [0.0, 0.05]
+      std_range:  [0.0, 0.05]

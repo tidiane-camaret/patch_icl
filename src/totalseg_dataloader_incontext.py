@@ -42,7 +42,7 @@ from src.totalseg_dataset import (
     _build_label_volume,
     _resize_volume,
 )
-from src.augmentations import apply_task_aug, apply_intensity_aug
+from src.augmentations import apply_task_aug, apply_intensity_aug, apply_synth_aug
 
 # Inverse map: orig label index → class name (covers all 117 classes)
 _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
@@ -87,12 +87,17 @@ class TotalSegInContextDataset(Dataset):
         context_size: int = 3,
         max_subjects: Optional[int] = None,
         aug_cfg=None,
+        synth_method: Optional[str] = None,
+        synth_unions: bool = False,
+        p_synth: float = 0.5,
     ):
         self.root = Path(root)
         self.classes = list(classes)
         self.image_size = image_size
         self.context_size = context_size
         self.aug_cfg = aug_cfg  # None → no augmentation
+        self.synth_method = synth_method
+        self.p_synth = p_synth
 
         subjects = self._get_subjects(split, meta_csv, max_subjects)
 
@@ -117,6 +122,18 @@ class TotalSegInContextDataset(Dataset):
         counts = {cls: len(self.label_to_subjects[cls]) for cls in self.classes}
         print(f"TotalSegInContextDataset: {len(self.samples)} samples | "
               f"context_size={context_size} | class counts: {counts}", flush=True)
+
+        # Synth path: build SV-ID cache for fast __getitem__ sampling
+        if synth_method is not None:
+            suffix = "_union" if synth_unions else ""
+            self._synth_fname = f"label_synth_{synth_method}{suffix}.npy"
+            self._synth_subjects, self._synth_sv_ids = \
+                self._load_or_build_synth_cache(subjects)
+            print(f"Synth path: method={synth_method} unions={synth_unions} "
+                  f"p_synth={p_synth} | {len(self._synth_subjects)} subjects", flush=True)
+        else:
+            self._synth_subjects = []
+            self._synth_sv_ids   = {}
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -167,6 +184,45 @@ class TotalSegInContextDataset(Dataset):
         print(f"Scan cache saved ({len(cache)} subjects).", flush=True)
         return cache
 
+    def _load_or_build_synth_cache(
+        self, subjects: list[str]
+    ) -> tuple[list[str], dict[str, np.ndarray]]:
+        """
+        Return (synth_subjects, {subject: array_of_sv_ids}).
+
+        Scans which subjects in this split have the synth label file and records
+        their unique SV indices, so __getitem__ never calls np.unique at runtime.
+        Persisted as a pickle next to the data; rebuilt only when the subject
+        set or filename changes.
+        """
+        synth_subs = [s for s in subjects
+                      if (self.root / s / self._synth_fname).exists()]
+
+        key = hashlib.sha256(
+            (self._synth_fname + "|".join(synth_subs)).encode()
+        ).hexdigest()[:12]
+        cache_path = self.root / f".synth_sv_cache_{key}.pkl"
+
+        if cache_path.exists():
+            with open(cache_path, "rb") as f:
+                sv_ids = pickle.load(f)
+            print(f"Loaded synth SV cache ({len(sv_ids)} subjects) from {cache_path.name}",
+                  flush=True)
+            return synth_subs, sv_ids
+
+        print(f"Building synth SV cache for {len(synth_subs)} subjects "
+              f"({self._synth_fname})...", flush=True)
+        sv_ids: dict[str, np.ndarray] = {}
+        for subj in synth_subs:
+            arr = np.load(self.root / subj / self._synth_fname, mmap_mode="r")
+            ids = np.unique(arr)
+            sv_ids[subj] = ids[ids > 0].copy()
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(sv_ids, f)
+        print(f"Synth SV cache saved ({len(sv_ids)} subjects).", flush=True)
+        return synth_subs, sv_ids
+
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
         if split is not None:
@@ -188,7 +244,49 @@ class TotalSegInContextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _get_synth_item(self) -> dict:
+        """
+        Build one in-context item from a single supervoxel, duplicated K+1
+        times with heavy independent augmentation applied to each copy so that
+        target and context diverge as much as possible.
+        """
+        subj   = random.choice(self._synth_subjects)
+        sv_ids = self._synth_sv_ids[subj]
+        sv_idx = int(random.choice(sv_ids))
+
+        image  = _load_ct(self.root / subj / "ct.nii.gz")                  # (D,H,W) float32
+        sv_vol = np.load(self.root / subj / self._synth_fname, mmap_mode="r")
+        mask   = (sv_vol == sv_idx).astype(np.uint8)                        # (D,H,W) binary
+
+        image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)         # (1,1,D,H,W)
+        mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        if self.image_size is not None:
+            image_t, mask_t = _resize_volume(image_t, mask_t, self.image_size)
+        image_t = image_t.squeeze(0)                    # (1, D, H, W)
+        mask_t  = mask_t.squeeze(0).squeeze(0).long()  # (D, H, W)
+
+        # K+1 independent copies, each separately augmented
+        items = [
+            apply_synth_aug(image_t.clone(), mask_t.clone(), self.aug_cfg.synth)
+            for _ in range(self.context_size + 1)
+        ]
+        image_out, label_out = items[0]
+        context_in  = torch.stack([it[0] for it in items[1:]])  # (K, 1, D, H, W)
+        context_out = torch.stack([it[1] for it in items[1:]])  # (K, D, H, W)
+
+        return {
+            "image":       image_out,
+            "label":       label_out,
+            "context_in":  context_in,
+            "context_out": context_out,
+            "subject":     subj,
+            "label_name":  f"sv_{sv_idx}",
+        }
+
     def __getitem__(self, idx: int) -> dict:
+        if self._synth_subjects and random.random() < self.p_synth:
+            return self._get_synth_item()
+
         subj, cls = self.samples[idx]
 
         image_t, label_t = self._load(subj, cls)
@@ -295,6 +393,9 @@ def get_incontext_loader(
     num_workers: int = 4,
     max_subjects: Optional[int] = None,
     aug_cfg=None,
+    synth_method: Optional[str] = None,
+    synth_unions: bool = False,
+    p_synth: float = 0.5,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -304,6 +405,9 @@ def get_incontext_loader(
         context_size=context_size,
         max_subjects=max_subjects,
         aug_cfg=aug_cfg,
+        synth_method=synth_method,
+        synth_unions=synth_unions,
+        p_synth=p_synth,
     )
     return DataLoader(
         ds,
