@@ -28,10 +28,10 @@ model:
 
 train:
   epochs: 100
-  batch_size: 8
+  batch_size: 32
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  workers: 10
+  workers: 16
   wandb_project: patch_icl # patch_icl  # set to null to disable W&B (offline-safe)
   run_name: null
   checkpoint: null  # path to a .pt checkpoint to resume from, e.g. results/vit_incontext_best.pt
