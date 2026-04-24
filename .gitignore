@@ -9,3 +9,4 @@ results/*.pt
 outputs/
 results/checkpoints/vit_incontext_best.pt
 results/checkpoints/
+*.npy
