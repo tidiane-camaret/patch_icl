@@ -26,6 +26,7 @@ augmentations:
   # Intensity augmentations  —  independently sampled per volume
   # -----------------------------------------------------------------------
   intensity:
+    hu_jitter: 0                # disabled: bypasses ct.npy cache (forces slow nii.gz decompression); brightness_contrast below covers equivalent intensity variation
     brightness_contrast:
       p: 0.5
       brightness: 0.10            # uniform ±brightness added

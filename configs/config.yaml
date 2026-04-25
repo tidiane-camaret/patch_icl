@@ -19,6 +19,7 @@ data:
   synth_method: null         # grid | watershed | slic | seeds3d | null = disabled
   synth_unions: false        # use label_synth_<method>_union.npy instead
   p_synth: 0.5               # fraction of train items from synth path; 1.0 = synth-only
+  class_balanced: false      # sample class uniformly first, then subject; prevents large classes dominating
 
 model:
   patch_size: [8, 8, 8]
@@ -31,10 +32,10 @@ model:
 
 train:
   epochs: 100
-  batch_size: 32
+  batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  workers: 16
+  workers: 8
   wandb_project: patch_icl # patch_icl  # set to null to disable W&B (offline-safe)
   run_name: null
   checkpoint: null  # path to a .pt checkpoint to resume from, e.g. results/vit_incontext_best.pt

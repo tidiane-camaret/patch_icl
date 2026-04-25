@@ -29,6 +29,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
+import scipy.ndimage as ndi
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -187,18 +188,26 @@ def _build_union_labels(label: np.ndarray, n_union: int, seed: int = 0) -> np.nd
 # Per-subject worker
 # ---------------------------------------------------------------------------
 
+def _resize_label(labels: np.ndarray, size: tuple) -> np.ndarray:
+    zoom = tuple(t / s for t, s in zip(size, labels.shape))
+    return ndi.zoom(labels, zoom, order=0).astype(labels.dtype)
+
+
 def _process(args: tuple) -> dict:
-    subj_dir, method, n_segments, overwrite, union_n = args
+    subj_dir, method, n_segments, overwrite, union_n, size = args
     subj_dir = Path(subj_dir)
     out_path = subj_dir / f"label_synth_{method}.npy"
+
+    size_str  = f"{size[0]}x{size[1]}x{size[2]}" if size else None
+    out_sized = subj_dir / f"label_synth_{method}_{size_str}.npy" if size else None
 
     result: dict = dict(subject=subj_dir.name, n_req=n_segments, elapsed_s=0.0)
 
     # --- Step 1: base supervoxel labels ----------------------------------
-    if out_path.exists() and not overwrite:
-        arr = np.load(out_path, mmap_mode="r")
-        result.update(status="skip", n_actual=int(arr.max()))
-    else:
+    need_base  = overwrite or not out_path.exists()
+    need_sized = size is not None and (overwrite or not out_sized.exists())
+
+    if need_base:
         ct_npy = subj_dir / "ct.npy"
         ct_nii = subj_dir / "ct.nii.gz"
         if not ct_npy.exists() and not ct_nii.exists():
@@ -222,14 +231,28 @@ def _process(args: tuple) -> dict:
         except Exception:
             return dict(subject=subj_dir.name, status="error",
                         error=traceback.format_exc(), elapsed_s=0.0, n_req=n_segments)
+    else:
+        arr = np.load(out_path, mmap_mode="r")
+        result.update(status="skip", n_actual=int(arr.max()))
+
+    # --- Step 1b: resized supervoxel labels (optional) -------------------
+    if need_sized:
+        try:
+            base = np.load(out_path, mmap_mode="r")
+            np.save(out_sized, _resize_label(base, size))
+            result.update(sized_status="ok")
+        except Exception:
+            result.update(sized_status="error", sized_error=traceback.format_exc())
 
     # --- Step 2: union labels (optional) ---------------------------------
     if union_n > 0:
         union_path = subj_dir / f"label_synth_{method}_union.npy"
-        if union_path.exists() and not overwrite:
-            u_arr = np.load(union_path, mmap_mode="r")
-            result.update(union_status="skip", union_n_actual=int(u_arr.max()))
-        else:
+        need_union = overwrite or not union_path.exists()
+
+        union_sized      = subj_dir / f"label_synth_{method}_union_{size_str}.npy" if size else None
+        need_union_sized = size is not None and (overwrite or not union_sized.exists())
+
+        if need_union:
             try:
                 base         = np.load(out_path, mmap_mode="r")
                 union_labels = _build_union_labels(base, union_n, seed=0)
@@ -237,6 +260,18 @@ def _process(args: tuple) -> dict:
                 result.update(union_status="ok", union_n_actual=int(union_labels.max()))
             except Exception:
                 result.update(union_status="error", union_error=traceback.format_exc())
+        else:
+            u_arr = np.load(union_path, mmap_mode="r")
+            result.update(union_status="skip", union_n_actual=int(u_arr.max()))
+
+        if need_union_sized:
+            try:
+                base = np.load(union_path, mmap_mode="r")
+                np.save(union_sized, _resize_label(base, size))
+                result.update(union_sized_status="ok")
+            except Exception:
+                result.update(union_sized_status="error",
+                               union_sized_error=traceback.format_exc())
 
     return result
 
@@ -277,6 +312,10 @@ def main():
         "--n-union", type=int, default=4,
         help="Max supervoxels per union group (default: 4)",
     )
+    parser.add_argument(
+        "--size", nargs=3, type=int, metavar=("D", "H", "W"), default=None,
+        help="also write label_synth_<method>_DxHxW.npy resized with nearest-neighbour",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data) if args.data else load_totalseg_path()
@@ -293,18 +332,24 @@ def main():
     )
 
     union_n = args.n_union if args.union else 0
+    size    = tuple(args.size) if args.size else None
     tasks = [
-        (str(subj), args.method, int(n), args.overwrite, union_n)
+        (str(subj), args.method, int(n), args.overwrite, union_n, size)
         for subj, n in zip(subjects, n_segs)
     ]
 
+    size_str = f"{size[0]}x{size[1]}x{size[2]}" if size else None
     print(f"Method   : {args.method}")
     print(f"Data     : {data_dir}")
     print(f"Subjects : {len(subjects)}")
     print(f"Workers  : {args.workers}")
     print(f"Output   : label_synth_{args.method}.npy  (saved next to ct.npy)")
+    if size:
+        print(f"Resized  : label_synth_{args.method}_{size_str}.npy")
     if union_n:
         print(f"Union    : label_synth_{args.method}_union.npy  (n_union={union_n})")
+        if size:
+            print(f"         : label_synth_{args.method}_union_{size_str}.npy")
     print()
 
     total = len(tasks)

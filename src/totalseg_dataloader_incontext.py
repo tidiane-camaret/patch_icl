@@ -90,14 +90,25 @@ class TotalSegInContextDataset(Dataset):
         synth_method: Optional[str] = None,
         synth_unions: bool = False,
         p_synth: float = 0.5,
+        class_balanced: bool = False,
     ):
         self.root = Path(root)
         self.classes = list(classes)
         self.image_size = image_size
+        self._size_str = (
+            f"{image_size[0]}x{image_size[1]}x{image_size[2]}"
+            if image_size is not None else None
+        )
         self.context_size = context_size
         self.aug_cfg = aug_cfg  # None → no augmentation
         self.synth_method = synth_method
         self.p_synth = p_synth
+        self.class_balanced = class_balanced
+        self.hu_jitter = (
+            getattr(aug_cfg.intensity, "hu_jitter", 0)
+            if aug_cfg is not None and aug_cfg.enabled
+            else 0
+        )
 
         subjects = self._get_subjects(split, meta_csv, max_subjects)
 
@@ -119,9 +130,13 @@ class TotalSegInContextDataset(Dataset):
             for subj in self.label_to_subjects[cls]
         ]
 
+        # Classes that actually have at least one subject (used by class-balanced sampler)
+        self.active_classes = [cls for cls in self.classes if self.label_to_subjects[cls]]
+
         counts = {cls: len(self.label_to_subjects[cls]) for cls in self.classes}
         print(f"TotalSegInContextDataset: {len(self.samples)} samples | "
-              f"context_size={context_size} | class counts: {counts}", flush=True)
+              f"context_size={context_size} | class_balanced={class_balanced} | "
+              f"hu_jitter={self.hu_jitter} | class counts: {counts}", flush=True)
 
         # Synth path: build SV-ID cache for fast __getitem__ sampling
         if synth_method is not None:
@@ -249,21 +264,44 @@ class TotalSegInContextDataset(Dataset):
         Build one in-context item from a single supervoxel, duplicated K+1
         times with heavy independent augmentation applied to each copy so that
         target and context diverge as much as possible.
+
+        Fast path: uses pre-resized ct_{size}.npy and label_synth_{method}_{size}.npy
+        when available, skipping CPU interpolation entirely.
         """
-        subj   = random.choice(self._synth_subjects)
-        sv_ids = self._synth_sv_ids[subj]
-        sv_idx = int(random.choice(sv_ids))
+        subj     = self._synth_subjects[torch.randint(len(self._synth_subjects), (1,)).item()]
+        sv_ids   = self._synth_sv_ids[subj]
+        sv_idx   = int(sv_ids[torch.randint(len(sv_ids), (1,)).item()])
+        subj_dir = self.root / subj
 
-        image  = _load_ct(self.root / subj / "ct.nii.gz")                  # (D,H,W) float32
-        sv_vol = np.load(self.root / subj / self._synth_fname, mmap_mode="r")
-        mask   = (sv_vol == sv_idx).astype(np.uint8)                        # (D,H,W) binary
+        # CT
+        ct_pre = subj_dir / f"ct_{self._size_str}.npy" if self._size_str else None
+        if ct_pre is not None and ct_pre.exists():
+            image_t = torch.from_numpy(
+                np.load(ct_pre, mmap_mode="r").astype(np.float32)
+            ).unsqueeze(0)                                          # (1, D, H, W)
+        else:
+            image   = _load_ct(subj_dir / "ct.nii.gz")
+            image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+            if self.image_size is not None:
+                image_t, _ = _resize_volume(image_t, image_t, self.image_size)
+            image_t = image_t.squeeze(0)                            # (1, D, H, W)
 
-        image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)         # (1,1,D,H,W)
-        mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-        if self.image_size is not None:
-            image_t, mask_t = _resize_volume(image_t, mask_t, self.image_size)
-        image_t = image_t.squeeze(0)                    # (1, D, H, W)
-        mask_t  = mask_t.squeeze(0).squeeze(0).long()  # (D, H, W)
+        # Synth label
+        sized_synth = (
+            subj_dir / self._synth_fname.replace(".npy", f"_{self._size_str}.npy")
+            if self._size_str else None
+        )
+        if sized_synth is not None and sized_synth.exists():
+            sv_vol = np.load(sized_synth, mmap_mode="r")
+            mask   = (sv_vol == sv_idx).astype(np.uint8)
+            mask_t = torch.from_numpy(mask).long()                  # (D, H, W)
+        else:
+            sv_vol  = np.load(subj_dir / self._synth_fname, mmap_mode="r")
+            mask    = (sv_vol == sv_idx).astype(np.uint8)
+            mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            if self.image_size is not None:
+                mask_t = F.interpolate(mask_t, size=self.image_size, mode="nearest")
+            mask_t = mask_t.squeeze(0).squeeze(0).long()            # (D, H, W)
 
         # K+1 independent copies, each separately augmented
         items = [
@@ -287,7 +325,11 @@ class TotalSegInContextDataset(Dataset):
         if self._synth_subjects and random.random() < self.p_synth:
             return self._get_synth_item()
 
-        subj, cls = self.samples[idx]
+        if self.class_balanced:
+            cls  = random.choice(self.active_classes)
+            subj = random.choice(self.label_to_subjects[cls])
+        else:
+            subj, cls = self.samples[idx]
 
         image_t, label_t = self._load(subj, cls)
 
@@ -345,21 +387,35 @@ class TotalSegInContextDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _load(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Load and resize one (image, binary_mask) pair for a single class."""
-        image = _load_ct(self.root / subj / "ct.nii.gz")            # (D,H,W) float32
-        label = _build_label_volume(
-            self.root / subj / "segmentations", [cls]
-        )                                                             # (D,H,W) uint8 0/1
+        """Load one (image, binary_mask) pair for a single class.
 
-        image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+        Fast path: use pre-resized ct_{size}.npy + label_{size}.npy when available —
+        no CPU interpolation needed.  Falls back to native resolution + resize.
+        """
+        subj_dir = self.root / subj
+        if self._size_str is not None:
+            ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
+            label_pre = subj_dir / f"label_{self._size_str}.npy"
+            if ct_pre.exists() and label_pre.exists():
+                image = np.load(ct_pre,    mmap_mode="r").astype(np.float32)
+                full  = np.load(label_pre, mmap_mode="r")
+                label = np.zeros(full.shape, dtype=np.uint8)
+                orig_idx = _ALL_CLASSES_IDX.get(cls)
+                if orig_idx is not None:
+                    label[full == orig_idx] = 1
+                return (
+                    torch.from_numpy(image).unsqueeze(0),  # (1, D, H, W)
+                    torch.from_numpy(label).long(),        # (D, H, W)
+                )
+
+        # Slow path: native resolution → resize on the fly
+        image   = _load_ct(subj_dir / "ct.nii.gz", jitter=self.hu_jitter)
+        label   = _build_label_volume(subj_dir / "segmentations", [cls])
+        image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
         label_t = torch.from_numpy(label.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-
         if self.image_size is not None:
             image_t, label_t = _resize_volume(image_t, label_t, self.image_size)
-
-        image_t = image_t.squeeze(0)                   # (1, D, H, W)
-        label_t = label_t.squeeze(0).squeeze(0).long() # (D, H, W)
-        return image_t, label_t
+        return image_t.squeeze(0), label_t.squeeze(0).squeeze(0).long()
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +452,7 @@ def get_incontext_loader(
     synth_method: Optional[str] = None,
     synth_unions: bool = False,
     p_synth: float = 0.5,
+    class_balanced: bool = False,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -408,6 +465,7 @@ def get_incontext_loader(
         synth_method=synth_method,
         synth_unions=synth_unions,
         p_synth=p_synth,
+        class_balanced=class_balanced,
     )
     return DataLoader(
         ds,

@@ -11,6 +11,7 @@ pre-convert to .npy (uncompressed) for near-instant random access.
 """
 
 import csv
+import random
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -58,23 +59,33 @@ ALL_CLASSES: list[str] = [
     "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
 ]
 
-# Soft-tissue Hounsfield-unit window → normalised to [0, 1]
-HU_MIN, HU_MAX = -150, 250
+# Hounsfield-unit window → normalised to [0, 1]
+# Wide range to cover bone (>400 HU), soft tissue, and lungs (~-800 HU).
+HU_MIN, HU_MAX = -500, 1000
 
 
 # -------------------------------------------------------------------------
 # Volume helpers
 # -------------------------------------------------------------------------
 
-def _load_ct(path: Path) -> np.ndarray:
+def _load_ct(path: Path, jitter: float = 0) -> np.ndarray:
     """Load CT, clip HU window, normalise to [0, 1].  Returns float32 (D,H,W).
-    Prefers a pre-converted ct.npy next to the .nii.gz for fast loading."""
-    npy = path.with_suffix("").with_suffix(".npy")  # ct.nii.gz → ct.npy
-    if npy.exists():
-        return np.load(npy, mmap_mode="r").astype(np.float32)
+    Prefers a pre-converted ct.npy next to the .nii.gz for fast loading.
+    When jitter > 0 the npy cache is bypassed (it stores pre-normalised values,
+    not raw HU) and window boundaries are randomly perturbed by ±jitter HU."""
+    if jitter == 0:
+        npy = path.with_suffix("").with_suffix(".npy")  # ct.nii.gz → ct.npy
+        if npy.exists():
+            return np.load(npy, mmap_mode="r").astype(np.float32)
     vol = nib.load(str(path)).get_fdata(dtype=np.float32)
-    vol = np.clip(vol, HU_MIN, HU_MAX)
-    vol = (vol - HU_MIN) / (HU_MAX - HU_MIN)
+    a_min, a_max = float(HU_MIN), float(HU_MAX)
+    if jitter > 0:
+        a_min += random.uniform(-jitter, jitter)
+        a_max += random.uniform(-jitter, jitter)
+        if a_max - a_min < 200:          # guard against degenerate window
+            a_max = a_min + 200
+    vol = np.clip(vol, a_min, a_max)
+    vol = (vol - a_min) / (a_max - a_min)
     return vol  # (D, H, W)
 
 

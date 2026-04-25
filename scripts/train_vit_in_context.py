@@ -242,7 +242,8 @@ def run_epoch(model, model_module, loader, optimizer, loss_fn, scaler, device, t
 
             with torch.no_grad():
                 for i, lname in enumerate(label_names):
-                    per_class_dice[lname].append(dice_score(logits[i:i+1], labels[i:i+1]))
+                    key = "synth" if lname.startswith("sv_") else lname
+                    per_class_dice[key].append(dice_score(logits[i:i+1], labels[i:i+1]))
 
     mean_per_class = {cls: sum(v) / len(v) for cls, v in per_class_dice.items()}
     if n == 0:
@@ -286,7 +287,7 @@ def main(cfg: DictConfig) -> None:
         num_workers=cfg.train.workers,
         pin_memory=True,
         persistent_workers=cfg.train.workers > 0,
-        prefetch_factor=4 if cfg.train.workers > 0 else None,
+        prefetch_factor=2 if cfg.train.workers > 0 else None,
         collate_fn=incontext_collate_fn,
     )
 
@@ -300,6 +301,7 @@ def main(cfg: DictConfig) -> None:
         synth_method=synth_method,
         synth_unions=cfg.data.synth_unions,
         p_synth=cfg.data.p_synth,
+        class_balanced=cfg.data.class_balanced,
     )
     val_ds = TotalSegInContextDataset(
         root=cfg.paths.totalseg, classes=val_classes,
@@ -311,11 +313,11 @@ def main(cfg: DictConfig) -> None:
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_ds,   batch_size=cfg.train.batch_size, shuffle=False, **loader_kw)
 
-    # Collect viz samples once — direct dataset[idx] calls, no DataLoader workers.
-    print("Collecting visualisation samples...", flush=True)
-    train_viz = collect_viz_samples(train_ds, train_classes)
-    val_viz   = collect_viz_samples(val_ds,   val_classes)
-    print(f"  train: {len(train_viz)} classes  |  val: {len(val_viz)} classes", flush=True)
+    # val has no synth and no augmentation — deterministic, collect once.
+    # train_viz is re-collected each epoch (inside the loop) so the synth sample
+    # and augmented real samples are fresh every time they are logged.
+    val_viz = collect_viz_samples(val_ds, val_classes)
+    print(f"Collected val viz samples: {len(val_viz)} classes", flush=True)
 
     # ------------------------------------------------------------------
     # Model
@@ -378,6 +380,11 @@ def main(cfg: DictConfig) -> None:
             model, model_module, val_loader, optimizer, loss_fn, scaler, device, train=False
         )
         scheduler.step()
+
+        # Re-collect after both loaders are fully consumed — workers are idle,
+        # no mid-flight iterator risk.  Synth sample and augmented real samples
+        # are drawn fresh so logged images vary across epochs.
+        train_viz = collect_viz_samples(train_ds, train_classes)
 
         is_best = va_dice > best_val_dice
         if is_best:
