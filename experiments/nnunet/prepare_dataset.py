@@ -117,7 +117,7 @@ export nnUNet_results="/work/dlclarge2/ndirt-SegFM3D/patch_icl/results/nnUNet/nn
 #naming convention 
 mv $nnUNet_raw/totalseg_ct $nnUNet_raw/Dataset001_totalseg_ct
 
-nnUNetv2_plan_and_preprocess -d 1 -pl nnUNetResEncUNetMPlanner -c 3d_fullres --verify_dataset_integrity
+nnUNetv2_plan_and_preprocess -d 1 -pl nnUNetPlannerResEncM -c 3d_fullres --verify_dataset_integrity
 
-nnUNetv2_train 1 3d_fullres 0 -p nnUNetResEncUNetMPlans --npz -num_gpus 2 
+nnUNetv2_train 1 3d_fullres 0 -p nnUNetPlannerResEncM -num_gpus 2
 """
