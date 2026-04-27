@@ -2,7 +2,6 @@
 import argparse
 import csv
 import json
-import shutil
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
@@ -12,16 +11,27 @@ import numpy as np
 from tqdm import tqdm
 
 
+def _orthonormalize_affine(affine):
+    """SVD-orthonormalize the rotation part while preserving voxel sizes."""
+    R = affine[:3, :3]
+    voxel_sizes = np.sqrt((R ** 2).sum(axis=0))
+    U, _, Vt = np.linalg.svd(R / voxel_sizes)
+    fixed = affine.copy()
+    fixed[:3, :3] = (U @ Vt) * voxel_sizes
+    return fixed
+
+
 def prepare_subject(subject_id, totalseg_path, img_out_dir, lbl_out_dir, label_map):
     subj_path = totalseg_path / subject_id
     seg_dir = subj_path / "segmentations"
 
     img_dst = img_out_dir / f"{subject_id}_0000.nii.gz"
     lbl_dst = lbl_out_dir / f"{subject_id}.nii.gz"
-    if img_dst.exists() and lbl_dst.exists():
+    if img_dst.exists() and img_dst.stat().st_size > 0 and lbl_dst.exists() and lbl_dst.stat().st_size > 0:
         return
 
     ref = nib.load(subj_path / "ct.nii.gz")
+    affine = _orthonormalize_affine(ref.affine)
     label_vol = np.zeros(ref.shape, dtype=np.uint8)
 
     for cls, idx in label_map.items():
@@ -33,15 +43,15 @@ def prepare_subject(subject_id, totalseg_path, img_out_dir, lbl_out_dir, label_m
             label_vol[mask] = idx
 
     if not img_dst.exists():
-        shutil.copy2(subj_path / "ct.nii.gz", img_dst)
+        nib.save(nib.Nifti1Image(ref.get_fdata(dtype=np.float32), affine), img_dst)
     if not lbl_dst.exists():
-        nib.save(nib.Nifti1Image(label_vol, ref.affine, ref.header), lbl_dst)
+        nib.save(nib.Nifti1Image(label_vol, affine), lbl_dst)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--totalseg", default="/work/dlclarge2/ndirt-SegFM3D/data/totalseg")
-    parser.add_argument("--out", default="results/nnUNet/nnUNet_raw/totalseg_ct")
+    parser.add_argument("--out", default="results/nnUNet/nnUNet_raw/Dataset001_totalseg_ct")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
@@ -95,3 +105,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+"""
+        
+export nnUNet_raw="/work/dlclarge2/ndirt-SegFM3D/patch_icl/results/nnUNet/nnUNet_raw"                                                                           
+export nnUNet_preprocessed="/work/dlclarge2/ndirt-SegFM3D/patch_icl/results/nnUNet/nnUNet_preprocessed"
+export nnUNet_results="/work/dlclarge2/ndirt-SegFM3D/patch_icl/results/nnUNet/nnUNet_results"
+
+#naming convention 
+mv $nnUNet_raw/totalseg_ct $nnUNet_raw/Dataset001_totalseg_ct
+
+nnUNetv2_plan_and_preprocess -d 1 -pl nnUNetResEncUNetMPlanner -c 3d_fullres --verify_dataset_integrity
+
+nnUNetv2_train 1 3d_fullres 0 -p nnUNetResEncUNetMPlans --npz -num_gpus 2 
+"""
