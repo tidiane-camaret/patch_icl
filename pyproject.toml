@@ -15,4 +15,5 @@ dependencies = [
     "gcloud>=0.18.3",
     "scikit-image>=0.26.0",
     "pybind11>=3.0.4",
+    "nnunetv2>=2.7.0",
 ]
