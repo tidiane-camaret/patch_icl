@@ -436,20 +436,11 @@ def main(cfg: DictConfig) -> None:
             torch.cuda.reset_peak_memory_stats()
 
         if use_wandb:
-            all_classes = sorted(set(train_classes + val_classes))
-            table = wandb.Table(
-                columns=["class", "train_dice", "val_dice"],
-                data=[
-                    [cls, tr_cls.get(cls, float("nan")), va_cls.get(cls, float("nan"))]
-                    for cls in sorted(all_classes)
-                ],
-            )
             log = {
                 "train/loss": tr_loss, "train/dice": tr_dice,
                 "val/loss":   va_loss, "val/dice":   va_dice,
                 "lr": scheduler.get_last_lr()[0],
                 "gpu/vram_peak_gb": mem,
-                "dice_by_class": table,
             }
             log.update({f"val/dice/{c}":   v for c, v in va_cls.items()})
             log.update({f"train/dice/{c}": v for c, v in tr_cls.items()})
