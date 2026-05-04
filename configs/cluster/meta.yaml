@@ -6,5 +6,5 @@ paths:
   nnunet:      /work/dlclarge2/ndirt-SegFM3D/results/nnunet
 
 train:
-  batch_size: 8
-  workers: 8
+  batch_size: 4
+  workers: 4
