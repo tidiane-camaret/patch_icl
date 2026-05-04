@@ -12,3 +12,4 @@ results/checkpoints/
 *.npy
 results/nnUNet/
 results/*.json
+slurm-*.out
