@@ -15,7 +15,7 @@ python scripts/train.py train.checkpoint=/home/dpxuser/dev/patch_icl/results/che
 
 ## benchmark 
 # uses config.yaml defaults: resenc_in_context, 64³, batch=2, K=3
-python scripts/benchmark.py --bench_aug
+python scripts/benchmark.py --bench_aug --bench_data
 # sweep image sizes with dataloader
 python scripts/benchmark.py --bench_data --image_size 64 128
 # compare both models
