@@ -3,16 +3,18 @@ defaults:
   - _self_
 
 paths:
-  totalseg:     /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  totalseg:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
+  #totalseg:     /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  nnunet:       /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
   results:      results
   checkpoints:  results/checkpoints
-  nnUNet_dir:   results/nnUNet
 
 data:
   # train_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]   
   train_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull]
   # val_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]
   val_classes: [colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
+  pretrain_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull, colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
   image_size: [64, 64, 64]
   context_size: 3
   max_train_subjects: null   # int to limit for debugging, e.g. 50
@@ -23,8 +25,14 @@ data:
   class_balanced: false      # sample class uniformly first, then subject; prevents large classes dominating
 
 model:
+  name: resenc_in_context   # resenc_in_context | vit_in_context
+  # ResEncInContext3D
+  features_per_stage: [32, 64, 128, 256]   # nnUNetResEncM default; last = bottleneck width
+  rope_theta: 100.0                         # RoPE base frequency; use ~100 for small grids (≤32 tokens/axis)
+  # ViTInContext3D
   patch_size: [8, 8, 8]
   embed_dim: 256
+  # shared
   depth_stage1: 3
   depth_stage2: 3
   num_heads: 8
@@ -33,7 +41,7 @@ model:
 
 train:
   epochs: 100
-  batch_size: 8
+  batch_size: 2
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 4
