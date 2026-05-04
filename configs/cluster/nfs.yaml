@@ -1,0 +1,11 @@
+# @package _global_
+# NFS cluster
+
+paths:
+  totalseg:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
+  nnunet:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
+
+
+train:
+  batch_size: 2
+  workers: 8

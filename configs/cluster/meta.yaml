@@ -1,0 +1,10 @@
+# @package _global_
+# dlclarge2 cluster 
+
+paths:
+  totalseg:    /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  nnunet:      /work/dlclarge2/ndirt-SegFM3D/results/nnunet
+
+train:
+  batch_size: 8
+  workers: 8

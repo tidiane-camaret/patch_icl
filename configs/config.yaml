@@ -1,11 +1,10 @@
 defaults:
-  - augmentations
   - _self_
+  - augmentations
+  - cluster: nfs
+
 
 paths:
-  totalseg:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
-  #totalseg:     /work/dlclarge2/ndirt-SegFM3D/data/totalseg
-  nnunet:       /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
   results:      results
   checkpoints:  results/checkpoints
 
@@ -15,8 +14,8 @@ data:
   # val_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]
   val_classes: [colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
   pretrain_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull, colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
-  image_size:  [64, 64, 64] # [128, 128, 128]
-  context_size: 5
+  image_size: [128, 128, 128] # [64, 64, 64] # 
+  context_size: 3
   max_train_subjects: null   # int to limit for debugging, e.g. 50
   max_val_subjects: null     # int to limit for debugging, e.g. 50
   synth_method: slic         # grid | watershed | slic | seeds3d | null = disabled
