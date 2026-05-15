@@ -17,6 +17,7 @@ Any value can be overridden on the command line using dot-notation:
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -28,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -66,8 +67,16 @@ def build_model(cfg: DictConfig, image_size: tuple[int, int, int]) -> nn.Module:
     if name == "resenc_in_context":
         return ResEncInContext3D(
             **shared,
+            encoder_name=cfg.model.encoder,
             features_per_stage=tuple(cfg.model.features_per_stage),
+            stunet_variant=cfg.model.stunet_variant,
+            stunet_pretrained=cfg.model.stunet_pretrained,
+            stunet_freeze=cfg.model.stunet_freeze,
+            stunet_num_stages=cfg.model.stunet_num_stages,
+            mask_fusion=cfg.model.mask_fusion,
             rope_theta=cfg.model.rope_theta,
+            num_registers=cfg.model.num_registers,
+            num_context_layers=cfg.model.num_context_layers,
         )
     raise ValueError(f"Unknown model.name: {name!r}. Choose vit_in_context or resenc_in_context.")
 
@@ -349,7 +358,14 @@ def main(cfg: DictConfig) -> None:
         use_crop=cfg.data.use_crop,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True,  **loader_kw)
+    max_ds_len = cfg.data.max_ds_len_train
+    if max_ds_len is not None:
+        n = min(int(max_ds_len), len(train_ds))
+        train_sampler = RandomSampler(train_ds, replacement=False, num_samples=n)
+        train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, **loader_kw)
+        print(f"max_ds_len_train={n} (dataset has {len(train_ds)} samples)")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True, **loader_kw)
     val_loader   = DataLoader(val_ds,   batch_size=cfg.train.batch_size, shuffle=False, **loader_kw)
 
     val_viz = collect_viz_samples(val_ds, val_classes)
@@ -390,7 +406,9 @@ def main(cfg: DictConfig) -> None:
 
     results_dir = Path(cfg.paths.results)
     results_dir.mkdir(exist_ok=True)
-    ckpt_dir = Path(cfg.paths.checkpoints)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    wandb_run_name = wandb.run.name if use_wandb else (cfg.train.run_name or cfg.model.name)
+    ckpt_dir = Path(cfg.paths.checkpoints) / f"{date_str}_{wandb_run_name}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt = ckpt_dir / f"{cfg.model.name}_best.pt"
 

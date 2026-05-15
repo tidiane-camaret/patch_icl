@@ -1,0 +1,59 @@
+# @package _global_
+# Baseline: no synthetic labels, augmentations matched to nnUNet 3d_fullres defaults.
+#
+# Geometric changes vs. default config:
+#   - rotation:    ±30° at p=0.2  (default: ±15° at p=0.8)
+#   - scale:       ×0.70–1.40 at p=0.2  (default: ×0.85–1.15 at p=0.8)
+#   - translation: disabled  (nnUNet uses crop headroom instead)
+#   - elastic:     disabled  (p_elastic=0 in nnUNet SpatialTransform)
+#
+# Intensity changes vs. default config:
+#   - gaussian_noise: p=0.10, max_std=0.316  (nnUNet var=U(0,0.1) → std up to √0.1)
+#   - gaussian_blur:  p=0.20, sigma_range capped at 1.0
+#   - brightness:     0.0 (purely multiplicative, matching nnUNet MultiplicativeBrightness)
+#   - contrast:       ×0.75–1.25, p=0.15  (approximate combined effect of nnUNet's two
+#                     brightness/contrast transforms, each at p=0.15)
+#   - gamma:          p=0.30 (nnUNet runs p=0.30 normal + p=0.10 inverted; inversion not
+#                     implemented here, so only the dominant variant is kept)
+#
+# Remaining gap vs. nnUNet (not significant):
+#   - Gamma inversion variant (nnUNet p=0.10 inverted gamma; not implemented)
+
+data:
+  synth_method: null
+  p_synth: 0.0
+  use_crop: true           # crop native-res ct.npy/label.npy instead of loading pre-resized files (~8× slower on NFS)
+  max_ds_len_train: 10000     # cap samples per epoch (reshuffled each epoch); null = full dataset
+
+
+augmentations:
+  task:
+    affine:
+      p: 0.2
+      max_angle_deg: 30.0
+      scale_min: 0.70
+      scale_max: 1.40
+      max_translate: 0.0
+    elastic:
+      p: 0.0
+
+  intensity:
+    brightness_contrast:
+      p: 0.15
+      brightness: 0.0
+      contrast_range: [0.75, 1.25]
+      preserve_range: true
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]
+      retain_stats: true
+    gaussian_noise:
+      p: 0.10
+      max_std: 0.316
+    gaussian_blur:
+      p: 0.20
+      sigma_range: [0.50, 1.00]
+    simulate_low_resolution:
+      p: 0.25
+      scale_min: 0.5
+      scale_max: 1.0

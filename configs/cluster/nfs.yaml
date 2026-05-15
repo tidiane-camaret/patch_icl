@@ -4,8 +4,9 @@
 paths:
   totalseg:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
   nnunet:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
+  results:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl
 
 
 train:
-  batch_size: 8
+  batch_size: 2
   workers: 16

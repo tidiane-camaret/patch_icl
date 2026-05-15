@@ -177,20 +177,45 @@ class RoPECrossAttn(nn.Module):
         self.register_buffer("rope_cos", cos)   # (N, head_dim)
         self.register_buffer("rope_sin", sin)
 
-    def forward(self, tgt: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        # tgt: (B, N, C),  ctx: (B, K*N, C)
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        ctx: torch.Tensor,
+        num_spatial_ctx: int | None = None,
+    ) -> torch.Tensor:
+        """
+        tgt : (B, N, C)
+        ctx : (B, M, C)  where M = K*N [+ R register tokens]
+        num_spatial_ctx : number of leading context tokens that carry spatial
+                          positions (K*N); trailing tokens (registers) get
+                          RoPE position 0 (= identity rotation).
+                          If None, all M tokens are treated as spatial.
+        """
         B, N, C = tgt.shape
-        K = ctx.shape[1] // N
+        M = ctx.shape[1]
 
         q  = self.q_proj(tgt).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(ctx).reshape(B, K * N, 2, self.num_heads, self.head_dim)
-        k  = kv[..., 0, :, :].transpose(1, 2)   # (B, heads, K*N, head_dim)
+        kv = self.kv_proj(ctx).reshape(B, M, 2, self.num_heads, self.head_dim)
+        k  = kv[..., 0, :, :].transpose(1, 2)   # (B, heads, M, head_dim)
         v  = kv[..., 1, :, :].transpose(1, 2)
 
-        cos_q = self.rope_cos[None, None]                         # (1, 1,   N, head_dim)
+        cos_q = self.rope_cos[None, None]   # (1, 1, N, head_dim)
         sin_q = self.rope_sin[None, None]
-        cos_k = self.rope_cos.repeat(K, 1)[None, None]           # (1, 1, K*N, head_dim)
-        sin_k = self.rope_sin.repeat(K, 1)[None, None]
+
+        K_spatial = num_spatial_ctx if num_spatial_ctx is not None else M
+        K = K_spatial // N
+        cos_k_spatial = self.rope_cos.repeat(K, 1)   # (K*N, head_dim)
+        sin_k_spatial = self.rope_sin.repeat(K, 1)
+        R = M - K_spatial
+        if R > 0:
+            # Register tokens: position 0 (identity rotation)
+            cos_k = torch.cat([cos_k_spatial,
+                                self.rope_cos[:1].expand(R, -1)], dim=0)[None, None]
+            sin_k = torch.cat([sin_k_spatial,
+                                self.rope_sin[:1].expand(R, -1)], dim=0)[None, None]
+        else:
+            cos_k = cos_k_spatial[None, None]
+            sin_k = sin_k_spatial[None, None]
 
         q = apply_rope(q, cos_q, sin_q)
         k = apply_rope(k, cos_k, sin_k)
@@ -254,7 +279,12 @@ class RoPECrossAttentionBlock(nn.Module):
         self.cross_attn = RoPECrossAttn(embed_dim, num_heads, dropout, grid_size, theta)
         self.ffn        = FFN(embed_dim, mlp_ratio, dropout)
 
-    def forward(self, tgt: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        ctx: torch.Tensor,
+        num_spatial_ctx: int | None = None,
+    ) -> torch.Tensor:
         tgt = self.self_attn(tgt)
-        tgt = self.cross_attn(tgt, ctx)
+        tgt = self.cross_attn(tgt, ctx, num_spatial_ctx=num_spatial_ctx)
         return self.ffn(tgt)

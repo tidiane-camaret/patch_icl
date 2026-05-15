@@ -6,8 +6,7 @@ defaults:
 
 
 paths:
-  results:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl
-  checkpoints:  ${results}/checkpoints
+  checkpoints:  ${paths.results}/checkpoints
 
 data:
   # Use split names from label_stats.csv ("train" / "val"), or an explicit list.
@@ -17,6 +16,7 @@ data:
   context_size: 3
   max_train_subjects: null   # int to limit for debugging, e.g. 50
   max_val_subjects: null     # int to limit for debugging, e.g. 50
+  max_ds_len_train: 10000     # cap samples per epoch (reshuffled each epoch); null = full dataset
   synth_method: slic         # grid | watershed | slic | seeds3d | null = disabled
   synth_unions: true        # use label_synth_<method>_union.npy instead
   p_synth: 0.5               # fraction of train items from synth path; 1.0 = synth-only
@@ -25,18 +25,29 @@ data:
 
 model:
   name: resenc_in_context   # resenc_in_context | vit_in_context
-  # ResEncInContext3D
+  # ResEncInContext3D — encoder selection
+  encoder: resenc           # resenc | stunet
+  # resenc options
   features_per_stage: [32, 64, 128, 256]   # nnUNetResEncM default; last = bottleneck width
-  rope_theta: 100.0                         # RoPE base frequency; use ~100 for small grids (≤32 tokens/axis)
-  # ViTInContext3D
-  patch_size: [8, 8, 8]
-  embed_dim: 256
-  # shared
+  # stunet options (only used when encoder=stunet)
+  stunet_variant: base      # small | base | large | huge
+  stunet_pretrained: null   # path to STU-Net checkpoint (.model or .pt); null = random init
+  stunet_freeze: false      # freeze STU-Net image encoder after loading pretrained weights
+  stunet_num_stages: null   # null = all 6 stages (32× stride); 4 = 8× stride (matches ResEnc at 64³)
+  mask_fusion: additive     # additive | concat  (how mask features join image features at bottleneck)
+  # transformer
+  rope_theta: 100.0         # RoPE base frequency; use ~100 for small grids (≤32 tokens/axis)
   depth_stage1: 6
   depth_stage2: 6
   num_heads: 8
   mlp_ratio: 4
   dropout: 0.1
+  # token conditioning (PatchICL-style)
+  num_registers: 0        # global KV tokens appended to Stage-2 context; 0 = disabled
+  num_context_layers: 0   # extra self-attn layers applied to ctx tokens before Stage 1
+  # ViTInContext3D
+  patch_size: [8, 8, 8]
+  embed_dim: 256
 
 train:
   epochs: 100
