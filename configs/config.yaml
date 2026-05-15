@@ -2,19 +2,18 @@ defaults:
   - _self_
   - augmentations
   - cluster: nfs
+  - experiment: null   # e.g. experiment=1_no_synth
 
 
 paths:
-  results:      results
-  checkpoints:  results/checkpoints
+  results:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl
+  checkpoints:  ${results}/checkpoints
 
 data:
-  # train_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]   
-  train_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull]
-  # val_classes: [liver, lung_upper_lobe_left, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, small_bowel, colon, heart, autochthon_left, autochthon_right]
-  val_classes: [colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
-  pretrain_classes: [liver, lung_lower_lobe_right, lung_lower_lobe_left, lung_upper_lobe_right, lung_upper_lobe_left, lung_middle_lobe_right, small_bowel, heart, autochthon_left, autochthon_right, hip_left, hip_right, aorta, brain, skull, colon, stomach, spleen, gluteus_maximus_right, gluteus_maximus_left, gluteus_medius_left, gluteus_medius_right, iliopsoas_left, iliopsoas_right, costal_cartilages, urinary_bladder, femur_left, femur_right, sacrum, kidney_left]
-  image_size:  [64, 64, 64] # [128, 128, 128] #
+  # Use split names from label_stats.csv ("train" / "val"), or an explicit list.
+  train_classes: train
+  val_classes:   val
+  image_size: [64, 64, 64] # [128, 128, 128] 
   context_size: 3
   max_train_subjects: null   # int to limit for debugging, e.g. 50
   max_val_subjects: null     # int to limit for debugging, e.g. 50
@@ -22,6 +21,7 @@ data:
   synth_unions: true        # use label_synth_<method>_union.npy instead
   p_synth: 0.5               # fraction of train items from synth path; 1.0 = synth-only
   class_balanced: true      # sample class uniformly first, then subject; prevents large classes dominating
+  use_crop: false           # crop native-res ct.npy/label.npy instead of loading pre-resized files (~8× slower on NFS)
 
 model:
   name: resenc_in_context   # resenc_in_context | vit_in_context
@@ -32,8 +32,8 @@ model:
   patch_size: [8, 8, 8]
   embed_dim: 256
   # shared
-  depth_stage1: 3
-  depth_stage2: 3
+  depth_stage1: 6
+  depth_stage2: 6
   num_heads: 8
   mlp_ratio: 4
   dropout: 0.1

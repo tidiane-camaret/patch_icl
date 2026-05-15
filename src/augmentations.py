@@ -14,7 +14,7 @@ Geometric ops batch the K+1 volumes into one grid_sample call for speed.
 
 Shapes
 ------
-  images : (N, 1, D, H, W)  float32  [0, 1]
+  images : (N, 1, D, H, W)  float32  z-score values in [CT_NORM_MIN, CT_NORM_MAX] ≈ [-1.66, +3.44]
   masks  : (N, D, H, W)     int64
 
 Usage
@@ -38,6 +38,8 @@ from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+
+from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -154,19 +156,46 @@ def apply_intensity_aug(
     if random.random() < bccfg.p:
         brightness = random.uniform(-bccfg.brightness, bccfg.brightness)
         contrast   = random.uniform(bccfg.contrast_range[0], bccfg.contrast_range[1])
-        image = (image * contrast + brightness).clamp_(0.0, 1.0)
+        if getattr(bccfg, "preserve_range", False):
+            # nnUNet ContrastTransform preserve_range=True: clip to per-volume range.
+            vol_min, vol_max = image.min(), image.max()
+            image = (image * contrast + brightness).clamp_(vol_min, vol_max)
+        else:
+            image = (image * contrast + brightness).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     # --- Gamma -----------------------------------------------------------
+    # Gamma requires [0,1] input: temporarily map z-score → [0,1] → back.
     gcfg = cfg.gamma
     if random.random() < gcfg.p:
         gamma = random.uniform(gcfg.range[0], gcfg.range[1])
-        image = image.clamp(0.0, 1.0).pow_(gamma)
+        span  = CT_NORM_MAX - CT_NORM_MIN
+        if getattr(gcfg, "retain_stats", False):
+            # nnUNet p_retain_stats=1: rescale output to match input mean/std.
+            mean_in = image.mean()
+            std_in  = image.std()
+        image = ((image - CT_NORM_MIN) / span).clamp_(0.0, 1.0).pow_(gamma)
+        image = image * span + CT_NORM_MIN
+        if getattr(gcfg, "retain_stats", False):
+            std_out = image.std()
+            if std_out > 1e-8:
+                image = (image - image.mean()) / std_out * std_in + mean_in
+            image = image.clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     # --- Gaussian noise --------------------------------------------------
     ncfg = cfg.gaussian_noise
     if random.random() < ncfg.p:
         std = random.uniform(0.0, ncfg.max_std)
-        image = (image + torch.randn_like(image).mul_(std)).clamp_(0.0, 1.0)
+        image = (image + torch.randn_like(image).mul_(std)).clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
+    # --- Simulate low resolution -----------------------------------------
+    # nnUNet SimulateLowResolutionTransform: downsample then upsample trilinear.
+    lrcfg = getattr(cfg, "simulate_low_resolution", None)
+    if lrcfg is not None and random.random() < lrcfg.p:
+        D, H, W = image.shape[1:]
+        scale = random.uniform(lrcfg.scale_min, lrcfg.scale_max)
+        small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
+        x = F.interpolate(image.unsqueeze(0), size=small, mode="trilinear", align_corners=False)
+        image = F.interpolate(x, size=(D, H, W), mode="trilinear", align_corners=False).squeeze(0)
 
     # --- Gaussian blur (separable 1-D convolutions) ----------------------
     blcfg = cfg.gaussian_blur
@@ -279,13 +308,17 @@ def apply_synth_aug(
     if random.random() < bccfg.p:
         brightness = random.uniform(-bccfg.brightness, bccfg.brightness)
         contrast   = random.uniform(bccfg.contrast_range[0], bccfg.contrast_range[1])
-        image = (image * contrast + brightness).clamp_(0.0, 1.0)
+        if getattr(bccfg, "preserve_range", False):
+            vol_min, vol_max = image.min(), image.max()
+            image = (image * contrast + brightness).clamp_(vol_min, vol_max)
+        else:
+            image = (image * contrast + brightness).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     # --- Intensity: sharpness (unsharp masking) --------------------------
     scfg = cfg.sharpness
     if random.random() < scfg.p:
         blurred = _separable_gaussian_blur_3d(image, sigma=1.0)
-        image   = (image + scfg.factor * (image - blurred)).clamp_(0.0, 1.0)
+        image   = (image + scfg.factor * (image - blurred)).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     # --- Intensity: Gaussian blur ----------------------------------------
     blcfg = cfg.gaussian_blur
@@ -298,6 +331,6 @@ def apply_synth_aug(
     if random.random() < ncfg.p:
         mean = random.uniform(ncfg.mean_range[0], ncfg.mean_range[1])
         std  = random.uniform(ncfg.std_range[0],  ncfg.std_range[1])
-        image = (image + mean + torch.randn_like(image) * std).clamp_(0.0, 1.0)
+        image = (image + mean + torch.randn_like(image) * std).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     return image, mask

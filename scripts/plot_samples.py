@@ -17,8 +17,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from totalseg_dataset import TotalSegDataset, ALL_CLASSES
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from data.totalseg_classes import ALL_CLASSES
+from src.totalseg_dataset import TotalSegDataset
 
 DATA_ROOT = "/work/dlclarge2/ndirt-SegFM3D/data/totalseg"
 LABEL_CMAP = plt.colormaps["tab20"]

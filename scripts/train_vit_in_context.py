@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from data.totalseg_classes import resolve_classes
 from src.totalseg_dataloader_incontext import (
     TotalSegInContextDataset,
     incontext_collate_fn,
@@ -260,8 +261,8 @@ def main(cfg: DictConfig) -> None:
     # Resolve to plain Python types where needed
     image_size = tuple(cfg.data.image_size)
     patch_size = tuple(cfg.model.patch_size)
-    train_classes = list(cfg.data.train_classes)
-    val_classes   = list(cfg.data.val_classes)
+    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
+    val_classes   = resolve_classes(cfg.data.val_classes,   cfg.paths.totalseg)
 
     if cfg.train.tpu:
         import torch_xla.core.xla_model as xm

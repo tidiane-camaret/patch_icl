@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import scipy.ndimage as ndi
-import yaml
+from hydra import compose, initialize_config_dir
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -41,10 +41,9 @@ sys.path.insert(0, str(ROOT))
 # ---------------------------------------------------------------------------
 
 def load_totalseg_path() -> Path:
-    cfg_path = ROOT / "configs" / "config.yaml"
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    return Path(cfg["paths"]["totalseg"])
+    with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
+        cfg = compose(config_name="config")
+    return Path(cfg.paths.totalseg)
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +188,17 @@ def _build_union_labels(label: np.ndarray, n_union: int, seed: int = 0) -> np.nd
 # ---------------------------------------------------------------------------
 
 def _resize_label(labels: np.ndarray, size: tuple) -> np.ndarray:
-    zoom = tuple(t / s for t, s in zip(size, labels.shape))
-    return ndi.zoom(labels, zoom, order=0).astype(labels.dtype)
+    """Isotropic nearest-neighbour resize + zero-pad to target cube."""
+    T = size[0]
+    scale = T / max(labels.shape)
+    new_shape = tuple(min(T, max(1, round(s * scale))) for s in labels.shape)
+    zoom = tuple(n / s for n, s in zip(new_shape, labels.shape))
+    resized = ndi.zoom(labels, zoom, order=0)
+    out = np.zeros(size, dtype=labels.dtype)
+    pad = [(T - s) // 2 for s in new_shape]
+    sl = tuple(slice(p, p + s) for p, s in zip(pad, new_shape))
+    out[sl] = resized
+    return out
 
 
 def _process(args: tuple) -> dict:

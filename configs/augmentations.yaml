@@ -31,10 +31,12 @@ augmentations:
       p: 0.5
       brightness: 0.10            # uniform ±brightness added
       contrast_range: [0.80, 1.20]
+      preserve_range: false       # if true: clip to per-volume [min,max] after transform
 
     gamma:
       p: 0.30
       range: [0.70, 1.50]         # CT-range gamma correction
+      retain_stats: false         # if true: rescale output to match input mean/std (nnUNet p_retain_stats)
 
     gaussian_noise:
       p: 0.50
@@ -43,6 +45,11 @@ augmentations:
     gaussian_blur:
       p: 0.50
       sigma_range: [0.50, 1.50]   # Gaussian sigma in voxels
+
+    simulate_low_resolution:
+      p: 0.0                      # nnUNet SimulateLowResolutionTransform (disabled by default)
+      scale_min: 0.5
+      scale_max: 1.0
 
   # -----------------------------------------------------------------------
   # Synth augmentations  —  applied independently to each of the K+1 copies

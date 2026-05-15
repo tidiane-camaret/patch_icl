@@ -35,11 +35,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from data.totalseg_classes import ALL_CLASSES
 from src.totalseg_dataset import (
-    ALL_CLASSES,
     _ALL_CLASSES_IDX,
     _load_ct,
     _build_label_volume,
+    _iso_size,
     _resize_volume,
 )
 from src.augmentations import apply_task_aug, apply_intensity_aug, apply_synth_aug
@@ -66,6 +67,15 @@ class TotalSegInContextDataset(Dataset):
         meta_csv     : Path to meta.csv; auto-detected when split is given.
         context_size : Number of context (image, mask) pairs per item.
         max_subjects : Limit to the first N subjects (for quick experiments).
+        use_crop     : If True, load native-resolution ct.npy/label.npy and
+                       extract an organ-centred random crop of image_size
+                       instead of using pre-resized files.  Requires native
+                       ct.npy and label.npy to exist (convert_to_npy.py always
+                       writes them).  ~5-13× slower than the pre-sized fast
+                       path on NFS (warm cache); useful when you want to avoid
+                       the quality loss from downsampling.
+        crop_jitter  : Max voxel offset from organ centroid when use_crop=True.
+                       Defaults to image_size[0] // 4.
 
     Scan cache
     ----------
@@ -75,6 +85,12 @@ class TotalSegInContextDataset(Dataset):
     different class subsets or splits.  The cache is keyed by a hash of the
     full set of subject directories, so it is automatically invalidated if
     subjects are added or removed.
+
+    Bbox cache
+    ----------
+    When use_crop=True, a second cache stores per-(subject, class) organ
+    centroids (integer voxel coordinates in the native label.npy space).
+    Built once on first use; keyed by the same subject-list hash.
     """
 
     def __init__(
@@ -91,6 +107,8 @@ class TotalSegInContextDataset(Dataset):
         synth_unions: bool = False,
         p_synth: float = 0.5,
         class_balanced: bool = False,
+        use_crop: bool = False,
+        crop_jitter: Optional[int] = None,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -104,6 +122,10 @@ class TotalSegInContextDataset(Dataset):
         self.synth_method = synth_method
         self.p_synth = p_synth
         self.class_balanced = class_balanced
+        self.use_crop = use_crop
+        self.crop_jitter = crop_jitter if crop_jitter is not None else (
+            image_size[0] // 4 if image_size is not None else 0
+        )
         self.hu_jitter = (
             getattr(aug_cfg.intensity, "hu_jitter", 0)
             if aug_cfg is not None and aug_cfg.enabled
@@ -136,7 +158,14 @@ class TotalSegInContextDataset(Dataset):
         counts = {cls: len(self.label_to_subjects[cls]) for cls in self.classes}
         print(f"TotalSegInContextDataset: {len(self.samples)} samples | "
               f"context_size={context_size} | class_balanced={class_balanced} | "
-              f"hu_jitter={self.hu_jitter} | class counts: {counts}", flush=True)
+              f"hu_jitter={self.hu_jitter} | use_crop={use_crop} | "
+              f"class counts: {counts}", flush=True)
+
+        # Bbox cache: organ centroids in native-res voxel space (needed for use_crop)
+        if use_crop:
+            self._bbox_cache = self._load_or_build_bbox_cache()
+        else:
+            self._bbox_cache = {}
 
         # Synth path: build SV-ID cache for fast __getitem__ sampling
         if synth_method is not None:
@@ -238,6 +267,58 @@ class TotalSegInContextDataset(Dataset):
         print(f"Synth SV cache saved ({len(sv_ids)} subjects).", flush=True)
         return synth_subs, sv_ids
 
+    def _load_or_build_bbox_cache(self) -> dict[str, dict[str, tuple[int, int, int]]]:
+        """
+        Return {subject: {class_name: (d, h, w)}} with integer organ centroids
+        in native label.npy voxel space.  Built once, keyed by subject-list hash.
+        """
+        all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
+        key = hashlib.sha256("|".join(all_subjects).encode()).hexdigest()[:12]
+        cache_path = self.root / f".bbox_cache_{key}.pkl"
+
+        if cache_path.exists():
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            print(f"Loaded bbox cache ({len(cache)} subjects) from {cache_path.name}",
+                  flush=True)
+            return cache
+
+        print(f"Building bbox cache for {len(all_subjects)} subjects "
+              f"(saved to {cache_path.name})...", flush=True)
+        cache: dict[str, dict[str, tuple[int, int, int]]] = {}
+        for subj in all_subjects:
+            label_npy = self.root / subj / "label.npy"
+            if not label_npy.exists():
+                continue
+            try:
+                arr = np.load(label_npy, mmap_mode="r")
+                D, H, W = arr.shape
+                # Build coordinate grids once per subject
+                d_g = np.arange(D, dtype=np.float32)[:, None, None]
+                h_g = np.arange(H, dtype=np.float32)[None, :, None]
+                w_g = np.arange(W, dtype=np.float32)[None, None, :]
+                subj_bboxes: dict[str, tuple[int, int, int]] = {}
+                for idx in np.unique(arr):
+                    if idx == 0 or idx not in _IDX_TO_CLASS:
+                        continue
+                    mask = (arr == idx)
+                    n = mask.sum()
+                    if n == 0:
+                        continue
+                    cd = int((d_g * mask).sum() / n)
+                    ch = int((h_g * mask).sum() / n)
+                    cw = int((w_g * mask).sum() / n)
+                    subj_bboxes[_IDX_TO_CLASS[idx]] = (cd, ch, cw)
+                cache[subj] = subj_bboxes
+            except (EOFError, ValueError, OSError):
+                print(f"  Skipping corrupt file: {label_npy}", flush=True)
+                continue
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache, f)
+        print(f"BBox cache saved ({len(cache)} subjects).", flush=True)
+        return cache
+
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
         if split is not None:
@@ -300,7 +381,15 @@ class TotalSegInContextDataset(Dataset):
             mask    = (sv_vol == sv_idx).astype(np.uint8)
             mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
             if self.image_size is not None:
-                mask_t = F.interpolate(mask_t, size=self.image_size, mode="nearest")
+                T = self.image_size[0]
+                D, H, W = mask_t.shape[2:]
+                new = _iso_size((D, H, W), T)
+                mask_small = F.interpolate(mask_t, size=new, mode="nearest")
+                mask_out = torch.zeros(1, 1, T, T, T, dtype=mask_t.dtype)
+                pads = [(T - s) // 2 for s in new]
+                sl = (slice(None), slice(None)) + tuple(slice(p, p + s) for p, s in zip(pads, new))
+                mask_out[sl] = mask_small
+                mask_t = mask_out
             mask_t = mask_t.squeeze(0).squeeze(0).long()            # (D, H, W)
 
         # K+1 independent copies, each separately augmented
@@ -386,13 +475,68 @@ class TotalSegInContextDataset(Dataset):
     # Loading helpers
     # ------------------------------------------------------------------
 
+    def _load_crop(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load native ct.npy + label.npy and return an organ-centred random crop
+        of self.image_size (assumed cubic: T = image_size[0]).
+
+        The crop start is jittered by ±crop_jitter voxels around the centroid
+        and clamped so the crop fits entirely within the volume.  Volumes smaller
+        than T in any dimension are zero-padded.
+        """
+        subj_dir = self.root / subj
+        T = self.image_size[0]
+
+        label_mm = np.load(subj_dir / "label.npy", mmap_mode="r")
+        D, H, W = label_mm.shape
+
+        center = self._bbox_cache.get(subj, {}).get(cls)
+        if center is not None:
+            cd, ch, cw = center
+        else:
+            cd, ch, cw = D // 2, H // 2, W // 2
+
+        j = self.crop_jitter
+        starts = []
+        for c, s in zip((cd, ch, cw), (D, H, W)):
+            ideal = c - T // 2
+            lo = max(0, ideal - j)
+            hi = max(lo, min(max(0, s - T), ideal + j))
+            starts.append(random.randint(lo, hi))
+        d0, h0, w0 = starts
+
+        ct_mm = np.load(subj_dir / "ct.npy", mmap_mode="r")
+        crop_ct  = ct_mm   [d0:d0+T, h0:h0+T, w0:w0+T]
+        crop_lbl = label_mm[d0:d0+T, h0:h0+T, w0:w0+T]
+
+        # Zero-pad if volume is smaller than T in any dim (rare)
+        image = np.zeros((T, T, T), dtype=np.float32)
+        label = np.zeros((T, T, T), dtype=np.uint8)
+        s = crop_ct.shape
+        image[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
+
+        orig_idx = _ALL_CLASSES_IDX.get(cls)
+        if orig_idx is not None:
+            label[:s[0], :s[1], :s[2]] = (crop_lbl == orig_idx).astype(np.uint8)
+
+        return (
+            torch.from_numpy(image).unsqueeze(0),  # (1, T, T, T)
+            torch.from_numpy(label).long(),          # (T, T, T)
+        )
+
     def _load(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Load one (image, binary_mask) pair for a single class.
 
-        Fast path: use pre-resized ct_{size}.npy + label_{size}.npy when available —
-        no CPU interpolation needed.  Falls back to native resolution + resize.
+        Crop path  (use_crop=True): load native ct.npy/label.npy and extract an
+        organ-centred random crop — no interpolation, native resolution detail.
+        Fast path  (default): use pre-resized ct_{size}.npy + label_{size}.npy.
+        Slow path  (fallback): native .nii.gz → resize on the fly.
         """
         subj_dir = self.root / subj
+
+        if self.use_crop:
+            return self._load_crop(subj, cls)
+
         if self._size_str is not None:
             ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
             label_pre = subj_dir / f"label_{self._size_str}.npy"
@@ -453,6 +597,8 @@ def get_incontext_loader(
     synth_unions: bool = False,
     p_synth: float = 0.5,
     class_balanced: bool = False,
+    use_crop: bool = False,
+    crop_jitter: Optional[int] = None,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -466,6 +612,8 @@ def get_incontext_loader(
         synth_unions=synth_unions,
         p_synth=p_synth,
         class_balanced=class_balanced,
+        use_crop=use_crop,
+        crop_jitter=crop_jitter,
     )
     return DataLoader(
         ds,

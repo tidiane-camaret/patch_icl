@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from data.totalseg_classes import resolve_classes
 from src.totalseg_dataloader_incontext import (
     TotalSegInContextDataset,
     incontext_collate_fn,
@@ -149,7 +150,8 @@ def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
         samples[item["label_name"]] = _extract(item)
 
     if dataset.synth_method is None or dataset.p_synth < 1.0:
-        saved_p, dataset.p_synth = dataset.p_synth, 0.0
+        saved_p,  dataset.p_synth        = dataset.p_synth,        0.0
+        saved_cb, dataset.class_balanced = dataset.class_balanced, False
         class_to_idx: dict[str, int] = {}
         for i, (_, cls) in enumerate(dataset.samples):
             if cls not in class_to_idx:
@@ -158,7 +160,8 @@ def collect_viz_samples(dataset, classes: list[str]) -> dict[str, dict]:
                 break
         for cls, idx in class_to_idx.items():
             samples[cls] = _extract(dataset[idx])
-        dataset.p_synth = saved_p
+        dataset.p_synth        = saved_p
+        dataset.class_balanced = saved_cb
 
     return samples
 
@@ -284,8 +287,8 @@ def run_epoch(model, model_module, loader, optimizer, loss_fn, scaler, device, t
 @hydra.main(config_path="../configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     image_size    = tuple(cfg.data.image_size)
-    train_classes = list(cfg.data.train_classes)
-    val_classes   = list(cfg.data.val_classes)
+    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
+    val_classes   = resolve_classes(cfg.data.val_classes,   cfg.paths.totalseg)
 
     if cfg.train.tpu:
         import torch_xla.core.xla_model as xm
@@ -336,12 +339,14 @@ def main(cfg: DictConfig) -> None:
         synth_unions=cfg.data.synth_unions,
         p_synth=cfg.data.p_synth,
         class_balanced=cfg.data.class_balanced,
+        use_crop=cfg.data.use_crop,
     )
     val_ds = TotalSegInContextDataset(
         root=cfg.paths.totalseg, classes=val_classes,
         image_size=image_size, split="val",
         context_size=cfg.data.context_size,
         max_subjects=cfg.data.max_val_subjects,
+        use_crop=cfg.data.use_crop,
     )
 
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True,  **loader_kw)

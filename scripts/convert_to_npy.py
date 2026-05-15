@@ -2,12 +2,12 @@
 Convert TotalSegmentator subjects from .nii.gz to .npy for fast data loading.
 
 Per subject written (always):
-  ct.npy     — float16, HU-clipped & normalised to [0,1], native resolution (D,H,W)
+  ct.npy     — float16, HU-clipped & z-score normalised, native resolution (D,H,W)
   label.npy  — uint8, merged label volume using ALL_CLASSES ordering (0=bg), native resolution
 
 With --size D H W (e.g. --size 64 64 64), also writes:
-  ct_DxHxW.npy     — float16, trilinear-resized to target (D,H,W)
-  label_DxHxW.npy  — uint8, nearest-neighbour-resized to target (D,H,W)
+  ct_DxHxW.npy     — float16, isotropic resize (longest axis → D) + Gaussian AA + zero-pad to cube
+  label_DxHxW.npy  — uint8, same isotropic resize with nearest-neighbour interpolation
 
 float16 halves ct disk use vs float32 with negligible precision loss after normalisation.
 
@@ -29,21 +29,48 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import scipy.ndimage as ndi
-import yaml
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.totalseg_dataset import ALL_CLASSES, HU_MIN, HU_MAX
+from data.totalseg_classes import ALL_CLASSES
+from src.totalseg_dataset import CT_CLIP_MIN, CT_CLIP_MAX, CT_MEAN, CT_STD
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True) -> np.ndarray:
+    """Isotropic resize: scale longest axis to target[0], zero-pad shorter axes.
+
+    With aa=True (and order > 0), applies a per-axis Gaussian blur before
+    downsampling (σ = 0.5*(s/n − 1)) to suppress aliasing.  Upsampled axes skip
+    the blur.  Uses order=0 for label volumes (nearest-neighbour, no AA needed).
+    """
+    T = target[0]
+    scale = T / max(vol.shape)
+    new_shape = tuple(min(T, max(1, round(s * scale))) for s in vol.shape)
+    if aa and order > 0:
+        sigma = [max(0.0, 0.5 * (s / n - 1)) for s, n in zip(vol.shape, new_shape)]
+        if any(s > 0.1 for s in sigma):
+            vol = ndi.gaussian_filter(vol, sigma=sigma)
+    zoom = tuple(n / s for n, s in zip(new_shape, vol.shape))
+    resized = ndi.zoom(vol, zoom, order=order)
+    out = np.zeros(target, dtype=vol.dtype)
+    pad = [(T - s) // 2 for s in new_shape]
+    sl = tuple(slice(p, p + s) for p, s in zip(pad, new_shape))
+    out[sl] = resized
+    return out
+
+
 def _default_data_dir() -> str:
-    cfg_path = ROOT / "configs" / "config.yaml"
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    return cfg["paths"]["totalseg"]
+    with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
+        cfg = compose(config_name="config")
+    return cfg.paths.totalseg
 
 _CLASS_TO_IDX = {cls: i + 1 for i, cls in enumerate(ALL_CLASSES)}  # 1-indexed
+
+# Verify constants match the expected fingerprint values at import time (fast sanity check).
+assert CT_CLIP_MIN == -1007.0 and CT_CLIP_MAX == 1573.0, "unexpected CT clip constants"
 
 
 def convert_subject(args: tuple) -> tuple[str, str]:
@@ -72,9 +99,10 @@ def convert_subject(args: tuple) -> tuple[str, str]:
 
         if need_native:
             ct_path = subj_dir / "ct.nii.gz"
-            vol = nib.load(str(ct_path)).get_fdata(dtype=np.float32)
-            vol = np.clip(vol, HU_MIN, HU_MAX)
-            vol = (vol - HU_MIN) / (HU_MAX - HU_MIN)  # float32 for resize reuse
+            ct_img = nib.as_closest_canonical(nib.load(str(ct_path)))
+            vol = ct_img.get_fdata(dtype=np.float32)
+            vol = np.clip(vol, CT_CLIP_MIN, CT_CLIP_MAX)
+            vol = (vol - CT_MEAN) / CT_STD   # z-score; float16 covers [-1.66, +3.44]
 
             seg_dir = subj_dir / "segmentations"
             label = np.zeros(vol.shape, dtype=np.uint8)
@@ -82,7 +110,7 @@ def convert_subject(args: tuple) -> tuple[str, str]:
                 mask_path = seg_dir / f"{cls}.nii.gz"
                 if not mask_path.exists():
                     continue
-                mask = nib.load(str(mask_path)).get_fdata(dtype=np.float32) > 0
+                mask = nib.as_closest_canonical(nib.load(str(mask_path))).get_fdata(dtype=np.float32) > 0
                 label[mask] = idx
 
             np.save(ct_out, vol.astype(np.float16))
@@ -93,9 +121,8 @@ def convert_subject(args: tuple) -> tuple[str, str]:
                 vol   = np.load(ct_out,    mmap_mode="r").astype(np.float32)
                 label = np.load(label_out, mmap_mode="r")
 
-            zoom = tuple(t / s for t, s in zip(size, vol.shape))
-            np.save(ct_sized,    ndi.zoom(vol,   zoom, order=1).astype(np.float16))
-            np.save(label_sized, ndi.zoom(label, zoom, order=0))
+            np.save(ct_sized,    _iso_resize(vol,   size, order=1, aa=True).astype(np.float16))
+            np.save(label_sized, _iso_resize(label, size, order=0, aa=False))
 
     except Exception:
         return subj, traceback.format_exc()
@@ -107,8 +134,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default=None,
                         help="dataset root; defaults to paths.totalseg in configs/config.yaml")
-    parser.add_argument("--workers", type=int, default=min(32, os.cpu_count()),
-                        help="parallel worker processes (default: min(32, cpu_count))")
+    parser.add_argument("--workers", type=int, default=min(20, os.cpu_count()),
+                        help="parallel worker processes (default: min(20, cpu_count))")
     parser.add_argument("--overwrite", action="store_true",
                         help="reconvert even if .npy files already exist")
     parser.add_argument("--size", nargs=3, type=int, metavar=("D", "H", "W"),

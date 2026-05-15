@@ -21,47 +21,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-# -------------------------------------------------------------------------
-# Full list of the 117 available segmentation classes
-# -------------------------------------------------------------------------
-ALL_CLASSES: list[str] = [
-    "adrenal_gland_left", "adrenal_gland_right", "aorta", "atrial_appendage_left",
-    "autochthon_left", "autochthon_right", "brachiocephalic_trunk",
-    "brachiocephalic_vein_left", "brachiocephalic_vein_right", "brain",
-    "clavicula_left", "clavicula_right", "colon", "common_carotid_artery_left",
-    "common_carotid_artery_right", "costal_cartilages", "duodenum", "esophagus",
-    "femur_left", "femur_right", "gallbladder", "gluteus_maximus_left",
-    "gluteus_maximus_right", "gluteus_medius_left", "gluteus_medius_right",
-    "gluteus_minimus_left", "gluteus_minimus_right", "heart", "hip_left", "hip_right",
-    "humerus_left", "humerus_right", "iliac_artery_left", "iliac_artery_right",
-    "iliac_vena_left", "iliac_vena_right", "iliopsoas_left", "iliopsoas_right",
-    "inferior_vena_cava", "kidney_cyst_left", "kidney_cyst_right",
-    "kidney_left", "kidney_right", "liver",
-    "lung_lower_lobe_left", "lung_lower_lobe_right", "lung_middle_lobe_right",
-    "lung_upper_lobe_left", "lung_upper_lobe_right",
-    "pancreas", "portal_vein_and_splenic_vein", "prostate", "pulmonary_vein",
-    "rib_left_1", "rib_left_2", "rib_left_3", "rib_left_4", "rib_left_5",
-    "rib_left_6", "rib_left_7", "rib_left_8", "rib_left_9", "rib_left_10",
-    "rib_left_11", "rib_left_12",
-    "rib_right_1", "rib_right_2", "rib_right_3", "rib_right_4", "rib_right_5",
-    "rib_right_6", "rib_right_7", "rib_right_8", "rib_right_9", "rib_right_10",
-    "rib_right_11", "rib_right_12",
-    "sacrum", "scapula_left", "scapula_right", "skull", "small_bowel",
-    "spinal_cord", "spleen", "sternum", "stomach",
-    "subclavian_artery_left", "subclavian_artery_right", "superior_vena_cava",
-    "thyroid_gland", "trachea", "urinary_bladder",
-    "vertebrae_C1", "vertebrae_C2", "vertebrae_C3", "vertebrae_C4",
-    "vertebrae_C5", "vertebrae_C6", "vertebrae_C7",
-    "vertebrae_L1", "vertebrae_L2", "vertebrae_L3", "vertebrae_L4", "vertebrae_L5",
-    "vertebrae_S1",
-    "vertebrae_T1", "vertebrae_T2", "vertebrae_T3", "vertebrae_T4", "vertebrae_T5",
-    "vertebrae_T6", "vertebrae_T7", "vertebrae_T8", "vertebrae_T9",
-    "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
-]
+from data.totalseg_classes import ALL_CLASSES  # noqa: F401  (re-exported for back-compat)
 
-# Hounsfield-unit window → normalised to [0, 1]
-# Wide range to cover bone (>400 HU), soft tissue, and lungs (~-800 HU).
-HU_MIN, HU_MAX = -500, 1000
+# CT normalisation constants matching nnUNet CTNormalization on this dataset.
+# Derived from the 1228-subject fingerprint in nnUNet_preprocessed/dataset_fingerprint.json.
+#   Clip:   p0.5 / p99.5 of foreground HU across all subjects.
+#   Z-score: global mean / std of foreground HU (after clipping).
+# Stored .npy files contain float16 z-score values; the runtime range is [-1.66, +3.44].
+CT_CLIP_MIN: float = -1007.0
+CT_CLIP_MAX: float =  1573.0
+CT_MEAN:     float =  -167.3
+CT_STD:      float =   505.8
+# Pre-computed z-score bounds (used by augmentations for clamping).
+CT_NORM_MIN: float = (CT_CLIP_MIN - CT_MEAN) / CT_STD   # ≈ -1.661
+CT_NORM_MAX: float = (CT_CLIP_MAX - CT_MEAN) / CT_STD   # ≈ +3.441
 
 
 # -------------------------------------------------------------------------
@@ -69,24 +42,24 @@ HU_MIN, HU_MAX = -500, 1000
 # -------------------------------------------------------------------------
 
 def _load_ct(path: Path, jitter: float = 0) -> np.ndarray:
-    """Load CT, clip HU window, normalise to [0, 1].  Returns float32 (D,H,W).
+    """Load CT, clip HU and z-score normalise.  Returns float32 (D,H,W).
     Prefers a pre-converted ct.npy next to the .nii.gz for fast loading.
     When jitter > 0 the npy cache is bypassed (it stores pre-normalised values,
-    not raw HU) and window boundaries are randomly perturbed by ±jitter HU."""
+    not raw HU) and clip boundaries are randomly perturbed by ±jitter HU."""
     if jitter == 0:
         npy = path.with_suffix("").with_suffix(".npy")  # ct.nii.gz → ct.npy
         if npy.exists():
             return np.load(npy, mmap_mode="r").astype(np.float32)
-    vol = nib.load(str(path)).get_fdata(dtype=np.float32)
-    a_min, a_max = float(HU_MIN), float(HU_MAX)
+    vol = nib.as_closest_canonical(nib.load(str(path))).get_fdata(dtype=np.float32)
+    a_min, a_max = CT_CLIP_MIN, CT_CLIP_MAX
     if jitter > 0:
         a_min += random.uniform(-jitter, jitter)
         a_max += random.uniform(-jitter, jitter)
         if a_max - a_min < 200:          # guard against degenerate window
             a_max = a_min + 200
     vol = np.clip(vol, a_min, a_max)
-    vol = (vol - a_min) / (a_max - a_min)
-    return vol  # (D, H, W)
+    vol = (vol - CT_MEAN) / CT_STD
+    return vol  # (D, H, W)  z-score, nominally in [CT_NORM_MIN, CT_NORM_MAX]
 
 
 # Maps ALL_CLASSES name → 1-based index used in label.npy
@@ -118,7 +91,7 @@ def _build_label_volume(seg_dir: Path, classes: list[str]) -> np.ndarray:
         mask_path = seg_dir / f"{cls}.nii.gz"
         if not mask_path.exists():
             continue
-        mask = (nib.load(str(mask_path)).get_fdata(dtype=np.float32) > 0).astype(np.uint8)
+        mask = (nib.as_closest_canonical(nib.load(str(mask_path))).get_fdata(dtype=np.float32) > 0).astype(np.uint8)
         if label is None:
             label = np.zeros_like(mask, dtype=np.uint8)
         label[mask > 0] = cls_idx
@@ -127,15 +100,53 @@ def _build_label_volume(seg_dir: Path, classes: list[str]) -> np.ndarray:
     return label  # (D, H, W)
 
 
+def _iso_size(native: tuple, target: int) -> tuple:
+    """Scale longest axis to target, keep proportions (result fits within target³)."""
+    scale = target / max(native)
+    return tuple(min(target, max(1, round(s * scale))) for s in native)
+
+
 def _resize_volume(
     image: torch.Tensor,   # (1, 1, D, H, W) float
     label: torch.Tensor,   # (1, 1, D, H, W) float
     size: tuple[int, int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resize both volumes to (D, H, W) using trilinear / nearest."""
-    image = F.interpolate(image, size=size, mode="trilinear", align_corners=False)
-    label = F.interpolate(label, size=size, mode="nearest")
-    return image, label
+    """Isotropic resize with separable Gaussian AA, then center-pad to a cubic target.
+
+    Preserves aspect ratio: the longest axis is scaled to size[0]; shorter axes
+    are scaled proportionally and then zero-padded to size[0].  A per-axis
+    Gaussian blur (σ = 0.5*(s/n − 1)) is applied before downsampling to suppress
+    aliasing.  Upsampled axes skip the blur.
+    """
+    T = size[0]
+    D, H, W = image.shape[2:]
+    new = _iso_size((D, H, W), T)
+
+    x = image
+    for dim, (s, n) in enumerate(zip((D, H, W), new)):
+        sigma = max(0.0, 0.5 * (s / n - 1))
+        if sigma < 0.1:
+            continue
+        k = max(3, 2 * round(2 * sigma) + 1)
+        coords = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
+        kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel = (kernel / kernel.sum()).view([1, 1] + [k if i == dim else 1 for i in range(3)])
+        pad_amt = k // 2
+        p = [0] * 6
+        ax = 2 - dim  # F.pad reverses axis order
+        p[ax * 2] = pad_amt; p[ax * 2 + 1] = pad_amt
+        x = F.conv3d(F.pad(x, p, mode="reflect"), kernel)
+
+    image_small = F.interpolate(x, size=new, mode="trilinear", align_corners=False)
+    label_small = F.interpolate(label, size=new, mode="nearest")
+
+    image_out = torch.zeros(1, 1, T, T, T, dtype=image.dtype, device=image.device)
+    label_out = torch.zeros(1, 1, T, T, T, dtype=label.dtype, device=label.device)
+    pads = [(T - s) // 2 for s in new]
+    sl = (slice(None), slice(None)) + tuple(slice(p, p + s) for p, s in zip(pads, new))
+    image_out[sl] = image_small
+    label_out[sl] = label_small
+    return image_out, label_out
 
 
 # -------------------------------------------------------------------------
