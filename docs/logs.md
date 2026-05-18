@@ -26,6 +26,33 @@ Refactored the encoder out of `resenc_in_context.py` into `src/models/encoders/`
 - `scripts/train.py` — `build_model` passes new encoder params to
   `ResEncInContext3D`.
 
+## 2026-05-18 — Feature-attention experiment
+
+Added `experiments/feature_attention/` to study the impact of attention mechanism design on patch-level in-context segmentation.
+
+**Motivation**: cosine-similarity retrieval (normed dice 0.324) vs. TabPFN in-context classifier (0.416) showed a clear gap. The goal is to understand which architectural decisions explain it and to train a lightweight learned attention module.
+
+**Files created**:
+
+- `experiments/feature_attention/model.py` — `PatchICLAttention`: learned cross-attention binary classifier. Target patches attend to context patches (K/V from context only, same train-only masking as TabPFN). Eight configurable decisions:
+  - `label_injection` — how context binary labels enter tokens: `additive` (TabPFN-style token += label_embed) | `concat` | `gate` | `none`
+  - `output_head` — `linear` | `mlp` | `retrieval` (cross-attention Q=tgt, K=label-conditioned ctx, V=scalar labels)
+  - `pos_encoding` — `none` | `sinusoidal` (fixed 3D sin/cos) | `learned` (nn.Embedding per grid position)
+  - `input_norm` — `none` | `rmsnorm` | `l2`
+  - `num_layers`, `num_heads`, `ff_factor`, `dropout`
+  - Zero-init residual output projections (stable early training, TabPFN-style)
+
+- `experiments/feature_attention/train.py` — trains `PatchICLAttention` on TotalSegmentator train split with frozen STU-Net encoder. Class-balanced sampling, AUROC-based validation each epoch, checkpoint saved on best val AUROC. W&B logging to `patch_icl_3d_exps`.
+
+- `experiments/feature_attention/run.py` — evaluation script mirroring `feature_similarity/run.py` (same metrics: soft dice, normed dice, AUROC; same visualisation; same W&B logging).
+
+**Also added to `experiments/feature_similarity/run.py`**:
+- `--method tabpfn` option using `TabPFNClassifier` as the prediction head
+- `--mask_pool` option (`max` / `avg`) for GT downsampling
+- `--feature_level all` to concatenate all encoder levels
+- W&B logging (project `patch_icl_3d_exps`, per-sample metrics + figures)
+- Avg inference time tracking
+
 ## 2026-05-15 — PatchICL-style token conditioning
 
 Added three token-level enrichments to `ResEncInContext3D`, inspired by PatchICL v3:

@@ -13,3 +13,4 @@ results/checkpoints/
 results/nnUNet/
 results/*.json
 slurm-*.out
+*.pt
