@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - augmentations
+  - augmentations: multiverseg
   - cluster: nfs
   - experiment: null   # e.g. experiment=1_no_synth
 

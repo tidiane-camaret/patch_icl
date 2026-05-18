@@ -11,6 +11,9 @@
 # Bottleneck grid: 128/32 = 4³ = 64 tokens  (vs. 64/8 = 8³ = 512 for resenc at 64³)
 # Adjust rope_theta if attention quality is poor at this grid size.
 
+defaults:
+  - override /augmentations: nnunet
+
 data:
   image_size: [128, 128, 128]
   synth_method: null
@@ -27,35 +30,3 @@ model:
   stunet_num_stages: 4
   model.num_registers: 1
   model.num_context_layers: 6
-
-augmentations:
-  task:
-    affine:
-      p: 0.2
-      max_angle_deg: 30.0
-      scale_min: 0.70
-      scale_max: 1.40
-      max_translate: 0.0
-    elastic:
-      p: 0.0
-
-  intensity:
-    brightness_contrast:
-      p: 0.15
-      brightness: 0.0
-      contrast_range: [0.75, 1.25]
-      preserve_range: true
-    gamma:
-      p: 0.30
-      range: [0.70, 1.50]
-      retain_stats: true
-    gaussian_noise:
-      p: 0.10
-      max_std: 0.316
-    gaussian_blur:
-      p: 0.20
-      sigma_range: [0.50, 1.00]
-    simulate_low_resolution:
-      p: 0.25
-      scale_min: 0.5
-      scale_max: 1.0

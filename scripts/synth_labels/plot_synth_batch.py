@@ -56,7 +56,7 @@ def main():
 
     # Load config (paths + augmentations)
     cfg = OmegaConf.load(ROOT / "configs" / "config.yaml")
-    aug_cfg = OmegaConf.load(ROOT / "configs" / "augmentations.yaml").augmentations
+    aug_cfg = OmegaConf.load(ROOT / "configs" / "augmentations" / "multiverseg.yaml").augmentations
 
     data_dir = args.data or cfg.paths.totalseg
 

@@ -1,5 +1,33 @@
 # Change log
 
+## 2026-05-18 — PatchICLAttention improvements from TabPFN comparison
+
+Rewrote `experiments/feature_attention/model.py` with five changes derived from
+comparing against TabPFN v3's ICL stage:
+
+- **K/V normalization (bug fix)**: cross-attention now pre-norms K and V via
+  per-layer `kv_norms` (RMSNorm). Previous code normalised only Q, breaking
+  pre-norm invariance as encoder features bled into K/V at each layer.
+- **Context self-attention**: each layer now runs a full transformer block
+  (SA + FFN) on context tokens before the cross-attention. This lets context
+  patches interact across K images before being retrieved, analogous to how
+  TabPFN's ICL train rows self-attend through train-only K/V.
+- **Log-n query scaling**: cross-attention Q is pre-scaled by
+  `log(M)/log(n_base)` before `F.scaled_dot_product_attention` (which applies
+  `1/sqrt(D)` internally). Calibrates softmax temperature for large context
+  sequences (M = K×8³ = 512+). Configurable via `log_n_base` (default 512).
+- **Retrieval head K projection**: added `ret_k_proj` separate from `ret_q_proj`,
+  decoupling the similarity space from the representation space (mirrors
+  TabPFN's `ManyClassDecoder`).
+- **Default input_norm → rmsnorm**: encoder features have per-channel scale
+  that varies across the 4 encoder levels; normalising at input stabilises
+  Q/K dot products.
+
+Switched from `nn.MultiheadAttention` to manual projections +
+`F.scaled_dot_product_attention` throughout, enabling Flash Attention and
+giving full control over scaling and norming. `train.py` gains
+`--no_ctx_self_attn`, `--no_log_n_scaling`, `--log_n_base` flags.
+
 ## 2026-05-15 — pluggable encoder + STU-Net
 
 Refactored the encoder out of `resenc_in_context.py` into `src/models/encoders/`:

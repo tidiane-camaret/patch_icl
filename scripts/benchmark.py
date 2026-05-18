@@ -45,7 +45,7 @@ from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontex
 from src.augmentations import apply_task_aug, apply_intensity_aug
 
 _CONFIG_PATH = Path(__file__).parent.parent / "configs" / "config.yaml"
-_AUG_CONFIG_PATH = Path(__file__).parent.parent / "configs" / "augmentations.yaml"
+_AUG_CONFIG_PATH = Path(__file__).parent.parent / "configs" / "augmentations" / "multiverseg.yaml"
 
 
 # ---------------------------------------------------------------------------
