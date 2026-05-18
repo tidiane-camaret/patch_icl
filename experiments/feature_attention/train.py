@@ -295,6 +295,60 @@ def save_val_figure(
 
 
 # ---------------------------------------------------------------------------
+# Train sample figures
+# ---------------------------------------------------------------------------
+
+def save_train_figures(
+    batch:     dict,
+    pred:      torch.Tensor,   # (B, N) on CPU, detached
+    out_size:  tuple,
+    fig_dir:   Path,
+    epoch:     int,
+    n_samples: int = 2,
+) -> dict:
+    """Save figures for the first n_samples items of a training batch.
+
+    Returns {key: Path} for W&B logging.
+    """
+    D_, H_, W_ = out_size
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    wandb_images: dict = {}
+    B = min(n_samples, pred.shape[0])
+
+    for i in range(B):
+        cls = batch["label_names"][i] if "label_names" in batch else f"sample{i}"
+
+        tgt_image = batch["image"][i].squeeze(0).cpu().numpy()   # (D, H, W)
+        tgt_gt    = batch["label"][i].cpu().numpy()              # (D, H, W)
+        tgt_gt_ds = downsample_mask(
+            batch["label"][i].unsqueeze(0), out_size, "max"
+        ).squeeze(0).numpy()                                     # (D', H', W')
+
+        pred_vol = pred[i].numpy().reshape(D_, H_, W_)
+
+        K = batch["context_in"].shape[1]
+        ctx_images = [batch["context_in"][i, k].squeeze(0).cpu().numpy() for k in range(K)]
+        ctx_gts    = [batch["context_out"][i, k].cpu().numpy() for k in range(K)]
+        ctx_gts_ds = [
+            downsample_mask(batch["context_out"][i, k].unsqueeze(0), out_size, "max")
+            .squeeze(0).numpy()
+            for k in range(K)
+        ]
+
+        fig_path = fig_dir / f"epoch{epoch:03d}_train_{cls}.png"
+        save_val_figure(
+            tgt_image=tgt_image, tgt_gt=tgt_gt, tgt_gt_ds=tgt_gt_ds,
+            pred=pred_vol,
+            ctx_images=ctx_images, ctx_gts=ctx_gts, ctx_gts_ds=ctx_gts_ds,
+            out_path=fig_path,
+            title=f"[ep {epoch}] TRAIN  {cls}",
+        )
+        wandb_images[f"train/pred/{cls}"] = fig_path
+
+    return wandb_images
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -324,7 +378,7 @@ def validate(
     for i, (_, cls) in enumerate(ds_val.samples):
         cls_to_indices[cls].append(i)
 
-    aurocs, norm_dices = [], []
+    aurocs, norm_dices, losses = [], [], []
     wandb_images: dict = {}
 
     for cls in ds_val.classes:
@@ -368,6 +422,7 @@ def validate(
             pred = model(tgt_feat, ctx_feat, ctx_lbls).squeeze(0)   # (N,)
             gt   = gt.squeeze(0)                                     # (N,)
 
+            losses.append(F.binary_cross_entropy(pred, gt).item())
             pred_np = pred.cpu().numpy()
             gt_np   = (gt.cpu().numpy() > 0).astype(int)
             if 0 < gt_np.sum() < len(gt_np):
@@ -404,6 +459,7 @@ def validate(
 
     model.train()
     metrics = {
+        "val/loss":      float(np.mean(losses))        if losses     else float("nan"),
         "val/auroc":     float(np.nanmean(aurocs))     if aurocs     else float("nan"),
         "val/norm_dice": float(np.nanmean(norm_dices)) if norm_dices else float("nan"),
     }
@@ -555,6 +611,7 @@ def main() -> None:
         last_nd = float("nan")
         t0 = time.perf_counter()
 
+        train_vis: tuple | None = None   # (batch_cpu, pred_cpu) from first batch
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{args.epochs}", unit="batch", leave=False)
         for batch in bar:
             pred, gt = process_batch(
@@ -569,6 +626,9 @@ def main() -> None:
             else:
                 loss.backward()
                 optimizer.step()
+
+            if train_vis is None:
+                train_vis = (batch, pred.detach().cpu())
 
             n_batches  += 1
             epoch_loss += loss.item()   # one sync per batch (unavoidable for loss display)
@@ -627,9 +687,14 @@ def main() -> None:
 
         if use_wandb:
             import wandb
-            wandb_figs = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
+            train_figs = {}
+            if train_vis is not None:
+                train_figs = save_train_figures(
+                    train_vis[0], train_vis[1], out_size, fig_dir, epoch,
+                )
+            all_figs = {k: wandb.Image(str(v)) for k, v in {**val_figs, **train_figs}.items()}
             wandb.log({"train/loss": avg_loss, "train/norm_dice": avg_nd,
-                       "epoch": epoch, **val_metrics, **wandb_figs})
+                       "epoch": epoch, **val_metrics, **all_figs})
 
     if use_wandb:
         import wandb
