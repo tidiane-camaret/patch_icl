@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT))
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
 from src.models.encoders.stunet import STUNetEncoder
 from experiments.feature_attention.model import PatchICLAttention
+from data.totalseg_classes import resolve_classes
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,23 @@ def downsample_multiclass(labels: torch.Tensor, size: tuple) -> torch.Tensor:
         pooled = F.adaptive_max_pool3d(binary, size).squeeze(1) > 0
         result[pooled] = int(lid)
     return result
+
+
+def colorize_soft(
+    labels:  torch.Tensor,   # (B, D, H, W) int64
+    palette: torch.Tensor,   # (B, L+1, 3) float
+    size:    tuple,          # (D', H', W')
+) -> torch.Tensor:           # (B, N, 3)  N = D'*H'*W'
+    """Soft RGB: each output patch = Σ_i avg_pool(label_i==lid) * color_i."""
+    B = labels.shape[0]
+    L = palette.shape[1] - 1
+    N = size[0] * size[1] * size[2]
+    # Build all-label one-hot in one shot, run a single pool kernel, then einsum.
+    lids    = torch.arange(1, L + 1, device=labels.device).view(1, L, 1, 1, 1)
+    one_hot = (labels.unsqueeze(1) == lids).float()                   # (B, L, D, H, W)
+    weights = F.adaptive_avg_pool3d(one_hot, size).reshape(B, L, N)   # (B, L, N)
+    result  = torch.einsum("bln,blc->bnc", weights, palette[:, 1:, :])
+    return result.clamp(0, 1)
 
 
 def downsample_mask(mask: torch.Tensor, size: tuple, mode: str = "max") -> torch.Tensor:
@@ -188,18 +206,14 @@ def process_batch(
     is_rgb   = palette is not None
     if is_rgb:
         palette = palette.to(device)  # (B, L+1, 3)
-        # Downsample integer labels correctly: per-label binary max pool so each
-        # patch gets exactly one label's colour — no phantom colours from blending.
-        tgt_ds = downsample_multiclass(labels, out_size)                          # (B, D',H',W')
-        ctx_ds = downsample_multiclass(
-            ctx_out.reshape(B * K, *ctx_out.shape[2:]), out_size
-        ).reshape(B, K, D_, H_, W_)
-
-        # Colorise by palette lookup: palette[b, label_id] → RGB
-        tgt_idx  = tgt_ds.reshape(B, N)           # (B, N)
-        ctx_idx  = ctx_ds.reshape(B, K * N)       # (B, K*N)
-        gt_loss  = palette.gather(1, tgt_idx.unsqueeze(-1).expand(-1, -1, 3))    # (B, N, 3)
-        ctx_lbls = palette.gather(1, ctx_idx.unsqueeze(-1).expand(-1, -1, 3))    # (B, K*N, 3)
+        # Soft colorization: each patch = Σ avg_pool(label==i) * color_i
+        gt_loss  = colorize_soft(labels, palette, out_size)                       # (B, N, 3)
+        palette_rep = palette.unsqueeze(1).expand(-1, K, -1, -1).reshape(
+            B * K, palette.shape[1], 3
+        )
+        ctx_lbls = colorize_soft(
+            ctx_out.reshape(B * K, *ctx_out.shape[2:]), palette_rep, out_size
+        ).reshape(B, K * N, 3)                                                    # (B, K*N, 3)
         gt_bin   = (gt_loss.norm(dim=-1) > 0).float()
     else:
         tgt_mask_ds = downsample_mask(labels, out_size, mask_pool)
@@ -276,6 +290,13 @@ def _overlay_multiclass(ax, image: np.ndarray, label_vol: np.ndarray, idx: int, 
     ax.axis("off")
 
 
+def _rgb_panel(ax, rgb_vol: np.ndarray, idx: int, title: str) -> None:
+    """rgb_vol: (D, H, W, 3) float in [0, 1] — displayed directly."""
+    ax.imshow(rgb_vol[idx].clip(0, 1))
+    ax.set_title(title, fontsize=8)
+    ax.axis("off")
+
+
 def _colored_vol(ax, label_vol: np.ndarray, palette: np.ndarray, idx: int, title: str) -> None:
     """label_vol: (D,H,W) int; palette: (L+1,3) float in [0,1]."""
     rgb = palette[label_vol[idx].clip(0, len(palette) - 1)]
@@ -321,13 +342,13 @@ def save_val_figure(
     else:
         _overlay(axes[0, 0], tgt_image, tgt_gt, tgt_z, "Target + GT")
 
-    # Downsampled GT always uses fixed viz palette so all labels are visible.
-    # Pred: random_coloring mode maps RGB → class ID via training palette → viz color.
+    # Downsampled GT and pred panels.
+    # RGB mode: both are (D', H', W', 3) soft float — display directly.
+    # Integer multiclass: use fixed viz palette. Binary: heatmap.
     max_lbl = int(np.asarray(tgt_gt_ds).max())
     if palette is not None:
-        viz_pal = _viz_palette(max_lbl)
-        _colored_vol (axes[0, 1], tgt_gt_ds.astype(int), viz_pal, tgt_z_ds, "GT ↓")
-        _pred_colored(axes[0, 2], pred,                  palette, tgt_z_ds, "Prediction")
+        _rgb_panel(axes[0, 1], tgt_gt_ds, tgt_z_ds, "GT ↓")
+        _rgb_panel(axes[0, 2], pred,      tgt_z_ds, "Prediction")
     elif max_lbl > 1:
         viz_pal = _viz_palette(max_lbl)
         _colored_vol(axes[0, 1], tgt_gt_ds.astype(int), viz_pal, tgt_z_ds, "GT ↓")
@@ -347,12 +368,15 @@ def save_val_figure(
             else:
                 _overlay(axes[1, 2 * k], ctx_images[k], ctx_gts[k], ctx_z, f"Ctx {k} + GT")
         if 2 * k + 1 < ncols:
-            ctx_max = int(np.asarray(ctx_gts_ds[k]).max())
-            if ctx_max > 1:
-                _colored_vol(axes[1, 2 * k + 1], ctx_gts_ds[k].astype(int),
-                             _viz_palette(ctx_max), ctx_z_ds, f"Ctx {k} GT ↓")
+            if palette is not None:
+                _rgb_panel(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
             else:
-                _heatmap(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
+                ctx_max = int(np.asarray(ctx_gts_ds[k]).max())
+                if ctx_max > 1:
+                    _colored_vol(axes[1, 2 * k + 1], ctx_gts_ds[k].astype(int),
+                                 _viz_palette(ctx_max), ctx_z_ds, f"Ctx {k} GT ↓")
+                else:
+                    _heatmap(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
     for col in range(2 * K, ncols):
         axes[1, col].set_visible(False)
 
@@ -373,6 +397,7 @@ def save_train_figures(
     fig_dir:   Path,
     epoch:     int,
     n_samples: int = 2,
+    mask_pool: str = "max",
 ) -> dict:
     """Save figures for the first n_samples items of a training batch.
 
@@ -395,16 +420,17 @@ def save_train_figures(
 
         palette = None
         if pred.ndim == 3 and "label_palette" in batch:
-            # RGB mode: integer label GT + raw RGB pred → coloured rendering
-            palette    = batch["label_palette"][i].numpy()                # (L+1, 3)
-            tgt_gt_ds  = downsample_multiclass(
-                batch["label"][i].unsqueeze(0), out_size
-            ).squeeze(0).numpy().astype(int)                              # (D', H', W') int
+            # RGB mode: soft colorized GT + raw RGB pred → direct RGB rendering
+            palette_t  = batch["label_palette"][i]                        # (L+1, 3)
+            palette    = palette_t.numpy()
+            tgt_gt_ds  = colorize_soft(
+                batch["label"][i].unsqueeze(0), palette_t.unsqueeze(0), out_size
+            ).squeeze(0).numpy().reshape(D_, H_, W_, 3)                   # (D', H', W', 3)
             pred_vol   = pred[i].numpy().reshape(D_, H_, W_, 3)          # (D', H', W', 3)
             ctx_gts_ds = [
-                downsample_multiclass(
-                    batch["context_out"][i, k].unsqueeze(0), out_size
-                ).squeeze(0).numpy().astype(int)
+                colorize_soft(
+                    batch["context_out"][i, k].unsqueeze(0), palette_t.unsqueeze(0), out_size
+                ).squeeze(0).numpy().reshape(D_, H_, W_, 3)
                 for k in range(K)
             ]
         else:
@@ -414,8 +440,8 @@ def save_train_figures(
             ).squeeze(0).numpy().astype(int)                              # (D', H', W') int
             pred_vol   = pred[i].numpy().reshape(D_, H_, W_)             # (D', H', W') scalar
             ctx_gts_ds = [
-                (downsample_mask(batch["context_out"][i, k].unsqueeze(0), out_size, "max") > 0)
-                .float().squeeze(0).numpy()
+                downsample_mask(batch["context_out"][i, k].unsqueeze(0), out_size, mask_pool)
+                .squeeze(0).numpy()
                 for k in range(K)
             ]
 
@@ -588,8 +614,9 @@ def main() -> None:
         aug_yaml = ROOT / "configs" / "augmentations" / f"{cfg.train.aug_preset}.yaml"
         aug_cfg  = OmegaConf.load(aug_yaml).augmentations
 
-    train_classes = list(cfg.data.train_classes)
-    val_classes   = list(cfg.data.val_classes) or train_classes
+    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
+    val_classes   = resolve_classes(cfg.data.val_classes, cfg.paths.totalseg) if cfg.data.val_classes else []
+    val_classes   = val_classes or train_classes
 
     # ---- Datasets ----------------------------------------------------------
     ds_train = TotalSegInContextDataset(
@@ -814,6 +841,7 @@ def main() -> None:
             if train_vis is not None:
                 train_figs = save_train_figures(
                     train_vis[0], train_vis[1], out_size, fig_dir, epoch,
+                    mask_pool=cfg.data.mask_pool,
                 )
             all_figs = {k: wandb.Image(str(v)) for k, v in {**val_figs, **train_figs}.items()}
             wandb.log({"train/loss": avg_loss, "train/dice": avg_dice,

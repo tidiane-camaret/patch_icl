@@ -25,6 +25,7 @@ Usage
 
 import csv
 import hashlib
+import math
 import pickle
 import random
 from pathlib import Path
@@ -343,30 +344,41 @@ class TotalSegInContextDataset(Dataset):
 
     @staticmethod
     def _sample_palette(
-        label: torch.Tensor,
-        ctx_masks: list[torch.Tensor],
+        label:      torch.Tensor,
+        ctx_masks:  list[torch.Tensor],
         num_labels: int,
     ) -> torch.Tensor:
-        """Sample a random RGB palette for label IDs shared across all masks.
+        """SegGPT-style palette: maximally separated grid colors, shuffled per sample.
 
-        Returns palette (num_labels+1, 3): row 0 = black (background), row i = a
-        random RGB colour if label ID i is present in ALL masks, else (0,0,0).
-        The palette is applied in process_batch *after* correct integer downsampling
-        so that each patch gets a single pure colour.
+        Divides the RGB cube into a base³ grid (base = ceil(num_labels^(1/3))),
+        takes the first num_labels non-black grid points, then randomly permutes
+        their assignment to label IDs so the model cannot memorise color↔class.
 
-        label     : (D, H, W) int64
-        ctx_masks : K × (D, H, W) int64
+        Returns (num_labels+1, 3) float32 in [0,1]: row 0 = black (background),
+        row i = a grid color if label i is shared across all masks, else (0,0,0).
         """
         shared = set(label.unique().tolist())
         for m in ctx_masks:
             shared &= set(m.unique().tolist())
         shared.discard(0)
+        shared = [int(lid) for lid in shared if 1 <= int(lid) <= num_labels]
+
+        base   = math.ceil(num_labels ** (1 / 3))
+        margin = 256 // base
+        grid: list[list[float]] = []
+        for i in range(base):
+            for j in range(base):
+                for k in range(base):
+                    if i == 0 and j == 0 and k == 0:
+                        continue
+                    grid.append([i * margin / 255.0, j * margin / 255.0, k * margin / 255.0])
+        grid = grid[:num_labels]
+        random.shuffle(grid)
 
         palette = torch.zeros(num_labels + 1, 3)
-        for lid in shared:
-            lid = int(lid)
-            if 1 <= lid <= num_labels:
-                palette[lid] = torch.rand(3)
+        for rank, lid in enumerate(shared):
+            if rank < len(grid):
+                palette[lid] = torch.tensor(grid[rank], dtype=torch.float32)
         return palette
 
     def __len__(self) -> int:
