@@ -278,19 +278,26 @@ def apply_synth_aug(
         tx = random.uniform(-acfg.max_translate, acfg.max_translate)
         ty = random.uniform(-acfg.max_translate, acfg.max_translate)
         tz = random.uniform(-acfg.max_translate, acfg.max_translate)
-        theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)   # (1, 3, 4)
+        theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)
         grid  = F.affine_grid(theta, (1, 1, D, H, W), align_corners=False)
         image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
         image = image.squeeze(0)   # (1, D, H, W)
         mask  = mask.squeeze(0)    # (D, H, W)
 
-    # --- Elastic: Gaussian-smoothed displacement field -------------------
+    # --- Elastic: coarse-grid displacement field (cheap, same smoothness) ---
     ecfg = cfg.elastic
     if random.random() < ecfg.p:
         alpha = random.uniform(*ecfg.alpha_range)   # voxels
-        sigma = random.uniform(*ecfg.sigma_range)   # voxels
-        disp  = torch.randn(3, D, H, W)
-        disp  = _gaussian_smooth_3d_field(disp, sigma)
+        sigma = random.uniform(*ecfg.sigma_range)   # smoothing scale in voxels
+        # Generate at 1/sigma resolution and upsample — equivalent smoothness,
+        # avoids expensive full-res Gaussian conv3d (kernel size 33–61 for sigma 8–15).
+        sd = max(2, round(D / sigma))
+        sh = max(2, round(H / sigma))
+        sw = max(2, round(W / sigma))
+        disp = F.interpolate(
+            torch.randn(1, 3, sd, sh, sw),
+            size=(D, H, W), mode="trilinear", align_corners=False,
+        ).squeeze(0)                                            # (3, D, H, W)
         # normalise to peak=alpha voxels then convert to [-1,1] grid coords
         mx    = disp.abs().amax().clamp(min=1e-6)
         disp  = disp / mx * alpha

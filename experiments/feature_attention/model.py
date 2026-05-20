@@ -27,26 +27,27 @@ class PatchICLAttention(nn.Module):
     """
     Args
     ----
-    embed_dim       : feature dimension C (must match encoder output)
-    num_heads       : MHA heads (embed_dim must be divisible by num_heads)
+    embed_dim       : raw encoder feature dimension (e.g. 1504 for STU-Net all-levels)
+    dim             : internal transformer working dimension (projected from embed_dim)
+    num_heads       : MHA heads (dim must be divisible by num_heads)
     num_layers      : stacked cross-attention + FFN blocks
-    ff_factor       : FFN hidden dim = embed_dim * ff_factor
+    ff_factor       : FFN hidden dim = dim * ff_factor
     label_injection : how context binary labels enter the context token representation
                         additive  — token += label_embed(y)
                         concat    — token = proj([token; label_embed(y)])
                         gate      — token = token * sigmoid(proj(label_embed(y)))
                         none      — labels only appear in the output head
     output_head     : how final target embeddings decode to probabilities
-                        linear    — Linear(C, 1) + sigmoid
+                        linear    — Linear(dim, 1) + sigmoid
                         mlp       — RMSNorm → Linear → GELU → Linear + sigmoid
                         retrieval — cross-attention(Q=tgt, K=ctx, V=ctx_labels)
     pos_encoding    : spatial position encoding for the D×H×W patch grid
                         none       — no positional information
                         sinusoidal — fixed 3D sinusoidal encoding
-                        learned    — nn.Embedding(D*H*W, C)
-    input_norm      : applied to raw features before all processing
+                        learned    — nn.Embedding(D*H*W, dim)
+    input_norm      : applied to raw encoder features before the input projection
                         none    — use encoder features as-is
-                        rmsnorm — RMSNorm per token
+                        rmsnorm — RMSNorm per token (at embed_dim)
                         l2      — unit-norm per token
     grid_size       : (D, H, W) of the output patch grid (for pos encoding)
     dropout         : attention dropout probability (applied during training only)
@@ -61,6 +62,7 @@ class PatchICLAttention(nn.Module):
     def __init__(
         self,
         embed_dim:       int,
+        dim:             int   = 256,
         num_heads:       int   = 8,
         num_layers:      int   = 1,
         ff_factor:       int   = 2,
@@ -73,17 +75,20 @@ class PatchICLAttention(nn.Module):
         ctx_self_attn:   bool  = True,
         log_n_scaling:   bool  = True,
         log_n_base:      int   = 512,
+        label_dim:       int   = 1,
+        soft_labels:     bool  = False,
     ):
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
         assert label_injection in ("additive", "concat", "gate", "none")
         assert output_head in ("linear", "mlp", "retrieval")
         assert pos_encoding in ("none", "sinusoidal", "learned")
         assert input_norm in ("none", "rmsnorm", "l2")
 
-        self.embed_dim          = embed_dim
+        self.embed_dim          = embed_dim   # raw encoder dim (input only)
+        self.dim                = dim         # internal working dim
         self.num_heads          = num_heads
-        self.head_dim           = embed_dim // num_heads
+        self.head_dim           = dim // num_heads
         self.num_layers         = num_layers
         self.label_injection    = label_injection
         self.output_head_type   = output_head
@@ -94,81 +99,88 @@ class PatchICLAttention(nn.Module):
         self.ctx_self_attn_flag = ctx_self_attn
         self.log_n_scaling      = log_n_scaling
         self.log_n_base         = log_n_base
+        self.label_dim          = label_dim
+        self.soft_labels        = soft_labels
 
-        # ---- Input normalization ----------------------------------------
+        # ---- Input normalization (at embed_dim, before projection) ------
         self.input_norm = nn.RMSNorm(embed_dim) if input_norm == "rmsnorm" else None
 
-        # ---- Label injection --------------------------------------------
-        if label_injection in ("additive", "gate"):
-            self.label_embed = nn.Embedding(2, embed_dim)
-            if label_injection == "gate":
-                self.gate_proj = nn.Linear(embed_dim, embed_dim)
-        elif label_injection == "concat":
-            self.label_embed = nn.Embedding(2, embed_dim)
-            self.concat_proj = nn.Linear(2 * embed_dim, embed_dim)
+        # ---- Input projection: embed_dim → dim --------------------------
+        self.input_proj = nn.Linear(embed_dim, dim, bias=False)
 
-        # ---- Positional encoding ----------------------------------------
+        # ---- Label injection (operates at dim) --------------------------
+        # label_dim=1: binary discrete path — nn.Embedding(2, dim) maps {0,1} → dim.
+        # label_dim>1: continuous RGB path — bias-free Linear(label_dim, dim) so black
+        #   (all-zero background) injects nothing and foreground scales with its color.
+        if label_injection in ("additive", "gate", "concat"):
+            if label_dim == 1 and not soft_labels:
+                self.label_embed = nn.Embedding(2, dim)
+            else:
+                # soft_labels=True or label_dim>1: bias-free linear so 0 → zero injection
+                self.label_embed = nn.Linear(label_dim, dim, bias=False)
+            if label_injection == "gate":
+                self.gate_proj = nn.Linear(dim, dim)
+            elif label_injection == "concat":
+                self.concat_proj = nn.Linear(2 * dim, dim)
+
+        # ---- Positional encoding (at dim) -------------------------------
         if pos_encoding == "learned":
             N = grid_size[0] * grid_size[1] * grid_size[2]
-            self.pos_embed = nn.Embedding(N, embed_dim)
+            self.pos_embed = nn.Embedding(N, dim)
 
-        ff_dim = embed_dim * ff_factor
+        ff_dim = dim * ff_factor
 
         # ---- Cross-attention layers (target Q, context K/V) -------------
         # Using manual projections + F.scaled_dot_product_attention for full control
         # over K/V normalization and log-n query scaling. Q/K/V use bias=False;
         # out_proj and FFN retain bias (standard practice).
-        self.q_projs    = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-        self.k_projs    = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-        self.v_projs    = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-        self.out_projs  = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(num_layers)])
-        self.attn_norms = nn.ModuleList([nn.RMSNorm(embed_dim) for _ in range(num_layers)])  # pre-norm for Q
-        self.kv_norms   = nn.ModuleList([nn.RMSNorm(embed_dim) for _ in range(num_layers)])  # pre-norm for K/V
+        self.q_projs    = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+        self.k_projs    = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+        self.v_projs    = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+        self.out_projs  = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_layers)])
+        self.attn_norms = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])  # pre-norm for Q
+        self.kv_norms   = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])  # pre-norm for K/V
 
         self.ffns = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(embed_dim, ff_dim),
+                nn.Linear(dim, ff_dim),
                 nn.GELU(),
-                nn.Linear(ff_dim, embed_dim),
+                nn.Linear(ff_dim, dim),
             )
             for _ in range(num_layers)
         ])
-        self.ffn_norms = nn.ModuleList([nn.RMSNorm(embed_dim) for _ in range(num_layers)])
+        self.ffn_norms = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])
 
         # ---- Context self-attention blocks (optional) -------------------
-        # Each layer: context tokens self-attend (full SA + FFN block) before
-        # the cross-attention, so context patches can interact across K images.
         if ctx_self_attn:
-            self.ctx_q_projs   = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-            self.ctx_k_projs   = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-            self.ctx_v_projs   = nn.ModuleList([nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)])
-            self.ctx_out_projs = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(num_layers)])
-            self.ctx_sa_norms  = nn.ModuleList([nn.RMSNorm(embed_dim) for _ in range(num_layers)])
+            self.ctx_q_projs   = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+            self.ctx_k_projs   = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+            self.ctx_v_projs   = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+            self.ctx_out_projs = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_layers)])
+            self.ctx_sa_norms  = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])
             self.ctx_ffns = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(embed_dim, ff_dim),
+                    nn.Linear(dim, ff_dim),
                     nn.GELU(),
-                    nn.Linear(ff_dim, embed_dim),
+                    nn.Linear(ff_dim, dim),
                 )
                 for _ in range(num_layers)
             ])
-            self.ctx_ffn_norms = nn.ModuleList([nn.RMSNorm(embed_dim) for _ in range(num_layers)])
+            self.ctx_ffn_norms = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])
 
-        # ---- Output head ------------------------------------------------
+        # ---- Output head (at dim) ---------------------------------------
         if output_head == "linear":
-            self.head = nn.Linear(embed_dim, 1)
+            self.head = nn.Linear(dim, label_dim)
         elif output_head == "mlp":
             self.head = nn.Sequential(
-                nn.RMSNorm(embed_dim),
-                nn.Linear(embed_dim, embed_dim),
+                nn.RMSNorm(dim),
+                nn.Linear(dim, dim),
                 nn.GELU(),
-                nn.Linear(embed_dim, 1),
+                nn.Linear(dim, label_dim),
             )
         elif output_head == "retrieval":
-            # Separate Q and K projections decouple the similarity space from
-            # the representation space (mirrors TabPFN's ManyClassDecoder).
-            self.ret_q_proj = nn.Linear(embed_dim, embed_dim)
-            self.ret_k_proj = nn.Linear(embed_dim, embed_dim)
+            self.ret_q_proj = nn.Linear(dim, dim)
+            self.ret_k_proj = nn.Linear(dim, dim)
 
         self._init_weights()
 
@@ -198,9 +210,9 @@ class PatchICLAttention(nn.Module):
 
     def _mha(
         self,
-        q:        torch.Tensor,    # (B, Sq, C) — already pre-normed
-        k:        torch.Tensor,    # (B, Sk, C) — already pre-normed
-        v:        torch.Tensor,    # (B, Sk, C) — already pre-normed (same as k)
+        q:        torch.Tensor,    # (B, Sq, dim) — already pre-normed
+        k:        torch.Tensor,    # (B, Sk, dim) — already pre-normed
+        v:        torch.Tensor,    # (B, Sk, dim) — already pre-normed (same as k)
         q_proj:   nn.Linear,
         k_proj:   nn.Linear,
         v_proj:   nn.Linear,
@@ -221,7 +233,7 @@ class PatchICLAttention(nn.Module):
 
         dp = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dp)   # (B, H, Sq, D)
-        return out_proj(out.transpose(1, 2).reshape(B, Sq, self.embed_dim))
+        return out_proj(out.transpose(1, 2).reshape(B, Sq, self.dim))
 
     # ------------------------------------------------------------------
     # Positional encoding helpers
@@ -236,9 +248,9 @@ class PatchICLAttention(nn.Module):
         gd, gh, gw = torch.meshgrid(d, h, w, indexing="ij")
         coords = torch.stack([gd, gh, gw], dim=-1).reshape(N, 3)   # (N, 3)
 
-        dim_per_axis = self.embed_dim // 6
+        dim_per_axis = self.dim // 6
         if dim_per_axis == 0:
-            return torch.zeros(N, self.embed_dim, device=device)
+            return torch.zeros(N, self.dim, device=device)
         freqs = torch.exp(
             -math.log(10000.0) * torch.arange(dim_per_axis, device=device).float()
             / max(dim_per_axis - 1, 1)
@@ -248,22 +260,22 @@ class PatchICLAttention(nn.Module):
             args = coords[:, ax:ax + 1] * freqs.unsqueeze(0)   # (N, dim_per_axis)
             parts += [torch.sin(args), torch.cos(args)]
         pos = torch.cat(parts, dim=-1)                          # (N, 6*dim_per_axis)
-        if pos.shape[-1] < self.embed_dim:
-            pos = F.pad(pos, (0, self.embed_dim - pos.shape[-1]))
-        return pos[:, :self.embed_dim]
+        if pos.shape[-1] < self.dim:
+            pos = F.pad(pos, (0, self.dim - pos.shape[-1]))
+        return pos[:, :self.dim]
 
     def _apply_pos(
         self, tgt: torch.Tensor, ctx: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # tgt: (B, N, C)  ctx: (B, M, C)  with M = K*N
+        # tgt: (B, N, dim)  ctx: (B, M, dim)  with M = K*N
         N, M = tgt.shape[1], ctx.shape[1]
         if self.pos_enc_type == "sinusoidal":
-            tgt_pos = self._sinusoidal_pos(N, tgt.device)          # (N, C)
+            tgt_pos = self._sinusoidal_pos(N, tgt.device)          # (N, dim)
             ctx_pos = self._sinusoidal_pos(N, ctx.device).repeat(M // N, 1)[:M]
             return tgt + tgt_pos, ctx + ctx_pos
         elif self.pos_enc_type == "learned":
             idx = torch.arange(N, device=tgt.device)
-            tgt_pos = self.pos_embed(idx)                           # (N, C)
+            tgt_pos = self.pos_embed(idx)                           # (N, dim)
             ctx_pos = tgt_pos.repeat(M // N, 1)[:M]
             return tgt + tgt_pos, ctx + ctx_pos
         return tgt, ctx
@@ -272,48 +284,52 @@ class PatchICLAttention(nn.Module):
 
     def forward(
         self,
-        tgt_feat:   torch.Tensor,  # (B, N, C)
-        ctx_feat:   torch.Tensor,  # (B, M, C)  M = K*N
-        ctx_labels: torch.Tensor,  # (B, M) float binary labels
-    ) -> torch.Tensor:             # (B, N) probabilities in [0, 1]
+        tgt_feat:   torch.Tensor,  # (B, N, embed_dim)
+        ctx_feat:   torch.Tensor,  # (B, M, embed_dim)  M = K*N
+        ctx_labels: torch.Tensor,  # (B, M) if label_dim=1 | (B, M, label_dim) if label_dim>1
+    ) -> torch.Tensor:             # (B, N) if label_dim=1 | (B, N, label_dim) if label_dim>1
         M = ctx_feat.shape[1]
 
-        # 1. Input normalization
+        # 1. Input normalization (at embed_dim)
         if self.input_norm_type == "l2":
-            tgt = F.normalize(tgt_feat, dim=-1)
-            ctx = F.normalize(ctx_feat, dim=-1)
+            tgt_feat = F.normalize(tgt_feat, dim=-1)
+            ctx_feat = F.normalize(ctx_feat, dim=-1)
         elif self.input_norm is not None:
-            tgt = self.input_norm(tgt_feat)
-            ctx = self.input_norm(ctx_feat)
-        else:
-            tgt, ctx = tgt_feat, ctx_feat
+            tgt_feat = self.input_norm(tgt_feat)
+            ctx_feat = self.input_norm(ctx_feat)
 
-        # 2. Label injection into context tokens
-        ctx_lab = (ctx_labels > 0).long()   # (B, M) int
-        if self.label_injection == "additive":
-            ctx = ctx + self.label_embed(ctx_lab)
-        elif self.label_injection == "concat":
-            ctx = self.concat_proj(torch.cat([ctx, self.label_embed(ctx_lab)], dim=-1))
-        elif self.label_injection == "gate":
-            gate = torch.sigmoid(self.gate_proj(self.label_embed(ctx_lab)))
-            ctx = ctx * gate
+        # 2. Project embed_dim → dim
+        tgt = self.input_proj(tgt_feat)   # (B, N, dim)
+        ctx = self.input_proj(ctx_feat)   # (B, M, dim)
 
-        # 3. Positional encoding
+        # 3. Label injection into context tokens (at dim)
+        if self.label_injection != "none":
+            if self.label_dim == 1 and not self.soft_labels:
+                lbl_emb = self.label_embed((ctx_labels > 0).long())    # (B, M, dim)
+            elif self.label_dim == 1:
+                lbl_emb = self.label_embed(ctx_labels.unsqueeze(-1).float())  # (B, M, dim)
+            else:
+                lbl_emb = self.label_embed(ctx_labels.float())         # (B, M, dim)
+            if self.label_injection == "additive":
+                ctx = ctx + lbl_emb
+            elif self.label_injection == "concat":
+                ctx = self.concat_proj(torch.cat([ctx, lbl_emb], dim=-1))
+            elif self.label_injection == "gate":
+                gate = torch.sigmoid(self.gate_proj(lbl_emb))
+                ctx = ctx * gate
+
+        # 4. Positional encoding
         tgt, ctx = self._apply_pos(tgt, ctx)
 
-        # Log-n query scaling: F.scaled_dot_product_attention uses 1/sqrt(D) internally;
-        # we additionally pre-scale Q by log(M)/log(n_base) so softmax doesn't flatten
-        # uniformly as the context sequence grows (matches TabPFN's SoftmaxScalingMLP idea).
+        # Log-n query scaling
         q_scale = (
             math.log(max(M, 1)) / math.log(max(self.log_n_base, 2))
             if self.log_n_scaling else 1.0
         )
 
-        # 4. Per-layer blocks
+        # 5. Per-layer blocks
         for i in range(self.num_layers):
-            # 4a. Context self-attention: let context patches interact before retrieval.
-            #     Each context image's patches can now attend to patches from other
-            #     context images (and themselves), building a richer representation.
+            # 5a. Context self-attention
             if self.ctx_self_attn_flag:
                 ctx_n = self.ctx_sa_norms[i](ctx)
                 ctx = ctx + self._mha(ctx_n, ctx_n, ctx_n,
@@ -321,9 +337,7 @@ class PatchICLAttention(nn.Module):
                                       self.ctx_v_projs[i], self.ctx_out_projs[i])
                 ctx = ctx + self.ctx_ffns[i](self.ctx_ffn_norms[i](ctx))
 
-            # 4b. Cross-attention: target Q attends to context K/V.
-            #     Both target (Q) and context (K/V) are independently pre-normed,
-            #     fixing the pre-norm invariance broken by the previous single-norm design.
+            # 5b. Cross-attention: target Q attends to context K/V
             ctx_kv = self.kv_norms[i](ctx)
             attn_out = self._mha(
                 self.attn_norms[i](tgt), ctx_kv, ctx_kv,
@@ -333,15 +347,17 @@ class PatchICLAttention(nn.Module):
             tgt = tgt + attn_out
             tgt = tgt + self.ffns[i](self.ffn_norms[i](tgt))
 
-        # 5. Output head
+        # 6. Output head
         if self.output_head_type in ("linear", "mlp"):
-            return torch.sigmoid(self.head(tgt).squeeze(-1))   # (B, N)
+            out = torch.sigmoid(self.head(tgt))   # (B, N, label_dim)
+            return out.squeeze(-1) if self.label_dim == 1 else out
 
-        # retrieval: separate Q/K projections into similarity space (mirrors
-        # TabPFN's ManyClassDecoder), V = scalar binary labels
-        q = self.ret_q_proj(tgt)                                      # (B, N, C)
-        k = self.ret_k_proj(ctx)                                      # (B, M, C)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.embed_dim)  # (B, N, M)
+        # retrieval: V = context labels (scalar or RGB vector)
+        q = self.ret_q_proj(tgt)                                      # (B, N, dim)
+        k = self.ret_k_proj(ctx)                                      # (B, M, dim)
+        scores  = (q @ k.transpose(-2, -1)) / math.sqrt(self.dim)    # (B, N, M)
         weights = F.softmax(scores, dim=-1)                           # (B, N, M)
-        v = ctx_labels.unsqueeze(-1)                                  # (B, M, 1)
-        return (weights @ v).squeeze(-1).clamp(0, 1)                  # (B, N)
+        if self.label_dim == 1:
+            v = ctx_labels.unsqueeze(-1)                  # (B, M, 1)
+            return (weights @ v).squeeze(-1).clamp(0, 1)  # (B, N)
+        return (weights @ ctx_labels).clamp(0, 1)         # (B, N, label_dim)

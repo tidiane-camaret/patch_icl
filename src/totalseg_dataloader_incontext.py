@@ -109,6 +109,8 @@ class TotalSegInContextDataset(Dataset):
         class_balanced: bool = False,
         use_crop: bool = False,
         crop_jitter: Optional[int] = None,
+        random_coloring: bool = False,
+        num_labels_per_sample: int = 1,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -123,6 +125,8 @@ class TotalSegInContextDataset(Dataset):
         self.p_synth = p_synth
         self.class_balanced = class_balanced
         self.use_crop = use_crop
+        self.random_coloring = random_coloring
+        self.num_labels_per_sample = num_labels_per_sample
         self.crop_jitter = crop_jitter if crop_jitter is not None else (
             image_size[0] // 4 if image_size is not None else 0
         )
@@ -337,6 +341,34 @@ class TotalSegInContextDataset(Dataset):
     # Dataset API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sample_palette(
+        label: torch.Tensor,
+        ctx_masks: list[torch.Tensor],
+        num_labels: int,
+    ) -> torch.Tensor:
+        """Sample a random RGB palette for label IDs shared across all masks.
+
+        Returns palette (num_labels+1, 3): row 0 = black (background), row i = a
+        random RGB colour if label ID i is present in ALL masks, else (0,0,0).
+        The palette is applied in process_batch *after* correct integer downsampling
+        so that each patch gets a single pure colour.
+
+        label     : (D, H, W) int64
+        ctx_masks : K × (D, H, W) int64
+        """
+        shared = set(label.unique().tolist())
+        for m in ctx_masks:
+            shared &= set(m.unique().tolist())
+        shared.discard(0)
+
+        palette = torch.zeros(num_labels + 1, 3)
+        for lid in shared:
+            lid = int(lid)
+            if 1 <= lid <= num_labels:
+                palette[lid] = torch.rand(3)
+        return palette
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -346,130 +378,216 @@ class TotalSegInContextDataset(Dataset):
         times with heavy independent augmentation applied to each copy so that
         target and context diverge as much as possible.
 
-        Fast path: uses pre-resized ct_{size}.npy and label_synth_{method}_{size}.npy
-        when available, skipping CPU interpolation entirely.
+        Crop path  (use_crop=True): loads native-res ct.npy + synth label and
+        crops a T³ patch centred on the picked supervoxels (same jitter logic as
+        _load_crop).
+        Fast path  (default): uses pre-resized ct_{size}.npy and
+        label_synth_{method}_{size}.npy when available.
         """
         subj     = self._synth_subjects[torch.randint(len(self._synth_subjects), (1,)).item()]
         sv_ids   = self._synth_sv_ids[subj]
-        sv_idx   = int(sv_ids[torch.randint(len(sv_ids), (1,)).item()])
         subj_dir = self.root / subj
 
-        # CT
-        ct_pre = subj_dir / f"ct_{self._size_str}.npy" if self._size_str else None
-        if ct_pre is not None and ct_pre.exists():
-            image_t = torch.from_numpy(
-                np.load(ct_pre, mmap_mode="r").astype(np.float32)
-            ).unsqueeze(0)                                          # (1, D, H, W)
-        else:
-            image   = _load_ct(subj_dir / "ct.nii.gz")
-            image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
-            if self.image_size is not None:
-                image_t, _ = _resize_volume(image_t, image_t, self.image_size)
-            image_t = image_t.squeeze(0)                            # (1, D, H, W)
+        # Pick num_labels_per_sample supervoxel IDs without replacement
+        sv_ids_list = sv_ids.tolist()
+        n_pick      = min(self.num_labels_per_sample, len(sv_ids_list))
+        picked_svs  = random.sample(sv_ids_list, n_pick)
 
-        # Synth label
-        sized_synth = (
-            subj_dir / self._synth_fname.replace(".npy", f"_{self._size_str}.npy")
-            if self._size_str else None
-        )
-        if sized_synth is not None and sized_synth.exists():
-            sv_vol = np.load(sized_synth, mmap_mode="r")
-            mask   = (sv_vol == sv_idx).astype(np.uint8)
-            mask_t = torch.from_numpy(mask).long()                  # (D, H, W)
+        if self.use_crop:
+            # Native-res crop centred on union of picked supervoxels
+            T     = self.image_size[0]
+            ct_mm = np.load(subj_dir / "ct.npy",          mmap_mode="r")
+            sv_mm = np.load(subj_dir / self._synth_fname, mmap_mode="r")
+            D, H, W = sv_mm.shape
+
+            sv_union = np.zeros((D, H, W), dtype=bool)
+            for sv_id in picked_svs:
+                sv_union |= (sv_mm == sv_id)
+            n = int(sv_union.sum())
+            if n > 0:
+                d_g = np.arange(D, dtype=np.float32)[:, None, None]
+                h_g = np.arange(H, dtype=np.float32)[None, :, None]
+                w_g = np.arange(W, dtype=np.float32)[None, None, :]
+                cd  = int((d_g * sv_union).sum() / n)
+                ch  = int((h_g * sv_union).sum() / n)
+                cw  = int((w_g * sv_union).sum() / n)
+            else:
+                cd, ch, cw = D // 2, H // 2, W // 2
+
+            j = self.crop_jitter
+            starts = []
+            for c, s in zip((cd, ch, cw), (D, H, W)):
+                ideal = c - T // 2
+                lo    = max(0, ideal - j)
+                hi    = max(lo, min(max(0, s - T), ideal + j))
+                starts.append(random.randint(lo, hi))
+            d0, h0, w0 = starts
+
+            crop_ct = ct_mm[d0:d0+T, h0:h0+T, w0:w0+T]
+            crop_sv = sv_mm[d0:d0+T, h0:h0+T, w0:w0+T]
+            s       = crop_ct.shape
+
+            img_arr = np.zeros((T, T, T), dtype=np.float32)
+            msk_arr = np.zeros((T, T, T), dtype=np.uint8)
+            img_arr[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
+            for label_id, sv_id in enumerate(picked_svs, 1):
+                msk_arr[:s[0], :s[1], :s[2]][crop_sv[:s[0], :s[1], :s[2]] == sv_id] = label_id
+
+            image_t = torch.from_numpy(img_arr).unsqueeze(0)  # (1, T, T, T)
+            mask_t  = torch.from_numpy(msk_arr).long()        # (T, T, T)
         else:
-            sv_vol  = np.load(subj_dir / self._synth_fname, mmap_mode="r")
-            mask    = (sv_vol == sv_idx).astype(np.uint8)
-            mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-            if self.image_size is not None:
-                T = self.image_size[0]
-                D, H, W = mask_t.shape[2:]
-                new = _iso_size((D, H, W), T)
-                mask_small = F.interpolate(mask_t, size=new, mode="nearest")
-                mask_out = torch.zeros(1, 1, T, T, T, dtype=mask_t.dtype)
-                pads = [(T - s) // 2 for s in new]
-                sl = (slice(None), slice(None)) + tuple(slice(p, p + s) for p, s in zip(pads, new))
-                mask_out[sl] = mask_small
-                mask_t = mask_out
-            mask_t = mask_t.squeeze(0).squeeze(0).long()            # (D, H, W)
+            # CT — fast path: pre-resized; slow path: native npy/nii.gz → resize
+            ct_pre = subj_dir / f"ct_{self._size_str}.npy" if self._size_str else None
+            if ct_pre is not None and ct_pre.exists():
+                image_t = torch.from_numpy(
+                    np.load(ct_pre, mmap_mode="r").astype(np.float32)
+                ).unsqueeze(0)                                          # (1, D, H, W)
+            else:
+                ct_npy = subj_dir / "ct.npy"
+                image = (np.load(ct_npy, mmap_mode="r").astype(np.float32)
+                         if ct_npy.exists() else _load_ct(subj_dir / "ct.nii.gz"))
+                image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
+                if self.image_size is not None:
+                    image_t, _ = _resize_volume(image_t, image_t, self.image_size)
+                image_t = image_t.squeeze(0)                            # (1, D, H, W)
+
+            # Synth label: assign each picked supervoxel a unique integer ID 1..n_pick
+            sized_synth = (
+                subj_dir / self._synth_fname.replace(".npy", f"_{self._size_str}.npy")
+                if self._size_str else None
+            )
+            if sized_synth is not None and sized_synth.exists():
+                sv_vol = np.load(sized_synth, mmap_mode="r")
+                mask   = np.zeros_like(sv_vol, dtype=np.uint8)
+                for label_id, sv_id in enumerate(picked_svs, 1):
+                    mask[sv_vol == sv_id] = label_id
+                mask_t = torch.from_numpy(mask).long()                  # (D, H, W)
+            else:
+                sv_vol  = np.load(subj_dir / self._synth_fname, mmap_mode="r")
+                mask    = np.zeros_like(sv_vol, dtype=np.uint8)
+                for label_id, sv_id in enumerate(picked_svs, 1):
+                    mask[sv_vol == sv_id] = label_id
+                mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+                if self.image_size is not None:
+                    T = self.image_size[0]
+                    D, H, W = mask_t.shape[2:]
+                    new = _iso_size((D, H, W), T)
+                    mask_small = F.interpolate(mask_t, size=new, mode="nearest")
+                    mask_out = torch.zeros(1, 1, T, T, T, dtype=mask_t.dtype)
+                    pads = [(T - s) // 2 for s in new]
+                    sl = (slice(None), slice(None)) + tuple(slice(p, p + s) for p, s in zip(pads, new))
+                    mask_out[sl] = mask_small
+                    mask_t = mask_out
+                mask_t = mask_t.squeeze(0).squeeze(0).long()            # (D, H, W)
 
         # K+1 independent copies, each separately augmented
-        items = [
-            apply_synth_aug(image_t.clone(), mask_t.clone(), self.aug_cfg.synth)
-            for _ in range(self.context_size + 1)
-        ]
-        image_out, label_out = items[0]
-        context_in  = torch.stack([it[0] for it in items[1:]])  # (K, 1, D, H, W)
-        context_out = torch.stack([it[1] for it in items[1:]])  # (K, D, H, W)
+        if self.aug_cfg is not None and self.aug_cfg.enabled:
+            items = [
+                apply_synth_aug(image_t.clone(), mask_t.clone(), self.aug_cfg.synth)
+                for _ in range(self.context_size + 1)
+            ]
+        else:
+            items = [(image_t.clone(), mask_t.clone()) for _ in range(self.context_size + 1)]
 
-        return {
+        image_out, label_out = items[0]
+        ctx_masks = [it[1] for it in items[1:]]
+
+        item = {
             "image":       image_out,
-            "label":       label_out,
-            "context_in":  context_in,
-            "context_out": context_out,
+            "label":       label_out,                                  # (D, H, W) int64
+            "context_in":  torch.stack([it[0] for it in items[1:]]),  # (K, 1, D, H, W)
+            "context_out": torch.stack(ctx_masks),                     # (K, D, H, W) int64
             "subject":     subj,
-            "label_name":  f"sv_{sv_idx}",
+            "label_name":  f"sv_{picked_svs[0]}",
         }
+        if self.random_coloring:
+            item["label_palette"] = self._sample_palette(
+                label_out, ctx_masks, self.num_labels_per_sample
+            )
+        return item
 
     def __getitem__(self, idx: int) -> dict:
         if self._synth_subjects and random.random() < self.p_synth:
             return self._get_synth_item()
 
-        if self.class_balanced:
-            cls  = random.choice(self.active_classes)
-            subj = random.choice(self.label_to_subjects[cls])
+        # --- Subject and class selection ------------------------------------
+        if self.num_labels_per_sample > 1:
+            # Multi-label: pick a primary class (balanced), then add up to
+            # num_labels_per_sample-1 extra classes present in the same subject.
+            if self.class_balanced:
+                primary_cls = random.choice(self.active_classes)
+                subj = random.choice(self.label_to_subjects[primary_cls])
+            else:
+                subj, primary_cls = self.samples[idx]
+
+            subj_classes = [c for c in self.active_classes
+                            if subj in self.label_to_subjects[c]]
+            extra = [c for c in subj_classes if c != primary_cls]
+            random.shuffle(extra)
+            selected = [primary_cls] + extra[:self.num_labels_per_sample - 1]
+            label_name = primary_cls
+
+            image_t, label_t = self._load_multi(subj, selected)
+            # Context pool: subjects that share at least the primary class
+            candidates = [s for s in self.label_to_subjects[primary_cls] if s != subj]
+            load_ctx = lambda s: self._load_multi(s, selected)
         else:
-            subj, cls = self.samples[idx]
+            if self.class_balanced:
+                cls  = random.choice(self.active_classes)
+                subj = random.choice(self.label_to_subjects[cls])
+            else:
+                subj, cls = self.samples[idx]
+            label_name = cls
 
-        image_t, label_t = self._load(subj, cls)
+            image_t, label_t = self._load(subj, cls)
+            candidates = [s for s in self.label_to_subjects[cls] if s != subj]
+            load_ctx = lambda s: self._load(s, cls)
 
-        # Sample context from other subjects that have this class
-        candidates = [s for s in self.label_to_subjects[cls] if s != subj]
+        # --- Context sampling ----------------------------------------------
         random.shuffle(candidates)
-
-        context_in: list[torch.Tensor] = []
+        context_in:  list[torch.Tensor] = []
         context_out: list[torch.Tensor] = []
-
         for ctx_subj in candidates:
             if len(context_in) >= self.context_size:
                 break
             try:
-                ctx_img, ctx_lbl = self._load(ctx_subj, cls)
+                ctx_img, ctx_lbl = load_ctx(ctx_subj)
                 context_in.append(ctx_img)
                 context_out.append(ctx_lbl)
             except Exception:
                 continue
 
-        # Pad by resampling if we don't have enough candidates
+        # Pad by resampling if not enough candidates
         while len(context_in) < self.context_size and len(context_in) > 0:
             i = random.randrange(len(context_in))
             context_in.append(context_in[i].clone())
             context_out.append(context_out[i].clone())
 
+        # --- Augmentation + coloring (shared by both paths) ----------------
         if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0:
-            # Stack query + context: (K+1, 1, D, H, W) and (K+1, D, H, W)
             all_images = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)],  dim=0)
             all_masks  = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
-
-            # Task aug: one set of geometric params for all volumes
             all_images, all_masks = apply_task_aug(all_images, all_masks, self.aug_cfg.task)
-
-            # Intensity aug: independent params per volume (image only)
             for i in range(all_images.shape[0]):
                 all_images[i] = apply_intensity_aug(all_images[i], self.aug_cfg.intensity)
+            image_t     = all_images[0]
+            label_t     = all_masks[0]
+            context_in  = list(all_images[1:])
+            context_out = list(all_masks[1:])
 
-            image_t    = all_images[0]          # (1, D, H, W)
-            label_t    = all_masks[0]           # (D, H, W)
-            context_in  = list(all_images[1:])  # K × (1, D, H, W)
-            context_out = list(all_masks[1:])   # K × (D, H, W)
-
-        return {
-            "image":       image_t,                    # (1, D, H, W)
-            "label":       label_t,                    # (D, H, W)  int64
-            "context_in":  torch.stack(context_in),    # (K, 1, D, H, W)
-            "context_out": torch.stack(context_out),   # (K, D, H, W)  int64
+        item = {
+            "image":       image_t,
+            "label":       label_t,                   # (D, H, W) int64 always
+            "context_in":  torch.stack(context_in),   # (K, 1, D, H, W)
+            "context_out": torch.stack(context_out),  # (K, D, H, W) int64 always
             "subject":     subj,
-            "label_name":  cls,
+            "label_name":  label_name,
         }
+        if self.random_coloring and len(context_out) > 0:
+            item["label_palette"] = self._sample_palette(
+                label_t, context_out, self.num_labels_per_sample
+            )  # (num_labels+1, 3) float32
+        return item
 
     # ------------------------------------------------------------------
     # Loading helpers
@@ -524,6 +642,78 @@ class TotalSegInContextDataset(Dataset):
             torch.from_numpy(label).long(),          # (T, T, T)
         )
 
+    def _load_crop_multi(self, subj: str, classes: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Like _load_crop but assigns label IDs 1…L for each class in one pass."""
+        subj_dir = self.root / subj
+        T = self.image_size[0]
+
+        label_mm = np.load(subj_dir / "label.npy", mmap_mode="r")
+        D, H, W = label_mm.shape
+
+        center = None
+        for cls in classes:
+            center = self._bbox_cache.get(subj, {}).get(cls)
+            if center is not None:
+                break
+        cd, ch, cw = center if center is not None else (D // 2, H // 2, W // 2)
+
+        j = self.crop_jitter
+        starts = []
+        for c, s in zip((cd, ch, cw), (D, H, W)):
+            ideal = c - T // 2
+            lo = max(0, ideal - j)
+            hi = max(lo, min(max(0, s - T), ideal + j))
+            starts.append(random.randint(lo, hi))
+        d0, h0, w0 = starts
+
+        ct_mm   = np.load(subj_dir / "ct.npy", mmap_mode="r")
+        crop_ct  = ct_mm[d0:d0+T, h0:h0+T, w0:w0+T]
+        crop_lbl = label_mm[d0:d0+T, h0:h0+T, w0:w0+T]
+        s = crop_ct.shape
+
+        image = np.zeros((T, T, T), dtype=np.float32)
+        label = np.zeros((T, T, T), dtype=np.uint8)
+        image[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
+        for i, cls in enumerate(classes, 1):
+            orig_idx = _ALL_CLASSES_IDX.get(cls)
+            if orig_idx is not None:
+                label[:s[0], :s[1], :s[2]][crop_lbl[:s[0], :s[1], :s[2]] == orig_idx] = i
+
+        return torch.from_numpy(image).unsqueeze(0), torch.from_numpy(label).long()
+
+    def _load_multi(self, subj: str, classes: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load image + multi-class label in a single pass (IDs 1…L per class).
+
+        Classes absent from a subject simply contribute no voxels; _apply_coloring
+        will then exclude them from the shared palette automatically.
+        """
+        if self.use_crop:
+            return self._load_crop_multi(subj, classes)
+
+        subj_dir = self.root / subj
+        if self._size_str is not None:
+            ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
+            label_pre = subj_dir / f"label_{self._size_str}.npy"
+            if ct_pre.exists() and label_pre.exists():
+                image = np.load(ct_pre,    mmap_mode="r").astype(np.float32)
+                full  = np.load(label_pre, mmap_mode="r")
+                label = np.zeros(full.shape, dtype=np.uint8)
+                for i, cls in enumerate(classes, 1):
+                    orig_idx = _ALL_CLASSES_IDX.get(cls)
+                    if orig_idx is not None:
+                        label[full == orig_idx] = i
+                return torch.from_numpy(image).unsqueeze(0), torch.from_numpy(label).long()
+
+        # Slow path: merge single-class loads
+        image_t = label_t = None
+        for i, cls in enumerate(classes, 1):
+            img, lbl = self._load(subj, cls)
+            if image_t is None:
+                image_t = img
+                label_t = torch.zeros_like(lbl)
+            label_t[lbl > 0] = i
+        return image_t, label_t
+
     def _load(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Load one (image, binary_mask) pair for a single class.
 
@@ -568,7 +758,7 @@ class TotalSegInContextDataset(Dataset):
 
 def incontext_collate_fn(batch: list[dict]) -> dict:
     """Stack a list of dataset items into a batch dict."""
-    return {
+    out = {
         "image":       torch.stack([b["image"]       for b in batch]),  # (B, 1, D, H, W)
         "label":       torch.stack([b["label"]       for b in batch]),  # (B, D, H, W)
         "context_in":  torch.stack([b["context_in"]  for b in batch]),  # (B, K, 1, D, H, W)
@@ -576,6 +766,9 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         "subjects":    [b["subject"]    for b in batch],
         "label_names": [b["label_name"] for b in batch],
     }
+    if "label_palette" in batch[0]:
+        out["label_palette"] = torch.stack([b["label_palette"] for b in batch])  # (B, L+1, 3)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +792,8 @@ def get_incontext_loader(
     class_balanced: bool = False,
     use_crop: bool = False,
     crop_jitter: Optional[int] = None,
+    random_coloring: bool = False,
+    num_labels_per_sample: int = 1,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -614,6 +809,8 @@ def get_incontext_loader(
         class_balanced=class_balanced,
         use_crop=use_crop,
         crop_jitter=crop_jitter,
+        random_coloring=random_coloring,
+        num_labels_per_sample=num_labels_per_sample,
     )
     return DataLoader(
         ds,

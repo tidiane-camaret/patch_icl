@@ -3,7 +3,7 @@
 # write totalsegmentator imgs/masks as resizes numpy arrays
 python scripts/convert_to_npy.py --size 128 128 128 --overwrite
 # generate synthetic labels
-python scripts/synth_labels/generate.py --method slic --union --overwrite --size 64 64 64 --workers 16
+I
 # generate bbox cache 
 python scripts/build_bbox_cache.py --workers 16
 

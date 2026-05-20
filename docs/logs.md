@@ -1,5 +1,70 @@
 # Change log
 
+## 2026-05-20 — Synth pipeline fixes in _get_synth_item
+
+Three issues fixed in `TotalSegInContextDataset._get_synth_item`
+(`src/totalseg_dataloader_incontext.py`):
+
+- **`use_crop` ignored** (main bug): synth items always loaded the whole-body
+  pre-resized 128³ image, giving ~16× worse effective resolution than real-data
+  items when `use_crop=True`. Fix: when `use_crop=True`, load native `ct.npy` +
+  native synth label file, compute the centroid of the picked supervoxels' union,
+  and crop a `T³` patch around it with the same jitter logic as `_load_crop`.
+- **`aug_cfg` not guarded**: `self.aug_cfg.synth` raised `AttributeError` when
+  no augmentation config was provided (valid for debug runs). Fix: guard with
+  `if self.aug_cfg is not None and self.aug_cfg.enabled`, falling back to
+  unaug'd identity copies.
+- **Slow-path CT preferred `ct.nii.gz` over `ct.npy`**: native numpy is faster
+  and avoids the nibabel stack. Fix: check for `ct.npy` first, fall back to
+  `ct.nii.gz` only if absent.
+
+## 2026-05-20 — Soft GT for avgpool downsampling
+
+In `process_batch` (`experiments/feature_attention/train.py`), the `> 0` threshold
+on `gt_loss` was discarding the continuous coverage fraction produced by avgpool,
+making `mask_pool: avg` identical to `max` in practice.
+
+**Fix**: `gt_loss` is now the raw avgpool output (soft float in [0,1]); a separate
+`gt_bin = (gt_loss > 0).float()` is kept for norm_dice. Context labels stay binary
+(`> 0`) since the model binarizes them internally anyway (`label_dim=1` path uses
+`nn.Embedding(2, dim)`). BCE with soft targets is valid and provides proportional
+gradient weighting by patch coverage fraction.
+
+## 2026-05-18 — Fix synth elastic augmentation bottleneck
+
+`apply_synth_aug` was generating a full-resolution `(3, D, H, W)` noise field
+and smoothing it with `_gaussian_smooth_3d_field` (sigma 8–15 → kernel size
+33–61).  For 128³ volumes that's three depthwise conv3d passes on 6M elements
+each call, done K+1 times per item.  This starved the DataLoader prefetch
+queue and caused periodic training stalls whenever workers drew large sigma.
+
+**Fix** (`src/augmentations.py`, `apply_synth_aug`): replaced the
+full-res-randn + Gaussian-conv path with a coarse-grid approach — generate
+displacement at `(D/sigma, H/sigma, W/sigma)` resolution and upsample
+trilinearly.  Equivalent smooth frequency, ~60× cheaper for sigma=8–15.
+The real-label path was unaffected (uses `apply_task_aug` where elastic p=0).
+
+## 2026-05-18 — SegGPT-style random coloring + synthetic label support
+
+**Random coloring** (`--random_coloring`, on by default):
+- `TotalSegInContextDataset._apply_coloring`: finds label ids shared across all
+  masks in a sample, samples one random RGB per id, returns `(3,D,H,W)` float32
+  tensors for `label` and `context_out` (same palette across target + context).
+- `PatchICLAttention` gains `label_dim` (1=binary discrete, 3=RGB). Label injection
+  uses `nn.Linear(label_dim, C, bias=False)` for RGB so background (black=0) injects
+  nothing; output head predicts `label_dim` values per patch.
+- Training uses smooth-L1 loss for RGB; metrics use L2 norm of predicted colour as
+  scalar probability for AUROC/norm-dice. Validation stays binary (val dataset
+  never colorises).
+
+## 2026-05-18 — Synthetic label support in feature_attention/train.py
+
+Added `--synth_method`, `--synth_unions`, and `--p_synth` CLI args to
+`experiments/feature_attention/train.py`.  These are forwarded to
+`TotalSegInContextDataset` for the training split (val unchanged), enabling
+the same supervoxel-based synthetic augmentation path already supported in
+`scripts/train.py`.
+
 ## 2026-05-18 — PatchICLAttention improvements from TabPFN comparison
 
 Rewrote `experiments/feature_attention/model.py` with five changes derived from
