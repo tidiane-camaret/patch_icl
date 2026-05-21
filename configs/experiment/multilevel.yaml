@@ -7,10 +7,9 @@ data:
   resolutions:
     - [8, 8, 8]
     - [16, 16, 16]
-  n_patches_l1: 256          # NP₁: number of sparse patches at each level > 0
-  frac_entropy: 0.5          # fraction of L1 target patches from entropy (rest: certain-fg)
-  certain_thresh: 0.7        # pred_0 threshold for "certain foreground" target patches
-  fg_thresh: 0.1             # avg-pooled mask threshold for context foreground patches
+  n_patches_l1: 512          # NP₁: number of sparse patches at L1
+  sampling_temperature: 1.0  # Gumbel-TopK temperature (higher → more uniform sampling)
+  target_sampling: gt_foreground_entropy_balanced  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
   context_size: 1
   max_ds_len_train: 2000
   mask_pool: avg             # how to pool masks to grid: max | avg
@@ -62,9 +61,9 @@ model:
   num_heads: 8
   num_layers: 4
   ff_factor: 2
-  label_injection: additive  # additive | concat | gate | none
+  label_injection: concat  # additive | concat | gate | none
   output_head: linear        # linear | mlp | retrieval
-  pos_encoding: sinusoidal   # none | sinusoidal | learned
+  pos_encoding: rope3d       # none | sinusoidal | learned | rope3d
   input_norm: rmsnorm        # none | rmsnorm | l2
   dropout: 0.1
   ctx_self_attn: true
@@ -79,7 +78,7 @@ train:
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 18
-  val_items_per_class: 50
+  val_items_per_class: 30
   nd_interval: 20
   seed: 42
   aug: true

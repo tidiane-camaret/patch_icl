@@ -8,10 +8,18 @@ conditioned on context labels, then a head decodes probabilities.
 Architecture decisions (all configurable):
   label_injection : "additive" | "concat" | "gate" | "none"
   output_head     : "linear" | "mlp" | "retrieval"
-  pos_encoding    : "none" | "sinusoidal" | "learned"
+  pos_encoding    : "none" | "sinusoidal" | "learned" | "rope3d"
   input_norm      : "none" | "rmsnorm" | "l2"
   ctx_self_attn   : bool — context tokens self-attend before each cross-attn block
   log_n_scaling   : bool — scale cross-attn queries by log(n_ctx)/log(n_base)
+
+rope3d notes
+------------
+When pos_encoding="rope3d", integer (d, h, w) coordinates are passed as optional
+tgt_coords / ctx_coords to forward().  RoPE is applied inside _mha() directly to
+Q and K after projection, so any token subset (dense or sparse) works without
+needing the tokens to fill a complete grid.  If coords are not supplied the model
+falls back to no positional encoding for that call.
 """
 
 from __future__ import annotations
@@ -21,6 +29,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from src.rope3d import build_rope_cache_3d, apply_rope_3d
 
 
 class PatchICLAttention(nn.Module):
@@ -43,8 +53,11 @@ class PatchICLAttention(nn.Module):
                         retrieval — cross-attention(Q=tgt, K=ctx, V=ctx_labels)
     pos_encoding    : spatial position encoding for the D×H×W patch grid
                         none       — no positional information
-                        sinusoidal — fixed 3D sinusoidal encoding
-                        learned    — nn.Embedding(D*H*W, dim)
+                        sinusoidal — fixed 3D sinusoidal encoding (dense grids only)
+                        learned    — nn.Embedding(D*H*W, dim) (dense grids only)
+                        rope3d     — 3D RoPE applied inside Q/K projections;
+                                     pass tgt_coords / ctx_coords (B, N, 3) int to
+                                     forward().  Works for any token subset.
     input_norm      : applied to raw encoder features before the input projection
                         none    — use encoder features as-is
                         rmsnorm — RMSNorm per token (at embed_dim)
@@ -77,12 +90,13 @@ class PatchICLAttention(nn.Module):
         log_n_base:      int   = 512,
         label_dim:       int   = 1,
         soft_labels:     bool  = False,
+        rope_max_pos:    int   = 0,  # override max_pos for rope3d cache (0 = use max(grid_size))
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         assert label_injection in ("additive", "concat", "gate", "none")
         assert output_head in ("linear", "mlp", "retrieval")
-        assert pos_encoding in ("none", "sinusoidal", "learned")
+        assert pos_encoding in ("none", "sinusoidal", "learned", "rope3d")
         assert input_norm in ("none", "rmsnorm", "l2")
 
         self.embed_dim          = embed_dim   # raw encoder dim (input only)
@@ -127,6 +141,10 @@ class PatchICLAttention(nn.Module):
         if pos_encoding == "learned":
             N = grid_size[0] * grid_size[1] * grid_size[2]
             self.pos_embed = nn.Embedding(N, dim)
+        elif pos_encoding == "rope3d":
+            _max_pos = rope_max_pos if rope_max_pos > 0 else max(grid_size)
+            rope_cache = build_rope_cache_3d(max_pos=_max_pos, dim=dim)
+            self.register_buffer("rope_cache_3d", rope_cache)  # not a param
 
         ff_dim = dim * ff_factor
 
@@ -218,15 +236,27 @@ class PatchICLAttention(nn.Module):
         v_proj:   nn.Linear,
         out_proj: nn.Linear,
         q_scale:  float = 1.0,
+        q_coords: torch.Tensor | None = None,  # (B, Sq, 3) int — for rope3d
+        k_coords: torch.Tensor | None = None,  # (B, Sk, 3) int — for rope3d
     ) -> torch.Tensor:
-        """Project Q/K/V, run scaled dot-product attention, project output."""
+        """Project Q/K/V, apply RoPE if configured, run SDPA, project output."""
         B, Sq, _ = q.shape
         Sk = k.shape[1]
         H, D = self.num_heads, self.head_dim
 
-        Q = q_proj(q).view(B, Sq, H, D).transpose(1, 2)   # (B, H, Sq, D)
-        K = k_proj(k).view(B, Sk, H, D).transpose(1, 2)   # (B, H, Sk, D)
-        V = v_proj(v).view(B, Sk, H, D).transpose(1, 2)   # (B, H, Sk, D)
+        Q = q_proj(q)   # (B, Sq, dim) — RoPE applied before head split
+        K = k_proj(k)   # (B, Sk, dim)
+        V = v_proj(v)
+
+        if self.pos_enc_type == "rope3d":
+            if q_coords is not None:
+                Q = apply_rope_3d(Q, q_coords, self.rope_cache_3d)
+            if k_coords is not None:
+                K = apply_rope_3d(K, k_coords, self.rope_cache_3d)
+
+        Q = Q.view(B, Sq, H, D).transpose(1, 2)   # (B, H, Sq, D)
+        K = K.view(B, Sk, H, D).transpose(1, 2)   # (B, H, Sk, D)
+        V = V.view(B, Sk, H, D).transpose(1, 2)   # (B, H, Sk, D)
 
         if q_scale != 1.0:
             Q = Q * q_scale
@@ -284,10 +314,12 @@ class PatchICLAttention(nn.Module):
 
     def forward(
         self,
-        tgt_feat:   torch.Tensor,  # (B, N, embed_dim)
-        ctx_feat:   torch.Tensor,  # (B, M, embed_dim)  M = K*N
-        ctx_labels: torch.Tensor,  # (B, M) if label_dim=1 | (B, M, label_dim) if label_dim>1
-    ) -> torch.Tensor:             # (B, N) if label_dim=1 | (B, N, label_dim) if label_dim>1
+        tgt_feat:   torch.Tensor,              # (B, N, embed_dim)
+        ctx_feat:   torch.Tensor,              # (B, M, embed_dim)  M = K*N
+        ctx_labels: torch.Tensor,              # (B, M) or (B, M, label_dim)
+        tgt_coords: torch.Tensor | None = None,  # (B, N, 3) int — d,h,w for rope3d
+        ctx_coords: torch.Tensor | None = None,  # (B, M, 3) int — d,h,w for rope3d
+    ) -> torch.Tensor:                         # (B, N) or (B, N, label_dim)
         M = ctx_feat.shape[1]
 
         # 1. Input normalization (at embed_dim)
@@ -334,7 +366,8 @@ class PatchICLAttention(nn.Module):
                 ctx_n = self.ctx_sa_norms[i](ctx)
                 ctx = ctx + self._mha(ctx_n, ctx_n, ctx_n,
                                       self.ctx_q_projs[i], self.ctx_k_projs[i],
-                                      self.ctx_v_projs[i], self.ctx_out_projs[i])
+                                      self.ctx_v_projs[i], self.ctx_out_projs[i],
+                                      q_coords=ctx_coords, k_coords=ctx_coords)
                 ctx = ctx + self.ctx_ffns[i](self.ctx_ffn_norms[i](ctx))
 
             # 5b. Cross-attention: target Q attends to context K/V
@@ -342,7 +375,7 @@ class PatchICLAttention(nn.Module):
             attn_out = self._mha(
                 self.attn_norms[i](tgt), ctx_kv, ctx_kv,
                 self.q_projs[i], self.k_projs[i], self.v_projs[i], self.out_projs[i],
-                q_scale=q_scale,
+                q_scale=q_scale, q_coords=tgt_coords, k_coords=ctx_coords,
             )
             tgt = tgt + attn_out
             tgt = tgt + self.ffns[i](self.ffn_norms[i](tgt))

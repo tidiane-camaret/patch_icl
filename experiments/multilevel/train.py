@@ -3,11 +3,10 @@ Multilevel coarse-to-fine PatchICLAttention on TotalSegmentator.
 
 Two levels trained jointly with detached gradients between them:
   L0: dense 8³ grid  — all 512 patches, standard ICL forward.
-  L1: sparse 16³ grid — NP₁ patches, sampled from:
-        target  : half highest-entropy patches from upsampled pred_0,
-                  half highest-certainty foreground patches.
-        context : half foreground patches (GT mask > fg_thresh),
-                  half border patches (dilation − erosion of GT mask).
+  L1: sparse 16³ grid — NP₁ patches sampled via Gumbel-TopK:
+        target  : gt_previous_pred_error or gt_foreground_entropy_balanced
+                  (controlled by data.target_sampling).
+        context : gt_foreground_entropy_balanced (0.5·GT + 0.5·H(GT)).
 
 Usage
 -----
@@ -86,107 +85,71 @@ def downsample_mask(mask: torch.Tensor, size: tuple, mode: str = "avg") -> torch
     return F.adaptive_avg_pool3d(x, output_size=size).squeeze(1)
 
 
-def border_mask_3d(fg: torch.Tensor) -> torch.Tensor:
-    """Binary mask of border voxels (dilation - erosion) for a (D, H, W) bool tensor.
-
-    Returns a bool tensor of the same shape.
-    """
-    x = fg.float().unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
-    dilated = F.max_pool3d(x, kernel_size=3, stride=1, padding=1).squeeze() > 0.5
-    eroded  = (-F.max_pool3d(-x, kernel_size=3, stride=1, padding=1)).squeeze() > 0.5
-    return dilated & ~eroded
-
-
 # ---------------------------------------------------------------------------
 # Patch sampling
 # ---------------------------------------------------------------------------
 
-def sample_target_patches(
-    pred_0_up: torch.Tensor,   # (B, N1) float in [0,1], N1 = 16³
-    n_entropy: int,
-    n_certain: int,
-    certain_thresh: float,
-) -> torch.Tensor:             # (B, NP₁) long
-    """Sample target patch indices at L1 from upsampled L0 prediction.
+def _binary_entropy(p: torch.Tensor) -> torch.Tensor:
+    """H(p) = -p log p - (1-p) log(1-p), clamped for numerical stability."""
+    p = p.clamp(1e-6, 1 - 1e-6)
+    return -(p * p.log() + (1 - p) * (1 - p).log())
 
-    Half from highest-entropy positions (|pred - 0.5| smallest),
-    half from highest-certainty foreground positions (pred > certain_thresh, argmax).
-    Falls back to random if there are fewer certain-fg patches than needed.
+
+def _gumbel_topk(weights: torch.Tensor, n: int, temperature: float) -> torch.Tensor:
+    """Stochastic top-n sampling via Gumbel noise.
+
+    Normalises weights to [0,1] per batch item, perturbs with Gumbel noise,
+    then takes the top-n scores.  Returns (B, n) unique LongTensor indices.
     """
-    B, N1 = pred_0_up.shape
-    NP = n_entropy + n_certain
-    idx_list = []
-    for b in range(B):
-        p = pred_0_up[b]  # (N1,)
+    w_min = weights.min(dim=1, keepdim=True).values
+    w_max = weights.max(dim=1, keepdim=True).values
+    w = (weights - w_min) / (w_max - w_min + 1e-6)
+    u = torch.rand_like(w).clamp(1e-6, 1 - 1e-6)
+    gumbel = -torch.log(-torch.log(u))
+    scores = w / max(temperature, 1e-6) + gumbel
+    return scores.topk(n, dim=1).indices  # always unique
 
-        # Entropy half: smallest |p - 0.5|
-        uncertainty = 0.5 - (p - 0.5).abs()
-        entropy_idx = uncertainty.topk(n_entropy, largest=True).indices  # (n_entropy,)
 
-        # Certain-fg half: largest p values among p > certain_thresh
-        certain_mask = p > certain_thresh
-        n_avail = int(certain_mask.sum())
-        if n_avail >= n_certain:
-            certain_idx = p[certain_mask].topk(n_certain, largest=True).indices
-            # Map back to global indices
-            global_fg = certain_mask.nonzero(as_tuple=False).squeeze(1)
-            certain_idx = global_fg[certain_idx]
-        else:
-            # Not enough certain-fg: fill remainder with most certain patches overall
-            certain_idx = p.topk(n_certain, largest=True).indices
+def sample_target_patches(
+    pred_0_up: torch.Tensor,   # (B, N1) float in [0,1]
+    gt_1_flat: torch.Tensor,   # (B, N1) float in [0,1]
+    n_patches: int,
+    temperature: float = 1.0,
+    mode: str = "gt_previous_pred_error",
+) -> torch.Tensor:             # (B, n_patches) long
+    """Gumbel-TopK target patch sampling.
 
-        idx_list.append(torch.cat([entropy_idx, certain_idx]))  # (NP,)
-
-    return torch.stack(idx_list)  # (B, NP)
+    gt_previous_pred_error         : weight = |pred_0_up - GT|       (where L0 is wrong)
+    gt_foreground_entropy_balanced : weight = 0.5·GT + 0.5·H(GT)     (fg + boundary, GT-only)
+    predicted_entropy              : weight = H(pred_0_up)            (where L0 is uncertain)
+    """
+    if mode == "gt_previous_pred_error":
+        weights = (pred_0_up - gt_1_flat).abs()
+    elif mode == "gt_foreground_entropy_balanced":
+        weights = 0.5 * gt_1_flat + 0.5 * _binary_entropy(gt_1_flat)
+    elif mode == "predicted_entropy":
+        weights = _binary_entropy(pred_0_up)
+    else:
+        raise ValueError(f"Unknown target_sampling mode: {mode!r}")
+    return _gumbel_topk(weights, n_patches, temperature)
 
 
 def sample_context_patches(
     ctx_mask_16: torch.Tensor,  # (B, K, D1, H1, W1) float avg-pooled
-    n_fg: int,
-    n_border: int,
-    fg_thresh: float,
-) -> torch.Tensor:              # (B, NP₁) long  — shared across K context volumes
-    """Sample context patch indices at L1 from GT context masks.
+    n_patches: int,
+    temperature: float = 1.0,
+) -> torch.Tensor:              # (B, n_patches) long — shared across K context volumes
+    """Gumbel-TopK over gt_foreground_entropy_balanced averaged across K context masks.
 
-    n_fg patches from foreground (mask > fg_thresh) of the first context volume
-    (masks are assumed consistent across contexts for the same class).
-    n_border patches from the morphological border.  Falls back to fg or random
-    if there are not enough patches in a pool.
+    weight = 0.5 * avg_mask + 0.5 * H(avg_mask)
+    High-weight positions are both foreground (avg_mask large) and boundary
+    (avg_mask ≈ 0.5, where H is maximal).
     """
     B, K, D1, H1, W1 = ctx_mask_16.shape
     N1 = D1 * H1 * W1
-    NP = n_fg + n_border
-    idx_list = []
-
-    for b in range(B):
-        # Average context masks across K contexts for stable fg/border estimate
-        avg_mask = ctx_mask_16[b].mean(0).reshape(N1)  # (N1,)
-
-        fg = avg_mask > fg_thresh
-        if fg.sum() == 0:
-            # Degenerate: no foreground — random sampling
-            idx_list.append(torch.randint(N1, (NP,), device=ctx_mask_16.device))
-            continue
-
-        # Border in 3D spatial layout
-        fg_3d = fg.reshape(D1, H1, W1)
-        border_3d = border_mask_3d(fg_3d)
-        border = border_3d.reshape(N1)
-
-        def _sample_from(mask: torch.Tensor, n: int) -> torch.Tensor:
-            pos = mask.nonzero(as_tuple=False).squeeze(1)
-            if len(pos) >= n:
-                perm = torch.randperm(len(pos), device=ctx_mask_16.device)[:n]
-                return pos[perm]
-            # Not enough: repeat-sample
-            repeats = (n + len(pos) - 1) // len(pos)
-            return pos.repeat(repeats)[:n]
-
-        fg_idx     = _sample_from(fg,     n_fg)
-        border_idx = _sample_from(border if border.any() else fg, n_border)
-        idx_list.append(torch.cat([fg_idx, border_idx]))  # (NP,)
-
-    return torch.stack(idx_list)  # (B, NP)
+    avg_mask = ctx_mask_16.mean(dim=1).reshape(B, N1)
+    weights  = 0.5 * avg_mask + 0.5 * _binary_entropy(avg_mask)
+    return _gumbel_topk(weights, n_patches, temperature)
 
 
 def gather_patches(feat_flat: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -197,16 +160,16 @@ def gather_patches(feat_flat: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return feat_flat.gather(1, idx_exp)
 
 
-def make_coords_3d(grid_size: tuple, device: torch.device) -> torch.Tensor:
-    """Normalised (d, h, w) coordinates in [0,1] for each position in a D×H×W grid.
+def grid_coords_3d(grid_size: tuple, device: torch.device) -> torch.Tensor:
+    """Integer (d, h, w) voxel coords for every position in a D×H×W grid.
 
-    Returns (N, 3) float32 where N = D*H*W, in the same flattening order as
-    tensor.reshape(-1) (i.e. d varies slowest, w varies fastest).
+    Returns (N, 3) long where N = D*H*W (d slowest, w fastest — matches
+    the default C-order reshape used everywhere in this file).
     """
     D, H, W = grid_size
-    d = torch.linspace(0, 1, D, device=device)
-    h = torch.linspace(0, 1, H, device=device)
-    w = torch.linspace(0, 1, W, device=device)
+    d = torch.arange(D, device=device)
+    h = torch.arange(H, device=device)
+    w = torch.arange(W, device=device)
     gd, gh, gw = torch.meshgrid(d, h, w, indexing="ij")
     return torch.stack([gd, gh, gw], dim=-1).reshape(-1, 3)  # (N, 3)
 
@@ -268,19 +231,24 @@ def process_batch(
     # GT target at L0
     gt_0 = downsample_mask(labels, res_0, cfg.data.mask_pool).reshape(B, N0)
 
+    # 3D RoPE coordinates for L0 (dense — all N0 grid positions)
+    coords_8   = grid_coords_3d(res_0, device)                                  # (N0, 3)
+    tgt_crds_0 = coords_8.unsqueeze(0).expand(B, -1, -1)                        # (B, N0, 3)
+    ctx_crds_0 = coords_8.unsqueeze(0).expand(B, -1, -1).repeat(1, K, 1)        # (B, K*N0, 3)
+
     with torch.autocast(device_type=device.type, enabled=amp):
-        pred_0 = model[0](tgt_f0, ctx_f0, ctx_lbl_0)  # (B, N0)
+        pred_0 = model[0](tgt_f0, ctx_f0, ctx_lbl_0,
+                          tgt_coords=tgt_crds_0, ctx_coords=ctx_crds_0)         # (B, N0)
     pred_0 = pred_0.float()
 
     loss_0 = F.binary_cross_entropy(pred_0, gt_0)
 
     # ---- Level 1 (sparse 16³) ---------------------------------------------
-    NP  = cfg.data.n_patches_l1
-    n_e = int(NP * cfg.data.frac_entropy)
-    n_c = NP - n_e
-    n_fg     = NP // 2
-    n_border = NP - n_fg
-    N1 = res_1[0] * res_1[1] * res_1[2]
+    NP   = cfg.data.n_patches_l1
+    temp = cfg.data.sampling_temperature
+    N1   = res_1[0] * res_1[1] * res_1[2]
+
+    gt_1_flat = downsample_mask(labels, res_1, cfg.data.mask_pool).reshape(B, N1)
 
     # Upsample pred_0 to 16³ using detached predictions
     with torch.no_grad():
@@ -290,11 +258,12 @@ def process_batch(
         ).reshape(B, N1)  # (B, N1)
 
     # Sample target and context positions
-    tgt_idx  = sample_target_patches(pred_0_up, n_e, n_c, cfg.data.certain_thresh)   # (B, NP)
+    tgt_idx  = sample_target_patches(pred_0_up, gt_1_flat, NP, temp,
+                                      cfg.data.target_sampling)                       # (B, NP)
     ctx_mask_1 = downsample_mask(
         ctx_out.reshape(B * K, *ctx_out.shape[2:]), res_1, cfg.data.mask_pool
     ).reshape(B, K, *res_1)
-    ctx_idx  = sample_context_patches(ctx_mask_1, n_fg, n_border, cfg.data.fg_thresh)  # (B, NP)
+    ctx_idx  = sample_context_patches(ctx_mask_1, NP, temp)                          # (B, NP)
 
     # Extract features at L1, gather only sampled positions
     tgt_feat_1  = extract_features(tgt_feats,      level, res_1, num_levels)   # (B, C, 16, 16, 16)
@@ -318,22 +287,18 @@ def process_batch(
     ctx_sparse  = torch.cat(ctx_pieces,     dim=1)   # (B, K*NP, C)
     ctx_lbl_1   = torch.cat(ctx_lbl_pieces, dim=1)   # (B, K*NP)
 
-    # Inject spatial position encoding for sparse level: project gathered (d,h,w)
-    # coords into embed_dim and add before the model's input_proj.
-    coords_16 = make_coords_3d(res_1, device)                                       # (N1, 3)
-    coord_proj = model.coord_projs[0]                                               # level 1 → index 0
-    tgt_coords = coords_16[tgt_idx.reshape(-1)].reshape(B, NP, 3)                  # (B, NP, 3)
-    ctx_coords = coords_16[ctx_idx.reshape(-1)].reshape(B, NP, 3)                  # (B, NP, 3)
-    tgt_sparse = tgt_sparse + coord_proj(tgt_coords)                                # (B, NP, C)
-    ctx_coord_rep = ctx_coords.unsqueeze(1).expand(-1, K, -1, -1).reshape(B, K * NP, 3)
-    ctx_sparse = ctx_sparse + coord_proj(ctx_coord_rep)                             # (B, K*NP, C)
+    # 3D RoPE coordinates for L1 (sparse — gather integer coords at sampled positions)
+    coords_16   = grid_coords_3d(res_1, device)                                     # (N1, 3)
+    tgt_crds_1  = coords_16[tgt_idx.reshape(-1)].reshape(B, NP, 3)                 # (B, NP, 3)
+    ctx_crds_1  = coords_16[ctx_idx.reshape(-1)].reshape(B, NP, 3)                 # (B, NP, 3)
+    ctx_crds_1  = ctx_crds_1.unsqueeze(1).expand(-1, K, -1, -1).reshape(B, K*NP, 3)
 
     with torch.autocast(device_type=device.type, enabled=amp):
-        pred_1 = model[1](tgt_sparse, ctx_sparse, ctx_lbl_1)   # (B, NP)
+        pred_1 = model[1](tgt_sparse, ctx_sparse, ctx_lbl_1,
+                          tgt_coords=tgt_crds_1, ctx_coords=ctx_crds_1)             # (B, NP)
     pred_1 = pred_1.float()
 
     # GT for sampled target positions at 16³
-    gt_1_flat  = downsample_mask(labels, res_1, cfg.data.mask_pool).reshape(B, N1)
     gt_1_sparse = gt_1_flat.gather(1, tgt_idx)  # (B, NP)
 
     loss_1 = F.binary_cross_entropy(pred_1, gt_1_sparse)
@@ -398,44 +363,116 @@ def _heatmap(ax, vol: np.ndarray, idx: int, title: str) -> None:
     ax.axis("off")
 
 
-def save_val_figure(
-    tgt_image:    np.ndarray,          # (D, H, W)
-    tgt_gt:       np.ndarray,          # (D, H, W)
-    pred_l0:      np.ndarray,          # (8, 8, 8)
-    pred_fused:   np.ndarray,          # (16, 16, 16)
-    gt_l1:        np.ndarray,          # (16, 16, 16)
-    ctx_images:   list[np.ndarray],    # K × (D, H, W)
-    ctx_gts:      list[np.ndarray],    # K × (D, H, W)
-    out_path:     Path,
-    title:        str = "",
+def _patch_overlay(
+    ax,
+    image:      np.ndarray,           # (D, H, W) full-res image
+    gt:         np.ndarray,           # (D, H, W) binary GT
+    z_img:      int,                  # slice index in image space
+    grid_size:  tuple,                # (D', H', W') — patch grid resolution
+    patch_idx:  np.ndarray | None,    # flat indices into grid (None = dense)
+    color:      str = "cyan",
+    title:      str = "",
 ) -> None:
-    K    = len(ctx_images)
-    ncols = max(4, 3 + K)
-    fig, axes = plt.subplots(2, ncols, figsize=(3.2 * ncols, 6.5))
+    """Image slice + GT overlay + sampled patch positions.
 
-    tgt_z     = _best_slice(tgt_gt)
-    z_l0      = tgt_z * pred_l0.shape[0]   // tgt_gt.shape[0]
-    z_l1      = tgt_z * pred_fused.shape[0] // tgt_gt.shape[0]
+    Dense levels (patch_idx=None): draw light grid lines at patch boundaries.
+    Sparse levels: draw filled boxes for each sampled patch on the best slice.
+    """
+    D_img, H_img, W_img = image.shape
+    D_grd, H_grd, W_grd = grid_size
+    ph = H_img / H_grd          # patch height in image pixels
+    pw = W_img / W_grd          # patch width in image pixels
+    z_grd = int(z_img * D_grd / D_img)   # corresponding grid depth slice
 
-    _overlay (axes[0, 0], tgt_image, tgt_gt.astype(float), tgt_z, "Target + GT")
-    _heatmap (axes[0, 1], pred_l0,   z_l0,  "pred L0 (8³)")
-    _heatmap (axes[0, 2], gt_l1,     z_l1,  "GT ↓ (16³)")
-    _heatmap (axes[0, 3], pred_fused,z_l1,  "pred fused (16³)")
-    for col in range(4, ncols):
-        axes[0, col].set_visible(False)
+    sl = image[z_img]
+    sl_norm = (sl - sl.min()) / (sl.max() - sl.min() + 1e-6)
+    ax.imshow(sl_norm, cmap="gray")
 
-    for k in range(K):
-        ctx_z = _best_slice(ctx_gts[k])
-        if 2 * k < ncols:
-            _overlay(axes[1, 2 * k], ctx_images[k], ctx_gts[k].astype(float), ctx_z, f"Ctx {k} + GT")
-        if 2 * k + 1 < ncols:
-            axes[1, 2 * k + 1].set_visible(False)
-    for col in range(2 * K, ncols):
-        axes[1, col].set_visible(False)
+    gt_sl = (gt[z_img] > 0).astype(float)
+    if gt_sl.max() > 0:
+        ax.imshow(gt_sl, cmap="Reds", alpha=0.35, vmin=0, vmax=1)
+
+    if patch_idx is None:
+        # Dense: light grid lines at patch boundaries
+        for i in range(1, H_grd):
+            ax.axhline(i * ph - 0.5, color=color, linewidth=0.4, alpha=0.4)
+        for j in range(1, W_grd):
+            ax.axvline(j * pw - 0.5, color=color, linewidth=0.4, alpha=0.4)
+    else:
+        # Sparse: filled box per sampled patch that intersects this depth slice
+        d_p = patch_idx // (H_grd * W_grd)
+        h_p = (patch_idx % (H_grd * W_grd)) // W_grd
+        w_p = patch_idx % W_grd
+        for d, h, w in zip(d_p, h_p, w_p):
+            if d == z_grd:
+                rect = plt.Rectangle(
+                    (w * pw, h * ph), pw, ph,
+                    linewidth=0.8, edgecolor=color, facecolor=color, alpha=0.4,
+                )
+                ax.add_patch(rect)
+
+    ax.set_title(title, fontsize=7)
+    ax.axis("off")
+
+
+def save_val_figure(
+    tgt_image:   np.ndarray,        # (D, H, W) full-res
+    tgt_gt:      np.ndarray,        # (D, H, W) binary GT full-res
+    ctx_image:   np.ndarray,        # (D, H, W) first context image
+    ctx_gt:      np.ndarray,        # (D, H, W) first context GT
+    levels:      list[dict],        # one dict per level — see below
+    out_path:    Path,
+    title:       str = "",
+) -> None:
+    """Save a figure with one row per level.
+
+    Each row has 5 columns:
+      0  Target slice + GT + sampled patch positions (cyan boxes / grid lines)
+      1  Context slice + GT + sampled patch positions (lime boxes / grid lines)
+      2  Downsampled GT mask at this level's resolution
+      3  Prediction at this level (L0: dense 8³; L1: sparse NP patches in 16³ grid)
+      4  Fused prediction (L0: pred_0 upsampled to 16³; L1: final pred_fused)
+
+    Each level dict must contain:
+      res        : (D', H', W') grid resolution
+      gt_ds      : (D', H', W') GT downsampled to res
+      pred       : (D', H', W') prediction at this level (zeros outside sampled pos for L1)
+      pred_fused : (D_f, H_f, W_f) cumulative fused prediction (same shape for all levels)
+      tgt_idx    : np.ndarray (NP,) flat patch indices, or None for dense
+      ctx_idx    : np.ndarray (NP,) flat patch indices, or None for dense
+    """
+    n_levels = len(levels)
+    fig, axes = plt.subplots(n_levels, 5, figsize=(18, 3.8 * n_levels),
+                             gridspec_kw={"wspace": 0.04, "hspace": 0.25})
+    if n_levels == 1:
+        axes = axes[np.newaxis, :]
+
+    tgt_z = _best_slice(tgt_gt.astype(float))
+    ctx_z = _best_slice(ctx_gt.astype(float))
+
+    for row, lvl in enumerate(levels):
+        res        = lvl["res"]          # (D', H', W')
+        gt_ds      = lvl["gt_ds"]        # (D', H', W')
+        pred       = lvl["pred"]         # (D', H', W')
+        pred_fused = lvl["pred_fused"]   # (D_f, H_f, W_f)
+        tgt_idx    = lvl.get("tgt_idx")  # None or (NP,)
+        ctx_idx    = lvl.get("ctx_idx")  # None or (NP,)
+
+        z_ds    = int(tgt_z * res[0]          / tgt_gt.shape[0])
+        z_fused = int(tgt_z * pred_fused.shape[0] / tgt_gt.shape[0])
+
+        _patch_overlay(axes[row, 0], tgt_image, tgt_gt, tgt_z,
+                       res, tgt_idx, color="cyan",
+                       title=f"L{row} target  {res}")
+        _patch_overlay(axes[row, 1], ctx_image, ctx_gt, ctx_z,
+                       res, ctx_idx, color="lime",
+                       title=f"L{row} context  {res}")
+        _heatmap(axes[row, 2], gt_ds,      z_ds,    f"GT ↓ L{row}")
+        _heatmap(axes[row, 3], pred,       z_ds,    f"pred L{row}")
+        _heatmap(axes[row, 4], pred_fused, z_fused, f"fused L{row}")
 
     fig.suptitle(title, fontsize=9)
-    fig.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -465,20 +502,20 @@ def validate(
     res_1 = tuple(cfg.data.resolutions[1])
     level      = cfg.model.feature_level
     num_levels = len(encoder.skip_channels) + 1
-    NP  = cfg.data.n_patches_l1
-    n_e = int(NP * cfg.data.frac_entropy)
-    n_c = NP - n_e
-    n_fg     = NP // 2
-    n_border = NP - n_fg
-    N0 = res_0[0] * res_0[1] * res_0[2]
-    N1 = res_1[0] * res_1[1] * res_1[2]
+    NP   = cfg.data.n_patches_l1
+    temp = cfg.data.sampling_temperature
+    N0   = res_0[0] * res_0[1] * res_0[2]
+    N1   = res_1[0] * res_1[1] * res_1[2]
 
     cls_to_indices: dict[str, list[int]] = defaultdict(list)
     for i, (_, cls) in enumerate(ds_val.samples):
         cls_to_indices[cls].append(i)
 
-    # Collect per-level metrics separately + fused
-    l0_dices, l1_dices, l1_soft_dices, l1_norm_dices, l1_aurocs, l1_losses = [], [], [], [], [], []
+    # Collect per-level metrics
+    # dice_l{i}       : dice at level i's own resolution (sparse for L1)
+    # dice_fused_l{i} : dice of the cumulative fused prediction at res_1
+    l0_dices, l0_fused_dices = [], []
+    l1_dices, l1_fused_dices, l1_soft_dices, l1_norm_dices, l1_aurocs, l1_losses = [], [], [], [], [], []
     wandb_images: dict = {}
 
     for cls in ds_val.classes:
@@ -515,18 +552,25 @@ def validate(
             ctx_lbl_0   = ctx_mask_0.reshape(1, K * N0)
             gt_0        = downsample_mask(label, res_0, cfg.data.mask_pool).reshape(1, N0)
 
-            pred_0 = model[0](tgt_f0, ctx_f0, ctx_lbl_0).float()  # (1, N0)
+            coords_8    = grid_coords_3d(res_0, device)
+            tgt_crds_0  = coords_8.unsqueeze(0)                                       # (1, N0, 3)
+            ctx_crds_0  = coords_8.unsqueeze(0).repeat(1, K, 1)                       # (1, K*N0, 3)
+
+            pred_0 = model[0](tgt_f0, ctx_f0, ctx_lbl_0,
+                              tgt_coords=tgt_crds_0, ctx_coords=ctx_crds_0).float()   # (1, N0)
 
             # L1
             pred_0_up = F.interpolate(
                 pred_0.reshape(1, 1, *res_0), size=res_1, mode="trilinear", align_corners=False
             ).reshape(1, N1)
 
-            tgt_idx = sample_target_patches(pred_0_up, n_e, n_c, cfg.data.certain_thresh)
+            gt_1 = downsample_mask(label, res_1, cfg.data.mask_pool).reshape(1, N1)
+            tgt_idx = sample_target_patches(pred_0_up, gt_1, NP, temp,
+                                            cfg.data.target_sampling)
             ctx_mask_1 = downsample_mask(
                 ctx_out.reshape(K, *ctx_out.shape[2:]), res_1, cfg.data.mask_pool
             ).reshape(1, K, *res_1)
-            ctx_idx = sample_context_patches(ctx_mask_1, n_fg, n_border, cfg.data.fg_thresh)
+            ctx_idx = sample_context_patches(ctx_mask_1, NP, temp)
 
             tgt_feat_1  = extract_features(tgt_feats,      level, res_1, num_levels)
             ctx_feat_1f = extract_features(ctx_feats_flat, level, res_1, num_levels)
@@ -543,38 +587,46 @@ def validate(
             ctx_sparse = torch.cat(ctx_pieces,     dim=1)
             ctx_lbl_1  = torch.cat(ctx_lbl_pieces, dim=1)
 
-            # Inject coord PE for sparse level (same as process_batch)
-            coords_16   = make_coords_3d(res_1, device)
-            coord_proj  = model.coord_projs[0]
-            tgt_coords  = coords_16[tgt_idx.reshape(-1)].reshape(1, NP, 3)
-            ctx_coords  = coords_16[ctx_idx.reshape(-1)].reshape(1, NP, 3)
-            tgt_sparse  = tgt_sparse + coord_proj(tgt_coords)
-            ctx_coord_rep = ctx_coords.unsqueeze(1).expand(-1, K, -1, -1).reshape(1, K * NP, 3)
-            ctx_sparse  = ctx_sparse + coord_proj(ctx_coord_rep)
+            # 3D RoPE coords for sparse L1
+            coords_16   = grid_coords_3d(res_1, device)
+            tgt_crds_1  = coords_16[tgt_idx.reshape(-1)].reshape(1, NP, 3)
+            ctx_crds_1  = coords_16[ctx_idx.reshape(-1)].reshape(1, NP, 3)
+            ctx_crds_1  = ctx_crds_1.unsqueeze(1).expand(-1, K, -1, -1).reshape(1, K * NP, 3)
 
-            pred_1 = model[1](tgt_sparse, ctx_sparse, ctx_lbl_1).float()   # (1, NP)
+            pred_1 = model[1](tgt_sparse, ctx_sparse, ctx_lbl_1,
+                              tgt_coords=tgt_crds_1, ctx_coords=ctx_crds_1).float()   # (1, NP)
 
             # Fused prediction at 16³
             pred_fused = pred_0_up.clone()
             pred_fused[0, tgt_idx[0]] = pred_1[0]  # overwrite sampled positions
 
-            gt_1 = downsample_mask(label, res_1, cfg.data.mask_pool).reshape(1, N1)
-
             # --- Metrics ---
-            # L0 dice (8³)
+            gf = (gt_1.squeeze(0) > 0).float()  # binary GT at 16³
+
+            # dice_l0: L0 prediction at 8³ vs GT at 8³
             d0 = dice_score(pred_0.squeeze(0), gt_0.squeeze(0))
             if d0 == d0:
                 l0_dices.append(d0)
 
-            # L1 fused metrics (16³)
+            # dice_fused_l0: pred_0 upsampled to 16³ vs GT at 16³ (L0-only baseline)
+            df0 = dice_score(pred_0_up.squeeze(0), gf)
+            if df0 == df0:
+                l0_fused_dices.append(df0)
+
+            # dice_l1: L1 prediction at the NP sampled positions vs GT at those positions
+            gt_1_at_tgt = gt_1.reshape(1, N1).gather(1, tgt_idx).squeeze(0)
+            d1 = dice_score(pred_1.squeeze(0), (gt_1_at_tgt > 0).float())
+            if d1 == d1:
+                l1_dices.append(d1)
+
+            # dice_fused_l1: final fused prediction at 16³ vs GT at 16³
             pf = pred_fused.squeeze(0)
-            gf = (gt_1.squeeze(0) > 0).float()
             loss_v = F.binary_cross_entropy(pf, gf).item()
             l1_losses.append(loss_v)
 
-            d1 = dice_score(pf, gf)
-            if d1 == d1:
-                l1_dices.append(d1)
+            df1 = dice_score(pf, gf)
+            if df1 == df1:
+                l1_fused_dices.append(df1)
             sd = soft_dice_score(pf, gf)
             if sd == sd:
                 l1_soft_dices.append(sd)
@@ -594,17 +646,47 @@ def validate(
             if not cls_fig_saved and fig_dir is not None:
                 D0, H0, W0 = res_0
                 D1, H1, W1 = res_1
-                fig_path  = fig_dir / f"epoch{epoch:03d}_{cls}.png"
+                fig_path = fig_dir / f"epoch{epoch:03d}_{cls}.png"
+
+                tgt_np    = item["image"].squeeze().cpu().numpy()
+                tgt_gt_np = item["label"].cpu().numpy()
+                ctx_np    = ctx_in[0, 0].squeeze(0).cpu().numpy()
+                ctx_gt_np = ctx_out[0, 0].cpu().numpy()
+
+                # L0 pred at 8³; "fused" at L0 = pred_0 upsampled to 16³ (before L1)
+                pred_0_np  = pred_0.squeeze().cpu().numpy().reshape(D0, H0, W0)
+                pred_0u_np = pred_0_up.squeeze().cpu().numpy().reshape(D1, H1, W1)
+
+                # L1 sparse pred: place NP values into 16³ grid (0 elsewhere)
+                pred_1_grid = np.zeros(N1, dtype=np.float32)
+                pred_1_grid[tgt_idx[0].cpu().numpy()] = pred_1[0].cpu().numpy()
+
+                levels_data = [
+                    {
+                        "res":        res_0,
+                        "gt_ds":      gt_0.squeeze().cpu().numpy().reshape(D0, H0, W0),
+                        "pred":       pred_0_np,
+                        "pred_fused": pred_0u_np,
+                        "tgt_idx":    None,                    # L0 is dense
+                        "ctx_idx":    None,
+                    },
+                    {
+                        "res":        res_1,
+                        "gt_ds":      gt_1.squeeze().cpu().numpy().reshape(D1, H1, W1),
+                        "pred":       pred_1_grid.reshape(D1, H1, W1),
+                        "pred_fused": pred_fused.squeeze().cpu().numpy().reshape(D1, H1, W1),
+                        "tgt_idx":    tgt_idx[0].cpu().numpy(),
+                        "ctx_idx":    ctx_idx[0].cpu().numpy(),
+                    },
+                ]
                 save_val_figure(
-                    tgt_image  = item["image"].squeeze().cpu().numpy(),
-                    tgt_gt     = item["label"].cpu().numpy().astype(float),
-                    pred_l0    = pred_0.squeeze().cpu().numpy().reshape(D0, H0, W0),
-                    pred_fused = pred_fused.squeeze().cpu().numpy().reshape(D1, H1, W1),
-                    gt_l1      = gt_1.squeeze().cpu().numpy().reshape(D1, H1, W1),
-                    ctx_images = [ctx_in[0, k].squeeze(0).cpu().numpy() for k in range(K)],
-                    ctx_gts    = [ctx_out[0, k].cpu().numpy() for k in range(K)],
+                    tgt_image  = tgt_np,
+                    tgt_gt     = tgt_gt_np,
+                    ctx_image  = ctx_np,
+                    ctx_gt     = ctx_gt_np,
+                    levels     = levels_data,
                     out_path   = fig_path,
-                    title      = f"[ep {epoch}] {cls}  dice_fused={d1:.3f}  dice_l0={d0:.3f}",
+                    title      = f"[ep {epoch}] {cls}  dice_fused_l1={df1:.3f}  dice_fused_l0={df0:.3f}  dice_l0={d0:.3f}",
                 )
                 wandb_images[f"val/pred/{cls}"] = fig_path
                 cls_fig_saved = True
@@ -613,12 +695,14 @@ def validate(
 
     model.train()
     metrics = {
-        "val/dice_l0":      float(np.nanmean(l0_dices))      if l0_dices      else float("nan"),
-        "val/dice_fused":   float(np.nanmean(l1_dices))      if l1_dices      else float("nan"),
-        "val/soft_dice":    float(np.nanmean(l1_soft_dices)) if l1_soft_dices else float("nan"),
-        "val/norm_dice":    float(np.nanmean(l1_norm_dices)) if l1_norm_dices else float("nan"),
-        "val/auroc":        float(np.nanmean(l1_aurocs))     if l1_aurocs     else float("nan"),
-        "val/loss":         float(np.mean(l1_losses))        if l1_losses     else float("nan"),
+        "val/dice_l0":        float(np.nanmean(l0_dices))        if l0_dices        else float("nan"),
+        "val/dice_fused_l0":  float(np.nanmean(l0_fused_dices))  if l0_fused_dices  else float("nan"),
+        "val/dice_l1":        float(np.nanmean(l1_dices))        if l1_dices        else float("nan"),
+        "val/dice_fused_l1":  float(np.nanmean(l1_fused_dices))  if l1_fused_dices  else float("nan"),
+        "val/soft_dice":      float(np.nanmean(l1_soft_dices))   if l1_soft_dices   else float("nan"),
+        "val/norm_dice":      float(np.nanmean(l1_norm_dices))   if l1_norm_dices   else float("nan"),
+        "val/auroc":          float(np.nanmean(l1_aurocs))       if l1_aurocs       else float("nan"),
+        "val/loss":           float(np.mean(l1_losses))          if l1_losses       else float("nan"),
     }
     return metrics, wandb_images
 
@@ -833,11 +917,13 @@ def main() -> None:
             fig_dir=fig_dir, epoch=epoch,
         )
         print(f"  val dice_l0={val_metrics['val/dice_l0']:.3f}  "
-              f"dice_fused={val_metrics['val/dice_fused']:.3f}  "
+              f"dice_fused_l0={val_metrics['val/dice_fused_l0']:.3f}  "
+              f"dice_l1={val_metrics['val/dice_l1']:.3f}  "
+              f"dice_fused_l1={val_metrics['val/dice_fused_l1']:.3f}  "
               f"auroc={val_metrics['val/auroc']:.3f}")
 
-        if val_metrics["val/dice_fused"] > best_dice:
-            best_dice = val_metrics["val/dice_fused"]
+        if val_metrics["val/dice_fused_l1"] > best_dice:
+            best_dice = val_metrics["val/dice_fused_l1"]
             ckpt = {
                 "epoch":  epoch,
                 "model":  model.state_dict(),
@@ -845,7 +931,7 @@ def main() -> None:
                 "val_dice": best_dice,
             }
             torch.save(ckpt, run_dir / "best.pt")
-            print(f"  saved best checkpoint  dice_fused={best_dice:.3f}")
+            print(f"  saved best checkpoint  dice_fused_l1={best_dice:.3f}")
 
         if use_wandb:
             import wandb
@@ -859,7 +945,7 @@ def main() -> None:
     if use_wandb:
         import wandb
         wandb.finish()
-    print(f"\nBest val dice_fused: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
+    print(f"\nBest val dice_fused_l1: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
 
 
 if __name__ == "__main__":

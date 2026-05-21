@@ -3,6 +3,18 @@ MultilevelICL: coarse-to-fine in-context segmentation.
 
 Wraps one PatchICLAttention per spatial level.  Training logic (sampling,
 feature extraction, loss) lives in train.py; this module only holds parameters.
+
+Positional encoding
+-------------------
+All levels use pos_encoding="rope3d".  RoPE is applied inside Q/K projections
+via explicit integer (d, h, w) coordinates passed at call time, so both dense
+levels (full 8³ grid) and sparse levels (NP sampled patches from 16³) share the
+same PE mechanism without any grid-size assumption.
+
+The rope cache is keyed by (max_pos, dim) and uses the same theta frequencies
+regardless of which resolution the tokens come from — coordinates just index into
+the cache at their actual voxel position.  rope_max_pos is set to the maximum
+spatial extent across all levels so that every valid coordinate is in range.
 """
 
 from __future__ import annotations
@@ -19,18 +31,16 @@ class MultilevelICL(nn.Module):
     ----
     embed_dim   : raw encoder feature dimension (shared across levels)
     level_cfgs  : list of dicts — kwargs forwarded to PatchICLAttention for each level,
-                  plus a required 'grid_size' key for the spatial resolution at that level.
-
-    Sparse levels (index > 0) receive only NP sampled tokens rather than the full
-    D×H×W grid, so the grid-based sinusoidal PE in PatchICLAttention can't be used.
-    Instead, MultilevelICL holds one learned coord_proj per sparse level: a bias-free
-    Linear(3, embed_dim) that maps normalised (d, h, w) coordinates of the sampled
-    patches into embed_dim space.  train.py gathers coords at sampled positions and
-    adds the projected PE to the features before calling forward on the sparse level.
+                  plus a required 'grid_size' key for the spatial resolution.
     """
 
     def __init__(self, embed_dim: int, level_cfgs: list[dict]):
         super().__init__()
+
+        # Shared max_pos: covers the largest coordinate across all levels so the
+        # same theta frequencies are valid everywhere.
+        global_max_pos = max(max(cfg["grid_size"]) for cfg in level_cfgs)
+
         self.levels = nn.ModuleList([
             PatchICLAttention(
                 embed_dim=embed_dim,
@@ -41,22 +51,16 @@ class MultilevelICL(nn.Module):
                 ff_factor=cfg.get("ff_factor", 2),
                 label_injection=cfg.get("label_injection", "additive"),
                 output_head=cfg.get("output_head", "linear"),
-                # Sparse levels use "none" — PE is injected externally via coord_projs.
-                pos_encoding=cfg.get("pos_encoding", "none"),
+                pos_encoding=cfg.get("pos_encoding", "rope3d"),
                 input_norm=cfg.get("input_norm", "rmsnorm"),
                 dropout=cfg.get("dropout", 0.0),
                 ctx_self_attn=cfg.get("ctx_self_attn", True),
                 log_n_scaling=cfg.get("log_n_scaling", True),
                 log_n_base=cfg.get("log_n_base", 512),
                 soft_labels=cfg.get("soft_labels", True),
+                rope_max_pos=global_max_pos,
             )
             for cfg in level_cfgs
-        ])
-        # Learned (d, h, w) → embed_dim projection for sparse levels (index ≥ 1).
-        # Level 0 is always dense and uses PatchICLAttention's own pos_encoding.
-        self.coord_projs = nn.ModuleList([
-            nn.Linear(3, embed_dim, bias=False)
-            for _ in level_cfgs[1:]
         ])
 
     def __len__(self) -> int:
