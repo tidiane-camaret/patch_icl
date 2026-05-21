@@ -707,13 +707,13 @@ def main() -> None:
     scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
     amp       = device.type == "cuda"
 
-    best_auroc = -1.0
+    best_dice = -1.0
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model"])
-        best_auroc = ckpt.get("val_auroc", -1.0)
+        best_dice = ckpt.get("val_dice", -1.0)
         print(f"Loaded checkpoint: {cfg.train.checkpoint}  "
-              f"(epoch {ckpt['epoch']}, val_auroc={best_auroc:.3f})")
+              f"(epoch {ckpt['epoch']}, val_dice={best_dice:.3f})")
 
     model_module = model
 
@@ -735,7 +735,7 @@ def main() -> None:
     fig_dir = run_dir / "figures"
 
     # ---- Training ----------------------------------------------------------
-    best_auroc = -1.0
+    best_dice = -1.0
     nd_interval = cfg.train.nd_interval
     for epoch in range(1, cfg.train.epochs + 1):
         model.train()
@@ -744,7 +744,9 @@ def main() -> None:
         last_nd, last_dice, last_sdice = float("nan"), float("nan"), float("nan")
         t0 = time.perf_counter()
 
-        train_vis: tuple | None = None   # (batch_cpu, pred_cpu) from first batch
+        train_vis: tuple | None = None        # first batch (any type)
+        train_vis_real: tuple | None = None   # first batch with ≥1 real label
+        n_real_batches = 0
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
         for batch in bar:
             pred, gt_loss, gt_bin = process_batch(
@@ -764,8 +766,18 @@ def main() -> None:
                 loss.backward()
                 optimizer.step()
 
-            if train_vis is None:
-                train_vis = (batch, pred.detach().cpu())
+            names = batch.get("label_names", [])
+            has_real = any(not n.startswith("sv_") for n in names)
+            if has_real:
+                n_real_batches += 1
+
+            # Only pay the CPU-sync cost for the two capture slots
+            if train_vis is None or (train_vis_real is None and has_real):
+                pred_cpu = pred.detach().cpu()
+                if train_vis is None:
+                    train_vis = (batch, pred_cpu)
+                if train_vis_real is None and has_real:
+                    train_vis_real = (batch, pred_cpu)
 
             n_batches  += 1
             epoch_loss += loss.item()   # one sync per batch (unavoidable for loss display)
@@ -795,7 +807,7 @@ def main() -> None:
         elapsed   = time.perf_counter() - t0
         print(f"Epoch {epoch:3d}/{cfg.train.epochs}  loss={avg_loss:.4f}  "
               f"dice={avg_dice:.3f}  soft_dice={avg_sdice:.3f}  norm_dice={avg_nd:.3f}  "
-              f"batches={n_batches}  {elapsed:.0f}s")
+              f"batches={n_batches}  real={n_real_batches}  synth={n_batches - n_real_batches}  {elapsed:.0f}s")
 
         # Validation
         val_metrics, val_figs = validate(
@@ -809,8 +821,8 @@ def main() -> None:
               f"norm_dice={val_metrics['val/norm_dice']:.3f}")
 
         # Save best checkpoint
-        if val_metrics["val/auroc"] > best_auroc:
-            best_auroc = val_metrics["val/auroc"]
+        if val_metrics["val/dice"] > best_dice:
+            best_dice = val_metrics["val/dice"]
             ckpt = {
                 "epoch":   epoch,
                 "model":   model_module.state_dict(),
@@ -830,19 +842,20 @@ def main() -> None:
                     "soft_labels":     cfg.model.soft_labels,
                 },
                 "feature_level": level,
-                "val_auroc":     best_auroc,
+                "val_dice":      best_dice,
             }
             torch.save(ckpt, run_dir / "best.pt")
-            print(f"  saved best checkpoint  auroc={best_auroc:.3f}")
+            print(f"  saved best checkpoint  dice={best_dice:.3f}")
+
+        train_figs = {}
+        for vis in filter(None, [train_vis, train_vis_real]):
+            train_figs.update(save_train_figures(
+                vis[0], vis[1], out_size, fig_dir, epoch,
+                mask_pool=cfg.data.mask_pool,
+            ))
 
         if use_wandb:
             import wandb
-            train_figs = {}
-            if train_vis is not None:
-                train_figs = save_train_figures(
-                    train_vis[0], train_vis[1], out_size, fig_dir, epoch,
-                    mask_pool=cfg.data.mask_pool,
-                )
             all_figs = {k: wandb.Image(str(v)) for k, v in {**val_figs, **train_figs}.items()}
             wandb.log({"train/loss": avg_loss, "train/dice": avg_dice,
                        "train/soft_dice": avg_sdice, "train/norm_dice": avg_nd,
@@ -851,7 +864,7 @@ def main() -> None:
     if use_wandb:
         import wandb
         wandb.finish()
-    print(f"\nBest val AUROC: {best_auroc:.3f}  |  checkpoint: {run_dir}/best.pt")
+    print(f"\nBest val dice: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
 
 
 if __name__ == "__main__":

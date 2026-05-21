@@ -1,16 +1,22 @@
-# Feature-attention experiment: frozen STU-Net encoder + PatchICLAttention head.
+# Multilevel ICL experiment: coarse-to-fine PatchICLAttention.
 # Loaded on top of configs/config.yaml + cluster config.
-# Override any value from the CLI: python train.py key=value  (dot-notation)
+# Override from CLI: python train.py key=value  (dot-notation)
 
 data:
   image_size: [128, 128, 128]
-  output_size: [8, 8, 8]          # spatial grid fed to the attention model
+  resolutions:
+    - [8, 8, 8]
+    - [16, 16, 16]
+  n_patches_l1: 256          # NP₁: number of sparse patches at each level > 0
+  frac_entropy: 0.5          # fraction of L1 target patches from entropy (rest: certain-fg)
+  certain_thresh: 0.7        # pred_0 threshold for "certain foreground" target patches
+  fg_thresh: 0.1             # avg-pooled mask threshold for context foreground patches
   context_size: 1
   max_ds_len_train: 2000
-  mask_pool: avg                  # how to pool masks to output_size: max | avg
+  mask_pool: avg             # how to pool masks to grid: max | avg
   synth_method: slic
   synth_unions: true
-  p_synth: 1
+  p_synth: 0.5
   class_balanced: true
   use_crop: true
   random_coloring: false
@@ -51,33 +57,34 @@ data:
 model:
   stunet_variant: base
   stunet_pretrained: ${paths.checkpoints}/stunet/base_statedict.pt
-  feature_level: all              # encoder level: int index or 'all'
-  dim: 512                        # internal transformer working dim (projected from embed_dim)
+  feature_level: all         # encoder level: int index or 'all'
+  dim: 512                   # internal transformer working dim
   num_heads: 8
   num_layers: 4
   ff_factor: 2
-  label_injection: additive       # additive | concat | gate | none
-  output_head: linear             # linear | mlp | retrieval
-  pos_encoding: sinusoidal        # none | sinusoidal | learned
-  input_norm: rmsnorm             # none | rmsnorm | l2
+  label_injection: additive  # additive | concat | gate | none
+  output_head: linear        # linear | mlp | retrieval
+  pos_encoding: sinusoidal   # none | sinusoidal | learned
+  input_norm: rmsnorm        # none | rmsnorm | l2
   dropout: 0.1
   ctx_self_attn: true
   log_n_scaling: true
-  log_n_base: 512                 # reference context size for log-n scaling (1×8³)
-  soft_labels: true              # use when data.mask_pool=avg true → Linear(1,dim,bias=False) instead of Embedding(2,dim)
+  log_n_base: 512
+  soft_labels: true
 
 train:
+  loss_weights: [1.0, 1.0]   # weight for L0 and L1 losses
   epochs: 100
   batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 18
   val_items_per_class: 50
-  nd_interval: 20                 # compute train norm_dice every N batches
+  nd_interval: 20
   seed: 42
   aug: true
-  aug_preset: nnunet              # multiverseg | nnunet
+  aug_preset: nnunet
   wandb_project: patch_icl_3d_exps
   run_name: null
   checkpoint: null
-  device: null                    # null = auto-detect cuda/cpu
+  device: null
