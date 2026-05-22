@@ -1,6 +1,6 @@
 """3D Rotary Position Embedding utilities.
 
-Splits the attention dimension into 3 equal parts (rounded down to even),
+Splits the attention dimension into 3 axis blocks aligned to head_dim boundaries,
 one per spatial axis (d, h, w).  Any leftover features are left unrotated.
 
 Works with arbitrary token subsets — RoPE is applied via per-token integer
@@ -15,22 +15,31 @@ import torch
 
 
 def build_rope_cache_3d(
-    max_pos: int,
-    dim:     int,
-    base:    float = 10000.0,
+    max_pos:   int,
+    dim:       int,
+    num_heads: int   = 1,
+    base:      float = 10000.0,
 ) -> torch.Tensor:
     """Precompute 3D RoPE sin/cos cache.
 
     Args:
-        max_pos : positions 0 … max_pos-1 are covered
-        dim     : full attention dimension (applied before head split)
-        base    : RoPE base frequency
+        max_pos   : positions 0 … max_pos-1 are covered
+        dim       : full attention dimension (applied before head split)
+        num_heads : number of attention heads; per_axis is rounded down to the
+                    nearest multiple of head_dim so head boundaries never fall
+                    inside a rotated axis block (fixes mixed-axis heads)
+        base      : RoPE base frequency
 
     Returns:
-        (max_pos, n_pairs, 2)  where n_pairs = (dim // 3 rounded-to-even) // 2.
+        (max_pos, n_pairs, 2)  where n_pairs = per_axis // 2.
         The two trailing values are [cos, sin] for each (position, pair) entry.
     """
-    per_axis = ((dim // 3) // 2) * 2      # features per axis, rounded to even
+    head_dim = dim // max(num_heads, 1)
+    # Align per_axis to head_dim so no head straddles two axis blocks.
+    # Example: dim=512, num_heads=8, head_dim=64 → per_axis=128 (2 heads/axis).
+    per_axis = (dim // 3 // head_dim) * head_dim  # multiple of head_dim
+    if per_axis == 0:
+        per_axis = (dim // 3 // 2) * 2            # fallback: just round to even
     n_pairs  = per_axis // 2              # complex pairs per axis
     if n_pairs == 0:
         return torch.zeros(max_pos, 1, 2)

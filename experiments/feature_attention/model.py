@@ -143,7 +143,7 @@ class PatchICLAttention(nn.Module):
             self.pos_embed = nn.Embedding(N, dim)
         elif pos_encoding == "rope3d":
             _max_pos = rope_max_pos if rope_max_pos > 0 else max(grid_size)
-            rope_cache = build_rope_cache_3d(max_pos=_max_pos, dim=dim)
+            rope_cache = build_rope_cache_3d(max_pos=_max_pos, dim=dim, num_heads=num_heads)
             self.register_buffer("rope_cache_3d", rope_cache)  # not a param
 
         ff_dim = dim * ff_factor

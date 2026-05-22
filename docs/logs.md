@@ -1,5 +1,20 @@
 # Change log
 
+## 2026-05-22 — Fix head-boundary misalignment in 3D RoPE
+
+`src/rope3d.py`, `experiments/feature_attention/model.py`.
+
+`build_rope_cache_3d` previously computed `per_axis = ((dim // 3) // 2) * 2`, which
+for `dim=512` gives `per_axis=170` — not a multiple of `head_dim=64`. After the head
+split, heads 2 and 5 straddled two axis blocks (d+h and h+w respectively), receiving
+mixed-axis rotations.
+
+Fix: added `num_heads` parameter; `per_axis` is now rounded down to the nearest
+multiple of `head_dim`. For `dim=512, num_heads=8`: `per_axis=128` (64 pairs/axis),
+heads 0–1→d, 2–3→h, 4–5→w, 6–7 unrotated. Default `num_heads=1` preserves old
+behaviour for callers that don't pass it. Call in `PatchICLAttention.__init__` updated
+to pass `num_heads=num_heads`.
+
 ## 2026-05-20 — Synth pipeline fixes in _get_synth_item
 
 Three issues fixed in `TotalSegInContextDataset._get_synth_item`
