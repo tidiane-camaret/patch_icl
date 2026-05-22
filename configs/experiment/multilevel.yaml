@@ -8,14 +8,14 @@ data:
     - [8, 8, 8]
     - [16, 16, 16]
   n_patches_l1: 512          # NP₁: number of sparse patches at L1
-  sampling_temperature: 1.0  # Gumbel-TopK temperature (higher → more uniform sampling)
-  target_sampling: gt_foreground_entropy_balanced  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
+  sampling_temperature: 0.05  # Gumbel-TopK temperature (higher → more uniform sampling)
+  target_sampling: predicted_entropy  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
   context_size: 1
   max_ds_len_train: 2000
   mask_pool: avg             # how to pool masks to grid: max | avg
   synth_method: slic
   synth_unions: true
-  p_synth: 0.5
+  p_synth: 1
   class_balanced: true
   use_crop: true
   random_coloring: false
