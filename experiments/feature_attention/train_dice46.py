@@ -41,7 +41,6 @@ sys.path.insert(0, str(ROOT))
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
 from src.models.encoders.stunet import STUNetEncoder
 from experiments.feature_attention.model import PatchICLAttention
-from data.totalseg_classes import resolve_classes
 
 
 # ---------------------------------------------------------------------------
@@ -104,23 +103,6 @@ def downsample_multiclass(labels: torch.Tensor, size: tuple) -> torch.Tensor:
         pooled = F.adaptive_max_pool3d(binary, size).squeeze(1) > 0
         result[pooled] = int(lid)
     return result
-
-
-def colorize_soft(
-    labels:  torch.Tensor,   # (B, D, H, W) int64
-    palette: torch.Tensor,   # (B, L+1, 3) float
-    size:    tuple,          # (D', H', W')
-) -> torch.Tensor:           # (B, N, 3)  N = D'*H'*W'
-    """Soft RGB: each output patch = Σ_i avg_pool(label_i==lid) * color_i."""
-    B = labels.shape[0]
-    L = palette.shape[1] - 1
-    N = size[0] * size[1] * size[2]
-    # Build all-label one-hot in one shot, run a single pool kernel, then einsum.
-    lids    = torch.arange(1, L + 1, device=labels.device).view(1, L, 1, 1, 1)
-    one_hot = (labels.unsqueeze(1) == lids).float()                   # (B, L, D, H, W)
-    weights = F.adaptive_avg_pool3d(one_hot, size).reshape(B, L, N)   # (B, L, N)
-    result  = torch.einsum("bln,blc->bnc", weights, palette[:, 1:, :])
-    return result.clamp(0, 1)
 
 
 def downsample_mask(mask: torch.Tensor, size: tuple, mode: str = "max") -> torch.Tensor:
@@ -206,14 +188,18 @@ def process_batch(
     is_rgb   = palette is not None
     if is_rgb:
         palette = palette.to(device)  # (B, L+1, 3)
-        # Soft colorization: each patch = Σ avg_pool(label==i) * color_i
-        gt_loss  = colorize_soft(labels, palette, out_size)                       # (B, N, 3)
-        palette_rep = palette.unsqueeze(1).expand(-1, K, -1, -1).reshape(
-            B * K, palette.shape[1], 3
-        )
-        ctx_lbls = colorize_soft(
-            ctx_out.reshape(B * K, *ctx_out.shape[2:]), palette_rep, out_size
-        ).reshape(B, K * N, 3)                                                    # (B, K*N, 3)
+        # Downsample integer labels correctly: per-label binary max pool so each
+        # patch gets exactly one label's colour — no phantom colours from blending.
+        tgt_ds = downsample_multiclass(labels, out_size)                          # (B, D',H',W')
+        ctx_ds = downsample_multiclass(
+            ctx_out.reshape(B * K, *ctx_out.shape[2:]), out_size
+        ).reshape(B, K, D_, H_, W_)
+
+        # Colorise by palette lookup: palette[b, label_id] → RGB
+        tgt_idx  = tgt_ds.reshape(B, N)           # (B, N)
+        ctx_idx  = ctx_ds.reshape(B, K * N)       # (B, K*N)
+        gt_loss  = palette.gather(1, tgt_idx.unsqueeze(-1).expand(-1, -1, 3))    # (B, N, 3)
+        ctx_lbls = palette.gather(1, ctx_idx.unsqueeze(-1).expand(-1, -1, 3))    # (B, K*N, 3)
         gt_bin   = (gt_loss.norm(dim=-1) > 0).float()
     else:
         tgt_mask_ds = downsample_mask(labels, out_size, mask_pool)
@@ -290,13 +276,6 @@ def _overlay_multiclass(ax, image: np.ndarray, label_vol: np.ndarray, idx: int, 
     ax.axis("off")
 
 
-def _rgb_panel(ax, rgb_vol: np.ndarray, idx: int, title: str) -> None:
-    """rgb_vol: (D, H, W, 3) float in [0, 1] — displayed directly."""
-    ax.imshow(rgb_vol[idx].clip(0, 1))
-    ax.set_title(title, fontsize=8)
-    ax.axis("off")
-
-
 def _colored_vol(ax, label_vol: np.ndarray, palette: np.ndarray, idx: int, title: str) -> None:
     """label_vol: (D,H,W) int; palette: (L+1,3) float in [0,1]."""
     rgb = palette[label_vol[idx].clip(0, len(palette) - 1)]
@@ -342,13 +321,13 @@ def save_val_figure(
     else:
         _overlay(axes[0, 0], tgt_image, tgt_gt, tgt_z, "Target + GT")
 
-    # Downsampled GT and pred panels.
-    # RGB mode: both are (D', H', W', 3) soft float — display directly.
-    # Integer multiclass: use fixed viz palette. Binary: heatmap.
+    # Downsampled GT always uses fixed viz palette so all labels are visible.
+    # Pred: random_coloring mode maps RGB → class ID via training palette → viz color.
     max_lbl = int(np.asarray(tgt_gt_ds).max())
     if palette is not None:
-        _rgb_panel(axes[0, 1], tgt_gt_ds, tgt_z_ds, "GT ↓")
-        _rgb_panel(axes[0, 2], pred,      tgt_z_ds, "Prediction")
+        viz_pal = _viz_palette(max_lbl)
+        _colored_vol (axes[0, 1], tgt_gt_ds.astype(int), viz_pal, tgt_z_ds, "GT ↓")
+        _pred_colored(axes[0, 2], pred,                  palette, tgt_z_ds, "Prediction")
     elif max_lbl > 1:
         viz_pal = _viz_palette(max_lbl)
         _colored_vol(axes[0, 1], tgt_gt_ds.astype(int), viz_pal, tgt_z_ds, "GT ↓")
@@ -368,15 +347,12 @@ def save_val_figure(
             else:
                 _overlay(axes[1, 2 * k], ctx_images[k], ctx_gts[k], ctx_z, f"Ctx {k} + GT")
         if 2 * k + 1 < ncols:
-            if palette is not None:
-                _rgb_panel(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
+            ctx_max = int(np.asarray(ctx_gts_ds[k]).max())
+            if ctx_max > 1:
+                _colored_vol(axes[1, 2 * k + 1], ctx_gts_ds[k].astype(int),
+                             _viz_palette(ctx_max), ctx_z_ds, f"Ctx {k} GT ↓")
             else:
-                ctx_max = int(np.asarray(ctx_gts_ds[k]).max())
-                if ctx_max > 1:
-                    _colored_vol(axes[1, 2 * k + 1], ctx_gts_ds[k].astype(int),
-                                 _viz_palette(ctx_max), ctx_z_ds, f"Ctx {k} GT ↓")
-                else:
-                    _heatmap(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
+                _heatmap(axes[1, 2 * k + 1], ctx_gts_ds[k], ctx_z_ds, f"Ctx {k} GT ↓")
     for col in range(2 * K, ncols):
         axes[1, col].set_visible(False)
 
@@ -397,7 +373,6 @@ def save_train_figures(
     fig_dir:   Path,
     epoch:     int,
     n_samples: int = 2,
-    mask_pool: str = "max",
 ) -> dict:
     """Save figures for the first n_samples items of a training batch.
 
@@ -420,17 +395,16 @@ def save_train_figures(
 
         palette = None
         if pred.ndim == 3 and "label_palette" in batch:
-            # RGB mode: soft colorized GT + raw RGB pred → direct RGB rendering
-            palette_t  = batch["label_palette"][i]                        # (L+1, 3)
-            palette    = palette_t.numpy()
-            tgt_gt_ds  = colorize_soft(
-                batch["label"][i].unsqueeze(0), palette_t.unsqueeze(0), out_size
-            ).squeeze(0).numpy().reshape(D_, H_, W_, 3)                   # (D', H', W', 3)
+            # RGB mode: integer label GT + raw RGB pred → coloured rendering
+            palette    = batch["label_palette"][i].numpy()                # (L+1, 3)
+            tgt_gt_ds  = downsample_multiclass(
+                batch["label"][i].unsqueeze(0), out_size
+            ).squeeze(0).numpy().astype(int)                              # (D', H', W') int
             pred_vol   = pred[i].numpy().reshape(D_, H_, W_, 3)          # (D', H', W', 3)
             ctx_gts_ds = [
-                colorize_soft(
-                    batch["context_out"][i, k].unsqueeze(0), palette_t.unsqueeze(0), out_size
-                ).squeeze(0).numpy().reshape(D_, H_, W_, 3)
+                downsample_multiclass(
+                    batch["context_out"][i, k].unsqueeze(0), out_size
+                ).squeeze(0).numpy().astype(int)
                 for k in range(K)
             ]
         else:
@@ -440,8 +414,8 @@ def save_train_figures(
             ).squeeze(0).numpy().astype(int)                              # (D', H', W') int
             pred_vol   = pred[i].numpy().reshape(D_, H_, W_)             # (D', H', W') scalar
             ctx_gts_ds = [
-                downsample_mask(batch["context_out"][i, k].unsqueeze(0), out_size, mask_pool)
-                .squeeze(0).numpy()
+                (downsample_mask(batch["context_out"][i, k].unsqueeze(0), out_size, "max") > 0)
+                .float().squeeze(0).numpy()
                 for k in range(K)
             ]
 
@@ -527,8 +501,6 @@ def validate(
 
             tgt_feat = tgt_feat_ds.reshape(1, C, N).permute(0, 2, 1)
             ctx_feat = ctx_feat_ds.permute(0, 1, 3, 4, 5, 2).reshape(1, K * N, C)
-            #ctx_raw  = ctx_mask_ds.reshape(1, K * N)
-            #ctx_lbls = ctx_raw if model.soft_labels else (ctx_raw > 0).float()
             ctx_lbls = (ctx_mask_ds.reshape(1, K * N) > 0).float()
             if model.label_dim > 1:
                 ctx_lbls = ctx_lbls.unsqueeze(-1).expand(-1, -1, model.label_dim)
@@ -616,9 +588,8 @@ def main() -> None:
         aug_yaml = ROOT / "configs" / "augmentations" / f"{cfg.train.aug_preset}.yaml"
         aug_cfg  = OmegaConf.load(aug_yaml).augmentations
 
-    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
-    val_classes   = resolve_classes(cfg.data.val_classes, cfg.paths.totalseg) if cfg.data.val_classes else []
-    val_classes   = val_classes or train_classes
+    train_classes = list(cfg.data.train_classes)
+    val_classes   = list(cfg.data.val_classes) or train_classes
 
     # ---- Datasets ----------------------------------------------------------
     ds_train = TotalSegInContextDataset(
@@ -709,13 +680,13 @@ def main() -> None:
     scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
     amp       = device.type == "cuda"
 
-    best_dice = -1.0
+    best_auroc = -1.0
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model"])
-        best_dice = ckpt.get("val_dice", -1.0)
+        best_auroc = ckpt.get("val_auroc", -1.0)
         print(f"Loaded checkpoint: {cfg.train.checkpoint}  "
-              f"(epoch {ckpt['epoch']}, val_dice={best_dice:.3f})")
+              f"(epoch {ckpt['epoch']}, val_auroc={best_auroc:.3f})")
 
     model_module = model
 
@@ -737,7 +708,7 @@ def main() -> None:
     fig_dir = run_dir / "figures"
 
     # ---- Training ----------------------------------------------------------
-    best_dice = -1.0
+    best_auroc = -1.0
     nd_interval = cfg.train.nd_interval
     for epoch in range(1, cfg.train.epochs + 1):
         model.train()
@@ -746,9 +717,7 @@ def main() -> None:
         last_nd, last_dice, last_sdice = float("nan"), float("nan"), float("nan")
         t0 = time.perf_counter()
 
-        train_vis: tuple | None = None        # first batch (any type)
-        train_vis_real: tuple | None = None   # first batch with ≥1 real label
-        n_real_batches = 0
+        train_vis: tuple | None = None   # (batch_cpu, pred_cpu) from first batch
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
         for batch in bar:
             pred, gt_loss, gt_bin = process_batch(
@@ -768,18 +737,8 @@ def main() -> None:
                 loss.backward()
                 optimizer.step()
 
-            names = batch.get("label_names", [])
-            has_real = any(not n.startswith("sv_") for n in names)
-            if has_real:
-                n_real_batches += 1
-
-            # Only pay the CPU-sync cost for the two capture slots
-            if train_vis is None or (train_vis_real is None and has_real):
-                pred_cpu = pred.detach().cpu()
-                if train_vis is None:
-                    train_vis = (batch, pred_cpu)
-                if train_vis_real is None and has_real:
-                    train_vis_real = (batch, pred_cpu)
+            if train_vis is None:
+                train_vis = (batch, pred.detach().cpu())
 
             n_batches  += 1
             epoch_loss += loss.item()   # one sync per batch (unavoidable for loss display)
@@ -809,7 +768,7 @@ def main() -> None:
         elapsed   = time.perf_counter() - t0
         print(f"Epoch {epoch:3d}/{cfg.train.epochs}  loss={avg_loss:.4f}  "
               f"dice={avg_dice:.3f}  soft_dice={avg_sdice:.3f}  norm_dice={avg_nd:.3f}  "
-              f"batches={n_batches}  real={n_real_batches}  synth={n_batches - n_real_batches}  {elapsed:.0f}s")
+              f"batches={n_batches}  {elapsed:.0f}s")
 
         # Validation
         val_metrics, val_figs = validate(
@@ -823,8 +782,8 @@ def main() -> None:
               f"norm_dice={val_metrics['val/norm_dice']:.3f}")
 
         # Save best checkpoint
-        if val_metrics["val/dice"] > best_dice:
-            best_dice = val_metrics["val/dice"]
+        if val_metrics["val/auroc"] > best_auroc:
+            best_auroc = val_metrics["val/auroc"]
             ckpt = {
                 "epoch":   epoch,
                 "model":   model_module.state_dict(),
@@ -844,20 +803,18 @@ def main() -> None:
                     "soft_labels":     cfg.model.soft_labels,
                 },
                 "feature_level": level,
-                "val_dice":      best_dice,
+                "val_auroc":     best_auroc,
             }
             torch.save(ckpt, run_dir / "best.pt")
-            print(f"  saved best checkpoint  dice={best_dice:.3f}")
-
-        train_figs = {}
-        for vis in filter(None, [train_vis, train_vis_real]):
-            train_figs.update(save_train_figures(
-                vis[0], vis[1], out_size, fig_dir, epoch,
-                mask_pool=cfg.data.mask_pool,
-            ))
+            print(f"  saved best checkpoint  auroc={best_auroc:.3f}")
 
         if use_wandb:
             import wandb
+            train_figs = {}
+            if train_vis is not None:
+                train_figs = save_train_figures(
+                    train_vis[0], train_vis[1], out_size, fig_dir, epoch,
+                )
             all_figs = {k: wandb.Image(str(v)) for k, v in {**val_figs, **train_figs}.items()}
             wandb.log({"train/loss": avg_loss, "train/dice": avg_dice,
                        "train/soft_dice": avg_sdice, "train/norm_dice": avg_nd,
@@ -866,7 +823,7 @@ def main() -> None:
     if use_wandb:
         import wandb
         wandb.finish()
-    print(f"\nBest val dice: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
+    print(f"\nBest val AUROC: {best_auroc:.3f}  |  checkpoint: {run_dir}/best.pt")
 
 
 if __name__ == "__main__":

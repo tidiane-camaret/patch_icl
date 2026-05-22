@@ -6,9 +6,9 @@ data:
   image_size: [128, 128, 128]
   resolutions:
     - [8, 8, 8]
-    - [16, 16, 16]
+  #  - [16, 16, 16]
   n_patches_l1: 512          # NP₁: number of sparse patches at L1
-  sampling_temperature: 0.05  # Gumbel-TopK temperature (higher → more uniform sampling)
+  sampling_temperature: 0.1  # Gumbel-TopK temperature (higher → more uniform sampling)
   target_sampling: predicted_entropy  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
   context_size: 1
   max_ds_len_train: 2000
@@ -57,19 +57,20 @@ model:
   stunet_variant: base
   stunet_pretrained: ${paths.checkpoints}/stunet/base_statedict.pt
   feature_level: all         # encoder level: int index or 'all'
-  dim: 512                   # internal transformer working dim
+  dim: 256                   # internal transformer working dim
   num_heads: 8
   num_layers: 4
   ff_factor: 2
-  label_injection: concat  # additive | concat | gate | none
+  label_injection: additive  # additive | concat | gate | none
   output_head: linear        # linear | mlp | retrieval
-  pos_encoding: rope3d       # none | sinusoidal | learned | rope3d
+  pos_encoding: sinusoidal       # none | sinusoidal | learned | rope3d
   input_norm: rmsnorm        # none | rmsnorm | l2
   dropout: 0.1
   ctx_self_attn: true
   log_n_scaling: true
   log_n_base: 512
-  soft_labels: true
+  soft_labels_train: true   # feed fractional avg-pool values to the model during training
+  soft_labels_eval: false   # binarize ctx labels at inference (cleaner retrieval signal)
 
 train:
   loss_weights: [1.0, 1.0]   # weight for L0 and L1 losses
