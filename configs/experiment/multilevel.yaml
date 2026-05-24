@@ -6,15 +6,19 @@ data:
   image_size: [128, 128, 128]
   resolutions:
     - [8, 8, 8]
-  #  - [16, 16, 16]
-  n_patches_l1: 512          # NP₁: number of sparse patches at L1
-  sampling_temperature: 0.1  # Gumbel-TopK temperature (higher → more uniform sampling)
+    - [16, 16, 16]
+    - [32, 32, 32]
+    #- [64, 64, 64]
+    #- [128, 128, 128]
+  n_patches_l1: 256          # NP₁: number of sparse patches at L1
+  sampling_temperature: 0.2  # Gumbel-TopK temperature (higher → more uniform sampling)
   target_sampling: predicted_entropy  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
   context_size: 1
   max_ds_len_train: 2000
   mask_pool: avg             # how to pool masks to grid: max | avg
   synth_method: slic
-  synth_unions: true
+  n_synth_merge_min: 1   # min number of adjacent SVs merged per label (inclusive)
+  n_synth_merge_max: 5   # max number of adjacent SVs merged per label (inclusive)
   p_synth: 1
   class_balanced: true
   use_crop: true
@@ -22,55 +26,35 @@ data:
   num_labels_per_sample: 1
   train_classes:
     - liver
-    - lung_lower_lobe_right
-    - lung_lower_lobe_left
-    - lung_upper_lobe_right
-    - lung_upper_lobe_left
-    - lung_middle_lobe_right
-    - small_bowel
-    - heart
-    - autochthon_left
-    - autochthon_right
-    - hip_left
-    - hip_right
-    - aorta
-    - brain
-    - skull
-  val_classes:
-    - colon
-    - stomach
-    - spleen
-    - gluteus_maximus_right
-    - gluteus_maximus_left
-    - gluteus_medius_left
-    - gluteus_medius_right
-    - iliopsoas_left
-    - iliopsoas_right
-    - costal_cartilages
-    - urinary_bladder
-    - femur_left
-    - femur_right
-    - sacrum
-    - kidney_left
-
+  val_classes: benchmark
 model:
   stunet_variant: base
   stunet_pretrained: ${paths.checkpoints}/stunet/base_statedict.pt
   feature_level: all         # encoder level: int index or 'all'
   dim: 256                   # internal transformer working dim
   num_heads: 8
-  num_layers: 4
+  num_layers: 8
   ff_factor: 2
-  label_injection: additive  # additive | concat | gate | none
+  label_injection: concat  # additive | concat | gate | none
   output_head: linear        # linear | mlp | retrieval
-  pos_encoding: sinusoidal       # none | sinusoidal | learned | rope3d
+  pos_encoding: rope3d       # none | sinusoidal | learned | rope3d
   input_norm: rmsnorm        # none | rmsnorm | l2
   dropout: 0.1
   ctx_self_attn: true
   log_n_scaling: true
   log_n_base: 512
-  soft_labels_train: true   # feed fractional avg-pool values to the model during training
-  soft_labels_eval: false   # binarize ctx labels at inference (cleaner retrieval signal)
+  # Context label encoding — two modes (pick one):
+  #   CNN encoder : mask_cnn_dim > 0  — 3D ConvNet encodes the context mask at the finest
+  #                                     resolution once, then interpolates to each level.
+  #                                     label_injection (above) mixes the resulting embedding
+  #                                     into context tokens.
+  #   Scalar      : mask_cnn_dim = 0  — avg-pool value per patch fed directly to label_inject.
+  mask_cnn_dim: 32
+  soft_labels_train: true   # keep avg-pool [0,1] values as CNN/scalar input during training
+  soft_labels_eval: false   # binarize to {0,1} at inference (cleaner signal)
+  num_registers: 4          # register tokens appended to context K/V and cascaded between levels (0 = off)
+  append_zero_attn: false   # add a null K/V slot to cross-attention so target patches can "abstain"
+  detach_cascade_registers: true  # detach register gradients between levels (false = cross-level gradient coupling)
 
 train:
   loss_weights: [1.0, 1.0]   # weight for L0 and L1 losses

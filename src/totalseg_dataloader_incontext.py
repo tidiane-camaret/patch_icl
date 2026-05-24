@@ -26,8 +26,10 @@ Usage
 import csv
 import hashlib
 import math
+import os
 import pickle
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +55,38 @@ _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+def _adj_for_subject(root: Path, subj: str, synth_fname: str) -> tuple[str, dict | None]:
+    """Vectorised face-adjacency computation for one subject (module-level for pickling)."""
+    try:
+        arr = np.load(root / subj / synth_fname, mmap_mode="r")
+        edge_lists = []
+        for axis in range(3):
+            sl_a = [slice(None)] * 3; sl_a[axis] = slice(None, -1)
+            sl_b = [slice(None)] * 3; sl_b[axis] = slice(1, None)
+            a = arr[tuple(sl_a)].ravel()
+            b = arr[tuple(sl_b)].ravel()
+            mask = (a != b) & (a > 0) & (b > 0)
+            if mask.any():
+                edge_lists.append(np.stack([a[mask], b[mask]], axis=1))
+        if not edge_lists:
+            return subj, {}
+        edges = np.concatenate(edge_lists)
+        edges = np.sort(edges, axis=1)       # canonical direction per edge
+        edges = np.unique(edges, axis=0)     # deduplicate
+        us = np.concatenate([edges[:, 0], edges[:, 1]])
+        vs = np.concatenate([edges[:, 1], edges[:, 0]])
+        order = np.argsort(us, stable=True)
+        us, vs = us[order], vs[order]
+        unique_u, starts = np.unique(us, return_index=True)
+        ends = np.append(starts[1:], len(us))
+        return subj, {
+            int(uid): frozenset(vs[starts[j]:ends[j]].tolist())
+            for j, uid in enumerate(unique_u.tolist())
+        }
+    except Exception as e:
+        return subj, None
+
 
 class TotalSegInContextDataset(Dataset):
     """
@@ -112,6 +146,8 @@ class TotalSegInContextDataset(Dataset):
         crop_jitter: Optional[int] = None,
         random_coloring: bool = False,
         num_labels_per_sample: int = 1,
+        n_synth_merge_min: int = 1,
+        n_synth_merge_max: int = 1,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -172,17 +208,27 @@ class TotalSegInContextDataset(Dataset):
         else:
             self._bbox_cache = {}
 
+        self.n_synth_merge_min = n_synth_merge_min
+        self.n_synth_merge_max = n_synth_merge_max
+
         # Synth path: build SV-ID cache for fast __getitem__ sampling
         if synth_method is not None:
-            suffix = "_union" if synth_unions else ""
+            # n_synth_merge_max > 1 → always load base labels and merge on-the-fly
+            suffix = "" if n_synth_merge_max > 1 else ("_union" if synth_unions else "")
             self._synth_fname = f"label_synth_{synth_method}{suffix}.npy"
             self._synth_subjects, self._synth_sv_ids = \
                 self._load_or_build_synth_cache(subjects)
-            print(f"Synth path: method={synth_method} unions={synth_unions} "
+            print(f"Synth path: method={synth_method} "
+                  f"n_synth_merge=[{n_synth_merge_min},{n_synth_merge_max}] "
                   f"p_synth={p_synth} | {len(self._synth_subjects)} subjects", flush=True)
+            if n_synth_merge_max > 1:
+                self._adj_cache = self._load_or_build_adj_cache()
+            else:
+                self._adj_cache = {}
         else:
             self._synth_subjects = []
             self._synth_sv_ids   = {}
+            self._adj_cache      = {}
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -271,6 +317,79 @@ class TotalSegInContextDataset(Dataset):
             pickle.dump(sv_ids, f)
         print(f"Synth SV cache saved ({len(sv_ids)} subjects).", flush=True)
         return synth_subs, sv_ids
+
+    def _load_or_build_adj_cache(self) -> dict[str, dict[int, frozenset[int]]]:
+        """
+        Return {subject: {sv_id: frozenset[face-adjacent sv_ids]}} built from
+        label_synth_{method}.npy (native resolution).  Built once, keyed by
+        synth filename + subject hash.  Used for on-the-fly random SV merging.
+        """
+        synth_subs = [s for s in self._synth_subjects
+                      if (self.root / s / self._synth_fname).exists()]
+        key = hashlib.sha256(
+            ("adj_" + self._synth_fname + "|".join(synth_subs)).encode()
+        ).hexdigest()[:12]
+        cache_path = self.root / f".adj_cache_{key}.pkl"
+
+        if cache_path.exists():
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            print(f"Loaded adj cache ({len(cache)} subjects) from {cache_path.name}",
+                  flush=True)
+            return cache
+
+        n_workers = min(16, os.cpu_count() or 1)
+        print(f"Building adj cache for {len(synth_subs)} subjects "
+              f"({self._synth_fname}, {n_workers} workers)...", flush=True)
+        cache: dict[str, dict[int, frozenset[int]]] = {}
+        done = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futs = {
+                ex.submit(_adj_for_subject, self.root, subj, self._synth_fname): subj
+                for subj in synth_subs
+            }
+            for fut in as_completed(futs):
+                try:
+                    subj, adj = fut.result()
+                    if adj is not None:
+                        cache[subj] = adj
+                    else:
+                        print(f"  Skipping adj for {subj}", flush=True)
+                except Exception as e:
+                    print(f"  Error in adj worker: {e}", flush=True)
+                done += 1
+                if done % 100 == 0:
+                    print(f"  adj cache: {done}/{len(synth_subs)}", flush=True)
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache, f)
+        print(f"Adj cache saved ({len(cache)} subjects).", flush=True)
+        return cache
+
+    @staticmethod
+    def _sample_merged_svs(
+        sv_ids_list: list[int],
+        adj: dict[int, frozenset[int]],
+        n_min: int,
+        n_max: int,
+    ) -> list[int]:
+        """Pick a seed SV then BFS-expand to randint(n_min, n_max) face-adjacent neighbors."""
+        seed = random.choice(sv_ids_list)
+        n_target = random.randint(n_min, n_max)
+        if n_target == 1:
+            return [seed]
+        merged = [seed]
+        merged_set = {seed}
+        frontier = list(adj.get(seed, frozenset()))
+        random.shuffle(frontier)
+        while len(merged) < n_target and frontier:
+            nxt = frontier.pop()
+            if nxt in merged_set:
+                continue
+            merged.append(nxt)
+            merged_set.add(nxt)
+            frontier += [sv for sv in adj.get(nxt, frozenset()) if sv not in merged_set]
+        return merged
 
     def _load_or_build_bbox_cache(self) -> dict[str, dict[str, tuple[int, int, int]]]:
         """
@@ -400,21 +519,31 @@ class TotalSegInContextDataset(Dataset):
         sv_ids   = self._synth_sv_ids[subj]
         subj_dir = self.root / subj
 
-        # Pick num_labels_per_sample supervoxel IDs without replacement
+        # Build SV groups: each group merges 1..n_synth_merge adjacent SVs into one label
         sv_ids_list = sv_ids.tolist()
         n_pick      = min(self.num_labels_per_sample, len(sv_ids_list))
-        picked_svs  = random.sample(sv_ids_list, n_pick)
+        adj         = self._adj_cache.get(subj, {})
+        sv_groups:  list[list[int]] = []
+        used:       set[int] = set()
+        for _ in range(n_pick):
+            available = [sv for sv in sv_ids_list if sv not in used]
+            if not available:
+                break
+            group = self._sample_merged_svs(available, adj, self.n_synth_merge_min, self.n_synth_merge_max)
+            sv_groups.append(group)
+            used.update(group)
 
         if self.use_crop:
-            # Native-res crop centred on union of picked supervoxels
+            # Native-res crop centred on union of all picked supervoxels
             T     = self.image_size[0]
             ct_mm = np.load(subj_dir / "ct.npy",          mmap_mode="r")
             sv_mm = np.load(subj_dir / self._synth_fname, mmap_mode="r")
             D, H, W = sv_mm.shape
 
             sv_union = np.zeros((D, H, W), dtype=bool)
-            for sv_id in picked_svs:
-                sv_union |= (sv_mm == sv_id)
+            for group in sv_groups:
+                for sv_id in group:
+                    sv_union |= (sv_mm == sv_id)
             n = int(sv_union.sum())
             if n > 0:
                 d_g = np.arange(D, dtype=np.float32)[:, None, None]
@@ -442,8 +571,9 @@ class TotalSegInContextDataset(Dataset):
             img_arr = np.zeros((T, T, T), dtype=np.float32)
             msk_arr = np.zeros((T, T, T), dtype=np.uint8)
             img_arr[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
-            for label_id, sv_id in enumerate(picked_svs, 1):
-                msk_arr[:s[0], :s[1], :s[2]][crop_sv[:s[0], :s[1], :s[2]] == sv_id] = label_id
+            for label_id, group in enumerate(sv_groups, 1):
+                for sv_id in group:
+                    msk_arr[:s[0], :s[1], :s[2]][crop_sv[:s[0], :s[1], :s[2]] == sv_id] = label_id
 
             image_t = torch.from_numpy(img_arr).unsqueeze(0)  # (1, T, T, T)
             mask_t  = torch.from_numpy(msk_arr).long()        # (T, T, T)
@@ -471,14 +601,16 @@ class TotalSegInContextDataset(Dataset):
             if sized_synth is not None and sized_synth.exists():
                 sv_vol = np.load(sized_synth, mmap_mode="r")
                 mask   = np.zeros_like(sv_vol, dtype=np.uint8)
-                for label_id, sv_id in enumerate(picked_svs, 1):
-                    mask[sv_vol == sv_id] = label_id
+                for label_id, group in enumerate(sv_groups, 1):
+                    for sv_id in group:
+                        mask[sv_vol == sv_id] = label_id
                 mask_t = torch.from_numpy(mask).long()                  # (D, H, W)
             else:
                 sv_vol  = np.load(subj_dir / self._synth_fname, mmap_mode="r")
                 mask    = np.zeros_like(sv_vol, dtype=np.uint8)
-                for label_id, sv_id in enumerate(picked_svs, 1):
-                    mask[sv_vol == sv_id] = label_id
+                for label_id, group in enumerate(sv_groups, 1):
+                    for sv_id in group:
+                        mask[sv_vol == sv_id] = label_id
                 mask_t  = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
                 if self.image_size is not None:
                     T = self.image_size[0]
@@ -510,7 +642,7 @@ class TotalSegInContextDataset(Dataset):
             "context_in":  torch.stack([it[0] for it in items[1:]]),  # (K, 1, D, H, W)
             "context_out": torch.stack(ctx_masks),                     # (K, D, H, W) int64
             "subject":     subj,
-            "label_name":  f"sv_{picked_svs[0]}",
+            "label_name":  f"sv_{sv_groups[0][0]}",
         }
         if self.random_coloring:
             item["label_palette"] = self._sample_palette(
@@ -806,6 +938,8 @@ def get_incontext_loader(
     crop_jitter: Optional[int] = None,
     random_coloring: bool = False,
     num_labels_per_sample: int = 1,
+    n_synth_merge_min: int = 1,
+    n_synth_merge_max: int = 1,
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -823,6 +957,8 @@ def get_incontext_loader(
         crop_jitter=crop_jitter,
         random_coloring=random_coloring,
         num_labels_per_sample=num_labels_per_sample,
+        n_synth_merge_min=n_synth_merge_min,
+        n_synth_merge_max=n_synth_merge_max,
     )
     return DataLoader(
         ds,

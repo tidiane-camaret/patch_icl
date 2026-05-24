@@ -175,6 +175,48 @@ def grid_coords_3d(grid_size: tuple, device: torch.device) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Context label encoding
+# ---------------------------------------------------------------------------
+
+def _encode_ctx_labels(
+    ctx_mask_i:   torch.Tensor,         # (B, K, *res) float avg-pool
+    ctx_idx:      torch.Tensor | None,  # (B, NP) long | None → dense
+    soft:         bool,
+    mask_cnn_vol: torch.Tensor | None,  # (B*K, mask_dim, D_f, H_f, W_f) pre-encoded
+    res:          tuple,                # current level resolution
+) -> torch.Tensor:
+    """Build context label tensor for one resolution level.
+
+    With mask_cnn_vol: trilinearly interpolate the pre-encoded feature volume to
+    `res`, then gather sparse positions when ctx_idx is given.
+    Without it: scalar avg-pool values (original behaviour).
+    """
+    B, K = ctx_mask_i.shape[:2]
+    N    = res[0] * res[1] * res[2]
+
+    if mask_cnn_vol is not None:
+        mask_dim = mask_cnn_vol.shape[1]
+        feat = (
+            F.interpolate(mask_cnn_vol, size=res, mode="trilinear", align_corners=False)
+            if tuple(mask_cnn_vol.shape[2:]) != res
+            else mask_cnn_vol
+        )  # (B*K, mask_dim, *res)
+        emb = feat.flatten(2).transpose(1, 2).reshape(B, K, N, mask_dim)
+        if ctx_idx is None:
+            return emb.reshape(B, K * N, mask_dim)
+        idx_exp = ctx_idx.unsqueeze(-1).expand(-1, -1, mask_dim)
+        return torch.cat([emb[:, k].gather(1, idx_exp) for k in range(K)], dim=1)
+
+    # Scalar fallback
+    flat = ctx_mask_i.reshape(B, K, N)
+    if ctx_idx is None:
+        lbl = flat.reshape(B, K * N)
+    else:
+        lbl = torch.cat([flat[:, k].gather(1, ctx_idx) for k in range(K)], dim=1)
+    return lbl if soft else (lbl > 0).float()
+
+
+# ---------------------------------------------------------------------------
 # Forward pass for one batch
 # ---------------------------------------------------------------------------
 
@@ -185,12 +227,15 @@ def process_batch(
     cfg:       OmegaConf,
     device:    torch.device,
     amp:       bool = False,
-) -> tuple[list, torch.Tensor, list]:
-    """Returns (preds, loss, level_losses).
+) -> tuple[list, torch.Tensor, list, list, list, list]:
+    """Returns (preds, loss, level_losses, grid_preds, tgt_idxs, ctx_idxs).
 
     preds        : per-level predictions — (B, N_i) dense for L0, (B, NP) sparse for L>0
     loss         : weighted scalar loss
     level_losses : per-level loss scalars for logging
+    grid_preds   : per-level fused prediction grids — (B, N_i)
+    tgt_idxs     : per-level sampled target indices — None for L0, (B, NP) for L>0
+    ctx_idxs     : per-level sampled context indices — None for L0, (B, NP) for L>0
     """
     images  = batch["image"].to(device, non_blocking=True)
     labels  = batch["label"].to(device, non_blocking=True)
@@ -209,8 +254,24 @@ def process_batch(
         ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
         ctx_feats_flat = encode_image_only(encoder, ctx_imgs_flat)
 
-    preds, grid_preds, raw_losses = [], [], []
+    preds, grid_preds, raw_losses, tgt_idxs, ctx_idxs = [], [], [], [], []
     C = None
+    cascade_regs = None
+
+    # Encode context masks once at finest resolution; interpolate per level below
+    mask_cnn_vol = None
+    if model.mask_cnn is not None:
+        finest_res = resolutions[-1]
+        mask_in = downsample_mask(
+            ctx_out.reshape(B * K, *ctx_out.shape[2:]), finest_res, cfg.data.mask_pool
+        ).unsqueeze(1)                                    # (B*K, 1, *finest_res)
+        if not cfg.model.soft_labels_train:
+            mask_in = (mask_in > 0).float()
+        with torch.autocast(device_type=device.type, enabled=amp):
+            emb = model.mask_cnn(mask_in)                # (B*K, N_f, mask_dim)
+        mask_cnn_vol = emb.transpose(1, 2).reshape(
+            B * K, model.mask_cnn_dim, *finest_res
+        )                                                 # (B*K, mask_dim, D_f, H_f, W_f)
 
     for i, res in enumerate(resolutions):
         N = res[0] * res[1] * res[2]
@@ -223,13 +284,13 @@ def process_batch(
             ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
         ).reshape(B, K, *res)
 
+        tgt_idx = ctx_idx = None
         if i == 0:
             # Dense forward over all N patches
             tgt_f   = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
             ctx_f   = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K * N, C)
-            ctx_lbl = ctx_mask_i.reshape(B, K * N)
-            if not cfg.model.soft_labels_train:
-                ctx_lbl = (ctx_lbl > 0).float()
+            ctx_lbl = _encode_ctx_labels(ctx_mask_i, None, cfg.model.soft_labels_train,
+                                         mask_cnn_vol, res)
             gt      = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
 
             coords   = grid_coords_3d(res, device)
@@ -237,9 +298,15 @@ def process_batch(
             ctx_crds = coords.unsqueeze(0).expand(B, -1, -1).repeat(1, K, 1)
 
             with torch.autocast(device_type=device.type, enabled=amp):
-                pred = model[i](tgt_f, ctx_f, ctx_lbl,
-                                tgt_coords=tgt_crds, ctx_coords=ctx_crds)
-            pred      = pred.float()
+                result = model[i](tgt_f, ctx_f, ctx_lbl,
+                                  tgt_coords=tgt_crds, ctx_coords=ctx_crds,
+                                  cascade_registers=cascade_regs)
+            if isinstance(result, tuple):
+                regs = result[1]
+                cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
+                pred = result[0].float()
+            else:
+                pred = result.float()
             grid_pred = pred
 
         else:
@@ -256,19 +323,14 @@ def process_batch(
                                              cfg.data.target_sampling)
             ctx_idx  = sample_context_patches(ctx_mask_i, NP, temp)
 
-            tgt_flat      = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
-            ctx_flat      = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K, N, C)
-            ctx_mask_flat = ctx_mask_i.reshape(B, K, N)
+            tgt_flat = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
+            ctx_flat = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K, N, C)
 
             tgt_sparse = gather_patches(tgt_flat, tgt_idx)
-            ctx_pieces, ctx_lbl_pieces = [], []
-            for k in range(K):
-                ctx_pieces.append(gather_patches(ctx_flat[:, k], ctx_idx))
-                ctx_lbl_pieces.append(ctx_mask_flat[:, k].gather(1, ctx_idx))
+            ctx_pieces = [gather_patches(ctx_flat[:, k], ctx_idx) for k in range(K)]
             ctx_sparse = torch.cat(ctx_pieces, dim=1)
-            ctx_lbl    = torch.cat(ctx_lbl_pieces, dim=1)
-            if not cfg.model.soft_labels_train:
-                ctx_lbl = (ctx_lbl > 0).float()
+            ctx_lbl    = _encode_ctx_labels(ctx_mask_i, ctx_idx, cfg.model.soft_labels_train,
+                                            mask_cnn_vol, res)
 
             coords   = grid_coords_3d(res, device)
             tgt_crds = coords[tgt_idx.reshape(-1)].reshape(B, NP, 3)
@@ -276,9 +338,15 @@ def process_batch(
             ctx_crds = ctx_crds.unsqueeze(1).expand(-1, K, -1, -1).reshape(B, K * NP, 3)
 
             with torch.autocast(device_type=device.type, enabled=amp):
-                pred = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
-                                tgt_coords=tgt_crds, ctx_coords=ctx_crds)
-            pred      = pred.float()
+                result = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
+                                  tgt_coords=tgt_crds, ctx_coords=ctx_crds,
+                                  cascade_registers=cascade_regs)
+            if isinstance(result, tuple):
+                regs = result[1]
+                cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
+                pred = result[0].float()
+            else:
+                pred = result.float()
             grid_pred = prev_up.clone()
             grid_pred.scatter_(1, tgt_idx, pred)
             gt        = gt_flat.gather(1, tgt_idx)
@@ -286,13 +354,15 @@ def process_batch(
         raw_losses.append(F.binary_cross_entropy(pred, gt))
         preds.append(pred)
         grid_preds.append(grid_pred)
+        tgt_idxs.append(tgt_idx)
+        ctx_idxs.append(ctx_idx)
 
     weights = list(cfg.train.loss_weights)
     while len(weights) < len(raw_losses):
         weights.append(1.0)
     loss = sum(w * l for w, l in zip(weights, raw_losses))
 
-    return preds, loss, [l.item() for l in raw_losses]
+    return preds, loss, [l.item() for l in raw_losses], grid_preds, tgt_idxs, ctx_idxs
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +532,65 @@ def save_val_figure(
 
 
 # ---------------------------------------------------------------------------
+# Training synth visualisation
+# ---------------------------------------------------------------------------
+
+def _save_synth_train_figure(
+    batch:       dict,
+    preds:       list,
+    grid_preds:  list,
+    tgt_idxs:    list,
+    ctx_idxs:    list,
+    b:           int,
+    epoch:       int,
+    out_dir:     Path,
+    resolutions: list,
+    cfg:         OmegaConf,
+) -> Path:
+    """Save a multilevel pred figure for one synth training item (no grad needed)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    label_name = batch["label_names"][b]
+    label_b    = batch["label"][b:b + 1]          # CPU tensor
+
+    tgt_np    = batch["image"][b].squeeze().cpu().numpy()
+    tgt_gt_np = batch["label"][b].cpu().numpy()
+    ctx_np    = batch["context_in"][b, 0].squeeze(0).cpu().numpy()
+    ctx_gt_np = batch["context_out"][b, 0].cpu().numpy()
+
+    levels_data = []
+    for i, res in enumerate(resolutions):
+        D_, H_, W_ = res
+        N_i      = D_ * H_ * W_
+        gt_ds_np = downsample_mask(label_b, res, cfg.data.mask_pool).squeeze().cpu().numpy().reshape(D_, H_, W_)
+        fused_np = grid_preds[i][b].detach().cpu().numpy().reshape(D_, H_, W_)
+
+        if tgt_idxs[i] is None:
+            pred_np = preds[i][b].detach().cpu().numpy().reshape(D_, H_, W_)
+        else:
+            sparse = np.zeros(N_i, dtype=np.float32)
+            sparse[tgt_idxs[i][b].cpu().numpy()] = preds[i][b].detach().cpu().numpy()
+            pred_np = sparse.reshape(D_, H_, W_)
+
+        levels_data.append({
+            "res":        res,
+            "gt_ds":      gt_ds_np,
+            "pred":       pred_np,
+            "pred_fused": fused_np,
+            "tgt_idx":    tgt_idxs[i][b].cpu().numpy() if tgt_idxs[i] is not None else None,
+            "ctx_idx":    ctx_idxs[i][b].cpu().numpy() if ctx_idxs[i] is not None else None,
+        })
+
+    fig_path = out_dir / f"epoch{epoch:03d}_{label_name}.png"
+    save_val_figure(
+        tgt_image=tgt_np, tgt_gt=tgt_gt_np,
+        ctx_image=ctx_np, ctx_gt=ctx_gt_np,
+        levels=levels_data, out_path=fig_path,
+        title=f"[ep {epoch}] train synth  {label_name}",
+    )
+    return fig_path
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -480,6 +609,7 @@ def validate(
     from sklearn.metrics import roc_auc_score
 
     model.eval()
+    amp = device.type == "cuda"
     if fig_dir is not None:
         fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -490,134 +620,170 @@ def validate(
     NP          = cfg.data.n_patches_l1
     temp        = cfg.data.sampling_temperature
 
-    cls_to_indices: dict[str, list[int]] = defaultdict(list)
-    for i, (_, cls) in enumerate(ds_val.samples):
-        cls_to_indices[cls].append(i)
+    val_loader = DataLoader(
+        ds_val,
+        batch_size=cfg.train.batch_size,
+        shuffle=False,
+        num_workers=cfg.train.workers,
+        collate_fn=incontext_collate_fn,
+        pin_memory=True,
+        persistent_workers=cfg.train.workers > 0,
+        prefetch_factor=2 if cfg.train.workers > 0 else None,
+        drop_last=False,
+    )
 
     # dice_l{i}       : dice at level i's resolution (dense for L0, sparse for L>0)
     # dice_fused_l{i} : dice of the fused grid at level i vs GT at that resolution
     level_dices       = [[] for _ in range(n_levels)]
     level_fused_dices = [[] for _ in range(n_levels)]
     final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_losses = [], [], [], [], []
-    wandb_images: dict = {}
+    wandb_images: dict  = {}
+    cls_fig_saved: set  = set()
+    class_counts: dict  = defaultdict(int)
 
-    for cls in ds_val.classes:
-        collected     = 0
-        cls_fig_saved = False
-        for idx in cls_to_indices[cls]:
-            if collected >= items_per_class:
-                break
-            try:
-                item = ds_val[idx]
-            except Exception:
-                continue
+    for batch in val_loader:
+        label_names = batch["label_names"]          # list[B]
+        images  = batch["image"].to(device, non_blocking=True)
+        labels  = batch["label"].to(device, non_blocking=True)
+        ctx_in  = batch["context_in"].to(device, non_blocking=True)
+        ctx_out = batch["context_out"].to(device, non_blocking=True)
+        B, K = ctx_in.shape[:2]
 
-            image   = item["image"].unsqueeze(0).to(device)
-            label   = item["label"].unsqueeze(0).to(device)
-            ctx_in  = item["context_in"].unsqueeze(0).to(device)
-            ctx_out = item["context_out"].unsqueeze(0).to(device)
-            K = ctx_in.shape[1]
-
-            tgt_feats      = encode_image_only(encoder, image)
-            ctx_imgs_flat  = ctx_in.reshape(K, 1, *ctx_in.shape[3:])
+        # Encode all B targets and B*K context images in two batched calls
+        with torch.inference_mode():
+            tgt_feats      = encode_image_only(encoder, images)
+            ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
             ctx_feats_flat = encode_image_only(encoder, ctx_imgs_flat)
 
-            preds_v, tgt_idxs_v, ctx_idxs_v, grid_preds_v = [], [], [], []
-            C = None
+        preds_l, tgt_idxs_l, ctx_idxs_l, grid_preds_l = [], [], [], []
+        C = None
+        cascade_regs = None
 
-            for i, res in enumerate(resolutions):
-                N = res[0] * res[1] * res[2]
-                tgt_feat_i  = extract_features(tgt_feats,      level, res, num_levels)
-                ctx_feat_if = extract_features(ctx_feats_flat, level, res, num_levels)
-                if C is None:
-                    C = tgt_feat_i.shape[1]
-                ctx_feat_i  = ctx_feat_if.reshape(1, K, C, *res)
-                ctx_mask_i  = downsample_mask(
-                    ctx_out.reshape(K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
-                ).reshape(1, K, *res)
+        mask_cnn_vol = None
+        if model.mask_cnn is not None:
+            finest_res = resolutions[-1]
+            mask_in = downsample_mask(
+                ctx_out.reshape(B * K, *ctx_out.shape[2:]), finest_res, cfg.data.mask_pool
+            ).unsqueeze(1)
+            if not cfg.model.soft_labels_eval:
+                mask_in = (mask_in > 0).float()
+            with torch.autocast(device_type=device.type, enabled=amp):
+                emb = model.mask_cnn(mask_in)
+            mask_cnn_vol = emb.transpose(1, 2).reshape(
+                B * K, model.mask_cnn_dim, *finest_res
+            )
 
-                if i == 0:
-                    tgt_f   = tgt_feat_i.float().reshape(1, C, N).permute(0, 2, 1)
-                    ctx_f   = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(1, K * N, C)
-                    ctx_lbl = ctx_mask_i.reshape(1, K * N)
-                    if not cfg.model.soft_labels_eval:
-                        ctx_lbl = (ctx_lbl > 0).float()
+        for i, res in enumerate(resolutions):
+            N = res[0] * res[1] * res[2]
+            tgt_feat_i  = extract_features(tgt_feats,      level, res, num_levels)
+            ctx_feat_if = extract_features(ctx_feats_flat, level, res, num_levels)
+            if C is None:
+                C = tgt_feat_i.shape[1]
+            ctx_feat_i  = ctx_feat_if.reshape(B, K, C, *res)
+            ctx_mask_i  = downsample_mask(
+                ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
+            ).reshape(B, K, *res)
 
-                    coords   = grid_coords_3d(res, device)
-                    tgt_crds = coords.unsqueeze(0)
-                    ctx_crds = coords.unsqueeze(0).repeat(1, K, 1)
+            if i == 0:
+                tgt_f   = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
+                ctx_f   = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K * N, C)
+                ctx_lbl = _encode_ctx_labels(ctx_mask_i, None, cfg.model.soft_labels_eval,
+                                             mask_cnn_vol, res)
 
-                    pred      = model[0](tgt_f, ctx_f, ctx_lbl,
-                                         tgt_coords=tgt_crds, ctx_coords=ctx_crds).float()
-                    tgt_idx   = None
-                    ctx_idx   = None
-                    grid_pred = pred
+                coords   = grid_coords_3d(res, device)
+                tgt_crds = coords.unsqueeze(0).expand(B, -1, -1)
+                ctx_crds = coords.unsqueeze(0).expand(B, -1, -1).repeat(1, K, 1)
 
+                with torch.autocast(device_type=device.type, enabled=amp):
+                    result = model[0](tgt_f, ctx_f, ctx_lbl,
+                                      tgt_coords=tgt_crds, ctx_coords=ctx_crds,
+                                      cascade_registers=cascade_regs)
+                if isinstance(result, tuple):
+                    regs = result[1]
+                    cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
+                    pred = result[0].float()
                 else:
-                    prev_res = resolutions[i - 1]
-                    prev_up  = F.interpolate(
-                        grid_preds_v[-1].reshape(1, 1, *prev_res),
-                        size=res, mode="trilinear", align_corners=False,
-                    ).reshape(1, N)
+                    pred = result.float()
+                tgt_idx   = None
+                ctx_idx   = None
+                grid_pred = pred
 
-                    gt_flat  = downsample_mask(label, res, cfg.data.mask_pool).reshape(1, N)
-                    tgt_idx  = sample_target_patches(prev_up, gt_flat, NP, temp,
-                                                     cfg.data.target_sampling)
-                    ctx_idx  = sample_context_patches(ctx_mask_i, NP, temp)
+            else:
+                prev_res = resolutions[i - 1]
+                prev_up  = F.interpolate(
+                    grid_preds_l[-1].reshape(B, 1, *prev_res),
+                    size=res, mode="trilinear", align_corners=False,
+                ).reshape(B, N)
 
-                    tgt_flat_f    = tgt_feat_i.float().reshape(1, C, N).permute(0, 2, 1)
-                    ctx_flat_f    = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(1, K, N, C)
-                    ctx_mask_flat = ctx_mask_i.reshape(1, K, N)
+                gt_flat  = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
+                tgt_idx  = sample_target_patches(prev_up, gt_flat, NP, temp,
+                                                 cfg.data.target_sampling)
+                ctx_idx  = sample_context_patches(ctx_mask_i, NP, temp)
 
-                    tgt_sparse = gather_patches(tgt_flat_f, tgt_idx)
-                    ctx_pieces, ctx_lbl_pieces = [], []
-                    for k in range(K):
-                        ctx_pieces.append(gather_patches(ctx_flat_f[:, k], ctx_idx))
-                        ctx_lbl_pieces.append(ctx_mask_flat[:, k].gather(1, ctx_idx))
-                    ctx_sparse = torch.cat(ctx_pieces, dim=1)
-                    ctx_lbl    = torch.cat(ctx_lbl_pieces, dim=1)
-                    if not cfg.model.soft_labels_eval:
-                        ctx_lbl = (ctx_lbl > 0).float()
+                tgt_flat_f = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
+                ctx_flat_f = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K, N, C)
 
-                    coords   = grid_coords_3d(res, device)
-                    tgt_crds = coords[tgt_idx.reshape(-1)].reshape(1, NP, 3)
-                    ctx_crds = coords[ctx_idx.reshape(-1)].reshape(1, NP, 3)
-                    ctx_crds = ctx_crds.unsqueeze(1).expand(-1, K, -1, -1).reshape(1, K * NP, 3)
+                tgt_sparse = gather_patches(tgt_flat_f, tgt_idx)
+                ctx_pieces = [gather_patches(ctx_flat_f[:, k], ctx_idx) for k in range(K)]
+                ctx_sparse = torch.cat(ctx_pieces, dim=1)
+                ctx_lbl    = _encode_ctx_labels(ctx_mask_i, ctx_idx, cfg.model.soft_labels_eval,
+                                                mask_cnn_vol, res)
 
-                    pred      = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
-                                         tgt_coords=tgt_crds, ctx_coords=ctx_crds).float()
-                    grid_pred = prev_up.clone()
-                    grid_pred.scatter_(1, tgt_idx, pred)
+                coords   = grid_coords_3d(res, device)
+                tgt_crds = coords[tgt_idx.reshape(-1)].reshape(B, NP, 3)
+                ctx_crds = coords[ctx_idx.reshape(-1)].reshape(B, NP, 3)
+                ctx_crds = ctx_crds.unsqueeze(1).expand(-1, K, -1, -1).reshape(B, K * NP, 3)
 
-                preds_v.append(pred)
-                tgt_idxs_v.append(tgt_idx)
-                ctx_idxs_v.append(ctx_idx)
-                grid_preds_v.append(grid_pred)
+                with torch.autocast(device_type=device.type, enabled=amp):
+                    result = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
+                                      tgt_coords=tgt_crds, ctx_coords=ctx_crds,
+                                      cascade_registers=cascade_regs)
+                if isinstance(result, tuple):
+                    regs = result[1]
+                    cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
+                    pred = result[0].float()
+                else:
+                    pred = result.float()
+                grid_pred = prev_up.clone()
+                grid_pred.scatter_(1, tgt_idx, pred)
 
-            # --- Per-level metrics ---
+            preds_l.append(pred)
+            tgt_idxs_l.append(tgt_idx)
+            ctx_idxs_l.append(ctx_idx)
+            grid_preds_l.append(grid_pred)
+
+        # --- Per-sample metrics and figures ---
+        for b in range(B):
+            cls = label_names[b]
+            if class_counts[cls] >= items_per_class:
+                continue
+
+            label_b = labels[b:b + 1]
+
+            # Per-level metrics
             for i, res in enumerate(resolutions):
                 N_i      = res[0] * res[1] * res[2]
-                gt_i     = downsample_mask(label, res, cfg.data.mask_pool).reshape(N_i)
+                gt_i     = downsample_mask(label_b, res, cfg.data.mask_pool).reshape(N_i)
                 gt_i_bin = (gt_i > 0).float()
 
-                if tgt_idxs_v[i] is None:
-                    di = dice_score(preds_v[i].squeeze(0), gt_i_bin)
+                if tgt_idxs_l[i] is None:
+                    di = dice_score(preds_l[i][b], gt_i_bin)
                 else:
-                    gt_at_tgt = gt_i[tgt_idxs_v[i][0]]
-                    di = dice_score(preds_v[i].squeeze(0), (gt_at_tgt > 0).float())
+                    gt_at_tgt = gt_i[tgt_idxs_l[i][b]]
+                    di = dice_score(preds_l[i][b], (gt_at_tgt > 0).float())
                 if di == di:
                     level_dices[i].append(di)
 
-                df = dice_score(grid_preds_v[i].squeeze(0), gt_i_bin)
+                df = dice_score(grid_preds_l[i][b], gt_i_bin)
                 if df == df:
                     level_fused_dices[i].append(df)
 
-            # --- Final level full metrics ---
+            # Final level full metrics
             final_res  = resolutions[-1]
             N_final    = final_res[0] * final_res[1] * final_res[2]
-            gt_final   = downsample_mask(label, final_res, cfg.data.mask_pool).reshape(N_final)
+            gt_final   = downsample_mask(label_b, final_res, cfg.data.mask_pool).reshape(N_final)
             gt_final_b = (gt_final > 0).float()
-            pf         = grid_preds_v[-1].squeeze(0)
+            pf         = grid_preds_l[-1][b]
 
             final_losses.append(F.binary_cross_entropy(pf, gt_final_b).item())
             d = dice_score(pf, gt_final_b)
@@ -637,25 +803,25 @@ def validate(
                 except Exception:
                     pass
 
-            # --- Visualisation ---
-            if not cls_fig_saved and fig_dir is not None:
-                tgt_np    = item["image"].squeeze().cpu().numpy()
-                tgt_gt_np = item["label"].cpu().numpy()
-                ctx_np    = ctx_in[0, 0].squeeze(0).cpu().numpy()
-                ctx_gt_np = ctx_out[0, 0].cpu().numpy()
+            # Visualisation — one figure per class, first time we see it
+            if cls not in cls_fig_saved and fig_dir is not None:
+                tgt_np    = batch["image"][b].squeeze().cpu().numpy()
+                tgt_gt_np = batch["label"][b].cpu().numpy()
+                ctx_np    = batch["context_in"][b, 0].squeeze(0).cpu().numpy()
+                ctx_gt_np = batch["context_out"][b, 0].cpu().numpy()
 
                 levels_data = []
                 for i, res in enumerate(resolutions):
                     D_, H_, W_ = res
                     N_i        = D_ * H_ * W_
-                    gt_ds_np   = downsample_mask(label, res, cfg.data.mask_pool).squeeze().cpu().numpy().reshape(D_, H_, W_)
-                    fused_np   = grid_preds_v[i].squeeze().cpu().numpy().reshape(D_, H_, W_)
+                    gt_ds_np   = downsample_mask(label_b, res, cfg.data.mask_pool).squeeze().cpu().numpy().reshape(D_, H_, W_)
+                    fused_np   = grid_preds_l[i][b].cpu().numpy().reshape(D_, H_, W_)
 
-                    if tgt_idxs_v[i] is None:
-                        pred_np = preds_v[i].squeeze().cpu().numpy().reshape(D_, H_, W_)
+                    if tgt_idxs_l[i] is None:
+                        pred_np = preds_l[i][b].cpu().numpy().reshape(D_, H_, W_)
                     else:
                         sparse = np.zeros(N_i, dtype=np.float32)
-                        sparse[tgt_idxs_v[i][0].cpu().numpy()] = preds_v[i][0].cpu().numpy()
+                        sparse[tgt_idxs_l[i][b].cpu().numpy()] = preds_l[i][b].cpu().numpy()
                         pred_np = sparse.reshape(D_, H_, W_)
 
                     levels_data.append({
@@ -663,8 +829,8 @@ def validate(
                         "gt_ds":      gt_ds_np,
                         "pred":       pred_np,
                         "pred_fused": fused_np,
-                        "tgt_idx":    tgt_idxs_v[i][0].cpu().numpy() if tgt_idxs_v[i] is not None else None,
-                        "ctx_idx":    ctx_idxs_v[i][0].cpu().numpy() if ctx_idxs_v[i] is not None else None,
+                        "tgt_idx":    tgt_idxs_l[i][b].cpu().numpy() if tgt_idxs_l[i] is not None else None,
+                        "ctx_idx":    ctx_idxs_l[i][b].cpu().numpy() if ctx_idxs_l[i] is not None else None,
                     })
 
                 title_parts = [f"[ep {epoch}] {cls}"]
@@ -679,9 +845,9 @@ def validate(
                     title="  ".join(title_parts),
                 )
                 wandb_images[f"val/pred/{cls}"] = fig_path
-                cls_fig_saved = True
+                cls_fig_saved.add(cls)
 
-            collected += 1
+            class_counts[cls] += 1
 
     model.train()
     metrics: dict = {}
@@ -734,7 +900,8 @@ def main() -> None:
         aug_cfg=aug_cfg,
         use_crop=cfg.data.use_crop,
         synth_method=cfg.data.synth_method or None,
-        synth_unions=cfg.data.synth_unions,
+        n_synth_merge_min=cfg.data.n_synth_merge_min,
+        n_synth_merge_max=cfg.data.n_synth_merge_max,
         p_synth=cfg.data.p_synth,
         random_coloring=False,
         num_labels_per_sample=cfg.data.num_labels_per_sample,
@@ -806,7 +973,13 @@ def main() -> None:
         }
         for i, res in enumerate(resolutions)
     ]
-    model = MultilevelICL(embed_dim=embed_dim, level_cfgs=level_cfgs).to(device)
+    mask_cnn_dim     = int(getattr(cfg.model, "mask_cnn_dim", 0) or 0)
+    num_registers    = int(getattr(cfg.model, "num_registers", 0) or 0)
+    append_zero_attn = bool(getattr(cfg.model, "append_zero_attn", False))
+    model = MultilevelICL(embed_dim=embed_dim, level_cfgs=level_cfgs,
+                          mask_cnn_dim=mask_cnn_dim,
+                          num_registers=num_registers,
+                          append_zero_attn=append_zero_attn).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultilevelICL  params: {n_params:,}  ({len(model)} levels)")
 
@@ -816,7 +989,18 @@ def main() -> None:
 
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        current_shapes = {k: v.shape for k, v in model.state_dict().items()}
+        ckpt_model = {k: v for k, v in ckpt["model"].items()
+                      if k in current_shapes and v.shape == current_shapes[k]}
+        shape_skipped = [k for k in ckpt["model"] if k in current_shapes
+                         and ckpt["model"][k].shape != current_shapes[k]]
+        missing, unexpected = model.load_state_dict(ckpt_model, strict=False)
+        if shape_skipped:
+            print(f"  Shape-mismatched keys (random init): {shape_skipped}")
+        if missing:
+            print(f"  New parameters (random init): {missing}")
+        if unexpected:
+            print(f"  Ignored checkpoint keys: {unexpected}")
         print(f"Loaded checkpoint: {cfg.train.checkpoint}  (epoch {ckpt['epoch']})")
 
     # ---- W&B ---------------------------------------------------------------
@@ -850,9 +1034,10 @@ def main() -> None:
         last_nd, last_dice = float("nan"), float("nan")
         t0 = time.perf_counter()
 
+        synth_train_fig_path = None
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
         for batch in bar:
-            preds, loss, level_losses = process_batch(
+            preds, loss, level_losses, grid_preds_b, tgt_idxs_b, ctx_idxs_b = process_batch(
                 encoder, model, batch, cfg, device, amp=amp,
             )
             optimizer.zero_grad(set_to_none=True)
@@ -883,6 +1068,15 @@ def main() -> None:
                     epoch_nd   += nd; n_nd   += 1; last_nd   = nd
                 if dc == dc:
                     epoch_dice += dc; n_dice += 1; last_dice = dc
+
+            if synth_train_fig_path is None and fig_dir is not None:
+                for b_idx, lname in enumerate(batch["label_names"]):
+                    if lname.startswith("sv_"):
+                        synth_train_fig_path = _save_synth_train_figure(
+                            batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
+                            b_idx, epoch, fig_dir / "train_synth", resolutions, cfg,
+                        )
+                        break
 
             bar.set_postfix(
                 loss=f"{epoch_loss / n_batches:.4f}",
@@ -928,6 +1122,8 @@ def main() -> None:
         if use_wandb:
             import wandb
             all_figs        = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
+            if synth_train_fig_path is not None:
+                all_figs["train/pred_synth"] = wandb.Image(str(synth_train_fig_path))
             level_loss_log  = {f"train/loss_l{j}": epoch_level_losses[j] / max(n_batches, 1)
                                for j in range(n_levels)}
             wandb.log({

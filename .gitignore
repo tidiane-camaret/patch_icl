@@ -15,3 +15,4 @@ results/*.json
 slurm-*.out
 *.pt
 experiments/feature_attention/checkpoints/figures/
+results/eval_*.csv

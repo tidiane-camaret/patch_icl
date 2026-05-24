@@ -46,6 +46,33 @@ ALL_CLASSES: list[str] = [
 ]
 
 
+BENCHMARK_CLASSES: list[str] = [
+    # Large solid organs
+    "liver", "spleen", "kidney_left", "kidney_right", "heart", "pancreas", "gallbladder",
+    # GI tract
+    "stomach", "colon", "small_bowel", "esophagus",
+    # Lungs
+    "lung_lower_lobe_left", "lung_upper_lobe_right", "lung_middle_lobe_right",
+    # Muscles
+    "gluteus_maximus_left", "gluteus_medius_right", "autochthon_left", "iliopsoas_right",
+    # Appendicular bones
+    "femur_left", "hip_right", "humerus_left", "clavicula_right", "scapula_left",
+    # Axial bones
+    "sacrum", "sternum", "skull", "costal_cartilages",
+    # Vertebrae (one per region)
+    "vertebrae_C3", "vertebrae_T6", "vertebrae_L3", "vertebrae_S1",
+    # Ribs
+    "rib_left_6", "rib_right_9",
+    # Vasculature
+    "aorta", "inferior_vena_cava", "portal_vein_and_splenic_vein", "iliac_artery_left",
+    # Neuro / airway / pelvis
+    "brain", "spinal_cord", "trachea", "urinary_bladder", "thyroid_gland",
+    # Near-zero sentinels
+    "adrenal_gland_left", "atrial_appendage_left", "common_carotid_artery_left",
+    "pulmonary_vein", "brachiocephalic_trunk",
+]
+
+
 def resolve_classes(
     value: Union[str, list],
     totalseg_root: Union[str, Path, None] = None,
@@ -53,6 +80,7 @@ def resolve_classes(
     """Resolve a class list from a Hydra config value.
 
     If *value* is already a list (or OmegaConf ListConfig), return it as a plain list.
+    If *value* is ``"benchmark"``, return BENCHMARK_CLASSES.
     If *value* is a string such as ``"train"`` or ``"val"``, read
     ``{totalseg_root}/label_stats.csv`` and return the classes whose ``split``
     column matches that string.
@@ -64,6 +92,9 @@ def resolve_classes(
     """
     if not isinstance(value, str):
         return list(value)
+
+    if value == "benchmark":
+        return list(BENCHMARK_CLASSES)
 
     if totalseg_root is None:
         raise ValueError("totalseg_root must be provided when train/val_classes is a split name")

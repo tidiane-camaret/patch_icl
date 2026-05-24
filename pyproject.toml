@@ -28,6 +28,9 @@ dependencies = [
     "psutil>=6.0",
     # nnUNet (ResEncEncoder + dynamic_network_architectures)
     "nnunetv2>=2.5",
+    "pytorch-lightning>=2.6.4",
+    "tabulate>=0.10.0",
+    "monai>=1.5.2",
 ]
 
 [tool.uv]

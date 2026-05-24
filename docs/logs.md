@@ -1,5 +1,18 @@
 # Change log
 
+## 2026-05-23 — Quality benchmark for in-context segmentation (eval.py)
+
+Added a segmentation-quality benchmark comparing native models against SOTA.
+
+- `scripts/eval.py` — new evaluation script; argparse CLI; measures per-class and mean Dice on TotalSegmentator test split; saves `results/eval_*.json` and `results/eval_*.csv`.
+- `data/benchmark_classes.py` — curated 16-organ class list covering a range of sizes and difficulty.
+- `src/benchmark_models/base.py` — `InContextModel` ABC (`predict(target, context_imgs, context_masks) → binary mask`).
+- `src/benchmark_models/native.py` — adapters for `ViTInContext3D` (`NativeViT`) and `ResEncInContext3D` (`NativeResEnc`), loading from checkpoint.
+- `src/benchmark_models/medverse.py` — adapter for Medverse (local repo at `/nfs/norasys/notebooks/camaret/repos/Medverse`); applies per-volume min-max normalisation; adds channel dim to context masks.
+- `src/benchmark_models/__init__.py` — `load_model(name, ...)` registry.
+
+Methods included: native_vit, native_resenc, medverse. UniverSeg (2D-only) and Show&Segment (CVPR 2025, no public code) excluded.
+
 ## 2026-05-22 — Fix head-boundary misalignment in 3D RoPE
 
 `src/rope3d.py`, `experiments/feature_attention/model.py`.

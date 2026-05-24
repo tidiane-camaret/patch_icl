@@ -91,6 +91,9 @@ class PatchICLAttention(nn.Module):
         label_dim:       int   = 1,
         soft_labels:     bool  = False,
         rope_max_pos:    int   = 0,  # override max_pos for rope3d cache (0 = use max(grid_size))
+        output_dim:      int   = 0,  # output head size; 0 = same as label_dim (default)
+        num_registers:   int   = 0,  # learnable context summary tokens, cascaded between levels
+        append_zero_attn: bool = False,  # add null K/V slot to cross-attention
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -115,6 +118,13 @@ class PatchICLAttention(nn.Module):
         self.log_n_base         = log_n_base
         self.label_dim          = label_dim
         self.soft_labels        = soft_labels
+        self.output_dim         = output_dim if output_dim > 0 else label_dim
+        self.num_registers      = num_registers
+        self.append_zero_attn   = append_zero_attn
+        if num_registers > 0:
+            self.register_tokens = nn.Parameter(torch.randn(1, num_registers, dim) * 0.02)
+        else:
+            self.register_tokens = None
 
         # ---- Input normalization (at embed_dim, before projection) ------
         self.input_norm = nn.RMSNorm(embed_dim) if input_norm == "rmsnorm" else None
@@ -187,14 +197,15 @@ class PatchICLAttention(nn.Module):
             self.ctx_ffn_norms = nn.ModuleList([nn.RMSNorm(dim) for _ in range(num_layers)])
 
         # ---- Output head (at dim) ---------------------------------------
+        _out = self.output_dim
         if output_head == "linear":
-            self.head = nn.Linear(dim, label_dim)
+            self.head = nn.Linear(dim, _out)
         elif output_head == "mlp":
             self.head = nn.Sequential(
                 nn.RMSNorm(dim),
                 nn.Linear(dim, dim),
                 nn.GELU(),
-                nn.Linear(dim, label_dim),
+                nn.Linear(dim, _out),
             )
         elif output_head == "retrieval":
             self.ret_q_proj = nn.Linear(dim, dim)
@@ -238,6 +249,7 @@ class PatchICLAttention(nn.Module):
         q_scale:  float = 1.0,
         q_coords: torch.Tensor | None = None,  # (B, Sq, 3) int — for rope3d
         k_coords: torch.Tensor | None = None,  # (B, Sk, 3) int — for rope3d
+        zero_attn: bool = False,
     ) -> torch.Tensor:
         """Project Q/K/V, apply RoPE if configured, run SDPA, project output."""
         B, Sq, _ = q.shape
@@ -260,6 +272,12 @@ class PatchICLAttention(nn.Module):
 
         if q_scale != 1.0:
             Q = Q * q_scale
+
+        if zero_attn:
+            zero_k = torch.zeros(B, H, 1, D, device=K.device, dtype=K.dtype)
+            zero_v = torch.zeros(B, H, 1, D, device=V.device, dtype=V.dtype)
+            K = torch.cat([K, zero_k], dim=2)
+            V = torch.cat([V, zero_v], dim=2)
 
         dp = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dp)   # (B, H, Sq, D)
@@ -319,7 +337,9 @@ class PatchICLAttention(nn.Module):
         ctx_labels: torch.Tensor,              # (B, M) or (B, M, label_dim)
         tgt_coords: torch.Tensor | None = None,  # (B, N, 3) int — d,h,w for rope3d
         ctx_coords: torch.Tensor | None = None,  # (B, M, 3) int — d,h,w for rope3d
+        cascade_registers: torch.Tensor | None = None,  # (B, R_cas, dim) from prev level
     ) -> torch.Tensor:                         # (B, N) or (B, N, label_dim)
+        B = tgt_feat.shape[0]
         M = ctx_feat.shape[1]
 
         # 1. Input normalization (at embed_dim)
@@ -350,6 +370,23 @@ class PatchICLAttention(nn.Module):
                 gate = torch.sigmoid(self.gate_proj(lbl_emb))
                 ctx = ctx * gate
 
+        # Prepend register tokens to context (cascade from prev level + own learnable)
+        R_own    = self.num_registers
+        R_cas    = cascade_registers.shape[1] if cascade_registers is not None else 0
+        R_prefix = R_cas + R_own
+        if R_prefix > 0:
+            pieces = []
+            if cascade_registers is not None:
+                pieces.append(cascade_registers)
+            if R_own > 0:
+                pieces.append(self.register_tokens.expand(B, -1, -1))
+            pieces.append(ctx)
+            ctx = torch.cat(pieces, dim=1)  # (B, R_prefix + M, dim)
+            if ctx_coords is not None:
+                zero_c = torch.zeros(B, R_prefix, 3, dtype=ctx_coords.dtype, device=ctx_coords.device)
+                ctx_coords = torch.cat([zero_c, ctx_coords], dim=1)
+            M = M + R_prefix
+
         # 4. Positional encoding
         tgt, ctx = self._apply_pos(tgt, ctx)
 
@@ -376,21 +413,29 @@ class PatchICLAttention(nn.Module):
                 self.attn_norms[i](tgt), ctx_kv, ctx_kv,
                 self.q_projs[i], self.k_projs[i], self.v_projs[i], self.out_projs[i],
                 q_scale=q_scale, q_coords=tgt_coords, k_coords=ctx_coords,
+                zero_attn=self.append_zero_attn,
             )
             tgt = tgt + attn_out
             tgt = tgt + self.ffns[i](self.ffn_norms[i](tgt))
 
+        # Extract own register outputs before decoding (for cascading to the next level)
+        reg_out = ctx[:, :R_own].clone() if R_own > 0 else None
+
         # 6. Output head
         if self.output_head_type in ("linear", "mlp"):
-            out = torch.sigmoid(self.head(tgt))   # (B, N, label_dim)
-            return out.squeeze(-1) if self.label_dim == 1 else out
+            out = torch.sigmoid(self.head(tgt))   # (B, N, output_dim)
+            pred = out.squeeze(-1) if self.output_dim == 1 else out
+            return (pred, reg_out) if R_own > 0 else pred
 
-        # retrieval: V = context labels (scalar or RGB vector)
-        q = self.ret_q_proj(tgt)                                      # (B, N, dim)
-        k = self.ret_k_proj(ctx)                                      # (B, M, dim)
-        scores  = (q @ k.transpose(-2, -1)) / math.sqrt(self.dim)    # (B, N, M)
-        weights = F.softmax(scores, dim=-1)                           # (B, N, M)
+        # retrieval: uses real context patches only, not register prefix
+        ctx_for_ret = ctx[:, R_prefix:] if R_prefix > 0 else ctx
+        q = self.ret_q_proj(tgt)                                            # (B, N, dim)
+        k = self.ret_k_proj(ctx_for_ret)                                    # (B, M_orig, dim)
+        scores  = (q @ k.transpose(-2, -1)) / math.sqrt(self.dim)          # (B, N, M_orig)
+        weights = F.softmax(scores, dim=-1)                                 # (B, N, M_orig)
         if self.label_dim == 1:
-            v = ctx_labels.unsqueeze(-1)                  # (B, M, 1)
-            return (weights @ v).squeeze(-1).clamp(0, 1)  # (B, N)
-        return (weights @ ctx_labels).clamp(0, 1)         # (B, N, label_dim)
+            v = ctx_labels.unsqueeze(-1)                      # (B, M_orig, 1)
+            pred = (weights @ v).squeeze(-1).clamp(0, 1)     # (B, N)
+            return (pred, reg_out) if R_own > 0 else pred
+        pred = (weights @ ctx_labels).clamp(0, 1)             # (B, N, label_dim)
+        return (pred, reg_out) if R_own > 0 else pred

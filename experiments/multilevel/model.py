@@ -19,9 +19,33 @@ spatial extent across all levels so that every valid coordinate is in range.
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 from experiments.feature_attention.model import PatchICLAttention
+
+
+class MaskCNN(nn.Module):
+    """3D ConvNet encoding a soft/binary mask grid into per-voxel embeddings.
+
+    Same-padding convolutions make it grid-size agnostic — shared across all
+    spatial levels in MultilevelICL.
+    """
+
+    def __init__(self, out_dim: int, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(1, hidden_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv3d(hidden_dim, out_dim, 1),
+        )
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        """mask: (B, 1, D, H, W) float → (B, D*H*W, out_dim)"""
+        out = self.net(mask.float())           # (B, out_dim, D, H, W)
+        return out.flatten(2).transpose(1, 2)  # (B, N, out_dim)
 
 
 class MultilevelICL(nn.Module):
@@ -34,12 +58,18 @@ class MultilevelICL(nn.Module):
                   plus a required 'grid_size' key for the spatial resolution.
     """
 
-    def __init__(self, embed_dim: int, level_cfgs: list[dict]):
+    def __init__(self, embed_dim: int, level_cfgs: list[dict], mask_cnn_dim: int = 0,
+                 num_registers: int = 0, append_zero_attn: bool = False):
         super().__init__()
 
         # Shared max_pos: covers the largest coordinate across all levels so the
         # same theta frequencies are valid everywhere.
         global_max_pos = max(max(cfg["grid_size"]) for cfg in level_cfgs)
+
+        # Optional shared mask CNN (None = scalar label injection).
+        self.mask_cnn     = MaskCNN(out_dim=mask_cnn_dim) if mask_cnn_dim > 0 else None
+        self.mask_cnn_dim = mask_cnn_dim
+        label_dim         = mask_cnn_dim if mask_cnn_dim > 0 else 1
 
         self.levels = nn.ModuleList([
             PatchICLAttention(
@@ -58,6 +88,10 @@ class MultilevelICL(nn.Module):
                 log_n_scaling=cfg.get("log_n_scaling", True),
                 log_n_base=cfg.get("log_n_base", 512),
                 soft_labels=cfg.get("soft_labels", True),
+                label_dim=label_dim,
+                output_dim=1,  # head always predicts binary mask regardless of label_dim
+                num_registers=num_registers,
+                append_zero_attn=append_zero_attn,
                 rope_max_pos=global_max_pos,
             )
             for cfg in level_cfgs
