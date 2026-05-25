@@ -10,7 +10,7 @@ data:
     - [32, 32, 32]
     #- [64, 64, 64]
     #- [128, 128, 128]
-  n_patches_l1: 256          # NP₁: number of sparse patches at L1
+  n_patches_l1: 512          # NP₁: number of sparse patches at L1
   sampling_temperature: 0.2  # Gumbel-TopK temperature (higher → more uniform sampling)
   target_sampling: predicted_entropy  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
   context_size: 1

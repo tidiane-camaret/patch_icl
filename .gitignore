@@ -16,3 +16,7 @@ slurm-*.out
 *.pt
 experiments/feature_attention/checkpoints/figures/
 results/eval_*.csv
+results/benchmarks/eval/eval_20260524_175835.csv
+results/benchmarks/vram_sweep/*.png
+results/synth_labels/*.png
+results/benchmarks/eval/*.json

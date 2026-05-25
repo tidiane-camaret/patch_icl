@@ -1,5 +1,53 @@
 # Change log
 
+## 2026-05-24 — MultilevelICL benchmark adapter
+
+Added `src/benchmark_models/multilevel.py` — `MultilevelICLAdapter` wrapping `MultilevelICL` for use in `scripts/eval.py`.
+
+- Loads a multilevel checkpoint and reconstructs both the frozen `STUNetEncoder` and `MultilevelICL` from the stored config.
+- Runs N-level coarse-to-fine inference: L0 is a dense forward over the full grid; finer levels sample `NP` sparse patches guided by the previous level's upsampled prediction (`predicted_entropy` at eval time — no GT available for error-based modes).
+- Upsamples the final grid prediction back to the input spatial size for fair Dice comparison against 128³ models.
+
+## 2026-05-22 — Multilevel train/val loop generalised to N levels
+
+`experiments/multilevel/train.py`, `experiments/multilevel/model.py`, `experiments/feature_attention/model.py`, `configs/experiment/multilevel.yaml`.
+
+**`MultilevelICL` model changes:**
+- `MaskCNN` — shared 3D ConvNet (same-padding, grid-size agnostic) that encodes a soft/binary mask into per-voxel embeddings, interpolated trilinearly to each level's resolution. Replaces the old scalar avg-pool label path when `mask_cnn_dim > 0`.
+- `num_registers` — learnable register tokens appended to context K/V and cascaded between levels; `detach_cascade_registers` controls whether gradients cross level boundaries.
+- `append_zero_attn` — adds a null K/V slot to cross-attention so target patches can "abstain" from retrieving context.
+- `output_dim` added to `PatchICLAttention` (separate from `label_dim`): head always predicts a 1-dim binary mask regardless of label embedding size.
+
+**Training loop:**
+- Train and validation loops now handle any number of levels (previously hardcoded to 2); loss weights configurable per level via `train.loss_weights`.
+- `_encode_ctx_labels` helper unifies CNN-embedded and scalar label injection paths.
+- `soft_labels_train` / `soft_labels_eval` separate: avg-pool float labels during training, binarised at inference.
+- New config keys: `mask_cnn_dim`, `soft_labels_train`, `soft_labels_eval`, `num_registers`, `append_zero_attn`, `detach_cascade_registers`.
+
+**`experiments/feature_attention/train_dice46.py`** — standalone training script for `PatchICLAttention` that uses Dice loss instead of BCE (experimental variant).
+
+## 2026-05-21 — 3D RoPE for PatchICLAttention + multilevel patch sampling rewrite
+
+`src/rope3d.py`, `experiments/feature_attention/model.py`, `experiments/multilevel/model.py`, `experiments/multilevel/train.py`.
+
+**3D RoPE (`src/rope3d.py`):**
+- `build_rope_cache_3d(max_pos, dim, num_heads)` — builds a `(max_pos, dim//2)` frequency cache; `per_axis` rounded to the nearest multiple of `head_dim` (same fix as in `src/rope.py`).
+- `apply_rope_3d(x, coords, cache)` — applies RoPE to a `(B, N, dim)` tensor given integer `(B, N, 3)` d/h/w coordinates; works for any token subset (dense or sparse, no grid-size assumption).
+
+**`PatchICLAttention` gains `pos_encoding="rope3d"`:**
+- RoPE applied inside `_mha()` directly to Q and K after projection; falls back gracefully to no PE if coords are not supplied.
+- `rope_max_pos` parameter overrides the cache extent (default: `max(grid_size)`).
+
+**`MultilevelICL` switches to RoPE:**
+- All levels use `pos_encoding="rope3d"` with a shared cache keyed by `global_max_pos = max(max(grid_size) for all levels)`.
+- Removed the old `coord_projs` (`nn.ModuleList` of `Linear(3, embed_dim)`) that injected normalised coordinates externally.
+
+**Patch sampling rewrite (`experiments/multilevel/train.py`):**
+- `_gumbel_topk(weights, n, temperature)` — stochastic top-n via Gumbel noise; normalises weights per batch item, replaces the old deterministic entropy/fg/border split.
+- `sample_target_patches` now accepts a `mode` argument: `gt_previous_pred_error` (|pred − GT|), `gt_foreground_entropy_balanced` (0.5·GT + 0.5·H(GT)), `predicted_entropy` (H(pred)); controlled by `data.target_sampling`.
+- `sample_context_patches` uses `gt_foreground_entropy_balanced` averaged across K context masks; replaces the old fg + border morphological sampling.
+- `grid_coords_3d` replaces `make_coords_3d` — returns integer voxel coords (long) rather than normalised floats.
+
 ## 2026-05-23 — Quality benchmark for in-context segmentation (eval.py)
 
 Added a segmentation-quality benchmark comparing native models against SOTA.
