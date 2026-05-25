@@ -1,5 +1,35 @@
 # Change log
 
+## 2026-05-25 — TotalSegMRI support (convert, synth labels, eval)
+
+`data/totalseg_classes.py`, `data/benchmark_classes.py`, `scripts/convert_to_npy.py`, `scripts/synth_labels/generate.py`, `scripts/eval.py`, `configs/config.yaml`, `configs/cluster/nfs.yaml`, `configs/cluster/meta.yaml`.
+
+- **4 MRI-only classes** appended to `ALL_CLASSES` (indices 118–121): `lung_left`, `lung_right`, `intervertebral_discs`, `vertebrae`. Zero-indexed at the tail so all existing CT label indices are unchanged.
+- **`convert_to_npy.py`**: added `--modality {ct,mri}` flag. MRI normalisation clips to `[0, p99.5(foreground)]` then z-scores with foreground mean/std (per-volume, no global constants). Output is still named `ct.npy` so the dataloader needs no changes. Fixed `get_zooms()` tuple vs ndarray bug by using `[float(x) for x in ...]`.
+- **`synth_labels/generate.py`**: added `--modality {ct,mri}` flag, routing to `paths.totalsegmri` and loading `mri.nii.gz` with per-volume normalisation as the NIfTI fallback.
+- **`eval.py`**: added `--dataset {totalseg,totalsegmri}` flag. `resolve_totalseg_root()` now uses an exact-key regex (`(?<!\w)totalseg:` vs `totalsegmri:`) to prevent prefix collision. Defaults to `MRI_BENCHMARK_CLASSES` when `--dataset totalsegmri`.
+- **`MRI_BENCHMARK_CLASSES`**: curated 18-class MRI benchmark covering organs, whole-lung, spine (individual + merged), vasculature, and bones.
+- Config: `paths.totalsegmri` added to `config.yaml`, `nfs.yaml`, and `meta.yaml`; `data.dataset: totalseg` default added.
+
+## 2026-05-25 — Shared weights, physical scale injection, and role embeddings for MultilevelICL
+
+`experiments/multilevel/model.py`, `experiments/multilevel/train.py`, `experiments/feature_attention/model.py`, `configs/experiment/multilevel.yaml`, `src/totalseg_dataloader_incontext.py`, `scripts/convert_to_npy.py`.
+
+**Shared weights (`model.shared_weights`)**:
+- `MultilevelICL` gains `shared_weights: bool` — when true, a single `PatchICLAttention` instance is used for all spatial levels instead of one per level. Works only with `pos_encoding="rope3d"` (learned PE has grid-size-dependent embedding tables; an assert guards this).
+- Checkpoint key remapping on load handles both transition directions: `levels.0.*` → `shared_level.*` (per-level → shared, uses L0 weights as init) and `shared_level.*` → `levels.{i}.*` (shared → per-level, broadcasts to all slots). Happens before the existing shape-filter step so no other changes are needed.
+
+**Physical scale injection (`model.use_scale_embed`)**:
+- `ContinuousScaleEncoding` added to `experiments/feature_attention/model.py`: maps `log(scale_mm)` → `dim`-dimensional embedding via log-spaced learnable sinusoidal frequencies (matches `patch_icl_v3`). Added to `PatchICLAttention` behind `use_scale_embed` flag (default off).
+- `spacings.json` at the dataset root stores `{"s0000": {"spacing": [dx,dy,dz], "shape": [D,H,W]}, ...}` for all subjects. `convert_to_npy.py` now writes it incrementally (merged with any existing entries). A standalone header-only extraction ran in 16 s for 1228 subjects.
+- `TotalSegInContextDataset._load_spacings()` reads `spacings.json` at init and converts to effective mm/voxel: pre-resized path scales by `max_native_shape / T`; crop path uses native spacing as-is. Falls back to 1 mm isotropic if the file is absent.
+- `incontext_collate_fn` stacks `"spacing"` → `(B, 3)`. `process_batch` and `validate` compute `scale_mm = (image_size / grid_size) * mean(spacing)` per level and pass it to `model[i](...)`.
+- Bug fix: `validate()` sparse-level model call was silently omitting `scale_mm=scale_mm`; fixed.
+
+**Role embeddings (`model.use_role_embed`)**:
+- `PatchICLAttention` gains three zero-initialised parameters when `use_role_embed=True`: `tgt_type_embed (1,1,dim)`, `ctx_type_embed (1,1,dim)`, and `ctx_idx_embed Embedding(max_context_size, dim)`. The type embeddings distinguish target from context tokens; `ctx_idx_embed[k]` is added to tokens from context image `k`, letting the model track which context image each token came from. Injected at step 2c (after scale encoding, before label injection), K inferred as `ctx.shape[1] // tgt.shape[1]`. Zero-init means the model starts identically to a checkpoint trained without this flag.
+- New config keys: `use_scale_embed: false`, `use_role_embed: false`, `max_context_size: 8`.
+
 ## 2026-05-24 — MultilevelICL benchmark adapter
 
 Added `src/benchmark_models/multilevel.py` — `MultilevelICLAdapter` wrapping `MultilevelICL` for use in `scripts/eval.py`.

@@ -241,6 +241,7 @@ def process_batch(
     labels  = batch["label"].to(device, non_blocking=True)
     ctx_in  = batch["context_in"].to(device, non_blocking=True)
     ctx_out = batch["context_out"].to(device, non_blocking=True)
+    spacing = batch["spacing"].to(device, non_blocking=True)  # (B, 3) mm/voxel
     B, K = ctx_in.shape[:2]
 
     resolutions = [tuple(r) for r in cfg.data.resolutions]
@@ -284,6 +285,9 @@ def process_batch(
             ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
         ).reshape(B, K, *res)
 
+        # Physical mm per patch at this level: (image_size / grid_size) * mean_spacing
+        scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)  # (B,)
+
         tgt_idx = ctx_idx = None
         if i == 0:
             # Dense forward over all N patches
@@ -300,7 +304,7 @@ def process_batch(
             with torch.autocast(device_type=device.type, enabled=amp):
                 result = model[i](tgt_f, ctx_f, ctx_lbl,
                                   tgt_coords=tgt_crds, ctx_coords=ctx_crds,
-                                  cascade_registers=cascade_regs)
+                                  cascade_registers=cascade_regs, scale_mm=scale_mm)
             if isinstance(result, tuple):
                 regs = result[1]
                 cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
@@ -340,7 +344,7 @@ def process_batch(
             with torch.autocast(device_type=device.type, enabled=amp):
                 result = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
                                   tgt_coords=tgt_crds, ctx_coords=ctx_crds,
-                                  cascade_registers=cascade_regs)
+                                  cascade_registers=cascade_regs, scale_mm=scale_mm)
             if isinstance(result, tuple):
                 regs = result[1]
                 cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
@@ -647,6 +651,7 @@ def validate(
         labels  = batch["label"].to(device, non_blocking=True)
         ctx_in  = batch["context_in"].to(device, non_blocking=True)
         ctx_out = batch["context_out"].to(device, non_blocking=True)
+        spacing = batch["spacing"].to(device, non_blocking=True)  # (B, 3)
         B, K = ctx_in.shape[:2]
 
         # Encode all B targets and B*K context images in two batched calls
@@ -684,6 +689,8 @@ def validate(
                 ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
             ).reshape(B, K, *res)
 
+            scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)  # (B,)
+
             if i == 0:
                 tgt_f   = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
                 ctx_f   = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K * N, C)
@@ -697,7 +704,7 @@ def validate(
                 with torch.autocast(device_type=device.type, enabled=amp):
                     result = model[0](tgt_f, ctx_f, ctx_lbl,
                                       tgt_coords=tgt_crds, ctx_coords=ctx_crds,
-                                      cascade_registers=cascade_regs)
+                                      cascade_registers=cascade_regs, scale_mm=scale_mm)
                 if isinstance(result, tuple):
                     regs = result[1]
                     cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
@@ -737,7 +744,7 @@ def validate(
                 with torch.autocast(device_type=device.type, enabled=amp):
                     result = model[i](tgt_sparse, ctx_sparse, ctx_lbl,
                                       tgt_coords=tgt_crds, ctx_coords=ctx_crds,
-                                      cascade_registers=cascade_regs)
+                                      cascade_registers=cascade_regs, scale_mm=scale_mm)
                 if isinstance(result, tuple):
                     regs = result[1]
                     cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
@@ -885,13 +892,16 @@ def main() -> None:
         aug_yaml = ROOT / "configs" / "augmentations" / f"{cfg.train.aug_preset}.yaml"
         aug_cfg  = OmegaConf.load(aug_yaml).augmentations
 
-    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
-    val_classes   = resolve_classes(cfg.data.val_classes, cfg.paths.totalseg) if cfg.data.val_classes else []
+    data_root = cfg.paths.totalsegmri if getattr(cfg.data, "dataset", "totalseg") == "totalsegmri" \
+                else cfg.paths.totalseg
+
+    train_classes = resolve_classes(cfg.data.train_classes, data_root)
+    val_classes   = resolve_classes(cfg.data.val_classes, data_root) if cfg.data.val_classes else []
     val_classes   = val_classes or train_classes
 
     # ---- Datasets ----------------------------------------------------------
     ds_train = TotalSegInContextDataset(
-        root=cfg.paths.totalseg,
+        root=data_root,
         classes=train_classes,
         image_size=tuple(cfg.data.image_size),
         split="train",
@@ -907,7 +917,7 @@ def main() -> None:
         num_labels_per_sample=cfg.data.num_labels_per_sample,
     )
     ds_val = TotalSegInContextDataset(
-        root=cfg.paths.totalseg,
+        root=data_root,
         classes=val_classes,
         image_size=tuple(cfg.data.image_size),
         split="val",
@@ -973,15 +983,21 @@ def main() -> None:
         }
         for i, res in enumerate(resolutions)
     ]
-    mask_cnn_dim     = int(getattr(cfg.model, "mask_cnn_dim", 0) or 0)
-    num_registers    = int(getattr(cfg.model, "num_registers", 0) or 0)
-    append_zero_attn = bool(getattr(cfg.model, "append_zero_attn", False))
-    shared_weights   = bool(getattr(cfg.model, "shared_weights", False))
+    mask_cnn_dim      = int(getattr(cfg.model, "mask_cnn_dim", 0) or 0)
+    num_registers     = int(getattr(cfg.model, "num_registers", 0) or 0)
+    append_zero_attn  = bool(getattr(cfg.model, "append_zero_attn", False))
+    shared_weights    = bool(getattr(cfg.model, "shared_weights", False))
+    use_scale_embed   = bool(getattr(cfg.model, "use_scale_embed", False))
+    use_role_embed    = bool(getattr(cfg.model, "use_role_embed", False))
+    max_context_size  = int(getattr(cfg.model, "max_context_size", 8))
     model = MultilevelICL(embed_dim=embed_dim, level_cfgs=level_cfgs,
                           mask_cnn_dim=mask_cnn_dim,
                           num_registers=num_registers,
                           append_zero_attn=append_zero_attn,
-                          shared_weights=shared_weights).to(device)
+                          shared_weights=shared_weights,
+                          use_scale_embed=use_scale_embed,
+                          use_role_embed=use_role_embed,
+                          max_context_size=max_context_size).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultilevelICL  params: {n_params:,}  ({len(model)} levels)")
 

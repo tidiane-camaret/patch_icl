@@ -1,9 +1,10 @@
 """
-Generate synthetic supervoxel labels for all subjects in paths.totalseg.
+Generate synthetic supervoxel labels for TotalSeg or TotalSegMRI subjects.
 
-Reads paths.totalseg from configs/config.yaml, loads each subject's ct.npy,
-runs the chosen supervoxel algorithm, and writes label_synth_<method>.npy
-alongside ct.npy and label.npy in the same subject directory.
+Reads paths.totalseg / paths.totalsegmri from configs/config.yaml (or --data
+override), loads each subject's ct.npy (the normalised volume regardless of
+modality), runs the chosen supervoxel algorithm, and writes
+label_synth_<method>.npy alongside the existing npy files.
 
 n_segments is drawn from U[50, 500] per subject (MultiverSeg protocol) unless
 --n-segments is given.
@@ -14,11 +15,9 @@ as label_synth_<method>_union.npy.  Fast at train time: just a numpy mmap load.
 
 Usage
 -----
-  uv run scripts/synth_labels/generate.py --method grid
-  uv run scripts/synth_labels/generate.py --method watershed --workers 4
-  uv run scripts/synth_labels/generate.py --method slic --n-segments 200
-  uv run scripts/synth_labels/generate.py --method seeds3d --overwrite
-  uv run scripts/synth_labels/generate.py --method seeds3d --union --n-union 4
+  python scripts/synth_labels/generate.py --method slic --union --size 128 128 128
+  python scripts/synth_labels/generate.py --method slic --modality mri --size 128 128 128
+  python scripts/synth_labels/generate.py --method slic --data /path/to/totalsegmri --modality mri
 """
 
 import argparse
@@ -40,10 +39,10 @@ sys.path.insert(0, str(ROOT))
 # Config
 # ---------------------------------------------------------------------------
 
-def load_totalseg_path() -> Path:
+def load_data_path(modality: str = "ct") -> Path:
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(config_name="config")
-    return Path(cfg.paths.totalseg)
+    return Path(cfg.paths.totalsegmri if modality == "mri" else cfg.paths.totalseg)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +201,7 @@ def _resize_label(labels: np.ndarray, size: tuple) -> np.ndarray:
 
 
 def _process(args: tuple) -> dict:
-    subj_dir, method, n_segments, overwrite, union_n, size = args
+    subj_dir, method, n_segments, overwrite, union_n, size, modality = args
     subj_dir = Path(subj_dir)
     out_path = subj_dir / f"label_synth_{method}.npy"
 
@@ -216,19 +215,29 @@ def _process(args: tuple) -> dict:
     need_sized = size is not None and (overwrite or not out_sized.exists())
 
     if need_base:
-        ct_npy = subj_dir / "ct.npy"
-        ct_nii = subj_dir / "ct.nii.gz"
-        if not ct_npy.exists() and not ct_nii.exists():
+        ct_npy  = subj_dir / "ct.npy"
+        raw_nii = subj_dir / ("mri.nii.gz" if modality == "mri" else "ct.nii.gz")
+        if not ct_npy.exists() and not raw_nii.exists():
             return dict(subject=subj_dir.name, status="error",
-                        error="neither ct.npy nor ct.nii.gz found",
+                        error=f"neither ct.npy nor {raw_nii.name} found",
                         elapsed_s=0.0, n_req=n_segments)
         try:
             if ct_npy.exists():
                 vol = np.load(ct_npy, mmap_mode="r").astype(np.float32)
             else:
                 import nibabel as nib
-                raw = nib.load(str(ct_nii)).get_fdata(dtype=np.float32)
-                vol = (np.clip(raw, -150, 250) + 150) / 400.0
+                raw = nib.as_closest_canonical(
+                    nib.load(str(raw_nii))
+                ).get_fdata(dtype=np.float32)
+                if modality == "mri":
+                    fg = raw[raw > 0]
+                    p995 = float(np.percentile(fg, 99.5)) if fg.size else 1.0
+                    raw  = np.clip(raw, 0.0, p995)
+                    fg   = raw[raw > 0]
+                    mean, std = float(fg.mean()), float(fg.std()) if fg.size else (0.0, 1.0)
+                    vol = (raw - mean) / max(std, 1e-6)
+                else:
+                    vol = (np.clip(raw, -150, 250) + 150) / 400.0
             fn      = ALGORITHMS[method]
             t0      = time.perf_counter()
             labels  = fn(vol, n_segments)
@@ -324,9 +333,14 @@ def main():
         "--size", nargs=3, type=int, metavar=("D", "H", "W"), default=None,
         help="also write label_synth_<method>_DxHxW.npy resized with nearest-neighbour",
     )
+    parser.add_argument(
+        "--modality", choices=["ct", "mri"], default="ct",
+        help="ct (default): loads ct.npy / ct.nii.gz; mri: loads ct.npy / mri.nii.gz "
+             "with per-volume z-score normalisation",
+    )
     args = parser.parse_args()
 
-    data_dir = Path(args.data) if args.data else load_totalseg_path()
+    data_dir = Path(args.data) if args.data else load_data_path(args.modality)
     subjects = sorted(p for p in data_dir.iterdir() if p.is_dir())
 
     if not subjects:
@@ -342,12 +356,13 @@ def main():
     union_n = args.n_union if args.union else 0
     size    = tuple(args.size) if args.size else None
     tasks = [
-        (str(subj), args.method, int(n), args.overwrite, union_n, size)
+        (str(subj), args.method, int(n), args.overwrite, union_n, size, args.modality)
         for subj, n in zip(subjects, n_segs)
     ]
 
     size_str = f"{size[0]}x{size[1]}x{size[2]}" if size else None
     print(f"Method   : {args.method}")
+    print(f"Modality : {args.modality}")
     print(f"Data     : {data_dir}")
     print(f"Subjects : {len(subjects)}")
     print(f"Workers  : {args.workers}")

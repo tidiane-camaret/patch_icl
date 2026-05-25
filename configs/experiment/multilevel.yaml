@@ -56,6 +56,9 @@ model:
   append_zero_attn: false   # add a null K/V slot to cross-attention so target patches can "abstain"
   detach_cascade_registers: true  # detach register gradients between levels (false = cross-level gradient coupling)
   shared_weights: true           # if true, one PatchICLAttention is shared across all levels (requires rope3d)
+  use_scale_embed: false         # if true, inject ContinuousScaleEncoding(scale_mm) into PatchICLAttention
+  use_role_embed: false          # if true, inject tgt/ctx type embeds + per-context-image index embeds
+  max_context_size: 8            # upper bound on K for ctx_idx_embed table
 
 train:
   loss_weights: [1.0, 1.0]   # weight for L0 and L1 losses
@@ -63,7 +66,7 @@ train:
   batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  workers: 18
+  workers: 20
   val_items_per_class: 30
   nd_interval: 20
   seed: 42

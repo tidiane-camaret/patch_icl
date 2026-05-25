@@ -63,7 +63,8 @@ class MultilevelICL(nn.Module):
 
     def __init__(self, embed_dim: int, level_cfgs: list[dict], mask_cnn_dim: int = 0,
                  num_registers: int = 0, append_zero_attn: bool = False,
-                 shared_weights: bool = False):
+                 shared_weights: bool = False, use_scale_embed: bool = False,
+                 use_role_embed: bool = False, max_context_size: int = 8):
         super().__init__()
 
         self._num_levels   = len(level_cfgs)
@@ -100,6 +101,9 @@ class MultilevelICL(nn.Module):
                 num_registers=num_registers,
                 append_zero_attn=append_zero_attn,
                 rope_max_pos=global_max_pos,
+                use_scale_embed=use_scale_embed,
+                use_role_embed=use_role_embed,
+                max_context_size=max_context_size,
             )
 
         if shared_weights:

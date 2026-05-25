@@ -43,6 +43,58 @@ ALL_CLASSES: list[str] = [
     "vertebrae_T1", "vertebrae_T2", "vertebrae_T3", "vertebrae_T4", "vertebrae_T5",
     "vertebrae_T6", "vertebrae_T7", "vertebrae_T8", "vertebrae_T9",
     "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
+    # TotalSegMRI-only (indices 118–121): no direct CT equivalent
+    "lung_left", "lung_right",     # whole-lung; CT has 5 lobe-level labels instead
+    "intervertebral_discs",        # MRI-only merged disc label
+    "vertebrae",                   # merged vertebrae; CT has per-level labels
+]
+
+
+MRI_ALL_CLASSES: list[str] = [
+    # Solid organs
+    "adrenal_gland_left", "adrenal_gland_right", "aorta", "brain",
+    "duodenum", "esophagus", "gallbladder", "heart",
+    "inferior_vena_cava", "kidney_left", "kidney_right", "liver",
+    "pancreas", "portal_vein_and_splenic_vein", "prostate", "spleen",
+    "stomach", "urinary_bladder",
+    # Lungs (whole — no lobe-level labels in TotalSegMRI)
+    "lung_left", "lung_right",
+    # GI
+    "colon", "small_bowel",
+    # Vasculature
+    "iliac_artery_left", "iliac_artery_right", "iliac_vena_left", "iliac_vena_right",
+    # Bones
+    "clavicula_left", "clavicula_right", "femur_left", "femur_right",
+    "hip_left", "hip_right", "humerus_left", "humerus_right",
+    "sacrum", "scapula_left", "scapula_right",
+    # Muscles
+    "autochthon_left", "autochthon_right",
+    "gluteus_maximus_left", "gluteus_maximus_right",
+    "gluteus_medius_left", "gluteus_medius_right",
+    "gluteus_minimus_left", "gluteus_minimus_right",
+    "iliopsoas_left", "iliopsoas_right",
+    # Spine
+    "spinal_cord", "intervertebral_discs", "vertebrae",
+]
+
+
+MRI_BENCHMARK_CLASSES: list[str] = [
+    # Large solid organs
+    "liver", "spleen", "kidney_left", "kidney_right", "heart", "pancreas",
+    # GI
+    "stomach", "colon", "small_bowel", "esophagus",
+    # Whole lungs (MRI-specific — no lobe-level labels in TotalSegMRI)
+    "lung_left", "lung_right",
+    # Muscles
+    "gluteus_maximus_left", "gluteus_medius_right", "autochthon_left", "iliopsoas_right",
+    # Bones
+    "femur_left", "hip_right", "humerus_left", "sacrum",
+    # Vasculature
+    "aorta", "inferior_vena_cava", "portal_vein_and_splenic_vein", "iliac_artery_left",
+    # Spine
+    "spinal_cord", "intervertebral_discs", "vertebrae",
+    # Near-zero sentinels
+    "adrenal_gland_left", "prostate", "urinary_bladder",
 ]
 
 

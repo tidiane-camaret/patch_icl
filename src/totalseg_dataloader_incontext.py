@@ -25,6 +25,7 @@ Usage
 
 import csv
 import hashlib
+import json
 import math
 import os
 import pickle
@@ -210,6 +211,11 @@ class TotalSegInContextDataset(Dataset):
 
         self.n_synth_merge_min = n_synth_merge_min
         self.n_synth_merge_max = n_synth_merge_max
+
+        # Spacing cache: {subject → effective spacing (mm/voxel) at image_size}.
+        # Loaded once from spacings.json at the dataset root; falls back to 1mm
+        # isotropic for subjects not present (pre-existing data without spacing info).
+        self._spacings = self._load_spacings()
 
         # Synth path: build SV-ID cache for fast __getitem__ sampling
         if synth_method is not None:
@@ -443,6 +449,34 @@ class TotalSegInContextDataset(Dataset):
         print(f"BBox cache saved ({len(cache)} subjects).", flush=True)
         return cache
 
+    def _load_spacings(self) -> dict[str, torch.Tensor]:
+        """Load spacings.json and convert to effective mm/voxel at self.image_size.
+
+        For the crop path (native resolution), native spacing is returned as-is.
+        For the resized path, effective spacing = native_spacing * max(native_shape) / T.
+        Returns {} if the file does not exist (spacing will default to 1mm isotropic).
+        """
+        path = self.root / "spacings.json"
+        if not path.exists():
+            return {}
+        with open(path) as f:
+            raw = json.load(f)
+
+        result: dict[str, torch.Tensor] = {}
+        T = self.image_size[0] if self.image_size is not None else None
+        for subj, meta in raw.items():
+            sp = torch.tensor(meta["spacing"], dtype=torch.float32)
+            if T is not None and not self.use_crop:
+                # Effective spacing: _iso_resize scales longest axis → T voxels
+                max_native = max(meta["shape"])
+                sp = sp * (max_native / T)
+            result[subj] = sp
+        return result
+
+    def _get_spacing(self, subj: str) -> torch.Tensor:
+        """Return effective spacing (3,) for subject, defaulting to 1mm isotropic."""
+        return self._spacings.get(subj, torch.ones(3, dtype=torch.float32))
+
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
         if split is not None:
@@ -643,6 +677,7 @@ class TotalSegInContextDataset(Dataset):
             "context_out": torch.stack(ctx_masks),                     # (K, D, H, W) int64
             "subject":     subj,
             "label_name":  f"sv_{sv_groups[0][0]}",
+            "spacing":     self._get_spacing(subj),                    # (3,) mm/voxel; 1mm default for synth
         }
         if self.random_coloring:
             item["label_palette"] = self._sample_palette(
@@ -726,6 +761,7 @@ class TotalSegInContextDataset(Dataset):
             "context_out": torch.stack(context_out),  # (K, D, H, W) int64 always
             "subject":     subj,
             "label_name":  label_name,
+            "spacing":     self._get_spacing(subj),   # (3,) mm/voxel
         }
         if self.random_coloring and len(context_out) > 0:
             item["label_palette"] = self._sample_palette(
@@ -907,6 +943,7 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         "label":       torch.stack([b["label"]       for b in batch]),  # (B, D, H, W)
         "context_in":  torch.stack([b["context_in"]  for b in batch]),  # (B, K, 1, D, H, W)
         "context_out": torch.stack([b["context_out"] for b in batch]),  # (B, K, D, H, W)
+        "spacing":     torch.stack([b["spacing"]     for b in batch]),  # (B, 3) mm/voxel
         "subjects":    [b["subject"]    for b in batch],
         "label_names": [b["label_name"] for b in batch],
     }

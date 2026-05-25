@@ -33,6 +33,27 @@ import torch.nn.functional as F
 from src.rope3d import build_rope_cache_3d, apply_rope_3d
 
 
+class ContinuousScaleEncoding(nn.Module):
+    """Maps a per-sample physical patch size (mm) to a dim-dimensional embedding.
+
+    Uses log-spaced sinusoidal functions with learnable frequencies, identical to
+    patch_icl_v3's ContinuousScaleEncoding.  Input is log(scale_mm) so the model
+    sees a roughly linear signal across the typical range (1–100 mm/patch).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        half = dim // 2
+        freqs = torch.exp(torch.arange(half).float() * -(math.log(10000.0) / max(half - 1, 1)))
+        self.freqs = nn.Parameter(freqs)
+
+    def forward(self, scale_mm: torch.Tensor) -> torch.Tensor:
+        """scale_mm: (B,) → (B, dim)"""
+        log_s = scale_mm.clamp(min=1e-3).log().unsqueeze(1)   # (B, 1)
+        args  = log_s * self.freqs.unsqueeze(0)                # (B, half)
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, dim)
+
+
 class PatchICLAttention(nn.Module):
     """
     Args
@@ -94,6 +115,9 @@ class PatchICLAttention(nn.Module):
         output_dim:      int   = 0,  # output head size; 0 = same as label_dim (default)
         num_registers:   int   = 0,  # learnable context summary tokens, cascaded between levels
         append_zero_attn: bool = False,  # add null K/V slot to cross-attention
+        use_scale_embed: bool  = False,  # inject ContinuousScaleEncoding after input_proj
+        use_role_embed:  bool  = False,  # inject target/context type + context-index embeddings
+        max_context_size: int  = 8,      # upper bound on K for ctx_idx_embed table
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -121,6 +145,17 @@ class PatchICLAttention(nn.Module):
         self.output_dim         = output_dim if output_dim > 0 else label_dim
         self.num_registers      = num_registers
         self.append_zero_attn   = append_zero_attn
+        self.use_scale_embed    = use_scale_embed
+        self.scale_encoder      = ContinuousScaleEncoding(dim) if use_scale_embed else None
+        self.use_role_embed     = use_role_embed
+        if use_role_embed:
+            # Zero-init so they start as identity; model learns to use them.
+            self.tgt_type_embed  = nn.Parameter(torch.zeros(1, 1, dim))
+            self.ctx_type_embed  = nn.Parameter(torch.zeros(1, 1, dim))
+            self.ctx_idx_embed   = nn.Embedding(max_context_size, dim)
+            nn.init.zeros_(self.ctx_idx_embed.weight)
+        else:
+            self.tgt_type_embed = self.ctx_type_embed = self.ctx_idx_embed = None
         if num_registers > 0:
             self.register_tokens = nn.Parameter(torch.randn(1, num_registers, dim) * 0.02)
         else:
@@ -338,6 +373,7 @@ class PatchICLAttention(nn.Module):
         tgt_coords: torch.Tensor | None = None,  # (B, N, 3) int — d,h,w for rope3d
         ctx_coords: torch.Tensor | None = None,  # (B, M, 3) int — d,h,w for rope3d
         cascade_registers: torch.Tensor | None = None,  # (B, R_cas, dim) from prev level
+        scale_mm:   torch.Tensor | None = None,  # (B,) physical mm per patch at this level
     ) -> torch.Tensor:                         # (B, N) or (B, N, label_dim)
         B = tgt_feat.shape[0]
         M = ctx_feat.shape[1]
@@ -353,6 +389,21 @@ class PatchICLAttention(nn.Module):
         # 2. Project embed_dim → dim
         tgt = self.input_proj(tgt_feat)   # (B, N, dim)
         ctx = self.input_proj(ctx_feat)   # (B, M, dim)
+
+        # 2b. Scale embedding: add physical patch-size signal to all tokens
+        if self.scale_encoder is not None and scale_mm is not None:
+            s = self.scale_encoder(scale_mm).unsqueeze(1)  # (B, 1, dim)
+            tgt = tgt + s
+            ctx = ctx + s
+
+        # 2c. Role embeddings: target/context type + per-context-image index
+        if self.use_role_embed:
+            tgt = tgt + self.tgt_type_embed                    # broadcast over (B, N, dim)
+            ctx = ctx + self.ctx_type_embed                    # broadcast over (B, K*NP, dim)
+            NP = tgt.shape[1]
+            K  = ctx.shape[1] // NP
+            k_idx = torch.arange(K, device=ctx.device).repeat_interleave(NP)  # (K*NP,)
+            ctx = ctx + self.ctx_idx_embed(k_idx).unsqueeze(0)  # (B, K*NP, dim)
 
         # 3. Label injection into context tokens (at dim)
         if self.label_injection != "none":

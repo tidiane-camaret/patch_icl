@@ -38,7 +38,7 @@ import wandb  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from data.benchmark_classes import BENCHMARK_CLASSES
+from data.benchmark_classes import BENCHMARK_CLASSES, MRI_ALL_CLASSES, MRI_BENCHMARK_CLASSES
 from data.totalseg_classes import ALL_CLASSES
 from src.benchmark_models import load_model
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
@@ -184,11 +184,13 @@ def parse_args():
     p.add_argument("--classes", nargs="*", default=None,
                    help="Organ classes to evaluate (default: BENCHMARK_CLASSES)")
     p.add_argument("--all_classes", action="store_true",
-                   help="Evaluate on all 117 TotalSegmentator classes (overrides --classes)")
+                   help="Evaluate on all 121 classes (117 CT + 4 MRI-only); overrides --classes")
     p.add_argument("--n_subjects", type=int, default=50,
                    help="Max test subjects per class")
+    p.add_argument("--dataset", choices=["totalseg", "totalsegmri"], default="totalseg",
+                   help="Dataset to evaluate on (default: totalseg)")
     p.add_argument("--totalseg_root", type=str, default=None,
-                   help="TotalSegmentator data root (auto-detected from cluster config if absent)")
+                   help="Dataset root (auto-detected from cluster config if absent)")
 
     # Native model checkpoints
     p.add_argument("--ckpt_vit",        type=str, default="results/checkpoints/vit_in_context_best.pt")
@@ -216,23 +218,27 @@ def parse_args():
     return p.parse_args()
 
 
-def resolve_totalseg_root(arg_root: str) -> str:
-    """Try cluster config files to find the TotalSegmentator root."""
+def resolve_totalseg_root(arg_root: str, dataset: str = "totalseg") -> str:
+    """Try cluster config files to find the dataset root.
+
+    Uses an exact-key regex so 'totalseg:' and 'totalsegmri:' are never confused.
+    """
     if arg_root:
         return arg_root
-    # Try to read from Hydra cluster configs
+    import re
+    # Match only the exact key, not a prefix of another key.
+    pattern = rf"(?<!\w){re.escape(dataset)}\s*:\s*(.+)"
     for cfg_path in [
         ROOT / "configs" / "cluster" / "nfs.yaml",
         ROOT / "configs" / "cluster" / "meta.yaml",
     ]:
         if cfg_path.exists():
-            import re
             text = cfg_path.read_text()
-            m = re.search(r"totalseg\s*:\s*(.+)", text)
+            m = re.search(pattern, text)
             if m:
                 return m.group(1).strip()
     raise RuntimeError(
-        "Cannot auto-detect TotalSegmentator root. Pass --totalseg_root explicitly."
+        f"Cannot auto-detect root for dataset '{dataset}'. Pass --totalseg_root explicitly."
     )
 
 
@@ -250,10 +256,13 @@ def main():
              torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    classes = ALL_CLASSES if args.all_classes else (args.classes or BENCHMARK_CLASSES)
+    default_classes = MRI_BENCHMARK_CLASSES if args.dataset == "totalsegmri" else BENCHMARK_CLASSES
+    all_classes     = MRI_ALL_CLASSES if args.dataset == "totalsegmri" else ALL_CLASSES
+    classes = all_classes if args.all_classes else (args.classes or default_classes)
     image_size = tuple(args.image_size)
-    totalseg_root = resolve_totalseg_root(args.totalseg_root)
-    print(f"TotalSeg root : {totalseg_root}")
+    totalseg_root = resolve_totalseg_root(args.totalseg_root, dataset=args.dataset)
+    print(f"Dataset       : {args.dataset}")
+    print(f"Data root     : {totalseg_root}")
     print(f"Classes ({len(classes)}): {', '.join(classes)}")
     print(f"Context K={args.K}  |  image_size={image_size}  |  n_subjects≤{args.n_subjects}\n")
 
@@ -296,6 +305,8 @@ def main():
                 name=model_name,
                 config=dict(
                     model=model_name,
+                    dataset=args.dataset,
+                    totalseg_root=totalseg_root,
                     K=args.K,
                     image_size=list(image_size),
                     n_subjects=args.n_subjects,
@@ -360,7 +371,7 @@ def main():
     # Save outputs
     # -----------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = ROOT / "results"
+    out_dir = ROOT / "results/eval"
     out_dir.mkdir(exist_ok=True)
 
     # JSON (full detail)

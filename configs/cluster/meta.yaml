@@ -3,6 +3,7 @@
 
 paths:
   totalseg:    /work/dlclarge2/ndirt-SegFM3D/data/totalseg
+  totalsegmri: /work/dlclarge2/ndirt-SegFM3D/data/totalsegmri
   nnunet:      /work/dlclarge2/ndirt-SegFM3D/results/nnunet
 
 train:

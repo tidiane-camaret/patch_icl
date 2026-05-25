@@ -7,8 +7,10 @@ defaults:
 
 paths:
   checkpoints:  ${paths.results}/checkpoints
+  totalsegmri:  ???   # set in cluster config
 
 data:
+  dataset: totalseg   # totalseg | totalsegmri
   # Use split names from label_stats.csv ("train" / "val"), or an explicit list.
   train_classes: train
   val_classes:   val
