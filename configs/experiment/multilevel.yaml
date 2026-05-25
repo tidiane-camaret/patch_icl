@@ -55,6 +55,7 @@ model:
   num_registers: 4          # register tokens appended to context K/V and cascaded between levels (0 = off)
   append_zero_attn: false   # add a null K/V slot to cross-attention so target patches can "abstain"
   detach_cascade_registers: true  # detach register gradients between levels (false = cross-level gradient coupling)
+  shared_weights: true           # if true, one PatchICLAttention is shared across all levels (requires rope3d)
 
 train:
   loss_weights: [1.0, 1.0]   # weight for L0 and L1 losses

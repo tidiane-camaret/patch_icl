@@ -49,18 +49,25 @@ class MaskCNN(nn.Module):
 
 
 class MultilevelICL(nn.Module):
-    """Container for per-level PatchICLAttention instances.
+    """Container for per-level (or shared) PatchICLAttention instances.
 
     Args
     ----
-    embed_dim   : raw encoder feature dimension (shared across levels)
-    level_cfgs  : list of dicts — kwargs forwarded to PatchICLAttention for each level,
-                  plus a required 'grid_size' key for the spatial resolution.
+    embed_dim      : raw encoder feature dimension (shared across levels)
+    level_cfgs     : list of dicts — kwargs forwarded to PatchICLAttention for each level,
+                     plus a required 'grid_size' key for the spatial resolution.
+    shared_weights : if True, a single PatchICLAttention is used for all levels.
+                     Requires pos_encoding="rope3d" (learned PE has grid-size-dependent
+                     embedding tables and cannot be shared across resolutions).
     """
 
     def __init__(self, embed_dim: int, level_cfgs: list[dict], mask_cnn_dim: int = 0,
-                 num_registers: int = 0, append_zero_attn: bool = False):
+                 num_registers: int = 0, append_zero_attn: bool = False,
+                 shared_weights: bool = False):
         super().__init__()
+
+        self._num_levels   = len(level_cfgs)
+        self.shared_weights = shared_weights
 
         # Shared max_pos: covers the largest coordinate across all levels so the
         # same theta frequencies are valid everywhere.
@@ -71,8 +78,8 @@ class MultilevelICL(nn.Module):
         self.mask_cnn_dim = mask_cnn_dim
         label_dim         = mask_cnn_dim if mask_cnn_dim > 0 else 1
 
-        self.levels = nn.ModuleList([
-            PatchICLAttention(
+        def _build(cfg: dict) -> PatchICLAttention:
+            return PatchICLAttention(
                 embed_dim=embed_dim,
                 grid_size=tuple(cfg["grid_size"]),
                 dim=cfg["dim"],
@@ -94,11 +101,19 @@ class MultilevelICL(nn.Module):
                 append_zero_attn=append_zero_attn,
                 rope_max_pos=global_max_pos,
             )
-            for cfg in level_cfgs
-        ])
+
+        if shared_weights:
+            assert level_cfgs[0].get("pos_encoding", "rope3d") != "learned", \
+                "shared_weights requires rope3d pos_encoding — learned PE has grid-size-dependent tables"
+            # Single module used for every level; levels ModuleList is empty (no extra params).
+            self.shared_level = _build(level_cfgs[0])
+            self.levels       = nn.ModuleList()
+        else:
+            self.shared_level = None
+            self.levels       = nn.ModuleList([_build(cfg) for cfg in level_cfgs])
 
     def __len__(self) -> int:
-        return len(self.levels)
+        return self._num_levels
 
     def __getitem__(self, idx: int) -> PatchICLAttention:
-        return self.levels[idx]
+        return self.shared_level if self.shared_weights else self.levels[idx]

@@ -976,10 +976,12 @@ def main() -> None:
     mask_cnn_dim     = int(getattr(cfg.model, "mask_cnn_dim", 0) or 0)
     num_registers    = int(getattr(cfg.model, "num_registers", 0) or 0)
     append_zero_attn = bool(getattr(cfg.model, "append_zero_attn", False))
+    shared_weights   = bool(getattr(cfg.model, "shared_weights", False))
     model = MultilevelICL(embed_dim=embed_dim, level_cfgs=level_cfgs,
                           mask_cnn_dim=mask_cnn_dim,
                           num_registers=num_registers,
-                          append_zero_attn=append_zero_attn).to(device)
+                          append_zero_attn=append_zero_attn,
+                          shared_weights=shared_weights).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultilevelICL  params: {n_params:,}  ({len(model)} levels)")
 
@@ -989,11 +991,42 @@ def main() -> None:
 
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
+        ckpt_state = ckpt["model"]
+
+        # Remap keys when switching between shared and per-level weight layouts.
+        # per-level → shared : take levels.0.* as the shared initialisation.
+        # shared → per-level : broadcast shared_level.* to every levels.i.* slot.
+        ckpt_has_levels = any(k.startswith("levels.") for k in ckpt_state)
+        ckpt_has_shared = any(k.startswith("shared_level.") for k in ckpt_state)
+        cur_has_shared  = model.shared_weights
+
+        if ckpt_has_levels and cur_has_shared:
+            remapped = {}
+            for k, v in ckpt_state.items():
+                if k.startswith("levels.0."):
+                    remapped["shared_level." + k[len("levels.0."):]] = v
+                elif not k.startswith("levels."):
+                    remapped[k] = v
+            ckpt_state = remapped
+            print("  Checkpoint remapped: levels.0.* → shared_level.*")
+        elif ckpt_has_shared and not cur_has_shared:
+            level_indices = sorted({
+                int(k.split(".")[1]) for k in model.state_dict() if k.startswith("levels.")
+            })
+            remapped = {k: v for k, v in ckpt_state.items() if not k.startswith("shared_level.")}
+            for k, v in ckpt_state.items():
+                if k.startswith("shared_level."):
+                    suffix = k[len("shared_level."):]
+                    for i in level_indices:
+                        remapped[f"levels.{i}.{suffix}"] = v
+            ckpt_state = remapped
+            print(f"  Checkpoint remapped: shared_level.* → levels.{level_indices}.*")
+
         current_shapes = {k: v.shape for k, v in model.state_dict().items()}
-        ckpt_model = {k: v for k, v in ckpt["model"].items()
+        ckpt_model = {k: v for k, v in ckpt_state.items()
                       if k in current_shapes and v.shape == current_shapes[k]}
-        shape_skipped = [k for k in ckpt["model"] if k in current_shapes
-                         and ckpt["model"][k].shape != current_shapes[k]]
+        shape_skipped = [k for k in ckpt_state if k in current_shapes
+                         and ckpt_state[k].shape != current_shapes[k]]
         missing, unexpected = model.load_state_dict(ckpt_model, strict=False)
         if shape_skipped:
             print(f"  Shape-mismatched keys (random init): {shape_skipped}")
