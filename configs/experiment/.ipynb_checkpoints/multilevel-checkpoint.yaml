@@ -19,12 +19,13 @@ data:
   synth_method: slic
   n_synth_merge_min: 1   # min number of adjacent SVs merged per label (inclusive)
   n_synth_merge_max: 5   # max number of adjacent SVs merged per label (inclusive)
-  p_synth: 0.5
+  p_synth: 1
   class_balanced: true
   use_crop: true
   random_coloring: false
   num_labels_per_sample: 1
-  train_classes: not_benchmark
+  train_classes:
+    - liver
   val_classes: benchmark
 model:
   stunet_variant: base

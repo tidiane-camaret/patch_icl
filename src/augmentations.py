@@ -138,6 +138,26 @@ def apply_task_aug(
         grid = (base_grid + disp).clamp(-1.0, 1.0)
         images, masks = _apply_grid(images, masks, grid)
 
+    # --- Independent per-volume elastic -----------------------------------
+    # Applied after shared geometric aug so each volume deforms differently,
+    # creating within-task appearance diversity similar to synth aug's
+    # independent-per-copy design but without decoupling context/query pose.
+    iecfg = getattr(cfg, "instance_elastic", None)
+    if iecfg is not None and iecfg.p > 0:
+        _, _, D, H, W = images.shape
+        gs = max(iecfg.grid_scale, 2)
+        sd, sh, sw = max(D // gs, 2), max(H // gs, 2), max(W // gs, 2)
+        for i in range(N):
+            if random.random() < iecfg.p:
+                disp = torch.randn(1, 3, sd, sh, sw) * iecfg.alpha
+                disp = F.interpolate(disp, size=(D, H, W),
+                                     mode="trilinear", align_corners=False)
+                disp = disp.permute(0, 2, 3, 4, 1)               # (1, D, H, W, 3)
+                theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0)
+                base_grid = F.affine_grid(theta_id, (1, 1, D, H, W), align_corners=False)
+                grid = (base_grid + disp).clamp(-1.0, 1.0)
+                images[i:i+1], masks[i:i+1] = _apply_grid(images[i:i+1], masks[i:i+1], grid)
+
     return images, masks
 
 
@@ -181,6 +201,13 @@ def apply_intensity_aug(
                 image = (image - image.mean()) / std_out * std_in + mean_in
             image = image.clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
+    # --- Inverted gamma (separate darkening pass, gamma forced > 1) ------
+    if random.random() < getattr(gcfg, "inverted_p", 0.0):
+        gamma = random.uniform(1.0, gcfg.range[1])
+        span  = CT_NORM_MAX - CT_NORM_MIN
+        image = ((image - CT_NORM_MIN) / span).clamp_(0.0, 1.0).pow_(gamma)
+        image = image * span + CT_NORM_MIN
+
     # --- Gaussian noise --------------------------------------------------
     ncfg = cfg.gaussian_noise
     if random.random() < ncfg.p:
@@ -203,6 +230,11 @@ def apply_intensity_aug(
         sigma  = random.uniform(blcfg.sigma_range[0], blcfg.sigma_range[1])
         image  = _separable_gaussian_blur_3d(image, sigma)
 
+    # --- Bias field (smooth multiplicative log-normal field) -------------
+    bfcfg = getattr(cfg, "bias_field", None)
+    if bfcfg is not None and random.random() < bfcfg.p:
+        image = _simulate_bias_field(image, bfcfg.magnitude, getattr(bfcfg, "coarse", 4))
+
     return image
 
 
@@ -222,6 +254,14 @@ def _separable_gaussian_blur_3d(image: torch.Tensor, sigma: float) -> torch.Tens
     x = F.conv3d(x, kh, padding=(0, radius, 0))
     x = F.conv3d(x, kw, padding=(0, 0, radius))
     return x.squeeze(0)                 # (1, D, H, W)
+
+
+def _simulate_bias_field(image: torch.Tensor, magnitude: float, coarse: int = 4) -> torch.Tensor:
+    """Smooth multiplicative field (log-normal) simulating MRI coil inhomogeneity or CT intensity drift."""
+    _, D, H, W = image.shape
+    field = torch.randn(1, 1, coarse, coarse, coarse) * magnitude
+    field = F.interpolate(field, size=(D, H, W), mode="trilinear", align_corners=False)
+    return (image * field.squeeze(0).exp()).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
 
 def _gaussian_smooth_3d_field(field: torch.Tensor, sigma: float) -> torch.Tensor:

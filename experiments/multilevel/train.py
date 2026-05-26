@@ -895,8 +895,9 @@ def main() -> None:
     data_root = cfg.paths.totalsegmri if getattr(cfg.data, "dataset", "totalseg") == "totalsegmri" \
                 else cfg.paths.totalseg
 
-    train_classes = resolve_classes(cfg.data.train_classes, data_root)
-    val_classes   = resolve_classes(cfg.data.val_classes, data_root) if cfg.data.val_classes else []
+    is_mri = getattr(cfg.data, "dataset", "totalseg") == "totalsegmri"
+    train_classes = resolve_classes(cfg.data.train_classes, data_root, is_mri=is_mri)
+    val_classes   = resolve_classes(cfg.data.val_classes,   data_root, is_mri=is_mri) if cfg.data.val_classes else []
     val_classes   = val_classes or train_classes
 
     # ---- Datasets ----------------------------------------------------------
@@ -1084,6 +1085,7 @@ def main() -> None:
         t0 = time.perf_counter()
 
         synth_train_fig_path = None
+        real_train_fig_path  = None
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
         for batch in bar:
             preds, loss, level_losses, grid_preds_b, tgt_idxs_b, ctx_idxs_b = process_batch(
@@ -1118,13 +1120,19 @@ def main() -> None:
                 if dc == dc:
                     epoch_dice += dc; n_dice += 1; last_dice = dc
 
-            if synth_train_fig_path is None and fig_dir is not None:
+            if fig_dir is not None:
                 for b_idx, lname in enumerate(batch["label_names"]):
-                    if lname.startswith("sv_"):
+                    if synth_train_fig_path is None and lname.startswith("sv_"):
                         synth_train_fig_path = _save_synth_train_figure(
                             batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
                             b_idx, epoch, fig_dir / "train_synth", resolutions, cfg,
                         )
+                    elif real_train_fig_path is None and not lname.startswith("sv_"):
+                        real_train_fig_path = _save_synth_train_figure(
+                            batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
+                            b_idx, epoch, fig_dir / "train_real", resolutions, cfg,
+                        )
+                    if synth_train_fig_path is not None and real_train_fig_path is not None:
                         break
 
             bar.set_postfix(
@@ -1173,6 +1181,8 @@ def main() -> None:
             all_figs        = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
             if synth_train_fig_path is not None:
                 all_figs["train/pred_synth"] = wandb.Image(str(synth_train_fig_path))
+            if real_train_fig_path is not None:
+                all_figs["train/pred_real"] = wandb.Image(str(real_train_fig_path))
             level_loss_log  = {f"train/loss_l{j}": epoch_level_losses[j] / max(n_batches, 1)
                                for j in range(n_levels)}
             wandb.log({

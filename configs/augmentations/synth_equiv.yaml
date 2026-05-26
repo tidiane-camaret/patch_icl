@@ -1,0 +1,95 @@
+augmentations:
+  enabled: true
+
+  # -----------------------------------------------------------------------
+  # Task augmentations  —  synth-equivalent strength, shared across K+1 volumes.
+  # Mirrors apply_synth_aug parameters so real-label training can be run at
+  # the same augmentation intensity as p_synth=1.0 runs.
+  # Use to isolate data-type effect from augmentation-strength effect:
+  #   python experiments/multilevel/train.py train.aug_preset=synth_equiv data.p_synth=0.0
+  # -----------------------------------------------------------------------
+  task:
+    flip:
+      p_d: 0.5
+      p_h: 0.5
+      p_w: 0.5
+
+    affine:
+      p: 0.8
+      max_angle_deg: 25.0           # synth aug: ±25° (vs ±15° multiverseg)
+      scale_min: 0.90               # synth aug: [0.90, 1.50]
+      scale_max: 1.50
+      max_translate: 0.20           # synth aug: ±0.20 (vs ±0.10 multiverseg)
+
+    elastic:
+      p: 0.8                        # synth aug: p=0.8 (vs p=0.3 multiverseg)
+      alpha: 0.09                   # ≈ synth alpha_mid (5.5 vox) / 64 vox-per-unit at 128³
+      grid_scale: 11                # ≈ D / synth sigma_mid (128 / 11.5 ≈ 11)
+
+  # -----------------------------------------------------------------------
+  # Intensity augmentations  —  matches synth aug ops.
+  # No gamma, no simulate_low_res (synth aug does not use these).
+  # -----------------------------------------------------------------------
+  intensity:
+    hu_jitter: 0
+    brightness_contrast:
+      p: 0.50
+      brightness: 0.10
+      contrast_range: [0.5, 1.5]
+      preserve_range: true
+
+    gamma:
+      p: 0.0                        # synth aug does not use gamma
+      range: [0.70, 1.50]
+      retain_stats: false
+
+    gaussian_noise:
+      p: 0.50
+      max_std: 0.05                 # synth: mean_range=[0,0.05] + std_range=[0,0.05] → ~0.05 total
+
+    gaussian_blur:
+      p: 0.50
+      sigma_range: [0.1, 1.5]      # synth aug: [0.1, 1.5]
+
+    simulate_low_resolution:
+      p: 0.0                        # synth aug does not use simulate_low_res
+      scale_min: 0.5
+      scale_max: 1.0
+
+  # -----------------------------------------------------------------------
+  # Synth augmentations  —  unchanged (used when p_synth > 0)
+  # -----------------------------------------------------------------------
+  synth:
+    flip_d: 0.5
+    flip_h: 0.5
+    flip_w: 0.5
+
+    affine:
+      p: 0.8
+      max_angle_deg: 25.0
+      scale_min: 0.90
+      scale_max: 1.50
+      max_translate: 0.20
+
+    elastic:
+      p: 0.8
+      alpha_range: [1, 10]
+      sigma_range: [8, 15]
+
+    brightness_contrast:
+      p: 0.5
+      brightness: 0.10
+      contrast_range: [0.5, 1.5]
+
+    sharpness:
+      p: 0.5
+      factor: 5.0
+
+    gaussian_blur:
+      p: 0.5
+      sigma_range: [0.1, 1.5]
+
+    gaussian_noise:
+      p: 0.5
+      mean_range: [0.0, 0.05]
+      std_range:  [0.0, 0.05]

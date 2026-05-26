@@ -128,25 +128,34 @@ BENCHMARK_CLASSES: list[str] = [
 def resolve_classes(
     value: Union[str, list],
     totalseg_root: Union[str, Path, None] = None,
+    is_mri: bool = False,
 ) -> list[str]:
     """Resolve a class list from a Hydra config value.
 
     If *value* is already a list (or OmegaConf ListConfig), return it as a plain list.
-    If *value* is ``"benchmark"``, return BENCHMARK_CLASSES.
-    If *value* is a string such as ``"train"`` or ``"val"``, read
-    ``{totalseg_root}/label_stats.csv`` and return the classes whose ``split``
-    column matches that string.
+    Special string values (CT by default; pass ``is_mri=True`` for MRI variants):
+      ``"benchmark"``     → BENCHMARK_CLASSES / MRI_BENCHMARK_CLASSES
+      ``"not_benchmark"`` → ALL_CLASSES[:117] / MRI_ALL_CLASSES minus the benchmark set
+    Otherwise read ``{totalseg_root}/label_stats.csv`` and return classes whose
+    ``split`` column matches *value* (e.g. ``"train"`` / ``"val"``).
 
     Args:
         value:          cfg.data.train_classes or cfg.data.val_classes.
-        totalseg_root:  Path to the TotalSegmentator data root (cfg.paths.totalseg).
-                        Required when value is a string.
+        totalseg_root:  Path to the dataset root. Required for split-name strings.
+        is_mri:         Set True when cfg.data.dataset == "totalsegmri".
     """
     if not isinstance(value, str):
         return list(value)
 
     if value == "benchmark":
-        return list(BENCHMARK_CLASSES)
+        return list(MRI_BENCHMARK_CLASSES if is_mri else BENCHMARK_CLASSES)
+
+    if value == "not_benchmark":
+        if is_mri:
+            bench_set = set(MRI_BENCHMARK_CLASSES)
+            return [c for c in MRI_ALL_CLASSES if c not in bench_set]
+        bench_set = set(BENCHMARK_CLASSES)
+        return [c for c in ALL_CLASSES[:117] if c not in bench_set]
 
     if totalseg_root is None:
         raise ValueError("totalseg_root must be provided when train/val_classes is a split name")

@@ -1,5 +1,34 @@
 # Change log
 
+## 2026-05-26 — `not_benchmark` class splits in resolve_classes
+
+`data/totalseg_classes.py`
+
+- Added `"not_benchmark"` → CT classes in `ALL_CLASSES[:117]` that are **not** in `BENCHMARK_CLASSES` (complement train set for CT).
+- Added `"benchmark_mri"` → `MRI_BENCHMARK_CLASSES`.
+- Added `"not_benchmark_mri"` → MRI classes in `MRI_ALL_CLASSES` that are **not** in `MRI_BENCHMARK_CLASSES` (complement train set for MRI).
+- Use in config: `data.train_classes=not_benchmark data.val_classes=benchmark` to train on held-out classes and evaluate on benchmark.
+
+## 2026-05-25 — Augmentation benchmark and synth_equiv preset
+
+`configs/augmentations/synth_equiv.yaml`, `experiments/multilevel/benchmark_aug.py`.
+
+- **`synth_equiv.yaml`**: new aug preset matching synth-aug strength applied to real labels (task.affine ±25°, scale [0.90–1.50], translate ±0.20, elastic p=0.8; intensity BC+noise+blur matching synth ops but no gamma/sim-low-res). Use with `train.aug_preset=synth_equiv data.p_synth=0.0` to isolate augmentation strength from data-type effect.
+- **`experiments/multilevel/benchmark_aug.py`**: comprehensive runtime benchmark comparing custom PyTorch, MONAI, and batchgenerators augmentation pipelines. Sweeps presets × K values, reports per-transform breakdown, worker throughput estimates. Key findings at 128³ (20 reps, n_workers=20):
+
+  | Preset | ms/vol (K=1) | ms/vol (K=3) | batch(K=1, 8 items) |
+  |--------|-------------|-------------|---------------------|
+  | nnunet (no elastic) | 68 ms | 32 ms | 26 ms |
+  | multiverseg | 152 ms | 112 ms | 65 ms |
+  | synth_equiv | 216 ms | 233 ms | 102 ms |
+  | synth pipeline (p_synth=1) | 419 ms | 465 ms | 143 ms |
+
+  - **Custom PyTorch vs libraries**: affine ≈ MONAI (1.03–1.28× at 128³, batching advantage lost to grid_sample cost), elastic custom is 2–3.5× faster than MONAI, batchgenerators `augment_spatial` is 17–20× slower.
+  - **Bottleneck**: affine (~128–140 ms/vol) + elastic (~150 ms/vol) dominate at 128³. nnunet avoids elastic (p=0) and is 3–4× faster.
+  - **Synth pipeline**: independent per-copy aug is the training bottleneck at 128³; with 20 workers K=3 gives only 45 sps → 180ms/batch, likely bottlenecking GPU pipeline.
+  - **Recommendation**: keep custom PyTorch (already optimal); consider `aug_preset=nnunet` for faster iterations; use `synth_equiv` + `p_synth=0.0` to test augmentation-strength hypothesis.
+  - Output saved to `results/aug_benchmark/aug_benchmark_*.json`.
+
 ## 2026-05-25 — TotalSegMRI support (convert, synth labels, eval)
 
 `data/totalseg_classes.py`, `data/benchmark_classes.py`, `scripts/convert_to_npy.py`, `scripts/synth_labels/generate.py`, `scripts/eval.py`, `configs/config.yaml`, `configs/cluster/nfs.yaml`, `configs/cluster/meta.yaml`.
