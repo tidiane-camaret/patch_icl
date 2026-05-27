@@ -94,3 +94,12 @@ augmentations:
       p: 0.5
       mean_range: [0.0, 0.05]
       std_range:  [0.0, 0.05]
+
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]
+
+    simulate_low_resolution:
+      p: 0.15
+      scale_min: 0.5
+      scale_max: 1.0

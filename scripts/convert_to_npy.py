@@ -19,7 +19,7 @@ Usage
 -----
   python scripts/convert_to_npy.py [--data DIR] [--workers N] [--overwrite]
   python scripts/convert_to_npy.py --size 128 128 128
-  python scripts/convert_to_npy.py --data /path/to/totalsegmri --modality mri --size 128 128 128
+  python scripts/convert_to_npy.py --data /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalsegmri --modality mri --size 128 128 128 --overwrite
 """
 
 import argparse
@@ -44,16 +44,26 @@ from src.totalseg_dataset import CT_CLIP_MIN, CT_CLIP_MAX, CT_MEAN, CT_STD
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True) -> np.ndarray:
-    """Isotropic resize: scale longest axis to target[0], zero-pad shorter axes.
+def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True,
+                spacing: tuple | None = None) -> np.ndarray:
+    """Isotropic resize: scale longest physical axis to target[0], zero-pad shorter axes.
 
     With aa=True (and order > 0), applies a per-axis Gaussian blur before
     downsampling (σ = 0.5*(s/n − 1)) to suppress aliasing.  Upsampled axes skip
     the blur.  Uses order=0 for label volumes (nearest-neighbour, no AA needed).
+
+    spacing: voxel size in mm (D, H, W). When provided, scaling is based on
+    physical extent (shape × spacing) rather than voxel count alone — critical
+    for anisotropic 2-D multi-slice MRI where slice thickness >> in-plane spacing.
     """
     T = target[0]
-    scale = T / max(vol.shape)
-    new_shape = tuple(min(T, max(1, round(s * scale))) for s in vol.shape)
+    if spacing is not None:
+        # Scale so the longest physical dimension fits in T voxels; preserve aspect ratio.
+        phys = tuple(s * sp for s, sp in zip(vol.shape, spacing))
+        new_shape = tuple(min(T, max(1, round(T * p / max(phys)))) for p in phys)
+    else:
+        scale = T / max(vol.shape)
+        new_shape = tuple(min(T, max(1, round(s * scale))) for s in vol.shape)
     if aa and order > 0:
         sigma = [max(0.0, 0.5 * (s / n - 1)) for s, n in zip(vol.shape, new_shape)]
         if any(s > 0.1 for s in sigma):
@@ -85,17 +95,16 @@ def _normalise_ct(vol: np.ndarray) -> np.ndarray:
 
 
 def _normalise_mri(vol: np.ndarray) -> np.ndarray:
-    """Per-volume MRI normalisation: clip bright outliers then z-score over foreground.
+    """Per-volume MRI normalisation: clip to [0.5, 99.5] percentile of foreground, then z-score.
 
-    1. Clip to [0, 99.5th percentile of foreground] — removes coil/air outliers.
-    2. Z-score using foreground (>0) mean and std — accounts for field-strength /
-       protocol variability across scanners.
+    Uses non-zero voxels to avoid background air biasing the percentiles.
     """
     fg = vol[vol > 0]
     if fg.size == 0:
         return vol.astype(np.float32)
+    p005 = float(np.percentile(fg, 0.5))
     p995 = float(np.percentile(fg, 99.5))
-    vol  = np.clip(vol, 0.0, p995)
+    vol  = np.clip(vol, p005, p995)
     fg   = vol[vol > 0]
     mean, std = float(fg.mean()), float(fg.std())
     if std < 1e-6:
@@ -137,7 +146,7 @@ def convert_subject(args: tuple) -> tuple[str, str, list | None, list | None]:
             img_fname = "mri.nii.gz" if modality == "mri" else "ct.nii.gz"
             img_path  = subj_dir / img_fname
             ct_img    = nib.as_closest_canonical(nib.load(str(img_path)))
-            native_spacing = [float(x) for x in ct_img.header.get_zooms()[:3]]
+            native_spacing = [float(x) for x in nib.affines.voxel_sizes(ct_img.affine)[:3]]
             vol = ct_img.get_fdata(dtype=np.float32)
             native_shape = list(vol.shape)
 
@@ -164,9 +173,17 @@ def convert_subject(args: tuple) -> tuple[str, str, list | None, list | None]:
                 label = np.load(label_out, mmap_mode="r")
             if native_shape is None:
                 native_shape = list(vol.shape)
+            if native_spacing is None:
+                # Read spacing from the NIfTI header (header-only, no data load)
+                img_fname = "mri.nii.gz" if modality == "mri" else "ct.nii.gz"
+                img_path  = subj_dir / img_fname
+                if img_path.exists():
+                    canonical = nib.as_closest_canonical(nib.load(str(img_path)))
+                    native_spacing = [float(x) for x in nib.affines.voxel_sizes(canonical.affine)[:3]]
 
-            np.save(ct_sized,    _iso_resize(vol,   size, order=1, aa=True).astype(np.float16))
-            np.save(label_sized, _iso_resize(label, size, order=0, aa=False))
+            sp = tuple(native_spacing) if native_spacing else None
+            np.save(ct_sized,    _iso_resize(vol,   size, order=1, aa=True,  spacing=sp).astype(np.float16))
+            np.save(label_sized, _iso_resize(label, size, order=0, aa=False, spacing=sp))
 
     except Exception:
         return subj, traceback.format_exc(), None, None

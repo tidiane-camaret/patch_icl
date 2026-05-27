@@ -26,6 +26,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
@@ -58,7 +62,55 @@ def dice_binary(pred: torch.Tensor, target: torch.Tensor) -> float:
     return (2 * inter + 1) / (union + 1)
 
 
-def make_loader(cfg, cls: str, context_size: int, n_subjects: int, use_crop: bool = True) -> DataLoader:
+def _best_slice(mask: np.ndarray) -> int:
+    counts = mask.sum(axis=(1, 2))
+    return int(counts.argmax()) if counts.max() > 0 else mask.shape[0] // 2
+
+
+def save_eval_figure(
+    target_img: np.ndarray,  # (D, H, W)
+    gt:         np.ndarray,  # (D, H, W) binary
+    pred:       np.ndarray,  # (D, H, W) binary
+    ctx_img:    np.ndarray,  # (D, H, W) first context image
+    ctx_gt:     np.ndarray,  # (D, H, W) first context mask
+    out_path:   Path,
+    title:      str = "",
+) -> None:
+    """Save a 4-panel figure: context | target | GT overlay | pred overlay."""
+    def _norm(sl):
+        mn, mx = sl.min(), sl.max()
+        return (sl - mn) / (mx - mn + 1e-6)
+
+    z     = _best_slice(gt)
+    z_ctx = _best_slice(ctx_gt)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4),
+                             gridspec_kw={"wspace": 0.04})
+    axes[0].imshow(_norm(ctx_img[z_ctx]), cmap="gray")
+    axes[0].imshow(ctx_gt[z_ctx].astype(float), cmap="Reds", alpha=0.45, vmin=0, vmax=1)
+    axes[0].set_title("context", fontsize=8)
+
+    axes[1].imshow(_norm(target_img[z]), cmap="gray")
+    axes[1].set_title("target", fontsize=8)
+
+    axes[2].imshow(_norm(target_img[z]), cmap="gray")
+    axes[2].imshow(gt[z].astype(float), cmap="Reds", alpha=0.45, vmin=0, vmax=1)
+    axes[2].set_title("GT", fontsize=8)
+
+    axes[3].imshow(_norm(target_img[z]), cmap="gray")
+    axes[3].imshow(pred[z].astype(float), cmap="Blues", alpha=0.45, vmin=0, vmax=1)
+    axes[3].set_title("pred", fontsize=8)
+
+    for ax in axes:
+        ax.axis("off")
+    fig.suptitle(title, fontsize=9)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_loader(cfg, cls: str, context_size: int, n_subjects: int, use_crop: bool = True,
+                batch_size: int = 1, num_workers: int = 4) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=cfg.totalseg_root,
         classes=[cls],
@@ -74,13 +126,13 @@ def make_loader(cfg, cls: str, context_size: int, n_subjects: int, use_crop: boo
     )
     return DataLoader(
         ds,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=num_workers,
         collate_fn=incontext_collate_fn,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
 
@@ -117,7 +169,8 @@ def _sync():
         torch.cuda.synchronize()
 
 
-def evaluate_model(model, loader, cls: str) -> tuple[dict, list[dict]]:
+def evaluate_model(model, loader, cls: str,
+                   fig_dir: Path | None = None) -> tuple[dict, list[dict]]:
     """
     Run inference over a dataloader.
 
@@ -126,12 +179,13 @@ def evaluate_model(model, loader, cls: str) -> tuple[dict, list[dict]]:
         cases    : list of per-case dicts {class, subject, dice, time_ms}
     """
     cases = []
+    fig_saved = False
 
     for batch in loader:
-        target_img    = batch["image"]          # (1, 1, D, H, W)
-        context_imgs  = batch["context_in"]     # (1, K, 1, D, H, W)
-        context_masks = batch["context_out"]    # (1, K, D, H, W)
-        label         = batch["label"]          # (1, D, H, W)
+        target_img    = batch["image"]          # (B, 1, D, H, W)
+        context_imgs  = batch["context_in"]     # (B, K, 1, D, H, W)
+        context_masks = batch["context_out"]    # (B, K, D, H, W)
+        label         = batch["label"]          # (B, D, H, W)
         subjects      = batch.get("subjects", [None] * target_img.shape[0])
 
         _sync()
@@ -142,6 +196,21 @@ def evaluate_model(model, loader, cls: str) -> tuple[dict, list[dict]]:
 
         pred  = pred.cpu()
         label = label.cpu()
+
+        if fig_dir is not None and not fig_saved:
+            subj = subjects[0] or "s0"
+            dice_val = dice_binary(pred[0], label[0])
+            save_eval_figure(
+                target_img=target_img[0].squeeze(0).numpy(),
+                gt=label[0].numpy(),
+                pred=pred[0].numpy(),
+                ctx_img=context_imgs[0, 0].squeeze(0).numpy(),
+                ctx_gt=context_masks[0, 0].numpy(),
+                out_path=fig_dir / f"{cls}_{subj}.png",
+                title=f"{cls}  {subj}  dice={dice_val:.3f}",
+            )
+            fig_saved = True
+
         for i in range(pred.shape[0]):
             cases.append({
                 "class":   cls,
@@ -214,6 +283,12 @@ def parse_args():
                    help="Disable W&B logging")
     p.add_argument("--use_crop", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable crop augmentation in the dataloader (default: True)")
+    p.add_argument("--batch_size", type=int, default=8,
+                   help="Dataloader batch size (default: 1)")
+    p.add_argument("--num_workers", type=int, default=20,
+                   help="Dataloader num_workers (default: 4)")
+    p.add_argument("--save_figs", action=argparse.BooleanOptionalAction, default=True,
+                   help="Save one segmentation figure per class (default: True)")
 
     return p.parse_args()
 
@@ -268,6 +343,11 @@ def main():
 
     cfg = _Cfg(totalseg_root=totalseg_root, image_size=image_size)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir   = ROOT / "results/eval"
+    out_dir.mkdir(exist_ok=True)
+    fig_base  = out_dir / f"figures_{timestamp}" if args.save_figs else None
+
     results = {}  # model_name → list[dict]
 
     for model_name in args.models:
@@ -311,18 +391,23 @@ def main():
                     image_size=list(image_size),
                     n_subjects=args.n_subjects,
                     classes=classes,
+                    batch_size=args.batch_size,
                     gflops=round(gflops, 2),
                 ),
                 reinit="finish_previous",
             )
             case_table = wandb.Table(columns=["class", "subject", "dice", "time_ms"])
 
+        fig_dir = fig_base / model_name if fig_base is not None else None
+
         model_results = []
         all_cases = []
         for cls in tqdm(classes, desc=model_name):
             try:
-                loader = make_loader(cfg, cls, context_size=args.K, n_subjects=args.n_subjects, use_crop=args.use_crop)
-                row, cases = evaluate_model(model, loader, cls)
+                loader = make_loader(cfg, cls, context_size=args.K, n_subjects=args.n_subjects,
+                                    use_crop=args.use_crop, batch_size=args.batch_size,
+                                    num_workers=args.num_workers)
+                row, cases = evaluate_model(model, loader, cls, fig_dir=fig_dir)
                 row["gflops"] = round(gflops, 2)
                 model_results.append(row)
                 all_cases.extend(cases)
@@ -370,10 +455,6 @@ def main():
     # -----------------------------------------------------------------------
     # Save outputs
     # -----------------------------------------------------------------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = ROOT / "results/eval"
-    out_dir.mkdir(exist_ok=True)
-
     # JSON (full detail)
     json_path = out_dir / f"eval_{timestamp}.json"
     json_path.write_text(json.dumps(results, indent=2))

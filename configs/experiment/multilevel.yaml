@@ -19,7 +19,7 @@ data:
   synth_method: slic
   n_synth_merge_min: 1   # min number of adjacent SVs merged per label (inclusive)
   n_synth_merge_max: 5   # max number of adjacent SVs merged per label (inclusive)
-  p_synth: 0.5
+  p_synth: 1
   class_balanced: true
   use_crop: true
   random_coloring: false
@@ -75,3 +75,4 @@ train:
   run_name: null
   checkpoint: null
   device: null
+  compile_model: false  # set true to enable torch.compile(reduce-overhead) — requires Python 3.11 + triton

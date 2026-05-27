@@ -380,4 +380,21 @@ def apply_synth_aug(
         std  = random.uniform(ncfg.std_range[0],  ncfg.std_range[1])
         image = (image + mean + torch.randn_like(image) * std).clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
+    # --- Gamma -----------------------------------------------------------
+    gcfg = getattr(cfg, "gamma", None)
+    if gcfg is not None and random.random() < gcfg.p:
+        gamma = random.uniform(gcfg.range[0], gcfg.range[1])
+        span  = CT_NORM_MAX - CT_NORM_MIN
+        image = ((image - CT_NORM_MIN) / span).clamp_(0.0, 1.0).pow_(gamma)
+        image = image * span + CT_NORM_MIN
+
+    # --- Simulate low resolution -----------------------------------------
+    lrcfg = getattr(cfg, "simulate_low_resolution", None)
+    if lrcfg is not None and random.random() < lrcfg.p:
+        D, H, W = image.shape[1:]
+        scale = random.uniform(lrcfg.scale_min, lrcfg.scale_max)
+        small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
+        x = F.interpolate(image.unsqueeze(0), size=small, mode="trilinear", align_corners=False)
+        image = F.interpolate(x, size=(D, H, W), mode="trilinear", align_corners=False).squeeze(0)
+
     return image, mask

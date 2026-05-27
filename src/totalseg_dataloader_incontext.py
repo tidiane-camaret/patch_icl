@@ -89,6 +89,31 @@ def _adj_for_subject(root: Path, subj: str, synth_fname: str) -> tuple[str, dict
         return subj, None
 
 
+def _bbox_for_subject(root: Path, subj: str) -> tuple[str, dict | None]:
+    """Compute per-class centroids for one subject (module-level for pickling)."""
+    try:
+        arr = np.load(root / subj / "label.npy", mmap_mode="r")
+        D, H, W = arr.shape
+        d_g = np.arange(D, dtype=np.float32)[:, None, None]
+        h_g = np.arange(H, dtype=np.float32)[None, :, None]
+        w_g = np.arange(W, dtype=np.float32)[None, None, :]
+        result: dict[str, tuple[int, int, int]] = {}
+        for idx in np.unique(arr):
+            if idx == 0 or idx not in _IDX_TO_CLASS:
+                continue
+            mask = (arr == idx)
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            cd = int((d_g * mask).sum() / n)
+            ch = int((h_g * mask).sum() / n)
+            cw = int((w_g * mask).sum() / n)
+            result[_IDX_TO_CLASS[idx]] = (cd, ch, cw)
+        return subj, result
+    except Exception:
+        return subj, None
+
+
 class TotalSegInContextDataset(Dataset):
     """
     In-context segmentation dataset over TotalSegmentator 3-D volumes.
@@ -413,36 +438,30 @@ class TotalSegInContextDataset(Dataset):
                   flush=True)
             return cache
 
-        print(f"Building bbox cache for {len(all_subjects)} subjects "
-              f"(saved to {cache_path.name})...", flush=True)
+        valid_subjects = [s for s in all_subjects
+                          if (self.root / s / "label.npy").exists()]
+        n_workers = min(16, os.cpu_count() or 1)
+        print(f"Building bbox cache for {len(valid_subjects)} subjects "
+              f"(saved to {cache_path.name}, {n_workers} workers)...", flush=True)
         cache: dict[str, dict[str, tuple[int, int, int]]] = {}
-        for subj in all_subjects:
-            label_npy = self.root / subj / "label.npy"
-            if not label_npy.exists():
-                continue
-            try:
-                arr = np.load(label_npy, mmap_mode="r")
-                D, H, W = arr.shape
-                # Build coordinate grids once per subject
-                d_g = np.arange(D, dtype=np.float32)[:, None, None]
-                h_g = np.arange(H, dtype=np.float32)[None, :, None]
-                w_g = np.arange(W, dtype=np.float32)[None, None, :]
-                subj_bboxes: dict[str, tuple[int, int, int]] = {}
-                for idx in np.unique(arr):
-                    if idx == 0 or idx not in _IDX_TO_CLASS:
-                        continue
-                    mask = (arr == idx)
-                    n = mask.sum()
-                    if n == 0:
-                        continue
-                    cd = int((d_g * mask).sum() / n)
-                    ch = int((h_g * mask).sum() / n)
-                    cw = int((w_g * mask).sum() / n)
-                    subj_bboxes[_IDX_TO_CLASS[idx]] = (cd, ch, cw)
-                cache[subj] = subj_bboxes
-            except (EOFError, ValueError, OSError):
-                print(f"  Skipping corrupt file: {label_npy}", flush=True)
-                continue
+        done = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futs = {
+                ex.submit(_bbox_for_subject, self.root, subj): subj
+                for subj in valid_subjects
+            }
+            for fut in as_completed(futs):
+                try:
+                    subj, result = fut.result()
+                    if result is not None:
+                        cache[subj] = result
+                    else:
+                        print(f"  Skipping {subj} (error in bbox worker)", flush=True)
+                except Exception as e:
+                    print(f"  Error in bbox worker: {e}", flush=True)
+                done += 1
+                if done % 100 == 0:
+                    print(f"  bbox cache: {done}/{len(valid_subjects)}", flush=True)
 
         with open(cache_path, "wb") as f:
             pickle.dump(cache, f)
@@ -470,6 +489,10 @@ class TotalSegInContextDataset(Dataset):
                 # Effective spacing: _iso_resize scales longest axis → T voxels
                 max_native = max(meta["shape"])
                 sp = sp * (max_native / T)
+            elif T is not None and self.use_crop:
+                # Effective spacing after crop + resize to T³ is always 1.5mm/voxel:
+                # phys_ref = T * 1.5mm is resampled into T voxels, isotropic.
+                sp = torch.full((3,), 1.5, dtype=torch.float32)
             result[subj] = sp
         return result
 
@@ -775,12 +798,12 @@ class TotalSegInContextDataset(Dataset):
 
     def _load_crop(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Load native ct.npy + label.npy and return an organ-centred random crop
-        of self.image_size (assumed cubic: T = image_size[0]).
+        Load native ct.npy + label.npy and return an organ-centred crop resized to T³.
 
-        The crop start is jittered by ±crop_jitter voxels around the centroid
-        and clamped so the crop fits entirely within the volume.  Volumes smaller
-        than T in any dimension are zero-padded.
+        Physical extent is fixed at T*1.5mm (192mm at T=128), matching the CT dataset
+        (always 1.5mm isotropic).  Crop voxel counts vary per axis and subject to cover
+        this extent, then trilinear resample to T³ gives 1.5mm/voxel isotropic for all
+        subjects and modalities.
         """
         subj_dir = self.root / subj
         T = self.image_size[0]
@@ -794,33 +817,43 @@ class TotalSegInContextDataset(Dataset):
         else:
             cd, ch, cw = D // 2, H // 2, W // 2
 
+        # Fixed physical crop: T * 1.5mm = 192mm at T=128, matching CT (always 1.5mm).
+        # Using a fixed extent gives identical effective spacing (1.5mm/voxel) across
+        # all subjects and modalities after the crop is resampled to T³.
+        sp = self._get_spacing(subj).tolist()   # native mm/voxel (3,)
+        phys_ref = T * 1.5
+        crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
+                      for spi, dim in zip(sp, (D, H, W))]
+
         j = self.crop_jitter
         starts = []
-        for c, s in zip((cd, ch, cw), (D, H, W)):
-            ideal = c - T // 2
+        for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
+            ideal = c - cs // 2
             lo = max(0, ideal - j)
-            hi = max(lo, min(max(0, s - T), ideal + j))
+            hi = max(lo, min(max(0, s - cs), ideal + j))
             starts.append(random.randint(lo, hi))
         d0, h0, w0 = starts
 
         ct_mm = np.load(subj_dir / "ct.npy", mmap_mode="r")
-        crop_ct  = ct_mm   [d0:d0+T, h0:h0+T, w0:w0+T]
-        crop_lbl = label_mm[d0:d0+T, h0:h0+T, w0:w0+T]
-
-        # Zero-pad if volume is smaller than T in any dim (rare)
-        image = np.zeros((T, T, T), dtype=np.float32)
-        label = np.zeros((T, T, T), dtype=np.uint8)
+        crop_ct  = ct_mm   [d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
+        crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
         s = crop_ct.shape
-        image[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
+
+        # Resize to T³ (trilinear for image, nearest for label)
+        image_t = F.interpolate(
+            torch.from_numpy(crop_ct.astype(np.float32)).unsqueeze(0).unsqueeze(0),
+            size=(T, T, T), mode="trilinear", align_corners=False,
+        ).squeeze(0)  # (1, T, T, T)
 
         orig_idx = _ALL_CLASSES_IDX.get(cls)
         if orig_idx is not None:
-            label[:s[0], :s[1], :s[2]] = (crop_lbl == orig_idx).astype(np.uint8)
+            bin_crop = torch.from_numpy((crop_lbl == orig_idx).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            label_t  = (F.interpolate(bin_crop, size=(T, T, T), mode="nearest")
+                        .squeeze(0).squeeze(0) > 0.5).long()
+        else:
+            label_t = torch.zeros(T, T, T, dtype=torch.long)
 
-        return (
-            torch.from_numpy(image).unsqueeze(0),  # (1, T, T, T)
-            torch.from_numpy(label).long(),          # (T, T, T)
-        )
+        return image_t, label_t
 
     def _load_crop_multi(self, subj: str, classes: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Like _load_crop but assigns label IDs 1…L for each class in one pass."""
@@ -837,29 +870,40 @@ class TotalSegInContextDataset(Dataset):
                 break
         cd, ch, cw = center if center is not None else (D // 2, H // 2, W // 2)
 
+        sp = self._get_spacing(subj).tolist()
+        phys_ref = T * 1.5
+        crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
+                      for spi, dim in zip(sp, (D, H, W))]
+
         j = self.crop_jitter
         starts = []
-        for c, s in zip((cd, ch, cw), (D, H, W)):
-            ideal = c - T // 2
+        for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
+            ideal = c - cs // 2
             lo = max(0, ideal - j)
-            hi = max(lo, min(max(0, s - T), ideal + j))
+            hi = max(lo, min(max(0, s - cs), ideal + j))
             starts.append(random.randint(lo, hi))
         d0, h0, w0 = starts
 
         ct_mm   = np.load(subj_dir / "ct.npy", mmap_mode="r")
-        crop_ct  = ct_mm[d0:d0+T, h0:h0+T, w0:w0+T]
-        crop_lbl = label_mm[d0:d0+T, h0:h0+T, w0:w0+T]
-        s = crop_ct.shape
+        crop_ct  = ct_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
+        crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
 
-        image = np.zeros((T, T, T), dtype=np.float32)
-        label = np.zeros((T, T, T), dtype=np.uint8)
-        image[:s[0], :s[1], :s[2]] = crop_ct.astype(np.float32)
+        image_t = F.interpolate(
+            torch.from_numpy(crop_ct.astype(np.float32)).unsqueeze(0).unsqueeze(0),
+            size=(T, T, T), mode="trilinear", align_corners=False,
+        ).squeeze(0)  # (1, T, T, T)
+
+        label_np = np.zeros(crop_lbl.shape, dtype=np.uint8)
         for i, cls in enumerate(classes, 1):
             orig_idx = _ALL_CLASSES_IDX.get(cls)
             if orig_idx is not None:
-                label[:s[0], :s[1], :s[2]][crop_lbl[:s[0], :s[1], :s[2]] == orig_idx] = i
+                label_np[crop_lbl == orig_idx] = i
+        label_t = F.interpolate(
+            torch.from_numpy(label_np.astype(np.float32)).unsqueeze(0).unsqueeze(0),
+            size=(T, T, T), mode="nearest",
+        ).squeeze(0).squeeze(0).long()
 
-        return torch.from_numpy(image).unsqueeze(0), torch.from_numpy(label).long()
+        return image_t, label_t
 
     def _load_multi(self, subj: str, classes: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Load image + multi-class label in a single pass (IDs 1…L per class).

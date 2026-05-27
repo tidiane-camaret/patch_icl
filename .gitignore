@@ -20,3 +20,9 @@ results/benchmarks/eval/eval_20260524_175835.csv
 results/benchmarks/vram_sweep/*.png
 results/synth_labels/*.png
 results/benchmarks/eval/*.json
+results/eval/**/*.png
+results/eval/**/*.csv
+results/eval/**/*.json
+
+experiments/synth_labels/*.png
+results/datasets/*.png

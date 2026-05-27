@@ -1,19 +1,31 @@
 """
-Multilevel coarse-to-fine PatchICLAttention on TotalSegmentator.
+NNInteractive encoder + multilevel PatchICLAttention on TotalSegmentator.
 
-Two levels trained jointly with detached gradients between them:
-  L0: dense 8³ grid  — all 512 patches, standard ICL forward.
-  L1: sparse 16³ grid — NP₁ patches sampled via Gumbel-TopK:
-        target  : gt_previous_pred_error or gt_foreground_entropy_balanced
-                  (controlled by data.target_sampling).
-        context : gt_foreground_entropy_balanced (0.5·GT + 0.5·H(GT)).
+Identical pipeline to experiments/multilevel/train.py with two differences:
+
+1. Encoder — NNInteractiveEncoder (pretrained, 90 M params, frozen) instead
+   of STUNetEncoder.  Supports two mask injection modes:
+
+     ch1      : context images encoded as [img, ctx_mask, 0, 0, 0, 0, 0, 0]
+                (uses nnInteractive's native "current segmentation" channel).
+                Target images encoded as [img, 0, 0, 0, 0, 0, 0, 0].
+     separate : image in ch0 only; mask fused at bottleneck via _Mask3DEncoder.
+
+2. Context encoding — context masks are passed to the encoder (not only to the
+   attention module as labels).  This lets the encoder leverage its interactive
+   segmentation pretraining to produce mask-conditioned features for context
+   images while keeping target features unconditional.
+
+Everything else — attention architecture (MultilevelICL), patch sampling,
+coarse-to-fine cascade, label injection, visualisation — is unchanged.
 
 Usage
 -----
-    python experiments/multilevel/train.py
-    python experiments/multilevel/train.py model.num_layers=4
-    python experiments/multilevel/train.py cluster=meta
-    python experiments/multilevel/train.py train.run_name=debug data.max_ds_len_train=100
+    python experiments/nninteractive/train.py
+    python experiments/nninteractive/train.py model.nnint_mask_injection=separate
+    python experiments/nninteractive/train.py model.nnint_num_stages=4
+    python experiments/nninteractive/train.py train.run_name=debug data.max_ds_len_train=100
+    python experiments/nninteractive/train.py cluster=meta
 """
 
 import random
@@ -36,9 +48,23 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
-from src.models.encoders.stunet import STUNetEncoder
+from src.models.encoders.nninteractive import NNInteractiveEncoder
 from experiments.multilevel.model import MultilevelICL
 from data.totalseg_classes import resolve_classes
+
+# ---------------------------------------------------------------------------
+# Re-use all stateless utilities from multilevel/train.py
+# ---------------------------------------------------------------------------
+from experiments.multilevel.train import (
+    downsample_feat, extract_features, downsample_mask,
+    _binary_entropy, _gumbel_topk,
+    sample_target_patches, sample_context_patches,
+    gather_patches, grid_coords_3d,
+    _encode_ctx_labels,
+    norm_dice_score, dice_score, soft_dice_score,
+    _best_slice, _overlay, _heatmap, _patch_overlay,
+    save_val_figure, _save_synth_train_figure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,181 +73,47 @@ from data.totalseg_classes import resolve_classes
 
 def load_config() -> OmegaConf:
     cli_overrides = [a for a in sys.argv[1:] if "=" in a]
-    cli = OmegaConf.from_dotlist(cli_overrides)
+    cli     = OmegaConf.from_dotlist(cli_overrides)
     cluster = OmegaConf.select(cli, "cluster") or "nfs"
     base    = OmegaConf.load(ROOT / "configs" / "config.yaml")
     cl_cfg  = OmegaConf.load(ROOT / "configs" / "cluster" / f"{cluster}.yaml")
-    ex_cfg  = OmegaConf.load(ROOT / "configs" / "experiment" / "multilevel.yaml")
+    ex_cfg  = OmegaConf.load(ROOT / "configs" / "experiment" / "nninteractive.yaml")
     return OmegaConf.merge(base, cl_cfg, ex_cfg, cli)
 
 
 # ---------------------------------------------------------------------------
-# Feature / mask helpers  (self-contained, no import from feature_attention)
+# Encoding  (the only structural difference vs multilevel/train.py)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def encode_image_only(encoder: STUNetEncoder, imgs: torch.Tensor) -> list[torch.Tensor]:
-    """imgs: (B, 1, D, H, W) → list of feature tensors, low-res to high-res."""
-    bottleneck, skips = encoder.image_encoder(imgs, num_stages=encoder._num_stages)
-    return skips + [bottleneck]
+def encode_target(
+    encoder: NNInteractiveEncoder,
+    imgs: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Encode target images — zero mask (no prior segmentation available).
 
-
-def downsample_feat(feat: torch.Tensor, size: tuple) -> torch.Tensor:
-    return F.interpolate(feat, size=size, mode="trilinear", align_corners=False)
-
-
-def extract_features(feats: list[torch.Tensor], level, out_size: tuple, num_levels: int) -> torch.Tensor:
-    """Returns (B, C, D', H', W').
-
-    level: 'all' | int | list[int]
-        'all'      — concatenate all encoder levels
-        int        — single level index (negative wraps from bottleneck)
-        list[int]  — concatenate selected levels, e.g. [2, 3, 4] skips early large features
+    imgs: (B, 1, D, H, W)  →  list of feature tensors [s0, …, bottleneck]
     """
-    if level == "all":
-        return torch.cat([downsample_feat(f, out_size) for f in feats], dim=1)
-    if not isinstance(level, str) and hasattr(level, "__iter__"):
-        return torch.cat([downsample_feat(feats[i % num_levels], out_size) for i in level], dim=1)
-    return downsample_feat(feats[int(level) % num_levels], out_size)
+    masks = torch.zeros_like(imgs)
+    return encoder(imgs, masks)
 
 
-def downsample_mask(mask: torch.Tensor, size: tuple, mode: str = "avg") -> torch.Tensor:
-    """(B, D, H, W) → (B, D', H', W') float."""
-    x = mask.float().unsqueeze(1)
-    if mode == "max":
-        return F.adaptive_max_pool3d(x, output_size=size).squeeze(1)
-    return F.adaptive_avg_pool3d(x, output_size=size).squeeze(1)
+@torch.no_grad()
+def encode_context(
+    encoder: NNInteractiveEncoder,
+    ctx_imgs: torch.Tensor,
+    ctx_masks: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Encode context images with their ground-truth masks.
 
+    ctx_imgs  : (B*K, 1, D, H, W) — normalised CT
+    ctx_masks : (B*K, 1, D, H, W) — binary GT mask at image resolution
 
-# ---------------------------------------------------------------------------
-# Patch sampling
-# ---------------------------------------------------------------------------
-
-def _binary_entropy(p: torch.Tensor) -> torch.Tensor:
-    """H(p) = -p log p - (1-p) log(1-p), clamped for numerical stability."""
-    p = p.clamp(1e-6, 1 - 1e-6)
-    return -(p * p.log() + (1 - p) * (1 - p).log())
-
-
-def _gumbel_topk(weights: torch.Tensor, n: int, temperature: float) -> torch.Tensor:
-    """Stochastic top-n sampling via Gumbel noise.
-
-    Normalises weights to [0,1] per batch item, perturbs with Gumbel noise,
-    then takes the top-n scores.  Returns (B, n) unique LongTensor indices.
+    For ch1 mode  : mask goes into channel 1 of the 8-channel input, directly
+                    conditioning encoder features on the segmentation target.
+    For separate  : mask encoded by _Mask3DEncoder and fused at the bottleneck.
     """
-    w_min = weights.min(dim=1, keepdim=True).values
-    w_max = weights.max(dim=1, keepdim=True).values
-    w = (weights - w_min) / (w_max - w_min + 1e-6)
-    u = torch.rand_like(w).clamp(1e-6, 1 - 1e-6)
-    gumbel = -torch.log(-torch.log(u))
-    scores = w / max(temperature, 1e-6) + gumbel
-    return scores.topk(n, dim=1).indices  # always unique
-
-
-def sample_target_patches(
-    pred_0_up: torch.Tensor,   # (B, N1) float in [0,1]
-    gt_1_flat: torch.Tensor,   # (B, N1) float in [0,1]
-    n_patches: int,
-    temperature: float = 1.0,
-    mode: str = "gt_previous_pred_error",
-) -> torch.Tensor:             # (B, n_patches) long
-    """Gumbel-TopK target patch sampling.
-
-    gt_previous_pred_error         : weight = |pred_0_up - GT|       (where L0 is wrong)
-    gt_foreground_entropy_balanced : weight = 0.5·GT + 0.5·H(GT)     (fg + boundary, GT-only)
-    predicted_entropy              : weight = H(pred_0_up)            (where L0 is uncertain)
-    """
-    if mode == "gt_previous_pred_error":
-        weights = (pred_0_up - gt_1_flat).abs()
-    elif mode == "gt_foreground_entropy_balanced":
-        weights = 0.5 * gt_1_flat + 0.5 * _binary_entropy(gt_1_flat)
-    elif mode == "predicted_entropy":
-        weights = _binary_entropy(pred_0_up)
-    else:
-        raise ValueError(f"Unknown target_sampling mode: {mode!r}")
-    return _gumbel_topk(weights, n_patches, temperature)
-
-
-def sample_context_patches(
-    ctx_mask_16: torch.Tensor,  # (B, K, D1, H1, W1) float avg-pooled
-    n_patches: int,
-    temperature: float = 1.0,
-) -> torch.Tensor:              # (B, n_patches) long — shared across K context volumes
-    """Gumbel-TopK over gt_foreground_entropy_balanced averaged across K context masks.
-
-    weight = 0.5 * avg_mask + 0.5 * H(avg_mask)
-    High-weight positions are both foreground (avg_mask large) and boundary
-    (avg_mask ≈ 0.5, where H is maximal).
-    """
-    B, K, D1, H1, W1 = ctx_mask_16.shape
-    N1 = D1 * H1 * W1
-    avg_mask = ctx_mask_16.mean(dim=1).reshape(B, N1)
-    weights  = 0.5 * avg_mask + 0.5 * _binary_entropy(avg_mask)
-    return _gumbel_topk(weights, n_patches, temperature)
-
-
-def gather_patches(feat_flat: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """feat_flat: (B, N, C), idx: (B, NP) → (B, NP, C)."""
-    B, NP = idx.shape
-    C = feat_flat.shape[-1]
-    idx_exp = idx.unsqueeze(-1).expand(B, NP, C)
-    return feat_flat.gather(1, idx_exp)
-
-
-def grid_coords_3d(grid_size: tuple, device: torch.device) -> torch.Tensor:
-    """Integer (d, h, w) voxel coords for every position in a D×H×W grid.
-
-    Returns (N, 3) long where N = D*H*W (d slowest, w fastest — matches
-    the default C-order reshape used everywhere in this file).
-    """
-    D, H, W = grid_size
-    d = torch.arange(D, device=device)
-    h = torch.arange(H, device=device)
-    w = torch.arange(W, device=device)
-    gd, gh, gw = torch.meshgrid(d, h, w, indexing="ij")
-    return torch.stack([gd, gh, gw], dim=-1).reshape(-1, 3)  # (N, 3)
-
-
-# ---------------------------------------------------------------------------
-# Context label encoding
-# ---------------------------------------------------------------------------
-
-def _encode_ctx_labels(
-    ctx_mask_i:   torch.Tensor,         # (B, K, *res) float avg-pool
-    ctx_idx:      torch.Tensor | None,  # (B, NP) long | None → dense
-    soft:         bool,
-    mask_cnn_vol: torch.Tensor | None,  # (B*K, mask_dim, D_f, H_f, W_f) pre-encoded
-    res:          tuple,                # current level resolution
-) -> torch.Tensor:
-    """Build context label tensor for one resolution level.
-
-    With mask_cnn_vol: trilinearly interpolate the pre-encoded feature volume to
-    `res`, then gather sparse positions when ctx_idx is given.
-    Without it: scalar avg-pool values (original behaviour).
-    """
-    B, K = ctx_mask_i.shape[:2]
-    N    = res[0] * res[1] * res[2]
-
-    if mask_cnn_vol is not None:
-        mask_dim = mask_cnn_vol.shape[1]
-        feat = (
-            F.interpolate(mask_cnn_vol, size=res, mode="trilinear", align_corners=False)
-            if tuple(mask_cnn_vol.shape[2:]) != res
-            else mask_cnn_vol
-        )  # (B*K, mask_dim, *res)
-        emb = feat.flatten(2).transpose(1, 2).reshape(B, K, N, mask_dim)
-        if ctx_idx is None:
-            return emb.reshape(B, K * N, mask_dim)
-        idx_exp = ctx_idx.unsqueeze(-1).expand(-1, -1, mask_dim)
-        return torch.cat([emb[:, k].gather(1, idx_exp) for k in range(K)], dim=1)
-
-    # Scalar fallback
-    flat = ctx_mask_i.reshape(B, K, N)
-    if ctx_idx is None:
-        lbl = flat.reshape(B, K * N)
-    else:
-        lbl = torch.cat([flat[:, k].gather(1, ctx_idx) for k in range(K)], dim=1)
-    return lbl if soft else (lbl > 0).float()
+    return encoder(ctx_imgs, ctx_masks)
 
 
 # ---------------------------------------------------------------------------
@@ -229,59 +121,55 @@ def _encode_ctx_labels(
 # ---------------------------------------------------------------------------
 
 def process_batch(
-    encoder:   STUNetEncoder,
-    model:     MultilevelICL,
-    batch:     dict,
-    cfg:       OmegaConf,
-    device:    torch.device,
-    amp:       bool = False,
+    encoder: NNInteractiveEncoder,
+    model:   MultilevelICL,
+    batch:   dict,
+    cfg:     OmegaConf,
+    device:  torch.device,
+    amp:     bool = False,
     compiled_attn = None,  # compiled PatchICLAttention (shared_weights=True only)
 ) -> tuple[list, torch.Tensor, list, list, list, list]:
-    """Returns (preds, loss, level_losses, grid_preds, tgt_idxs, ctx_idxs).
-
-    preds        : per-level predictions — (B, N_i) dense for L0, (B, NP) sparse for L>0
-    loss         : weighted scalar loss
-    level_losses : per-level loss scalars for logging
-    grid_preds   : per-level fused prediction grids — (B, N_i)
-    tgt_idxs     : per-level sampled target indices — None for L0, (B, NP) for L>0
-    ctx_idxs     : per-level sampled context indices — None for L0, (B, NP) for L>0
-    """
+    """Returns (preds, loss, level_losses, grid_preds, tgt_idxs, ctx_idxs)."""
     images  = batch["image"].to(device, non_blocking=True)
     labels  = batch["label"].to(device, non_blocking=True)
     ctx_in  = batch["context_in"].to(device, non_blocking=True)
     ctx_out = batch["context_out"].to(device, non_blocking=True)
-    spacing = batch["spacing"].to(device, non_blocking=True)  # (B, 3) mm/voxel
+    spacing = batch["spacing"].to(device, non_blocking=True)
     B, K = ctx_in.shape[:2]
 
     resolutions = [tuple(r) for r in cfg.data.resolutions]
     level       = cfg.model.feature_level
     num_levels  = len(encoder.skip_channels) + 1
-    NP          = cfg.data.n_patches_l1   # used for all sparse levels (L>0)
+    NP          = cfg.data.n_patches_l1
     temp        = cfg.data.sampling_temperature
 
+    # ── Encode all images (no_grad; gradients flow only through the ICL model) ──
+    ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
+    # ctx_out: (B, K, D, H, W) → (B*K, 1, D, H, W) float
+    ctx_masks_flat = ctx_out.reshape(B * K, *ctx_out.shape[2:]).unsqueeze(1).float()
+
     with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=amp):
-        tgt_feats      = encode_image_only(encoder, images)
-        ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
-        ctx_feats_flat = encode_image_only(encoder, ctx_imgs_flat)
+        tgt_feats      = encode_target(encoder, images)
+        ctx_feats_flat = encode_context(encoder, ctx_imgs_flat, ctx_masks_flat)
 
     preds, grid_preds, raw_losses, tgt_idxs, ctx_idxs = [], [], [], [], []
     C = None
     cascade_regs = None
 
-    # Encode context masks once at finest resolution; interpolate per level below
+    # Encode context masks once at finest resolution for the MaskCNN (if used)
     mask_cnn_vol = None
     if model.mask_cnn is not None:
         finest_res = resolutions[-1]
         mask_in = downsample_mask(
             ctx_out.reshape(B * K, *ctx_out.shape[2:]), finest_res, cfg.data.mask_pool
-        ).unsqueeze(1)                                    # (B*K, 1, *finest_res)
+        ).unsqueeze(1)
         if not cfg.model.soft_labels_train:
             mask_in = (mask_in > 0).float()
         with torch.autocast(device_type=device.type, enabled=amp):
-            emb = model.mask_cnn(mask_in)                # (B*K, N_f, mask_dim)
+            emb = model.mask_cnn(mask_in)
         mask_cnn_vol = emb.transpose(1, 2).reshape(
             B * K, model.mask_cnn_dim, *finest_res
-        )                                                 # (B*K, mask_dim, D_f, H_f, W_f)
+        )
 
     for i, res in enumerate(resolutions):
         N = res[0] * res[1] * res[2]
@@ -289,13 +177,12 @@ def process_batch(
         ctx_feat_if = extract_features(ctx_feats_flat, level, res, num_levels)
         if C is None:
             C = tgt_feat_i.shape[1]
-        ctx_feat_i  = ctx_feat_if.reshape(B, K, C, *res)
-        ctx_mask_i  = downsample_mask(
+        ctx_feat_i = ctx_feat_if.reshape(B, K, C, *res)
+        ctx_mask_i = downsample_mask(
             ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
         ).reshape(B, K, *res)
 
-        # Physical mm per patch at this level: (image_size / grid_size) * mean_spacing
-        scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)  # (B,)
+        scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)
 
         tgt_idx = ctx_idx = None
         if i == 0:
@@ -328,7 +215,7 @@ def process_batch(
             grid_pred = pred
 
         else:
-            # Sparse: Gumbel-TopK sampling guided by the previous level's fused grid
+            # Sparse: Gumbel-TopK sampling guided by previous level
             prev_res = resolutions[i - 1]
             with torch.no_grad():
                 prev_up = F.interpolate(
@@ -336,10 +223,10 @@ def process_batch(
                     size=res, mode="trilinear", align_corners=False,
                 ).reshape(B, N)
 
-            gt_flat  = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
-            tgt_idx  = sample_target_patches(prev_up, gt_flat, NP, temp,
-                                             cfg.data.target_sampling)
-            ctx_idx  = sample_context_patches(ctx_mask_i, NP, temp)
+            gt_flat = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
+            tgt_idx = sample_target_patches(prev_up, gt_flat, NP, temp,
+                                            cfg.data.target_sampling)
+            ctx_idx = sample_context_patches(ctx_mask_i, NP, temp)
 
             tgt_flat = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
             ctx_flat = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K, N, C)
@@ -372,7 +259,7 @@ def process_batch(
                 pred = result.float()
             grid_pred = prev_up.clone()
             grid_pred.scatter_(1, tgt_idx, pred)
-            gt        = gt_flat.gather(1, tgt_idx)
+            gt = gt_flat.gather(1, tgt_idx)
 
         raw_losses.append(F.binary_cross_entropy(pred, gt))
         preds.append(pred)
@@ -384,233 +271,7 @@ def process_batch(
     while len(weights) < len(raw_losses):
         weights.append(1.0)
     loss = sum(w * l for w, l in zip(weights, raw_losses))
-
     return preds, loss, [l.item() for l in raw_losses], grid_preds, tgt_idxs, ctx_idxs
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def norm_dice_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    p = pred - pred.min()
-    pmax = p.max()
-    if pmax < 1e-8:
-        return float("nan")
-    p = p / pmax
-    return (2 * (p * gt).sum() / (p.sum() + gt.sum() + 1e-6)).item()
-
-
-def dice_score(pred: torch.Tensor, gt: torch.Tensor, thresh: float = 0.5) -> float:
-    gt_bin = (gt > 0).float()
-    if gt_bin.sum() < 1:
-        return float("nan")
-    p = (pred >= thresh).float()
-    return (2 * (p * gt_bin).sum() / (p.sum() + gt_bin.sum() + 1e-6)).item()
-
-
-def soft_dice_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    gt_bin = (gt > 0).float()
-    if gt_bin.sum() < 1:
-        return float("nan")
-    p = pred.float().clamp(0, 1)
-    return (2 * (p * gt_bin).sum() / (p.sum() + gt_bin.sum() + 1e-6)).item()
-
-
-# ---------------------------------------------------------------------------
-# Visualisation helpers
-# ---------------------------------------------------------------------------
-
-def _best_slice(mask: np.ndarray) -> int:
-    counts = mask.sum(axis=(1, 2))
-    return int(counts.argmax()) if counts.max() > 0 else mask.shape[0] // 2
-
-
-def _overlay(ax, image: np.ndarray, mask: np.ndarray, idx: int, title: str) -> None:
-    sl = image[idx]
-    sl_norm = (sl - sl.min()) / (sl.max() - sl.min() + 1e-6)
-    ax.imshow(sl_norm, cmap="gray")
-    ax.imshow(mask[idx], cmap="Reds", alpha=0.45, vmin=0, vmax=1)
-    ax.set_title(title, fontsize=8)
-    ax.axis("off")
-
-
-def _heatmap(ax, vol: np.ndarray, idx: int, title: str) -> None:
-    ax.imshow(vol[idx], cmap="hot", vmin=0, vmax=1, interpolation="nearest")
-    ax.set_title(title, fontsize=8)
-    ax.axis("off")
-
-
-def _patch_overlay(
-    ax,
-    image:      np.ndarray,           # (D, H, W) full-res image
-    gt:         np.ndarray,           # (D, H, W) binary GT
-    z_img:      int,                  # slice index in image space
-    grid_size:  tuple,                # (D', H', W') — patch grid resolution
-    patch_idx:  np.ndarray | None,    # flat indices into grid (None = dense)
-    color:      str = "cyan",
-    title:      str = "",
-) -> None:
-    """Image slice + GT overlay + sampled patch positions.
-
-    Dense levels (patch_idx=None): draw light grid lines at patch boundaries.
-    Sparse levels: draw filled boxes for each sampled patch on the best slice.
-    """
-    D_img, H_img, W_img = image.shape
-    D_grd, H_grd, W_grd = grid_size
-    ph = H_img / H_grd          # patch height in image pixels
-    pw = W_img / W_grd          # patch width in image pixels
-    z_grd = int(z_img * D_grd / D_img)   # corresponding grid depth slice
-
-    sl = image[z_img]
-    sl_norm = (sl - sl.min()) / (sl.max() - sl.min() + 1e-6)
-    ax.imshow(sl_norm, cmap="gray")
-
-    gt_sl = (gt[z_img] > 0).astype(float)
-    if gt_sl.max() > 0:
-        ax.imshow(gt_sl, cmap="Reds", alpha=0.35, vmin=0, vmax=1)
-
-    if patch_idx is None:
-        # Dense: light grid lines at patch boundaries
-        for i in range(1, H_grd):
-            ax.axhline(i * ph - 0.5, color=color, linewidth=0.4, alpha=0.4)
-        for j in range(1, W_grd):
-            ax.axvline(j * pw - 0.5, color=color, linewidth=0.4, alpha=0.4)
-    else:
-        # Sparse: filled box per sampled patch that intersects this depth slice
-        d_p = patch_idx // (H_grd * W_grd)
-        h_p = (patch_idx % (H_grd * W_grd)) // W_grd
-        w_p = patch_idx % W_grd
-        for d, h, w in zip(d_p, h_p, w_p):
-            if d == z_grd:
-                rect = plt.Rectangle(
-                    (w * pw, h * ph), pw, ph,
-                    linewidth=0.8, edgecolor=color, facecolor=color, alpha=0.4,
-                )
-                ax.add_patch(rect)
-
-    ax.set_title(title, fontsize=7)
-    ax.axis("off")
-
-
-def save_val_figure(
-    tgt_image:   np.ndarray,        # (D, H, W) full-res
-    tgt_gt:      np.ndarray,        # (D, H, W) binary GT full-res
-    ctx_image:   np.ndarray,        # (D, H, W) first context image
-    ctx_gt:      np.ndarray,        # (D, H, W) first context GT
-    levels:      list[dict],        # one dict per level — see below
-    out_path:    Path,
-    title:       str = "",
-) -> None:
-    """Save a figure with one row per level.
-
-    Each row has 5 columns:
-      0  Target slice + GT + sampled patch positions (cyan boxes / grid lines)
-      1  Context slice + GT + sampled patch positions (lime boxes / grid lines)
-      2  Downsampled GT mask at this level's resolution
-      3  Prediction at this level (L0: dense 8³; L1: sparse NP patches in 16³ grid)
-      4  Fused prediction (L0: pred_0 upsampled to 16³; L1: final pred_fused)
-
-    Each level dict must contain:
-      res        : (D', H', W') grid resolution
-      gt_ds      : (D', H', W') GT downsampled to res
-      pred       : (D', H', W') prediction at this level (zeros outside sampled pos for L1)
-      pred_fused : (D_f, H_f, W_f) cumulative fused prediction (same shape for all levels)
-      tgt_idx    : np.ndarray (NP,) flat patch indices, or None for dense
-      ctx_idx    : np.ndarray (NP,) flat patch indices, or None for dense
-    """
-    n_levels = len(levels)
-    fig, axes = plt.subplots(n_levels, 5, figsize=(18, 3.8 * n_levels),
-                             gridspec_kw={"wspace": 0.04, "hspace": 0.25})
-    if n_levels == 1:
-        axes = axes[np.newaxis, :]
-
-    tgt_z = _best_slice(tgt_gt.astype(float))
-    ctx_z = _best_slice(ctx_gt.astype(float))
-
-    for row, lvl in enumerate(levels):
-        res        = lvl["res"]          # (D', H', W')
-        gt_ds      = lvl["gt_ds"]        # (D', H', W')
-        pred       = lvl["pred"]         # (D', H', W')
-        pred_fused = lvl["pred_fused"]   # (D_f, H_f, W_f)
-        tgt_idx    = lvl.get("tgt_idx")  # None or (NP,)
-        ctx_idx    = lvl.get("ctx_idx")  # None or (NP,)
-
-        z_ds    = int(tgt_z * res[0]          / tgt_gt.shape[0])
-        z_fused = int(tgt_z * pred_fused.shape[0] / tgt_gt.shape[0])
-
-        _patch_overlay(axes[row, 0], tgt_image, tgt_gt, tgt_z,
-                       res, tgt_idx, color="cyan",
-                       title=f"L{row} target  {res}")
-        _patch_overlay(axes[row, 1], ctx_image, ctx_gt, ctx_z,
-                       res, ctx_idx, color="lime",
-                       title=f"L{row} context  {res}")
-        _heatmap(axes[row, 2], gt_ds,      z_ds,    f"GT ↓ L{row}")
-        _heatmap(axes[row, 3], pred,       z_ds,    f"pred L{row}")
-        _heatmap(axes[row, 4], pred_fused, z_fused, f"fused L{row}")
-
-    fig.suptitle(title, fontsize=9)
-    plt.savefig(out_path, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Training synth visualisation
-# ---------------------------------------------------------------------------
-
-def _save_synth_train_figure(
-    batch:       dict,
-    preds:       list,
-    grid_preds:  list,
-    tgt_idxs:    list,
-    ctx_idxs:    list,
-    b:           int,
-    epoch:       int,
-    out_dir:     Path,
-    resolutions: list,
-    cfg:         OmegaConf,
-) -> Path:
-    """Save a multilevel pred figure for one synth training item (no grad needed)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    label_name = batch["label_names"][b]
-    label_b    = batch["label"][b:b + 1]          # CPU tensor
-
-    tgt_np    = batch["image"][b].squeeze().cpu().numpy()
-    tgt_gt_np = batch["label"][b].cpu().numpy()
-    ctx_np    = batch["context_in"][b, 0].squeeze(0).cpu().numpy()
-    ctx_gt_np = batch["context_out"][b, 0].cpu().numpy()
-
-    levels_data = []
-    for i, res in enumerate(resolutions):
-        D_, H_, W_ = res
-        N_i      = D_ * H_ * W_
-        gt_ds_np = downsample_mask(label_b, res, cfg.data.mask_pool).squeeze().cpu().numpy().reshape(D_, H_, W_)
-        fused_np = grid_preds[i][b].detach().cpu().numpy().reshape(D_, H_, W_)
-
-        if tgt_idxs[i] is None:
-            pred_np = preds[i][b].detach().cpu().numpy().reshape(D_, H_, W_)
-        else:
-            sparse = np.zeros(N_i, dtype=np.float32)
-            sparse[tgt_idxs[i][b].cpu().numpy()] = preds[i][b].detach().cpu().numpy()
-            pred_np = sparse.reshape(D_, H_, W_)
-
-        levels_data.append({
-            "res":        res,
-            "gt_ds":      gt_ds_np,
-            "pred":       pred_np,
-            "pred_fused": fused_np,
-            "tgt_idx":    tgt_idxs[i][b].cpu().numpy() if tgt_idxs[i] is not None else None,
-            "ctx_idx":    ctx_idxs[i][b].cpu().numpy() if ctx_idxs[i] is not None else None,
-        })
-
-    fig_path = out_dir / f"epoch{epoch:03d}_{label_name}.png"
-    save_val_figure(
-        tgt_image=tgt_np, tgt_gt=tgt_gt_np,
-        ctx_image=ctx_np, ctx_gt=ctx_gt_np,
-        levels=levels_data, out_path=fig_path,
-        title=f"[ep {epoch}] train synth  {label_name}",
-    )
-    return fig_path
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +281,7 @@ def _save_synth_train_figure(
 @torch.no_grad()
 def validate(
     model:           MultilevelICL,
-    encoder:         STUNetEncoder,
+    encoder:         NNInteractiveEncoder,
     ds_val:          TotalSegInContextDataset,
     cfg:             OmegaConf,
     device:          torch.device,
@@ -656,29 +317,28 @@ def validate(
         drop_last=False,
     )
 
-    # dice_l{i}       : dice at level i's resolution (dense for L0, sparse for L>0)
-    # dice_fused_l{i} : dice of the fused grid at level i vs GT at that resolution
     level_dices       = [[] for _ in range(n_levels)]
     level_fused_dices = [[] for _ in range(n_levels)]
     final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_losses = [], [], [], [], []
-    wandb_images: dict  = {}
-    cls_fig_saved: set  = set()
-    class_counts: dict  = defaultdict(int)
+    wandb_images: dict = {}
+    cls_fig_saved: set = set()
+    class_counts: dict = defaultdict(int)
 
     for batch in val_loader:
-        label_names = batch["label_names"]          # list[B]
+        label_names = batch["label_names"]
         images  = batch["image"].to(device, non_blocking=True)
         labels  = batch["label"].to(device, non_blocking=True)
         ctx_in  = batch["context_in"].to(device, non_blocking=True)
         ctx_out = batch["context_out"].to(device, non_blocking=True)
-        spacing = batch["spacing"].to(device, non_blocking=True)  # (B, 3)
+        spacing = batch["spacing"].to(device, non_blocking=True)
         B, K = ctx_in.shape[:2]
 
-        # Encode all B targets and B*K context images in two batched calls
+        ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
+        ctx_masks_flat = ctx_out.reshape(B * K, *ctx_out.shape[2:]).unsqueeze(1).float()
+
         with torch.inference_mode():
-            tgt_feats      = encode_image_only(encoder, images)
-            ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
-            ctx_feats_flat = encode_image_only(encoder, ctx_imgs_flat)
+            tgt_feats      = encode_target(encoder, images)
+            ctx_feats_flat = encode_context(encoder, ctx_imgs_flat, ctx_masks_flat)
 
         preds_l, tgt_idxs_l, ctx_idxs_l, grid_preds_l = [], [], [], []
         C = None
@@ -704,12 +364,12 @@ def validate(
             ctx_feat_if = extract_features(ctx_feats_flat, level, res, num_levels)
             if C is None:
                 C = tgt_feat_i.shape[1]
-            ctx_feat_i  = ctx_feat_if.reshape(B, K, C, *res)
-            ctx_mask_i  = downsample_mask(
+            ctx_feat_i = ctx_feat_if.reshape(B, K, C, *res)
+            ctx_mask_i = downsample_mask(
                 ctx_out.reshape(B * K, *ctx_out.shape[2:]), res, cfg.data.mask_pool
             ).reshape(B, K, *res)
 
-            scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)  # (B,)
+            scale_mm = (cfg.data.image_size[0] / res[0]) * spacing.mean(dim=1)
 
             if i == 0:
                 tgt_f   = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
@@ -736,8 +396,7 @@ def validate(
                     pred = result[0].float()
                 else:
                     pred = result.float()
-                tgt_idx   = None
-                ctx_idx   = None
+                tgt_idx = ctx_idx = None
                 grid_pred = pred
 
             else:
@@ -747,10 +406,10 @@ def validate(
                     size=res, mode="trilinear", align_corners=False,
                 ).reshape(B, N)
 
-                gt_flat  = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
-                tgt_idx  = sample_target_patches(prev_up, gt_flat, NP, temp,
-                                                 cfg.data.target_sampling)
-                ctx_idx  = sample_context_patches(ctx_mask_i, NP, temp)
+                gt_flat = downsample_mask(labels, res, cfg.data.mask_pool).reshape(B, N)
+                tgt_idx = sample_target_patches(prev_up, gt_flat, NP, temp,
+                                                cfg.data.target_sampling)
+                ctx_idx = sample_context_patches(ctx_mask_i, NP, temp)
 
                 tgt_flat_f = tgt_feat_i.float().reshape(B, C, N).permute(0, 2, 1)
                 ctx_flat_f = ctx_feat_i.float().permute(0, 1, 3, 4, 5, 2).reshape(B, K, N, C)
@@ -789,20 +448,16 @@ def validate(
             ctx_idxs_l.append(ctx_idx)
             grid_preds_l.append(grid_pred)
 
-        # --- Per-sample metrics and figures ---
         for b in range(B):
             cls = label_names[b]
             if class_counts[cls] >= items_per_class:
                 continue
-
             label_b = labels[b:b + 1]
 
-            # Per-level metrics
             for i, res in enumerate(resolutions):
                 N_i      = res[0] * res[1] * res[2]
                 gt_i     = downsample_mask(label_b, res, cfg.data.mask_pool).reshape(N_i)
                 gt_i_bin = (gt_i > 0).float()
-
                 if tgt_idxs_l[i] is None:
                     di = dice_score(preds_l[i][b], gt_i_bin)
                 else:
@@ -810,15 +465,13 @@ def validate(
                     di = dice_score(preds_l[i][b], (gt_at_tgt > 0).float())
                 if di == di:
                     level_dices[i].append(di)
-
                 df = dice_score(grid_preds_l[i][b], gt_i_bin)
                 if df == df:
                     level_fused_dices[i].append(df)
 
-            # Final level full metrics
-            final_res  = resolutions[-1]
-            N_final    = final_res[0] * final_res[1] * final_res[2]
-            gt_final   = downsample_mask(label_b, final_res, cfg.data.mask_pool).reshape(N_final)
+            final_res = resolutions[-1]
+            N_final   = final_res[0] * final_res[1] * final_res[2]
+            gt_final  = downsample_mask(label_b, final_res, cfg.data.mask_pool).reshape(N_final)
             gt_final_b = (gt_final > 0).float()
             pf         = grid_preds_l[-1][b]
 
@@ -836,40 +489,33 @@ def validate(
             gf_np = gt_final_b.cpu().numpy().astype(int)
             if 0 < gf_np.sum() < len(gf_np):
                 try:
-                    final_aurocs.append(roc_auc_score(gf_np, pf_np))
+                    final_aurocs.append(__import__("sklearn.metrics", fromlist=["roc_auc_score"]).roc_auc_score(gf_np, pf_np))
                 except Exception:
                     pass
 
-            # Visualisation — one figure per class, first time we see it
             if cls not in cls_fig_saved and fig_dir is not None:
                 tgt_np    = batch["image"][b].squeeze().cpu().numpy()
                 tgt_gt_np = batch["label"][b].cpu().numpy()
                 ctx_np    = batch["context_in"][b, 0].squeeze(0).cpu().numpy()
                 ctx_gt_np = batch["context_out"][b, 0].cpu().numpy()
-
                 levels_data = []
                 for i, res in enumerate(resolutions):
                     D_, H_, W_ = res
                     N_i        = D_ * H_ * W_
                     gt_ds_np   = downsample_mask(label_b, res, cfg.data.mask_pool).squeeze().cpu().numpy().reshape(D_, H_, W_)
                     fused_np   = grid_preds_l[i][b].cpu().numpy().reshape(D_, H_, W_)
-
                     if tgt_idxs_l[i] is None:
                         pred_np = preds_l[i][b].cpu().numpy().reshape(D_, H_, W_)
                     else:
                         sparse = np.zeros(N_i, dtype=np.float32)
                         sparse[tgt_idxs_l[i][b].cpu().numpy()] = preds_l[i][b].cpu().numpy()
                         pred_np = sparse.reshape(D_, H_, W_)
-
                     levels_data.append({
-                        "res":        res,
-                        "gt_ds":      gt_ds_np,
-                        "pred":       pred_np,
+                        "res": res, "gt_ds": gt_ds_np, "pred": pred_np,
                         "pred_fused": fused_np,
-                        "tgt_idx":    tgt_idxs_l[i][b].cpu().numpy() if tgt_idxs_l[i] is not None else None,
-                        "ctx_idx":    ctx_idxs_l[i][b].cpu().numpy() if ctx_idxs_l[i] is not None else None,
+                        "tgt_idx": tgt_idxs_l[i][b].cpu().numpy() if tgt_idxs_l[i] is not None else None,
+                        "ctx_idx": ctx_idxs_l[i][b].cpu().numpy() if ctx_idxs_l[i] is not None else None,
                     })
-
                 title_parts = [f"[ep {epoch}] {cls}"]
                 for i in range(n_levels):
                     v = level_fused_dices[i][-1] if level_fused_dices[i] else float("nan")
@@ -913,10 +559,9 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    out_dir = Path(cfg.paths.results) / "multilevel"
+    out_dir = Path(cfg.paths.results) / "nninteractive"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Augmentation config -----------------------------------------------
     aug_cfg = None
     if cfg.train.aug:
         aug_yaml = ROOT / "configs" / "augmentations" / f"{cfg.train.aug_preset}.yaml"
@@ -924,13 +569,12 @@ def main() -> None:
 
     data_root = cfg.paths.totalsegmri if getattr(cfg.data, "dataset", "totalseg") == "totalsegmri" \
                 else cfg.paths.totalseg
+    is_mri    = getattr(cfg.data, "dataset", "totalseg") == "totalsegmri"
 
-    is_mri = getattr(cfg.data, "dataset", "totalseg") == "totalsegmri"
     train_classes = resolve_classes(cfg.data.train_classes, data_root, is_mri=is_mri)
-    val_classes   = resolve_classes(cfg.data.val_classes,   data_root, is_mri=is_mri) if cfg.data.val_classes else []
+    val_classes   = resolve_classes(cfg.data.val_classes, data_root, is_mri=is_mri) if cfg.data.val_classes else []
     val_classes   = val_classes or train_classes
 
-    # ---- Datasets ----------------------------------------------------------
     ds_train = TotalSegInContextDataset(
         root=data_root,
         classes=train_classes,
@@ -970,26 +614,37 @@ def main() -> None:
     )
     print(f"Train: {n_train} samples  |  {len(train_loader)} batches/epoch")
 
-    # ---- Encoder (frozen) -------------------------------------------------
-    encoder = STUNetEncoder(
-        in_channels=1,
-        variant=cfg.model.stunet_variant,
-        pretrained=cfg.model.stunet_pretrained,
+    # ── NNInteractive encoder (frozen) ──────────────────────────────────────
+    ckpt_dir        = str(cfg.model.nnint_ckpt)
+    mask_injection  = str(cfg.model.nnint_mask_injection)
+    num_stages      = int(cfg.model.nnint_num_stages)
+
+    encoder = NNInteractiveEncoder(
+        ckpt_dir=ckpt_dir,
+        mask_injection=mask_injection,
         freeze_encoder=True,
+        num_stages=num_stages,
+        device="cpu",
     ).to(device).eval()
+
+    total_enc_params    = sum(p.numel() for p in encoder.parameters()) / 1e6
+    trainable_enc_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad) / 1e6
+    print(f"NNInteractiveEncoder  mask={mask_injection}  stages={num_stages}  "
+          f"{total_enc_params:.1f} M total / {trainable_enc_params:.2f} M trainable")
 
     num_levels = len(encoder.skip_channels) + 1
     level      = cfg.model.feature_level
 
-    # Determine embed_dim from a dummy forward
+    # ── Determine embed_dim from dummy forward ───────────────────────────────
     with torch.inference_mode():
-        dummy      = torch.zeros(1, 1, *cfg.data.image_size, device=device)
-        dummy_feat = encode_image_only(encoder, dummy)
+        dummy_img  = torch.zeros(1, 1, *cfg.data.image_size, device=device)
+        dummy_msk  = torch.zeros(1, 1, *cfg.data.image_size, device=device)
+        dummy_feat = encoder(dummy_img, dummy_msk)
         dummy_ds   = extract_features(dummy_feat, level, tuple(cfg.data.resolutions[0]), num_levels)
     embed_dim = dummy_ds.shape[1]
     print(f"embed_dim={embed_dim}  |  level={level}  |  resolutions={list(cfg.data.resolutions)}")
 
-    # ---- Model: one PatchICLAttention per level ---------------------------
+    # ── MultilevelICL (same as multilevel/train.py) ──────────────────────────
     resolutions = [tuple(r) for r in cfg.data.resolutions]
     level_cfgs  = [
         {
@@ -1000,8 +655,6 @@ def main() -> None:
             "ff_factor":       cfg.model.ff_factor,
             "label_injection": cfg.model.label_injection,
             "output_head":     cfg.model.output_head,
-            # rope3d works at any level (uses explicit coords); sinusoidal/learned
-            # assume a dense fixed grid so they fall back to "none" for sparse levels.
             "pos_encoding":    cfg.model.pos_encoding
                                if (i == 0 or cfg.model.pos_encoding == "rope3d")
                                else "none",
@@ -1014,21 +667,19 @@ def main() -> None:
         }
         for i, res in enumerate(resolutions)
     ]
-    mask_cnn_dim      = int(getattr(cfg.model, "mask_cnn_dim", 0) or 0)
-    num_registers     = int(getattr(cfg.model, "num_registers", 0) or 0)
-    append_zero_attn  = bool(getattr(cfg.model, "append_zero_attn", False))
-    shared_weights    = bool(getattr(cfg.model, "shared_weights", False))
-    use_scale_embed   = bool(getattr(cfg.model, "use_scale_embed", False))
-    use_role_embed    = bool(getattr(cfg.model, "use_role_embed", False))
-    max_context_size  = int(getattr(cfg.model, "max_context_size", 8))
-    model = MultilevelICL(embed_dim=embed_dim, level_cfgs=level_cfgs,
-                          mask_cnn_dim=mask_cnn_dim,
-                          num_registers=num_registers,
-                          append_zero_attn=append_zero_attn,
-                          shared_weights=shared_weights,
-                          use_scale_embed=use_scale_embed,
-                          use_role_embed=use_role_embed,
-                          max_context_size=max_context_size).to(device)
+
+    model = MultilevelICL(
+        embed_dim=embed_dim,
+        level_cfgs=level_cfgs,
+        mask_cnn_dim=int(getattr(cfg.model, "mask_cnn_dim", 0) or 0),
+        num_registers=int(getattr(cfg.model, "num_registers", 0) or 0),
+        append_zero_attn=bool(getattr(cfg.model, "append_zero_attn", False)),
+        shared_weights=bool(getattr(cfg.model, "shared_weights", False)),
+        use_scale_embed=bool(getattr(cfg.model, "use_scale_embed", False)),
+        use_role_embed=bool(getattr(cfg.model, "use_role_embed", False)),
+        max_context_size=int(getattr(cfg.model, "max_context_size", 8)),
+    ).to(device)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultilevelICL  params: {n_params:,}  ({len(model)} levels)")
 
@@ -1038,52 +689,12 @@ def main() -> None:
 
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
-        ckpt_state = ckpt["model"]
-
-        # Remap keys when switching between shared and per-level weight layouts.
-        # per-level → shared : take levels.0.* as the shared initialisation.
-        # shared → per-level : broadcast shared_level.* to every levels.i.* slot.
-        ckpt_has_levels = any(k.startswith("levels.") for k in ckpt_state)
-        ckpt_has_shared = any(k.startswith("shared_level.") for k in ckpt_state)
-        cur_has_shared  = model.shared_weights
-
-        if ckpt_has_levels and cur_has_shared:
-            remapped = {}
-            for k, v in ckpt_state.items():
-                if k.startswith("levels.0."):
-                    remapped["shared_level." + k[len("levels.0."):]] = v
-                elif not k.startswith("levels."):
-                    remapped[k] = v
-            ckpt_state = remapped
-            print("  Checkpoint remapped: levels.0.* → shared_level.*")
-        elif ckpt_has_shared and not cur_has_shared:
-            level_indices = sorted({
-                int(k.split(".")[1]) for k in model.state_dict() if k.startswith("levels.")
-            })
-            remapped = {k: v for k, v in ckpt_state.items() if not k.startswith("shared_level.")}
-            for k, v in ckpt_state.items():
-                if k.startswith("shared_level."):
-                    suffix = k[len("shared_level."):]
-                    for i in level_indices:
-                        remapped[f"levels.{i}.{suffix}"] = v
-            ckpt_state = remapped
-            print(f"  Checkpoint remapped: shared_level.* → levels.{level_indices}.*")
-
-        current_shapes = {k: v.shape for k, v in model.state_dict().items()}
-        ckpt_model = {k: v for k, v in ckpt_state.items()
-                      if k in current_shapes and v.shape == current_shapes[k]}
-        shape_skipped = [k for k in ckpt_state if k in current_shapes
-                         and ckpt_state[k].shape != current_shapes[k]]
-        missing, unexpected = model.load_state_dict(ckpt_model, strict=False)
-        if shape_skipped:
-            print(f"  Shape-mismatched keys (random init): {shape_skipped}")
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
         if missing:
             print(f"  New parameters (random init): {missing}")
-        if unexpected:
-            print(f"  Ignored checkpoint keys: {unexpected}")
         print(f"Loaded checkpoint: {cfg.train.checkpoint}  (epoch {ckpt['epoch']})")
 
-    # ---- Compile attention module (optional; reduce-overhead ≈ 6× speedup) --
+    # ── Compile attention module (optional; reduce-overhead ≈ 6× speedup) ────
     compiled_attn = None
     if getattr(cfg.train, "compile_model", False) and device.type == "cuda":
         if model.shared_weights:
@@ -1092,7 +703,7 @@ def main() -> None:
         else:
             print("Note: compile_model=True requires shared_weights=True — skipping.")
 
-    # ---- W&B ---------------------------------------------------------------
+    # ── W&B ─────────────────────────────────────────────────────────────────
     use_wandb = bool(cfg.train.wandb_project) and str(cfg.train.wandb_project).lower() != "null"
     if use_wandb:
         import wandb
@@ -1101,7 +712,11 @@ def main() -> None:
             name=cfg.train.run_name or None,
             config=OmegaConf.to_container(cfg, resolve=True),
         )
-        wandb.config.update({"embed_dim": embed_dim, "n_params": n_params})
+        wandb.config.update({
+            "embed_dim": embed_dim, "n_params": n_params,
+            "nnint_mask_injection": mask_injection,
+            "nnint_num_stages": num_stages,
+        })
 
     date_str = datetime.today().strftime("%Y-%m-%d")
     run_name  = (wandb.run.name if use_wandb else None) or cfg.train.run_name or "run"
@@ -1109,7 +724,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     fig_dir   = run_dir / "figures"
 
-    # ---- Training ----------------------------------------------------------
+    # ── Training ─────────────────────────────────────────────────────────────
     best_dice   = -1.0
     nd_interval = cfg.train.nd_interval
     n_levels    = len(resolutions)
@@ -1126,6 +741,7 @@ def main() -> None:
         synth_train_fig_path = None
         real_train_fig_path  = None
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
+
         for batch in bar:
             preds, loss, level_losses, grid_preds_b, tgt_idxs_b, ctx_idxs_b = process_batch(
                 encoder, model, batch, cfg, device, amp=amp, compiled_attn=compiled_attn,
@@ -1146,9 +762,9 @@ def main() -> None:
 
             if n_batches % nd_interval == 0:
                 with torch.no_grad():
-                    res_0  = tuple(cfg.data.resolutions[0])
-                    N0     = res_0[0] * res_0[1] * res_0[2]
-                    gt_0   = downsample_mask(
+                    res_0 = tuple(cfg.data.resolutions[0])
+                    N0    = res_0[0] * res_0[1] * res_0[2]
+                    gt_0  = downsample_mask(
                         batch["label"].to(device), res_0, cfg.data.mask_pool
                     ).reshape(preds[0].shape[0], N0)
                     gt_bin = (gt_0 > 0).float()
@@ -1182,15 +798,14 @@ def main() -> None:
             )
 
         bar.close()
-        elapsed   = time.perf_counter() - t0
-        avg_loss  = epoch_loss / max(n_batches, 1)
+        elapsed  = time.perf_counter() - t0
+        avg_loss = epoch_loss / max(n_batches, 1)
         level_str = "  ".join(
             f"l{j}={epoch_level_losses[j] / max(n_batches, 1):.4f}" for j in range(n_levels)
         )
         print(f"Epoch {epoch:3d}/{cfg.train.epochs}  loss={avg_loss:.4f}  {level_str}  "
               f"dice_l0={epoch_dice / max(n_dice, 1):.3f}  {elapsed:.0f}s")
 
-        # Validation
         val_metrics, val_figs = validate(
             model, encoder, ds_val, cfg, device,
             cfg.train.val_items_per_class,
@@ -1206,27 +821,24 @@ def main() -> None:
         best_key = f"val/dice_fused_l{n_levels - 1}"
         if val_metrics[best_key] > best_dice:
             best_dice = val_metrics[best_key]
-            ckpt = {
+            torch.save({
                 "epoch":    epoch,
                 "model":    model.state_dict(),
                 "config":   OmegaConf.to_container(cfg, resolve=True),
                 "val_dice": best_dice,
-            }
-            torch.save(ckpt, run_dir / "best.pt")
-            print(f"  saved best checkpoint  {best_key.split('/')[-1]}={best_dice:.3f}")
+            }, run_dir / "best.pt")
+            print(f"  saved best  {best_key.split('/')[-1]}={best_dice:.3f}")
 
         if use_wandb:
             import wandb
-            all_figs        = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
+            all_figs = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
             if synth_train_fig_path is not None:
                 all_figs["train/pred_synth"] = wandb.Image(str(synth_train_fig_path))
             if real_train_fig_path is not None:
                 all_figs["train/pred_real"] = wandb.Image(str(real_train_fig_path))
-            level_loss_log  = {f"train/loss_l{j}": epoch_level_losses[j] / max(n_batches, 1)
-                               for j in range(n_levels)}
             wandb.log({
                 "train/loss": avg_loss,
-                **level_loss_log,
+                **{f"train/loss_l{j}": epoch_level_losses[j] / max(n_batches, 1) for j in range(n_levels)},
                 "train/dice_l0": epoch_dice / max(n_dice, 1),
                 "epoch": epoch, **val_metrics, **all_figs,
             })

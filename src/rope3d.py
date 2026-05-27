@@ -83,10 +83,17 @@ def apply_rope_3d(
     w_rope = rope_cache[w_idx]
 
     def _rotate(part: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
-        """Complex-multiply part (B, K, n_pairs, 2) by rope (B, K, n_pairs, 2)."""
-        cx = torch.view_as_complex(part.contiguous())
-        cr = torch.view_as_complex(rope.contiguous())
-        return torch.view_as_real(cx * cr).reshape(B, K, per_axis)
+        """Real-space rotation — avoids view_as_complex for inductor compatibility.
+
+        Equivalent to complex multiply (x0 + x1·i)(cos + sin·i):
+          real = x0·cos − x1·sin
+          imag = x0·sin + x1·cos
+        part: (B, K, n_pairs, 2)  rope: (B, K, n_pairs, 2) = [cos, sin]
+        """
+        x0, x1   = part[..., 0], part[..., 1]
+        cos, sin = rope[..., 0], rope[..., 1]
+        return torch.stack([x0 * cos - x1 * sin,
+                            x0 * sin + x1 * cos], dim=-1).reshape(B, K, per_axis)
 
     d_part = x[:, :, 0           : per_axis    ].reshape(B, K, n_pairs, 2)
     h_part = x[:, :, per_axis    : per_axis * 2].reshape(B, K, n_pairs, 2)

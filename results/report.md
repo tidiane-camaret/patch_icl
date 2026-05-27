@@ -1,6 +1,100 @@
 # patch_icl — Results Summary
 
-*Last updated: 2026-05-25*
+*Last updated: 2026-05-27 (attention compile benchmark; feature_level list; torch.compile integration)*
+
+---
+
+## Encoder optimization benchmark
+
+Script: `experiments/encoders/benchmark_optimizations.py`  
+Setup: STUNet-base, RTX A6000 (50.8 GB), fp16 autocast, B=1, 3 warmup + 10 measured runs.
+
+### Inference
+
+| Config | Method | Latency | Speedup | Peak VRAM | ΔVRAM |
+|--------|--------|--------:|--------:|----------:|------:|
+| 64³ | baseline | 3.7 ms | 1.00× | 188 MB | — |
+| 64³ | compile_reduce | 3.8 ms | 0.97× | 188 MB | +0 |
+| 64³ | compile_autotune | 3.5 ms | 1.05× | 188 MB | +0 |
+| 64³ | **cuda_graph** | **2.5 ms** | **1.47×** | **144 MB** | **−44 MB** |
+| 64³ | vmap (fp32) | 5.4 ms | 0.68× | 279 MB | +91 MB |
+| 128³ | baseline | 13.8 ms | 1.00× | 685 MB | — |
+| 128³ | compile_reduce | 13.7 ms | 1.01× | 685 MB | +0 |
+| 128³ | compile_autotune | 13.8 ms | 1.00× | 685 MB | +0 |
+| 128³ | **cuda_graph** | **13.4 ms** | **1.03×** | **331 MB** | **−354 MB** |
+| 128³ | vmap (fp32) | 26.5 ms | 0.52× | 1.41 GB | +728 MB |
+
+### Training (fwd + bwd)
+
+| Config | Method | Latency | Speedup | Peak VRAM | ΔVRAM |
+|--------|--------|--------:|--------:|----------:|------:|
+| 64³ | baseline | 13.3 ms | 1.00× | 714 MB | — |
+| 64³ | checkpoint only | 23.3 ms | 0.57× | 710 MB | −4 MB |
+| 64³ | **compile_checkpoint** | **8.9 ms** | **1.50×** | **474 MB** | **−240 MB** |
+| 128³ | baseline | 45.8 ms | 1.00× | 1.72 GB | — |
+| 128³ | checkpoint only | 59.7 ms | 0.77× | 1.69 GB | −34 MB |
+| 128³ | **compile_checkpoint** | **43.0 ms** | **1.06×** | **634 MB** | **−1.09 GB** |
+
+`compile_checkpoint` = `torch.compile(mode="reduce-overhead")` wrapping per-stage gradient checkpointing. One-time compile cost ~50 s.
+
+### Conclusions
+
+- **`torch.compile` alone does nothing** on this architecture — STU-Net is memory-bandwidth–bound 3D convs with no fuseable pointwise clusters for Triton to exploit.
+- **CUDA graphs** are the best inference option: 1.47× at 64³ (kernel-dispatch overhead removal); −354 MB VRAM at 128³ (static allocation pool).
+- **Gradient checkpointing alone is counterproductive**: slower (0.57–0.77×) with negligible VRAM savings. Recomputation cost exceeds savings on this encoder.
+- **`compile_checkpoint` is the clear training winner**: fuses the recomputed forward pass. −1.09 GB VRAM at 128³ (63% reduction) at 1.06× speed; 1.50× speedup at 64³. Use for any training run above 64³.
+- **vmap**: avoid — slower and higher VRAM at B=1.
+
+---
+
+## Attention model compile benchmark
+
+Script: `/tmp/compile_bench.py` (inline, not committed)  
+Setup: `PatchICLAttention` (8.8 M params), RTX A6000 (50.8 GB), Python 3.11 + triton 3.2.0, B=4, K=1, N=M=512 (dense 8³), embed_dim=800 (5-stage `feature_level=all`), dim=256, L=8, fwd+bwd, 3 warmup + 10 measured runs.
+
+> **Note:** current `nninteractive.yaml` uses `feature_level: [2, 3, 4]` → embed_dim=704 (128+256+320 ch). The benchmark above used `feature_level=all` (800 ch); speedup and VRAM savings are comparable at 704 ch.
+
+| Method | Latency | Speedup | Peak VRAM | ΔVRAM |
+|--------|--------:|--------:|----------:|------:|
+| baseline (eager) | 87.8 ms | 1.00× | 591 MB | — |
+| **compile reduce-overhead** | **13.8 ms** | **6.34×** | **92 MB** | **−499 MB** |
+| compile max-autotune | 17.2 ms | 5.11× | 92 MB | −499 MB |
+
+`reduce-overhead` (CUDA graph capture via torch.compile) wins both speed and VRAM:
+**6.3× faster, −500 MB VRAM**. `max-autotune` costs ~5 min extra compile time for a slightly worse result here (attention is dominated by SDPA, not pointwise kernels).
+
+### Conclusions
+
+- **`torch.compile(mode="reduce-overhead")` is the clear winner for training the attention model.** Apply to `model.shared_level` (or the per-level `PatchICLAttention`) — not the frozen encoder.
+- VRAM savings (−500 MB) are large enough to increase batch size by 1–2 at 128³.
+- `max-autotune` is not worth the extra compile time here — prefer `reduce-overhead`.
+- These numbers reflect the attention-only pass. The full training step adds encoder time (frozen, ~70 ms at 128³ B=8) which dilutes the speedup slightly.
+
+---
+
+## NNInteractive encoder — feature stage dimensions
+
+Encoder: `NNInteractiveEncoder`, `num_stages=5`, 128³ input.  
+`forward()` returns `feats[0..4]` ordered high-res → low-res.
+
+| Index | Channels | Spatial | Stride | VRAM @ B=8 fp16 |
+|-------|----------|---------|--------|-----------------|
+| 0 | 32 | 128³ | 1× | 1 074 MB |
+| 1 | 64 | 64³ | 2× | 268 MB |
+| 2 | 128 | 32³ | 4× | 67 MB |
+| 3 | 256 | 16³ | 8× | 17 MB |
+| 4 | 320 | 8³ | 16× | 2.6 MB ← bottleneck |
+
+`model.feature_level` selects which levels are passed to the attention stack. Each selected tensor is interpolated (trilinear) to the current attention grid resolution, then concatenated channel-wise to form `embed_dim`:
+
+| `feature_level` | Levels used | `embed_dim` | Skip VRAM |
+|---|---|---|---|
+| `all` | 0+1+2+3+4 | 800 | 1 428 MB |
+| `[2, 3, 4]` ← current | 2+3+4 | 704 | 87 MB |
+| `[3, 4]` | 3+4 | 576 | 20 MB |
+| `4` | bottleneck only | 320 | 3 MB |
+
+`embed_dim` is projected down to `model.dim` (256) by a learned linear at the start of each `PatchICLAttention` forward. Changing `feature_level` only affects that projection and which encoder tensors are retained in memory.
 
 ---
 

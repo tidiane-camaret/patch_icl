@@ -98,7 +98,14 @@ def _seeds3d(vol: np.ndarray, n_segments: int) -> np.ndarray:
             "Run:  bash scripts/synth_labels/install_seeds3d.sh"
         )
     D, H, W = vol.shape
-    data = np.ascontiguousarray(vol, dtype=np.float32)
+    # SEEDS requires values in [0, 1] for float32 input (initImageBins<float>
+    # computes bin = int(val * nr_bins)); out-of-range values cause a segfault.
+    # ct.npy is already in [0,1] but may have a padding-zero minimum, so
+    # renormalise to be safe.  Float32 [0,1] is preferred over uint8 [0,255]
+    # because the pre-normalised CT already clusters soft tissue in a narrow
+    # band, giving more organ-scale blobs with less fragmentation.
+    mn, mx = float(vol.min()), float(vol.max())
+    data = np.ascontiguousarray((vol - mn) / (mx - mn + 1e-8), dtype=np.float32)
     sv = python_3d_seeds.createSupervoxelSEEDS(
         width=W, height=H, depth=D, channels=1,
         num_superpixels=n_segments, num_levels=4,
@@ -314,8 +321,8 @@ def main():
         help="Fixed supervoxel count; default=random U[50,500] per subject",
     )
     parser.add_argument(
-        "--workers", type=int, default=mp.cpu_count(),
-        help=f"Parallel worker processes (default: cpu_count={mp.cpu_count()})",
+        "--workers", type=int, default=20,
+        help="Parallel worker processes (default: cpu_count=20)",
     )
     parser.add_argument(
         "--overwrite", action="store_true",

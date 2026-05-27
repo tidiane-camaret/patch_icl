@@ -16,8 +16,18 @@ fi
 echo "Conda env: $CONDA_PREFIX"
 
 # ---- g++ required ------------------------------------------------------------
-if ! command -v g++ &>/dev/null; then
-    echo "ERROR: g++ not found. Install with: conda install -c conda-forge gxx_linux-64" >&2
+# Prefer /usr/bin/g++ over the conda env's g++: the conda toolchain links against
+# a newer glibc (2.34+) that may not be present on the host system at runtime.
+if [ -x "/usr/bin/g++" ]; then
+    export CXX=/usr/bin/g++
+    export CC=/usr/bin/gcc
+    echo "Compiler : /usr/bin/g++ (system, avoids conda glibc mismatch)"
+elif command -v g++ &>/dev/null; then
+    export CXX=$(command -v g++)
+    export CC=$(command -v gcc)
+    echo "Compiler : $CXX (conda env — may require matching glibc on host)"
+else
+    echo "ERROR: g++ not found. Install with: sudo apt install g++ OR conda install -c conda-forge gxx_linux-64" >&2
     exit 1
 fi
 
@@ -46,7 +56,6 @@ echo "Building python_3d_seeds ..."
 CFLAGS="-I$CONDA_PREFIX/include/opencv4" \
 CXXFLAGS="-I$CONDA_PREFIX/include/opencv4" \
 LDFLAGS="-L$CONDA_PREFIX/lib -lopencv_core -lopencv_imgproc -Wl,-rpath,$CONDA_PREFIX/lib" \
-CXX=g++ CC=gcc \
 pip install --no-build-isolation git+https://github.com/zch0414/3d-seeds
 
 echo ""

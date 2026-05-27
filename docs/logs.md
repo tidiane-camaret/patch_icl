@@ -1,5 +1,165 @@
 # Change log
 
+## 2026-05-27 — feature_level list support in extract_features
+
+`experiments/multilevel/train.py`, `configs/experiment/nninteractive.yaml`.
+
+`extract_features` now accepts a list of level indices in addition to `'all'` and a single
+integer. This lets a run select any subset of encoder levels without computing or storing
+the unused ones.
+
+```
+feature_level: [2, 3, 4]   # skip large early stages; concat levels 2+3+4 only
+feature_level: 4            # bottleneck only
+feature_level: all          # concat all num_stages outputs (original behaviour)
+```
+
+Hydra deserialises YAML lists as `omegaconf.ListConfig`, so the isinstance check uses
+duck-typing (`not isinstance(level, str) and hasattr(level, "__iter__")`) rather than
+`isinstance(level, (list, tuple))`.
+
+`configs/experiment/nninteractive.yaml` updated to `feature_level: [2, 3, 4]` (drops
+skip0=32ch@128³ and skip1=64ch@64³, which account for 94% of skip-feature VRAM at B=8 fp16).
+`embed_dim` drops from 800 → 704 (128+256+320); auto-detected via dummy forward in `main()`.
+
+---
+
+## 2026-05-27 — torch.compile integration + CUDA graph + RoPE fixes
+
+`experiments/nninteractive/train.py`, `experiments/multilevel/train.py`, `src/rope3d.py`.
+
+### torch.compile integration
+
+Added `compile_model` flag to both training scripts (config key `train.compile_model`).
+When enabled on a `shared_weights=True` run, compiles `model.shared_level` (the single
+`PatchICLAttention` instance) with `mode="reduce-overhead"` (CUDA graph capture).
+The compiled module is kept in a local `compiled_attn` variable — `model.state_dict()`,
+optimizer parameters, and checkpoint saving are unaffected.
+
+Default: `compile_model: true` in `nninteractive.yaml`; `false` in `multilevel.yaml` (opt-in).
+
+### CUDA graph cascade_regs fix
+
+`cascade_regs = regs.detach()` shares storage with the CUDA graph's output pool.
+Passing that tensor as input to the *next* level's CUDA graph (a sibling graph) triggers:
+
+    RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run
+
+Fix: `.clone()` after every cascade_regs assignment so the tensor lives in normal GPU
+memory and is no longer a view of the CUDA graph output pool:
+
+```python
+cascade_regs = regs.detach() if cfg.model.detach_cascade_registers else regs
+if compiled_attn is not None:
+    cascade_regs = cascade_regs.clone()
+```
+
+Applied at all 4 call sites in each train.py (L0 + L1, training + validation).
+`torch.compiler.cudagraph_mark_step_begin()` is also called before each compiled forward
+as a step-boundary hint for the CUDA graph tree.
+
+### RoPE real-space rotation fix
+
+`src/rope3d.py` `_rotate()` previously used `torch.view_as_complex` / `view_as_real`,
+which Torchinductor does not support:
+
+    UserWarning: Torchinductor does not support code generation for complex operators.
+    Performance may be worse than eager.
+
+Replaced with equivalent real-space arithmetic:
+
+```python
+x0' = x0·cos − x1·sin
+x1' = x0·sin + x1·cos
+```
+
+No correctness change (fp32 max diff 4.77e-7; fp16 9.77e-4 — normal fp16 rounding).
+The new path is fully fuseable by Triton.
+
+---
+
+## 2026-05-27 — Attention compile benchmark (torch.compile on PatchICLAttention)
+
+`/tmp/compile_bench.py` (inline benchmark, not committed).
+
+Benchmarked `torch.compile` modes on `PatchICLAttention` fwd+bwd using `.venv311`
+(Python 3.11 + triton 3.2.0 — required for max-autotune; Python 3.12 breaks triton).
+
+Config: B=4, K=1, N=M=512 (dense 8³), embed_dim=800, dim=256, L=8.
+
+| Method | Latency | Speedup | ΔVRAM |
+|--------|--------:|--------:|------:|
+| baseline eager | 87.8 ms | 1.00× | — |
+| **compile reduce-overhead** | **13.8 ms** | **6.34×** | **−499 MB** |
+| compile max-autotune | 17.2 ms | 5.11× | −499 MB |
+
+`reduce-overhead` wins (CUDA graph capture); `max-autotune` spends 5 min tuning Triton
+kernels for a slightly worse result. Recommendation: add
+`torch.compile(model.shared_level, mode="reduce-overhead")` to `train.py`.
+
+## 2026-05-27 — NNInteractive experiment
+
+`experiments/nninteractive/train.py` (new), `configs/experiment/nninteractive.yaml` (new).
+
+New training experiment: same multilevel PatchICLAttention stack as `experiments/multilevel/`
+but driven by the frozen `NNInteractiveEncoder` (90 M params) instead of STUNetEncoder.
+
+Key architectural difference: context images are encoded **with their ground-truth masks**
+(`encode_context(encoder, ctx_imgs, ctx_masks)`) so the encoder features are already
+mask-conditioned at the backbone level. Target images are encoded with a zero mask.
+The downstream label injection in PatchICLAttention is kept unchanged.
+
+`embed_dim=800` (feature_level=all, 5 stages) vs 992 for STUNet-base.
+MultilevelICL 2.48 M trainable params (encoder frozen).
+
+Usage:
+    python experiments/nninteractive/train.py
+    python experiments/nninteractive/train.py model.nnint_mask_injection=separate
+    python experiments/nninteractive/train.py model.nnint_ckpt=/local/path/...
+
+## 2026-05-27 — NNInteractive pretrained encoder wrapper
+
+`src/models/encoders/nninteractive.py` (new).
+
+`NNInteractiveEncoder` wraps the pretrained ResidualEncoder from the nnInteractive v1.0
+checkpoint (383 M params, 8-channel input: 1 image + 7 interaction slots).
+Implements the same `(skip_channels, bot_features, total_stride, forward(imgs, masks))`
+interface as `STUNetEncoder` so it can drop in as an encoder swap.
+
+Two mask injection modes:
+- **ch1** — pack `[image, mask, 0, 0, 0, 0, 0, 0]` as the 8-channel input, using the
+  model's native "current segmentation" channel.
+- **separate** — image in ch0 only; mask encoded by a SAM-style 3-D CNN
+  (`_Mask3DEncoder` from stunet.py) and fused additively at the bottleneck.
+
+`num_stages` controls depth (default 6 → 32× stride; 5 → 16× recommended for 64³/128³).
+Encoder weights are frozen by default. nnInteractive installed as editable package into `.venv`.
+
+## 2026-05-27 — Fix seeds3d segfault (float32 → uint8)
+
+`scripts/synth_labels/generate.py`.
+
+`seeds3d` was crashing with a segfault (core dump) on every call, causing forked worker processes to die silently and the pool to hang indefinitely waiting for results. Root cause: `python_3d_seeds` (a pybind11 wrapper around OpenCV's SEEDS) requires **uint8** input normalised to `[0, 255]`; passing `float32` causes an out-of-bounds memory access in the C++ layer. Fix: normalise the volume with `((vol - mn) / (mx - mn + 1e-8) * 255).astype(np.uint8)` before calling `sv.iterate()`.
+
+## 2026-05-26 — MRI normalisation fix + bbox cache parallelisation
+
+`scripts/convert_to_npy.py`, `src/totalseg_dataloader_incontext.py`.
+
+**MRI normalisation (`convert_to_npy.py` `_normalise_mri`)**:
+- Lower clip bound changed from hard `0` to the 0.5th percentile of non-zero foreground voxels (matches the 2D zopt dataloader in `ic_segmentation`). Upper bound remains p99.5. Z-score step retained.
+- Motivation: `0` is an arbitrary floor that can include background signal and biases the clip range for certain MRI protocols. Using p0.5 of foreground is protocol-agnostic.
+- **Pre-resized MRI `.npy` files must be regenerated**: `python scripts/convert_to_npy.py --data .../totalsegmri --modality mri --size 128 128 128 --overwrite`
+
+**Bbox cache parallelisation (`totalseg_dataloader_incontext.py`)**:
+- Added module-level `_bbox_for_subject(root, subj)` (picklable worker) — same pattern as `_adj_for_subject`.
+- `_load_or_build_bbox_cache` now uses `ProcessPoolExecutor(max_workers=16)` instead of a sequential loop. Critical for TotalSegMRI where native label volumes can exceed 1000 × 1280 × 1900 voxels.
+- Existing `.bbox_cache_*.pkl` files are reused as-is; only fresh builds benefit.
+
+**MRI crop size fix (`totalseg_dataloader_incontext.py` `_load_crop` / `_load_crop_multi`)**:
+- CT dataset: perfectly isotropic at 1.5 mm → `T × sp_min = 192 mm` always (consistent).
+- TotalSegMRI: spacing 0.17–28 mm, up to 120× anisotropy → old formula gave physical crops as small as **21 mm** (zoomed in).
+- Fix: `phys_ref = max(T * sp_min, T * 1.5)` — clamps the physical crop to at least 192 mm regardless of how fine the in-plane voxels are. High-res subjects (0.2 mm in-plane) now crop ~960 voxels in-plane and downsample to 128, giving the same physical context as CT.
+
 ## 2026-05-26 — `not_benchmark` class splits in resolve_classes
 
 `data/totalseg_classes.py`
