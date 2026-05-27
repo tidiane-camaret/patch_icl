@@ -282,13 +282,14 @@ def process_batch(
 def validate(
     model:           MultilevelICL,
     encoder:         NNInteractiveEncoder,
-    ds_val:          TotalSegInContextDataset,
+    val_loader:      DataLoader,
     cfg:             OmegaConf,
     device:          torch.device,
     items_per_class: int,
     fig_dir:         Path | None = None,
     epoch:           int = 0,
     compiled_attn    = None,  # compiled PatchICLAttention (shared_weights=True only)
+    n_val_classes:   int = 0,  # if >0, stop iterating once all classes are saturated
 ) -> tuple[dict, dict]:
     from collections import defaultdict
     from sklearn.metrics import roc_auc_score
@@ -305,18 +306,6 @@ def validate(
     NP          = cfg.data.n_patches_l1
     temp        = cfg.data.sampling_temperature
 
-    val_loader = DataLoader(
-        ds_val,
-        batch_size=cfg.train.batch_size,
-        shuffle=False,
-        num_workers=cfg.train.workers,
-        collate_fn=incontext_collate_fn,
-        pin_memory=True,
-        persistent_workers=cfg.train.workers > 0,
-        prefetch_factor=2 if cfg.train.workers > 0 else None,
-        drop_last=False,
-    )
-
     level_dices       = [[] for _ in range(n_levels)]
     level_fused_dices = [[] for _ in range(n_levels)]
     final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_losses = [], [], [], [], []
@@ -326,6 +315,14 @@ def validate(
 
     for batch in val_loader:
         label_names = batch["label_names"]
+
+        # Skip batch if every item is from a class that already has enough samples.
+        # This avoids running the encoder + attention forward for unneeded items.
+        if all(class_counts.get(ln, 0) >= items_per_class for ln in label_names):
+            if n_val_classes > 0 and len(class_counts) >= n_val_classes:
+                break   # all classes saturated — stop iterating entirely
+            continue
+
         images  = batch["image"].to(device, non_blocking=True)
         labels  = batch["label"].to(device, non_blocking=True)
         ctx_in  = batch["context_in"].to(device, non_blocking=True)
@@ -614,6 +611,19 @@ def main() -> None:
     )
     print(f"Train: {n_train} samples  |  {len(train_loader)} batches/epoch")
 
+    # Val loader created once so persistent workers survive across epochs.
+    val_loader = DataLoader(
+        ds_val,
+        batch_size=cfg.train.batch_size,
+        shuffle=False,
+        num_workers=cfg.train.workers,
+        collate_fn=incontext_collate_fn,
+        pin_memory=True,
+        persistent_workers=cfg.train.workers > 0,
+        prefetch_factor=2 if cfg.train.workers > 0 else None,
+        drop_last=False,
+    )
+
     # ── NNInteractive encoder (frozen) ──────────────────────────────────────
     ckpt_dir        = str(cfg.model.nnint_ckpt)
     mask_injection  = str(cfg.model.nnint_mask_injection)
@@ -807,9 +817,10 @@ def main() -> None:
               f"dice_l0={epoch_dice / max(n_dice, 1):.3f}  {elapsed:.0f}s")
 
         val_metrics, val_figs = validate(
-            model, encoder, ds_val, cfg, device,
+            model, encoder, val_loader, cfg, device,
             cfg.train.val_items_per_class,
             fig_dir=fig_dir, epoch=epoch, compiled_attn=compiled_attn,
+            n_val_classes=len(val_classes),
         )
         dice_str = "  ".join(
             f"{k.split('/')[-1]}={v:.3f}"

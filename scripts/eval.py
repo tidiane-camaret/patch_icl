@@ -244,7 +244,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="In-context segmentation quality benchmark")
 
     p.add_argument("--models", nargs="+", required=True,
-                   choices=["native_vit", "native_resenc", "medverse", "multilevel"],
+                   choices=["native_vit", "native_resenc", "medverse", "multilevel", "nninteractive"],
                    help="Models to evaluate")
     p.add_argument("--K", type=int, default=1,
                    help="Number of context (image, mask) pairs")
@@ -266,6 +266,10 @@ def parse_args():
     p.add_argument("--ckpt_resenc",     type=str, default="results/checkpoints/resenc_in_context_best.pt")
     p.add_argument("--ckpt_multilevel", type=str, default=None,
                    help="Path to MultilevelICL best.pt checkpoint")
+    p.add_argument("--ckpt_nninteractive", type=str, default=None,
+                   help="Path to NNInteractive experiment best.pt checkpoint")
+    p.add_argument("--nnint_ckpt", type=str, default=None,
+                   help="Override the NNInteractive encoder checkpoint path stored in the experiment config")
 
     # Medverse options
     p.add_argument("--medverse_ckpt", type=str, default=None,
@@ -370,6 +374,12 @@ def main():
             if args.ckpt_multilevel is None:
                 raise ValueError("--ckpt_multilevel is required for the multilevel model")
             model_kwargs["ckpt_path"] = args.ckpt_multilevel
+        elif model_name == "nninteractive":
+            if args.ckpt_nninteractive is None:
+                raise ValueError("--ckpt_nninteractive is required for the nninteractive model")
+            model_kwargs["ckpt_path"] = args.ckpt_nninteractive
+            if args.nnint_ckpt:
+                model_kwargs["nnint_ckpt"] = args.nnint_ckpt
 
         model = load_model(model_name, image_size=image_size, device=device, **model_kwargs)
 

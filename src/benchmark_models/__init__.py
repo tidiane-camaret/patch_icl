@@ -4,7 +4,8 @@ Registry of in-context segmentation models for the benchmark.
 Usage:
     from src.benchmark_models import load_model
     model = load_model("medverse")
-    model = load_model("multilevel", ckpt_path="results/multilevel/.../best.pt")
+    model = load_model("multilevel",    ckpt_path="results/multilevel/.../best.pt")
+    model = load_model("nninteractive", ckpt_path="results/nninteractive/.../best.pt")
     model = load_model("native_resenc", ckpt_path="results/checkpoints/resenc_in_context_best.pt")
     model = load_model("native_vit",    ckpt_path="results/checkpoints/vit_in_context_best.pt")
 """
@@ -13,7 +14,7 @@ import torch
 
 from src.benchmark_models.base import InContextModel  # noqa: F401
 
-_ALL_MODELS = ["native_vit", "native_resenc", "medverse", "multilevel"]
+_ALL_MODELS = ["native_vit", "native_resenc", "medverse", "multilevel", "nninteractive"]
 
 
 def load_model(
@@ -54,6 +55,12 @@ def load_model(
         if ckpt_path is None:
             raise ValueError("ckpt_path is required for multilevel")
         return MultilevelICLAdapter(ckpt_path=ckpt_path, device=device, **kwargs)
+
+    if name == "nninteractive":
+        from src.benchmark_models.nninteractive import NNInteractiveAdapter
+        if ckpt_path is None:
+            raise ValueError("ckpt_path is required for nninteractive")
+        return NNInteractiveAdapter(ckpt_path=ckpt_path, device=device, **kwargs)
 
     raise ValueError(
         f"Unknown model {name!r}. Choose from: {', '.join(_ALL_MODELS)}"
