@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, Subset
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
 from src.models.encoders.nninteractive import NNInteractiveEncoder
+from src.losses import get_loss_fn
 from experiments.multilevel.model import MultilevelICL
 from data.totalseg_classes import resolve_classes
 
@@ -62,9 +63,8 @@ from experiments.multilevel.train import (
     gather_patches, grid_coords_3d,
     _encode_ctx_labels,
     norm_dice_score, dice_score, soft_dice_score,
-    _best_slice, _overlay, _heatmap, _patch_overlay,
-    save_val_figure, _save_synth_train_figure,
 )
+from src.utils.plotting import save_val_figure, _save_synth_train_figure
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +128,11 @@ def process_batch(
     device:  torch.device,
     amp:     bool = False,
     compiled_attn = None,  # compiled PatchICLAttention (shared_weights=True only)
+    loss_fn = None,        # callable (pred, gt) -> scalar; defaults to BCE
 ) -> tuple[list, torch.Tensor, list, list, list, list]:
     """Returns (preds, loss, level_losses, grid_preds, tgt_idxs, ctx_idxs)."""
+    if loss_fn is None:
+        loss_fn = F.binary_cross_entropy
     images  = batch["image"].to(device, non_blocking=True)
     labels  = batch["label"].to(device, non_blocking=True)
     ctx_in  = batch["context_in"].to(device, non_blocking=True)
@@ -151,6 +154,12 @@ def process_batch(
     with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=amp):
         tgt_feats      = encode_target(encoder, images)
         ctx_feats_flat = encode_context(encoder, ctx_imgs_flat, ctx_masks_flat)
+
+    _keep = set(level) if hasattr(level, "__iter__") and not isinstance(level, str) else None
+    if _keep is not None:
+        for i in range(len(tgt_feats)):
+            if i not in _keep:
+                tgt_feats[i] = ctx_feats_flat[i] = None
 
     preds, grid_preds, raw_losses, tgt_idxs, ctx_idxs = [], [], [], [], []
     C = None
@@ -261,7 +270,7 @@ def process_batch(
             grid_pred.scatter_(1, tgt_idx, pred)
             gt = gt_flat.gather(1, tgt_idx)
 
-        raw_losses.append(F.binary_cross_entropy(pred, gt))
+        raw_losses.append(loss_fn(pred, gt))
         preds.append(pred)
         grid_preds.append(grid_pred)
         tgt_idxs.append(tgt_idx)
@@ -290,10 +299,13 @@ def validate(
     epoch:           int = 0,
     compiled_attn    = None,  # compiled PatchICLAttention (shared_weights=True only)
     n_val_classes:   int = 0,  # if >0, stop iterating once all classes are saturated
-) -> tuple[dict, dict]:
+    loss_fn          = None,  # same loss used during training
+) -> tuple[dict, dict, float]:
     from collections import defaultdict
     from sklearn.metrics import roc_auc_score
 
+    if loss_fn is None:
+        loss_fn = F.binary_cross_entropy
     model.eval()
     amp = device.type == "cuda"
     if fig_dir is not None:
@@ -306,14 +318,17 @@ def validate(
     NP          = cfg.data.n_patches_l1
     temp        = cfg.data.sampling_temperature
 
-    level_dices       = [[] for _ in range(n_levels)]
-    level_fused_dices = [[] for _ in range(n_levels)]
+    level_dices         = [[] for _ in range(n_levels)]
+    level_fused_dices   = [[] for _ in range(n_levels)]
+    level_fullres_dices = [[] for _ in range(n_levels)]
     final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_losses = [], [], [], [], []
     wandb_images: dict = {}
     cls_fig_saved: set = set()
     class_counts: dict = defaultdict(int)
 
-    for batch in val_loader:
+    t0_val = time.perf_counter()
+    bar = tqdm(val_loader, desc="val", unit="batch", leave=False)
+    for batch in bar:
         label_names = batch["label_names"]
 
         # Skip batch if every item is from a class that already has enough samples.
@@ -333,9 +348,15 @@ def validate(
         ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
         ctx_masks_flat = ctx_out.reshape(B * K, *ctx_out.shape[2:]).unsqueeze(1).float()
 
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=amp):
             tgt_feats      = encode_target(encoder, images)
             ctx_feats_flat = encode_context(encoder, ctx_imgs_flat, ctx_masks_flat)
+
+        _keep = set(level) if hasattr(level, "__iter__") and not isinstance(level, str) else None
+        if _keep is not None:
+            for i in range(len(tgt_feats)):
+                if i not in _keep:
+                    tgt_feats[i] = ctx_feats_flat[i] = None
 
         preds_l, tgt_idxs_l, ctx_idxs_l, grid_preds_l = [], [], [], []
         C = None
@@ -450,6 +471,7 @@ def validate(
             if class_counts[cls] >= items_per_class:
                 continue
             label_b = labels[b:b + 1]
+            gt_nat  = (labels[b].reshape(-1) > 0).float()   # native image_size, reused across levels
 
             for i, res in enumerate(resolutions):
                 N_i      = res[0] * res[1] * res[2]
@@ -465,6 +487,13 @@ def validate(
                 df = dice_score(grid_preds_l[i][b], gt_i_bin)
                 if df == df:
                     level_fused_dices[i].append(df)
+                pf_up   = F.interpolate(
+                    grid_preds_l[i][b].reshape(1, 1, *res),
+                    size=tuple(cfg.data.image_size), mode="trilinear", align_corners=False,
+                ).reshape(-1)
+                df_full = dice_score(pf_up, gt_nat)
+                if df_full == df_full:
+                    level_fullres_dices[i].append(df_full)
 
             final_res = resolutions[-1]
             N_final   = final_res[0] * final_res[1] * final_res[2]
@@ -472,7 +501,7 @@ def validate(
             gt_final_b = (gt_final > 0).float()
             pf         = grid_preds_l[-1][b]
 
-            final_losses.append(F.binary_cross_entropy(pf, gt_final_b).item())
+            final_losses.append(loss_fn(pf.unsqueeze(0), gt_final_b.unsqueeze(0)).item())
             d = dice_score(pf, gt_final_b)
             if d == d:
                 final_dices.append(d)
@@ -529,17 +558,26 @@ def validate(
 
             class_counts[cls] += 1
 
+        bar.set_postfix(
+            dice=f"{np.nanmean(final_dices):.3f}" if final_dices else "n/a",
+            n=sum(class_counts.values()),
+        )
+
+    bar.close()
+    val_elapsed = time.perf_counter() - t0_val
     model.train()
     metrics: dict = {}
     for i in range(n_levels):
-        metrics[f"val/dice_l{i}"]       = float(np.nanmean(level_dices[i]))       if level_dices[i]       else float("nan")
-        metrics[f"val/dice_fused_l{i}"] = float(np.nanmean(level_fused_dices[i])) if level_fused_dices[i] else float("nan")
+        metrics[f"val/dice_l{i}"]          = float(np.nanmean(level_dices[i]))          if level_dices[i]          else float("nan")
+        metrics[f"val/dice_fused_l{i}"]    = float(np.nanmean(level_fused_dices[i]))    if level_fused_dices[i]    else float("nan")
+        metrics[f"val/dice_l{i}_fullres"]  = float(np.nanmean(level_fullres_dices[i]))  if level_fullres_dices[i]  else float("nan")
+    metrics["val/dice_fullres"] = metrics[f"val/dice_l{n_levels - 1}_fullres"]
     metrics["val/dice"]      = float(np.nanmean(final_dices))      if final_dices      else float("nan")
     metrics["val/soft_dice"] = float(np.nanmean(final_soft_dices)) if final_soft_dices else float("nan")
     metrics["val/norm_dice"] = float(np.nanmean(final_norm_dices)) if final_norm_dices else float("nan")
     metrics["val/auroc"]     = float(np.nanmean(final_aurocs))     if final_aurocs     else float("nan")
     metrics["val/loss"]      = float(np.mean(final_losses))        if final_losses     else float("nan")
-    return metrics, wandb_images
+    return metrics, wandb_images, val_elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +623,7 @@ def main() -> None:
         n_synth_merge_min=cfg.data.n_synth_merge_min,
         n_synth_merge_max=cfg.data.n_synth_merge_max,
         p_synth=cfg.data.p_synth,
-        random_coloring=False,
+        random_coloring=cfg.data.random_coloring,
         num_labels_per_sample=cfg.data.num_labels_per_sample,
     )
     ds_val = TotalSegInContextDataset(
@@ -611,16 +649,36 @@ def main() -> None:
     )
     print(f"Train: {n_train} samples  |  {len(train_loader)} batches/epoch")
 
-    # Val loader created once so persistent workers survive across epochs.
+    # Val loader: pre-select ≤ val_items_per_class indices per class from
+    # ds_val.samples so the loader only contains items we will actually score.
+    # ds_val.samples is ordered (cls, subj), so iterating once gives a
+    # deterministic, reproducible subset without any shuffling.
+    # This replaces the batch-level skip inside validate() which still ran
+    # the full encoder + attention forward for every item in an
+    # "only partially saturated" batch.
+    _per_cls: dict[str, int] = {}
+    val_indices: list[int] = []
+    for _i, (_, _cls) in enumerate(ds_val.samples):
+        cnt = _per_cls.get(_cls, 0)
+        if cnt < cfg.train.val_items_per_class:
+            val_indices.append(_i)
+            _per_cls[_cls] = cnt + 1
+    n_val_items   = len(val_indices)
+    n_val_batches = (n_val_items + cfg.train.batch_size - 1) // cfg.train.batch_size
+    print(f"Val:   {n_val_items} items  "
+          f"({len(_per_cls)} classes, ≤{cfg.train.val_items_per_class}/class)  "
+          f"|  {n_val_batches} batches/epoch")
+
+    val_workers = int(getattr(cfg.train, "val_workers", min(cfg.train.workers, 4)))
     val_loader = DataLoader(
-        ds_val,
+        Subset(ds_val, val_indices),
         batch_size=cfg.train.batch_size,
         shuffle=False,
-        num_workers=cfg.train.workers,
+        num_workers=val_workers,
         collate_fn=incontext_collate_fn,
         pin_memory=True,
-        persistent_workers=cfg.train.workers > 0,
-        prefetch_factor=2 if cfg.train.workers > 0 else None,
+        persistent_workers=val_workers > 0,
+        prefetch_factor=2 if val_workers > 0 else None,
         drop_last=False,
     )
 
@@ -693,13 +751,17 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MultilevelICL  params: {n_params:,}  ({len(model)} levels)")
 
+    loss_fn = get_loss_fn(str(getattr(cfg.train, "loss", "bce")))
+    print(f"Loss: {getattr(cfg.train, 'loss', 'bce')}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
     amp       = device.type == "cuda"
 
     if cfg.train.checkpoint:
         ckpt = torch.load(cfg.train.checkpoint, map_location=device)
-        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        state = {k: v for k, v in ckpt["model"].items() if "rope_cache_3d" not in k}
+        missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             print(f"  New parameters (random init): {missing}")
         print(f"Loaded checkpoint: {cfg.train.checkpoint}  (epoch {ckpt['epoch']})")
@@ -708,8 +770,15 @@ def main() -> None:
     compiled_attn = None
     if getattr(cfg.train, "compile_model", False) and device.type == "cuda":
         if model.shared_weights:
-            print("torch.compile (reduce-overhead) shared attention module ...", flush=True)
-            compiled_attn = torch.compile(model.shared_level, mode="reduce-overhead")
+            # Use "default" mode instead of "reduce-overhead": the shared attention module
+            # is called once per resolution level per batch, and cascade_registers changes
+            # from None (level 0) to a tensor (levels 1+).  CUDA-graph capture
+            # ("reduce-overhead") locks the graph on the first call and segfaults when
+            # the input changes type.  "default" (TorchDynamo + inductor, no CUDA graphs)
+            # handles optional/variable-shape inputs safely while still giving meaningful
+            # kernel-fusion speedup.
+            print("torch.compile (default) shared attention module ...", flush=True)
+            compiled_attn = torch.compile(model.shared_level, mode="default")
         else:
             print("Note: compile_model=True requires shared_weights=True — skipping.")
 
@@ -746,15 +815,22 @@ def main() -> None:
         epoch_nd, epoch_dice = 0.0, 0.0
         n_batches, n_nd, n_dice = 0, 0, 0
         last_nd, last_dice = float("nan"), float("nan")
+        epoch_dice_fused   = [0.0] * n_levels
+        epoch_dice_fullres = [0.0] * n_levels
+        n_dice_fused       = [0]   * n_levels
+        n_dice_fullres     = [0]   * n_levels
+        last_dice_fused    = [float("nan")] * n_levels
+        last_dice_fullres  = [float("nan")] * n_levels
         t0 = time.perf_counter()
 
-        synth_train_fig_path = None
-        real_train_fig_path  = None
+        synth_train_fig_path  = None
+        train_real_fig_paths: dict = {}  # cls -> Path, one figure per real class
         bar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{cfg.train.epochs}", unit="batch", leave=False)
 
         for batch in bar:
             preds, loss, level_losses, grid_preds_b, tgt_idxs_b, ctx_idxs_b = process_batch(
                 encoder, model, batch, cfg, device, amp=amp, compiled_attn=compiled_attn,
+                loss_fn=loss_fn,
             )
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
@@ -772,14 +848,29 @@ def main() -> None:
 
             if n_batches % nd_interval == 0:
                 with torch.no_grad():
-                    res_0 = tuple(cfg.data.resolutions[0])
-                    N0    = res_0[0] * res_0[1] * res_0[2]
-                    gt_0  = downsample_mask(
-                        batch["label"].to(device), res_0, cfg.data.mask_pool
-                    ).reshape(preds[0].shape[0], N0)
-                    gt_bin = (gt_0 > 0).float()
-                    nd = norm_dice_score(preds[0].detach(), gt_bin)
-                    dc = dice_score(preds[0].detach(), gt_bin)
+                    B_nd     = preds[0].shape[0]
+                    img_size = tuple(cfg.data.image_size)
+                    lbl_dev  = batch["label"].to(device)
+                    gt_nat   = (lbl_dev > 0).float().reshape(B_nd, -1)
+                    res_0    = tuple(cfg.data.resolutions[0])
+                    N0       = res_0[0] * res_0[1] * res_0[2]
+                    gt_0     = downsample_mask(lbl_dev, res_0, cfg.data.mask_pool).reshape(B_nd, N0)
+                    nd = norm_dice_score(preds[0].detach(), (gt_0 > 0).float())
+                    dc = dice_score(preds[0].detach(), (gt_0 > 0).float())
+                    for j, res_j in enumerate(resolutions):
+                        N_j    = res_j[0] * res_j[1] * res_j[2]
+                        gt_j   = downsample_mask(lbl_dev, res_j, cfg.data.mask_pool).reshape(B_nd, N_j)
+                        gp     = grid_preds_b[j].detach()
+                        df     = dice_score(gp, (gt_j > 0).float())
+                        gp_up  = F.interpolate(
+                            gp.reshape(B_nd, 1, *res_j),
+                            size=img_size, mode="trilinear", align_corners=False,
+                        ).reshape(B_nd, -1)
+                        df_full = dice_score(gp_up, gt_nat)
+                        if df == df:
+                            epoch_dice_fused[j]   += df;     n_dice_fused[j]   += 1; last_dice_fused[j]   = df
+                        if df_full == df_full:
+                            epoch_dice_fullres[j] += df_full; n_dice_fullres[j] += 1; last_dice_fullres[j] = df_full
                 if nd == nd:
                     epoch_nd   += nd; n_nd   += 1; last_nd   = nd
                 if dc == dc:
@@ -787,23 +878,23 @@ def main() -> None:
 
             if fig_dir is not None:
                 for b_idx, lname in enumerate(batch["label_names"]):
-                    if synth_train_fig_path is None and lname.startswith("sv_"):
-                        synth_train_fig_path = _save_synth_train_figure(
-                            batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
-                            b_idx, epoch, fig_dir / "train_synth", resolutions, cfg,
-                        )
-                    elif real_train_fig_path is None and not lname.startswith("sv_"):
-                        real_train_fig_path = _save_synth_train_figure(
+                    if lname.startswith("sv_"):
+                        if synth_train_fig_path is None:
+                            synth_train_fig_path = _save_synth_train_figure(
+                                batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
+                                b_idx, epoch, fig_dir / "train_synth", resolutions, cfg,
+                            )
+                    elif lname not in train_real_fig_paths:
+                        train_real_fig_paths[lname] = _save_synth_train_figure(
                             batch, preds, grid_preds_b, tgt_idxs_b, ctx_idxs_b,
                             b_idx, epoch, fig_dir / "train_real", resolutions, cfg,
                         )
-                    if synth_train_fig_path is not None and real_train_fig_path is not None:
-                        break
 
             bar.set_postfix(
                 loss=f"{epoch_loss / n_batches:.4f}",
                 **{f"l{j}": f"{epoch_level_losses[j] / n_batches:.4f}" for j in range(n_levels)},
-                dice=f"{last_dice:.3f}",
+                **{f"f{j}": f"{last_dice_fused[j]:.3f}" for j in range(n_levels)},
+                **{f"fr{j}": f"{last_dice_fullres[j]:.3f}" for j in range(n_levels)},
                 nd=f"{last_nd:.3f}",
             )
 
@@ -813,21 +904,23 @@ def main() -> None:
         level_str = "  ".join(
             f"l{j}={epoch_level_losses[j] / max(n_batches, 1):.4f}" for j in range(n_levels)
         )
+        fused_str   = "  ".join(f"fused_l{j}={epoch_dice_fused[j]   / max(n_dice_fused[j],   1):.3f}" for j in range(n_levels))
+        fullres_str = "  ".join(f"full_l{j}={epoch_dice_fullres[j] / max(n_dice_fullres[j], 1):.3f}" for j in range(n_levels))
         print(f"Epoch {epoch:3d}/{cfg.train.epochs}  loss={avg_loss:.4f}  {level_str}  "
-              f"dice_l0={epoch_dice / max(n_dice, 1):.3f}  {elapsed:.0f}s")
+              f"{fused_str}  {fullres_str}  {elapsed:.0f}s")
 
-        val_metrics, val_figs = validate(
+        val_metrics, val_figs, val_elapsed = validate(
             model, encoder, val_loader, cfg, device,
             cfg.train.val_items_per_class,
             fig_dir=fig_dir, epoch=epoch, compiled_attn=compiled_attn,
-            n_val_classes=len(val_classes),
+            n_val_classes=len(val_classes), loss_fn=loss_fn,
         )
-        dice_str = "  ".join(
-            f"{k.split('/')[-1]}={v:.3f}"
-            for k, v in val_metrics.items()
-            if "dice" in k or k == "val/auroc"
-        )
-        print(f"  val {dice_str}")
+        dice_parts = []
+        for i in range(n_levels):
+            dice_parts.append(f"dice_fused_l{i}={val_metrics[f'val/dice_fused_l{i}']:.3f}")
+            dice_parts.append(f"dice_l{i}_fullres={val_metrics[f'val/dice_l{i}_fullres']:.3f}")
+        dice_str = "  ".join(dice_parts)
+        print(f"  val {dice_str}  {val_elapsed:.0f}s")
 
         best_key = f"val/dice_fused_l{n_levels - 1}"
         if val_metrics[best_key] > best_dice:
@@ -845,19 +938,20 @@ def main() -> None:
             all_figs = {k: wandb.Image(str(v)) for k, v in val_figs.items()}
             if synth_train_fig_path is not None:
                 all_figs["train/pred_synth"] = wandb.Image(str(synth_train_fig_path))
-            if real_train_fig_path is not None:
-                all_figs["train/pred_real"] = wandb.Image(str(real_train_fig_path))
+            for cls, path in train_real_fig_paths.items():
+                all_figs[f"train/pred_real/{cls}"] = wandb.Image(str(path))
             wandb.log({
                 "train/loss": avg_loss,
-                **{f"train/loss_l{j}": epoch_level_losses[j] / max(n_batches, 1) for j in range(n_levels)},
-                "train/dice_l0": epoch_dice / max(n_dice, 1),
+                **{f"train/loss_l{j}":        epoch_level_losses[j]   / max(n_batches, 1)        for j in range(n_levels)},
+                **{f"train/dice_fused_l{j}":  epoch_dice_fused[j]     / max(n_dice_fused[j], 1)  for j in range(n_levels)},
+                **{f"train/dice_fullres_l{j}": epoch_dice_fullres[j]  / max(n_dice_fullres[j], 1) for j in range(n_levels)},
                 "epoch": epoch, **val_metrics, **all_figs,
             })
 
     if use_wandb:
         import wandb
         wandb.finish()
-    print(f"\nBest val dice_fused_l1: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
+    print(f"\nBest val dice_fused_l{n_levels - 1}: {best_dice:.3f}  |  checkpoint: {run_dir}/best.pt")
 
 
 if __name__ == "__main__":

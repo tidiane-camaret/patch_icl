@@ -1,5 +1,22 @@
 # Change log
 
+## 2026-05-27 — val_loader pre-filtered to val_items_per_class
+
+`experiments/nninteractive/train.py`.
+
+`val_loader` now wraps a `torch.utils.data.Subset` that pre-selects at most
+`val_items_per_class` indices per class from `ds_val.samples` (deterministic,
+class-ordered). Previously the full val dataset was loaded (1686 samples / 211
+batches) and a batch-level guard inside `validate()` skipped batches only when
+**all** items were saturated — so the encoder + attention still ran for items
+that were already counted. With the Subset, the loader contains exactly the items
+that will be scored (~1410 samples / ~177 batches for 47 classes × 30 items).
+
+Also fixed: `torch.compile(mode="reduce-overhead")` replaced with
+`mode="default"` to avoid CUDA-graph segfaults caused by `cascade_registers`
+changing from `None` (level 0) to a tensor (levels 1+) across calls to the
+shared attention module.
+
 ## 2026-05-27 — feature_level list support in extract_features
 
 `experiments/multilevel/train.py`, `configs/experiment/nninteractive.yaml`.

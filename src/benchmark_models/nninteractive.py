@@ -86,7 +86,7 @@ class NNInteractiveAdapter(InContextModel):
         self._num_encoder_levels = len(self.encoder.skip_channels) + 1
 
         # ── Determine embed_dim via dummy forward ────────────────────────────
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
             dummy_img = torch.zeros(1, 1, *self.image_size, device=self.device)
             dummy_msk = torch.zeros(1, 1, *self.image_size, device=self.device)
             feats     = self.encoder(dummy_img, dummy_msk)
@@ -151,11 +151,17 @@ class NNInteractiveAdapter(InContextModel):
         context_masks = context_masks.to(self.device).float()
 
         # Encode: target with zero mask; context images with their GT masks
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=amp):
             tgt_feats = encode_target(self.encoder, target_img)
             ctx_flat  = context_imgs.reshape(B * K, 1, *context_imgs.shape[3:])
             ctx_masks_flat = context_masks.reshape(B * K, *context_masks.shape[2:]).unsqueeze(1)
             ctx_feats = encode_context(self.encoder, ctx_flat, ctx_masks_flat)
+
+        _keep = set(self.level) if hasattr(self.level, "__iter__") and not isinstance(self.level, str) else None
+        if _keep is not None:
+            for i in range(len(tgt_feats)):
+                if i not in _keep:
+                    tgt_feats[i] = ctx_feats[i] = None
 
         # Encode context masks for MaskCNN (if used)
         mask_cnn_vol = None

@@ -15,8 +15,8 @@ data:
   image_size: [128, 128, 128]
   resolutions:
     - [8, 8, 8]
-    - [16, 16, 16]
-    - [32, 32, 32]
+    #- [16, 16, 16]
+    #- [32, 32, 32]
   n_patches_l1: 512
   sampling_temperature: 0.2
   target_sampling: predicted_entropy  # gt_previous_pred_error | gt_foreground_entropy_balanced | predicted_entropy
@@ -43,7 +43,7 @@ model:
   feature_level: [2, 3, 4]     # int index | 'all' | list[int] — [2,3,4] skips large early stages
   dim: 256
   num_heads: 8
-  num_layers: 8
+  num_layers: 4
   ff_factor: 2
   label_injection: concat      # additive | concat | gate | none
   output_head: linear
@@ -53,7 +53,7 @@ model:
   ctx_self_attn: true
   log_n_scaling: true
   log_n_base: 512
-  mask_cnn_dim: 32             # 0 = scalar label injection; >0 = MaskCNN
+  mask_cnn_dim: 0             # 0 = scalar label injection; >0 = MaskCNN
   soft_labels_train: true
   soft_labels_eval: false
   num_registers: 4
@@ -65,19 +65,21 @@ model:
   max_context_size: 8
 
 train:
-  loss_weights: [1.0, 1.0]
+  loss: dice_bce          # bce | dice_bce | dice_focal
+  loss_weights: [1.0]
   epochs: 100
-  batch_size: 8
+  batch_size: 12
   lr: 1.0e-4
   weight_decay: 1.0e-5
   workers: 20
+  val_workers: 8          # separate low worker count for val; train workers cause NFS contention
   val_items_per_class: 30
   nd_interval: 20
   seed: 42
   aug: true
-  aug_preset: nnunet
+  aug_preset: multiverseg_v2
   wandb_project: patch_icl_3d_exps
   run_name: null
   checkpoint: null
   device: null
-  compile_model: false   # torch.compile(reduce-overhead) on shared attention — 6× speedup, −500 MB VRAM
+  compile_model: true   # torch.compile(default) on shared attention — kernel fusion speedup; reduce-overhead crashes due to cascade_registers None→tensor shape change across levels

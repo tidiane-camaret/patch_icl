@@ -1,0 +1,104 @@
+augmentations:
+  enabled: true
+
+  # -----------------------------------------------------------------------
+  # Task augmentations  —  same random params applied to query + all context.
+  # Geometric strength matches synth: affine p=0.8, elastic p=0.8.
+  # Shared deformation is intentional — preserves in-context correspondence
+  # while exposing the model to the same pose diversity as synth training.
+  # -----------------------------------------------------------------------
+  task:
+    flip:
+      p_d: 0.5
+      p_h: 0.5
+      p_w: 0.5
+
+    affine:
+      p: 0.8
+      max_angle_deg: 25.0
+      scale_min: 0.80
+      scale_max: 1.40
+      max_translate: 0.20           # ↑ from v2 0.15 → synth-equivalent
+
+    elastic:
+      p: 0.8                        # ↑ from v2 0.5 → synth-equivalent
+      alpha: 0.12
+      grid_scale: 8
+
+  # -----------------------------------------------------------------------
+  # Intensity augmentations  —  independently sampled per volume.
+  # Parameters matched to synth where the intensity aug code supports it
+  # (sharpness and mean_range/std_range noise are synth-only).
+  # -----------------------------------------------------------------------
+  intensity:
+    hu_jitter: 0
+    brightness_contrast:
+      p: 0.50
+      brightness: 0.10
+      contrast_range: [0.50, 1.50]  # ↑ wider, matches synth
+      preserve_range: false
+
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]
+      retain_stats: false
+
+    gaussian_noise:
+      p: 0.50                       # ↑ from v2 0.30 → synth-equivalent
+      max_std: 0.05
+
+    gaussian_blur:
+      p: 0.50
+      sigma_range: [0.50, 1.50]
+
+    simulate_low_resolution:
+      p: 0.15
+      scale_min: 0.5
+      scale_max: 1.0
+
+  # -----------------------------------------------------------------------
+  # Synth augmentations  —  unchanged
+  # -----------------------------------------------------------------------
+  synth:
+    flip_d: 0.5
+    flip_h: 0.5
+    flip_w: 0.5
+
+    affine:
+      p: 0.8
+      max_angle_deg: 25.0
+      scale_min: 0.90
+      scale_max: 1.50
+      max_translate: 0.20
+
+    elastic:
+      p: 0.8
+      alpha_range: [1, 10]
+      sigma_range: [8, 15]
+
+    brightness_contrast:
+      p: 0.5
+      brightness: 0.10
+      contrast_range: [0.5, 1.5]
+
+    sharpness:
+      p: 0.5
+      factor: 5.0
+
+    gaussian_blur:
+      p: 0.5
+      sigma_range: [0.1, 1.5]
+
+    gaussian_noise:
+      p: 0.5
+      mean_range: [0.0, 0.05]
+      std_range:  [0.0, 0.05]
+
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]
+
+    simulate_low_resolution:
+      p: 0.15
+      scale_min: 0.5
+      scale_max: 1.0

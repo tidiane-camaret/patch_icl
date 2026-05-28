@@ -70,7 +70,7 @@ train:
   nd_interval: 20
   seed: 42
   aug: true
-  aug_preset: nnunet
+  aug_preset: multiverseg_v2
   wandb_project: patch_icl_3d_exps
   run_name: null
   checkpoint: null
