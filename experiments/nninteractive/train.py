@@ -66,6 +66,8 @@ from experiments.multilevel.train import (
 )
 from src.utils.plotting import save_val_figure, _save_synth_train_figure
 
+TOP_K_FRAC = 0.2   # fraction of patches selected for ROI metrics (AUPRC / top-K recall)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -78,7 +80,16 @@ def load_config() -> OmegaConf:
     base    = OmegaConf.load(ROOT / "configs" / "config.yaml")
     cl_cfg  = OmegaConf.load(ROOT / "configs" / "cluster" / f"{cluster}.yaml")
     ex_cfg  = OmegaConf.load(ROOT / "configs" / "experiment" / "nninteractive.yaml")
-    return OmegaConf.merge(base, cl_cfg, ex_cfg, cli)
+    cfgs    = [base, cl_cfg, ex_cfg]
+    override_path = OmegaConf.select(cli, "override")
+    if override_path:
+        p = Path(override_path)
+        if not p.is_absolute():
+            p = ROOT / p
+        print(f"Loading override config: {p}")
+        cfgs.append(OmegaConf.load(p))
+    cfgs.append(cli)
+    return OmegaConf.merge(*cfgs)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +332,7 @@ def validate(
     level_dices         = [[] for _ in range(n_levels)]
     level_fused_dices   = [[] for _ in range(n_levels)]
     level_fullres_dices = [[] for _ in range(n_levels)]
-    final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_losses = [], [], [], [], []
+    final_dices, final_soft_dices, final_norm_dices, final_aurocs, final_auprc, final_topk, final_losses = [], [], [], [], [], [], []
     wandb_images: dict = {}
     cls_fig_saved: set = set()
     class_counts: dict = defaultdict(int)
@@ -515,9 +526,14 @@ def validate(
             gf_np = gt_final_b.cpu().numpy().astype(int)
             if 0 < gf_np.sum() < len(gf_np):
                 try:
-                    final_aurocs.append(__import__("sklearn.metrics", fromlist=["roc_auc_score"]).roc_auc_score(gf_np, pf_np))
+                    import sklearn.metrics as _skm
+                    final_aurocs.append(_skm.roc_auc_score(gf_np, pf_np))
+                    final_auprc.append(_skm.average_precision_score(gf_np, pf_np))
                 except Exception:
                     pass
+                k = max(1, int(TOP_K_FRAC * len(pf_np)))
+                top_k_idx = pf_np.argsort()[::-1][:k]
+                final_topk.append(float(gf_np[top_k_idx].sum() / max(gf_np.sum(), 1)))
 
             if cls not in cls_fig_saved and fig_dir is not None:
                 tgt_np    = batch["image"][b].squeeze().cpu().numpy()
@@ -575,8 +591,10 @@ def validate(
     metrics["val/dice"]      = float(np.nanmean(final_dices))      if final_dices      else float("nan")
     metrics["val/soft_dice"] = float(np.nanmean(final_soft_dices)) if final_soft_dices else float("nan")
     metrics["val/norm_dice"] = float(np.nanmean(final_norm_dices)) if final_norm_dices else float("nan")
-    metrics["val/auroc"]     = float(np.nanmean(final_aurocs))     if final_aurocs     else float("nan")
-    metrics["val/loss"]      = float(np.mean(final_losses))        if final_losses     else float("nan")
+    metrics["val/auroc"]       = float(np.nanmean(final_aurocs)) if final_aurocs else float("nan")
+    metrics["val/auprc"]       = float(np.nanmean(final_auprc))  if final_auprc  else float("nan")
+    metrics["val/topk_recall"] = float(np.nanmean(final_topk))   if final_topk   else float("nan")
+    metrics["val/loss"]        = float(np.mean(final_losses))    if final_losses  else float("nan")
     return metrics, wandb_images, val_elapsed
 
 
@@ -814,7 +832,8 @@ def main() -> None:
         epoch_level_losses = [0.0] * n_levels
         epoch_nd, epoch_dice = 0.0, 0.0
         n_batches, n_nd, n_dice = 0, 0, 0
-        last_nd, last_dice = float("nan"), float("nan")
+        last_nd, last_dice, last_auprc, last_topk = float("nan"), float("nan"), float("nan"), float("nan")
+        epoch_auprc, epoch_topk, n_auprc = 0.0, 0.0, 0
         epoch_dice_fused   = [0.0] * n_levels
         epoch_dice_fullres = [0.0] * n_levels
         n_dice_fused       = [0]   * n_levels
@@ -875,6 +894,22 @@ def main() -> None:
                     epoch_nd   += nd; n_nd   += 1; last_nd   = nd
                 if dc == dc:
                     epoch_dice += dc; n_dice += 1; last_dice = dc
+                import sklearn.metrics as _skm
+                _auprc_vals, _topk_vals = [], []
+                for _b in range(B_nd):
+                    _pf = preds[0][_b].detach().cpu().numpy()
+                    _gf = (gt_0[_b] > 0).cpu().numpy().astype(np.int32)
+                    if 0 < _gf.sum() < len(_gf):
+                        try:
+                            _auprc_vals.append(_skm.average_precision_score(_gf, _pf))
+                        except Exception:
+                            pass
+                        _k = max(1, int(TOP_K_FRAC * len(_pf)))
+                        _topk_vals.append(float(_gf[_pf.argsort()[::-1][:_k]].sum() / max(_gf.sum(), 1)))
+                if _auprc_vals:
+                    last_auprc = float(np.nanmean(_auprc_vals))
+                    last_topk  = float(np.nanmean(_topk_vals))
+                    epoch_auprc += last_auprc; epoch_topk += last_topk; n_auprc += 1
 
             if fig_dir is not None:
                 for b_idx, lname in enumerate(batch["label_names"]):
@@ -896,6 +931,8 @@ def main() -> None:
                 **{f"f{j}": f"{last_dice_fused[j]:.3f}" for j in range(n_levels)},
                 **{f"fr{j}": f"{last_dice_fullres[j]:.3f}" for j in range(n_levels)},
                 nd=f"{last_nd:.3f}",
+                ap=f"{last_auprc:.3f}",
+                tk=f"{last_topk:.3f}",
             )
 
         bar.close()
@@ -920,7 +957,7 @@ def main() -> None:
             dice_parts.append(f"dice_fused_l{i}={val_metrics[f'val/dice_fused_l{i}']:.3f}")
             dice_parts.append(f"dice_l{i}_fullres={val_metrics[f'val/dice_l{i}_fullres']:.3f}")
         dice_str = "  ".join(dice_parts)
-        print(f"  val {dice_str}  {val_elapsed:.0f}s")
+        print(f"  val {dice_str}  auprc={val_metrics['val/auprc']:.3f}  topk={val_metrics['val/topk_recall']:.3f}  {val_elapsed:.0f}s")
 
         best_key = f"val/dice_fused_l{n_levels - 1}"
         if val_metrics[best_key] > best_dice:
@@ -945,6 +982,8 @@ def main() -> None:
                 **{f"train/loss_l{j}":        epoch_level_losses[j]   / max(n_batches, 1)        for j in range(n_levels)},
                 **{f"train/dice_fused_l{j}":  epoch_dice_fused[j]     / max(n_dice_fused[j], 1)  for j in range(n_levels)},
                 **{f"train/dice_fullres_l{j}": epoch_dice_fullres[j]  / max(n_dice_fullres[j], 1) for j in range(n_levels)},
+                "train/auprc":       epoch_auprc / max(n_auprc, 1),
+                "train/topk_recall": epoch_topk  / max(n_auprc, 1),
                 "epoch": epoch, **val_metrics, **all_figs,
             })
 

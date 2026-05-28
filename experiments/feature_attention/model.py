@@ -390,22 +390,8 @@ class PatchICLAttention(nn.Module):
         tgt = self.input_proj(tgt_feat)   # (B, N, dim)
         ctx = self.input_proj(ctx_feat)   # (B, M, dim)
 
-        # 2b. Scale embedding: add physical patch-size signal to all tokens
-        if self.scale_encoder is not None and scale_mm is not None:
-            s = self.scale_encoder(scale_mm).unsqueeze(1)  # (B, 1, dim)
-            tgt = tgt + s
-            ctx = ctx + s
-
-        # 2c. Role embeddings: target/context type + per-context-image index
-        if self.use_role_embed:
-            tgt = tgt + self.tgt_type_embed                    # broadcast over (B, N, dim)
-            ctx = ctx + self.ctx_type_embed                    # broadcast over (B, K*NP, dim)
-            NP = tgt.shape[1]
-            K  = ctx.shape[1] // NP
-            k_idx = torch.arange(K, device=ctx.device).repeat_interleave(NP)  # (K*NP,)
-            ctx = ctx + self.ctx_idx_embed(k_idx).unsqueeze(0)  # (B, K*NP, dim)
-
-        # 3. Label injection into context tokens (at dim)
+        # 3. Label injection into context tokens — before scale/role embeddings so
+        #    scale, role, and RoPE all condition the already-fused (feature+label) token.
         if self.label_injection != "none":
             if self.label_dim == 1 and not self.soft_labels:
                 lbl_emb = self.label_embed((ctx_labels > 0).long())    # (B, M, dim)
@@ -420,6 +406,21 @@ class PatchICLAttention(nn.Module):
             elif self.label_injection == "gate":
                 gate = torch.sigmoid(self.gate_proj(lbl_emb))
                 ctx = ctx * gate
+
+        # 2b. Scale embedding: add physical patch-size signal to all tokens
+        if self.scale_encoder is not None and scale_mm is not None:
+            s = self.scale_encoder(scale_mm).unsqueeze(1)  # (B, 1, dim)
+            tgt = tgt + s
+            ctx = ctx + s
+
+        # 2c. Role embeddings: target/context type + per-context-image index
+        if self.use_role_embed:
+            tgt = tgt + self.tgt_type_embed                    # broadcast over (B, N, dim)
+            ctx = ctx + self.ctx_type_embed                    # broadcast over (B, K*NP, dim)
+            NP = tgt.shape[1]
+            K  = ctx.shape[1] // NP
+            k_idx = torch.arange(K, device=ctx.device).repeat_interleave(NP)  # (K*NP,)
+            ctx = ctx + self.ctx_idx_embed(k_idx).unsqueeze(0)  # (B, K*NP, dim)
 
         # Prepend register tokens to context (cascade from prev level + own learnable)
         R_own    = self.num_registers

@@ -156,6 +156,13 @@ def save_val_figure(
         ).squeeze().numpy()
         axes[row, 5].imshow(tgt_sl_norm, cmap="gray")
         axes[row, 5].imshow(pf_up[tgt_z], cmap="Reds", alpha=0.5, vmin=0, vmax=1)
+        # GT contour (cyan) and predicted hard mask contour (yellow)
+        gt_sl = (tgt_gt[tgt_z] > 0).astype(float)
+        if gt_sl.max() > 0:
+            axes[row, 5].contour(gt_sl, levels=[0.5], colors=["cyan"], linewidths=0.8)
+        pred_sl = (pf_up[tgt_z] > 0.5).astype(float)
+        if pred_sl.max() > 0:
+            axes[row, 5].contour(pred_sl, levels=[0.5], colors=["yellow"], linewidths=0.8)
         axes[row, 5].set_title(f"fused↑full L{row}", fontsize=7)
         axes[row, 5].axis("off")
 

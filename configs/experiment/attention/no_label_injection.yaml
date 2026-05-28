@@ -1,0 +1,11 @@
+data:
+  image_size: [192, 192, 192]
+  resolutions:
+    - [12, 12, 12]
+
+model:
+  feature_level: [4]
+  label_injection: none
+
+train:
+  batch_size: 8
