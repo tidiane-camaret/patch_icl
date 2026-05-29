@@ -12,6 +12,8 @@ Two mask injection modes
     separate  — image in ch0 only (ch1-7 = 0); mask is encoded by a lightweight
                 SAM-style 3-D CNN and fused at the bottleneck — identical to
                 STUNetEncoder's mask path.
+    none      — image in ch0 only (ch1-7 always zero); mask argument ignored.
+                Useful as a baseline: encoder features are purely image-driven.
 
 Interface (same as STUNetEncoder)
 -----------------------------------
@@ -32,10 +34,9 @@ Encoder stages (v1.0, all 6 stages)
 
 Input normalisation
 --------------------
-nnInteractive trains with per-volume z-score normalisation (clip to ±3σ then
-z-score). Apply the same before passing imgs:
-    imgs = (imgs - imgs.mean()) / (imgs.std() + 1e-8)
-    imgs = imgs.clamp(-3, 3)
+nnInteractive uses ZScoreNormalization on a "nonCT" channel — global per-volume
+z-score with no clipping (inference_session.py: image -= mean; image /= std).
+Applied internally in forward() so any reasonable input scale is accepted.
 
 Requirements
 ------------
@@ -104,7 +105,7 @@ class NNInteractiveEncoder(nn.Module):
     Args
     ----
         ckpt_dir        : path to the nnInteractive_v1.0 checkpoint folder.
-        mask_injection  : "ch1" | "separate"  (see module docstring).
+        mask_injection  : "ch1" | "separate" | "none"  (see module docstring).
         mask_fusion     : "additive" | "concat"  (only used for mask_injection="separate").
         freeze_encoder  : freeze all pretrained encoder weights (default True).
         num_stages      : how many encoder stages to run (2 … 6, default 6).
@@ -125,8 +126,8 @@ class NNInteractiveEncoder(nn.Module):
         device:         str  = "cpu",
     ):
         super().__init__()
-        assert mask_injection in ("ch1", "separate"), (
-            "mask_injection must be 'ch1' or 'separate'"
+        assert mask_injection in ("ch1", "separate", "none"), (
+            "mask_injection must be 'ch1', 'separate', or 'none'"
         )
         assert mask_fusion in ("additive", "concat")
 
@@ -185,19 +186,33 @@ class NNInteractiveEncoder(nn.Module):
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalise(imgs: torch.Tensor) -> torch.Tensor:
+        """Per-volume z-score, no clipping — matches nnInteractive's 'nonCT' normalization.
+
+        The inference session does: image -= image.mean(); image /= image.std()
+        No clipping; dataset channel_names={"0": "nonCT"} uses global-volume stats only.
+        """
+        x = imgs.float()
+        flat = x.reshape(x.shape[0], -1)
+        mu  = flat.mean(dim=1).reshape(-1, 1, 1, 1, 1)
+        sig = flat.std(dim=1).reshape(-1, 1, 1, 1, 1)
+        return (x - mu) / (sig + 1e-8)
+
     def forward(
         self, imgs: torch.Tensor, masks: torch.Tensor
     ) -> list[torch.Tensor]:
         """
         Args
         ----
-            imgs  : (B, 1, D, H, W) — z-score normalised CT image
+            imgs  : (B, 1, D, H, W) — CT image (any scale; per-volume z-score applied internally)
             masks : (B, 1, D, H, W) — binary mask; zeros for the target volume
 
         Returns
         -------
             [s0, s1, …, s_{n-2}, bottleneck]  ordered high-res → low-res
         """
+        imgs = self._normalise(imgs)
         B, _, D, H, W = imgs.shape
         x = torch.zeros(B, 8, D, H, W, device=imgs.device, dtype=imgs.dtype)
         x[:, 0] = imgs[:, 0]

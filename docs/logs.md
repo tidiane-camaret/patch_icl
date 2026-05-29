@@ -1,5 +1,28 @@
 # Change log
 
+## 2026-05-29 — VoComniNNUNetEncoder (PlainConvUNet/VoComni)
+
+`src/models/encoders/vocomni_nnunet.py` — new encoder wrapping PlainConvUNet
+(nnUNet CNN backbone) from the VoComni_nnunet.pt checkpoint (supervised on 20K
+CT volumes, 21 classes). 6 stages, channels 32→64→128→256→320→320, total_stride=32.
+Loads only the `encoder.*` prefix from the full model checkpoint.
+torch.compile default True (~2× speedup vs eager).
+
+`run.py` — added `--encoder vocomni_nnunet`, `--vocomni_nnunet_ckpt`,
+`--vocomni_nnunet_compile` args.
+
+## 2026-05-29 — VoComniEncoder (SwinUNETR/VoCo)
+
+`src/models/encoders/vocomni.py` — new encoder wrapping MONAI SwinUNETR with
+VoCo/VoComni pretrained weights.  Returns 5 feature levels at strides 2–32.
+`skip_channels=[fs, 2fs, 4fs, 8fs]`, `bot_features=16fs`, `total_stride=32`.
+Checkpoint loading handles `state_dict`/`student`/`module.`/`backbone.` prefixes.
+Supports feature_size 48 (Base, 72M), 96 (Large, 290M), 192 (Huge, 1.2B).
+
+`experiments/feature_similarity/run.py` — added `--encoder vocomni`,
+`--vocomni_ckpt`, `--vocomni_feature_size` CLI args; vocomni uses the same
+image-only combined-batch path as threedino.
+
 ## 2026-05-27 — val_loader pre-filtered to val_items_per_class
 
 `experiments/nninteractive/train.py`.

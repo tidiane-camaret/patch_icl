@@ -57,7 +57,7 @@ model:
   soft_labels_train: true
   soft_labels_eval: false
   num_registers: 4
-  append_zero_attn: true
+  append_zero_attn: false
   detach_cascade_registers: true
   shared_weights: true
   use_scale_embed: true
@@ -74,7 +74,7 @@ train:
   workers: 20
   val_workers: 8          # separate low worker count for val; train workers cause NFS contention
   val_items_per_class: 30
-  nd_interval: 10
+  nd_interval: 20
   seed: 42
   aug: true
   aug_preset: multiverseg_v2

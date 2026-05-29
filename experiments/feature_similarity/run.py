@@ -15,6 +15,7 @@ Usage
 import argparse
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -22,17 +23,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-TABPFN_SRC = "/nfs/norasys/notebooks/camaret/repos/TabPFN/src"
-if TABPFN_SRC not in sys.path:
-    sys.path.insert(0, TABPFN_SRC)
-
-from src.totalseg_dataloader_incontext import TotalSegInContextDataset
+from torch.utils.data import DataLoader, Subset
+from src.totalseg_dataloader_incontext import TotalSegInContextDataset, incontext_collate_fn
 from src.models.encoders.stunet import STUNetEncoder
+from src.models.encoders.nninteractive import NNInteractiveEncoder
+from src.models.encoders.threedino import ThreeDINOEncoder
+from src.models.encoders.vocomni import VoComniEncoder
+from src.models.encoders.vocomni_nnunet import VoComniNNUNetEncoder
+from data.totalseg_classes import resolve_classes
 
 TOTALSEG_ROOT = (
     "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation"
@@ -47,34 +51,82 @@ TOTALSEG_ROOT = (
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data_root", default=TOTALSEG_ROOT)
-    p.add_argument("--classes", nargs="+", default=["liver","lung_lower_lobe_right","lung_lower_lobe_left","lung_upper_lobe_right","lung_upper_lobe_left","lung_middle_lobe_right","small_bowel","heart","autochthon_left","autochthon_right","hip_left","hip_right","aorta","brain", "skull"])
+    p.add_argument("--classes", nargs="+", default=["benchmark"],
+                   help="Class list or a named preset: 'benchmark', 'not_benchmark', "
+                        "or any split name in label_stats.csv.")#["liver","lung_lower_lobe_right","lung_lower_lobe_left","lung_upper_lobe_right","lung_upper_lobe_left","lung_middle_lobe_right","small_bowel","heart","autochthon_left","autochthon_right","hip_left","hip_right","aorta","brain", "skull"])
     p.add_argument("--context_size", type=int, default=1)
-    p.add_argument("--image_size", type=int, nargs=3, default=[128, 128, 128])
+    p.add_argument("--image_size", type=int, nargs=3, default=[192, 192, 192])
     p.add_argument("--max_subjects", type=int, default=None,
                    help="Limit total subjects loaded (None = all). Keep None so "
                         "rare classes have enough context candidates.")
-    p.add_argument("--samples_per_class", type=int, default=5,
+    p.add_argument("--samples_per_class", type=int, default=10,
                    help="How many valid target samples to evaluate per class.")
-    p.add_argument("--mask_pool", default="max", choices=["max", "avg"],
+    p.add_argument("--mask_pool", default="avg", choices=["max", "avg"],
                    help="How to downsample GT masks: 'max' (patch=1 if any voxel labeled) "
                         "or 'avg' (patch = fraction of labeled voxels).")
     p.add_argument("--feature_level", type=str, default="-1",
                    help="Encoder level to use: int index (-1 = bottleneck) or 'all' "
                         "to concatenate all levels along the channel dim.")
-    p.add_argument("--output_size", type=int, nargs=3, default=[16, 16, 16],
+    p.add_argument("--output_size", type=int, nargs=3, default=[8, 8, 8],
                    help="Spatial resolution for similarity computation.")
     p.add_argument("--temperature", type=float, default=0.05,
                    help="Softmax temperature for similarity weights.")
     p.add_argument("--method", default="cosine", choices=["cosine", "tabpfn"],
                    help="Prediction method: cosine-similarity retrieval or TabPFN classifier.")
+    p.add_argument("--encoder", default="stunet",
+                   choices=["stunet", "nninteractive", "threedino", "vocomni", "vocomni_nnunet"],
+                   help="Encoder backbone.")
+    # STU-Net options
     p.add_argument("--stunet_variant", default="base",
                    choices=["small", "base", "large", "huge"])
     p.add_argument("--stunet_pretrained", default="/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/checkpoints/stunet/base_statedict.pt",
                    help="Path to a STU-Net checkpoint (.model or .pt).")
+    # NNInteractive options
+    p.add_argument("--nnint_ckpt", default="/home/dpxuser/model_checkpoints/nnint/nnInteractive_v1.0",
+                   help="Path to NNInteractive checkpoint directory.")
+    p.add_argument("--nnint_mask_injection", default="none", choices=["ch1", "separate", "none"],
+                   help="How context masks are injected into the NNInteractive encoder.")
+    p.add_argument("--nnint_num_stages", type=int, default=5,
+                   help="Number of encoder stages (5 → 16× stride, 320-ch bottleneck at 128³).")
+    # 3DINO options
+    p.add_argument("--dino_ckpt",
+                   default="/home/dpxuser/model_checkpoints/3DINO/3dino_vit_weights.pth",
+                   help="Path to 3DINO ViT-Large-3D weights (.pth).")
+    p.add_argument("--dino_n_blocks", type=int, default=4,
+                   help="How many block-group outputs to use (1–4). All at D//16 resolution.")
+    # VoComni options
+    p.add_argument("--vocomni_ckpt", default="/home/dpxuser/model_checkpoints/voco/VoComni_B.pt",
+                   help="Path to VoCo/VoComni .pt checkpoint (VoComni_B/L/H.pt). "
+                        "Omit to use random weights.")
+    p.add_argument("--vocomni_feature_size", type=int, default=48, choices=[48, 96, 192],
+                   help="SwinUNETR base embedding dim: 48=Base, 96=Large, 192=Huge.")
+    p.add_argument("--vocomni_compile", action="store_true", default=True,
+                   help="Wrap SwinUNETR with torch.compile (default True; use --vocomni_compile=False to disable).")
+    p.add_argument("--no_vocomni_compile", dest="vocomni_compile", action="store_false")
+    # VoComni nnUNet options
+    p.add_argument("--vocomni_nnunet_ckpt",
+                   default="/home/dpxuser/model_checkpoints/voco/VoComni_nnunet.pt",
+                   help="Path to VoComni_nnunet.pt PlainConvUNet checkpoint.")
+    p.add_argument("--vocomni_nnunet_compile", action="store_true", default=True,
+                   help="Wrap PlainConvEncoder with torch.compile (default True).")
+    p.add_argument("--no_vocomni_nnunet_compile", dest="vocomni_nnunet_compile", action="store_false")
+    # Dataset options
+    p.add_argument("--use_crop", action="store_true",
+                   help="Load native-res crops centred on the organ instead of pre-resized volumes.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out_dir", default="experiments/feature_similarity/outputs")
-    p.add_argument("--wandb_project", default="patch_icl_3d_exps",
+    p.add_argument("--out_dir", default="results/feature_similarity/outputs")
+    p.add_argument("--batch_size", type=int, default=8,
+                   help="Number of samples to encode in one GPU forward pass.")
+    p.add_argument("--num_workers", type=int, default=20,
+                   help="DataLoader worker processes for data loading.")
+    p.add_argument("--tabpfn_n_estimators", type=int, default=6,
+                   help="TabPFN ensemble size. 1=fastest; 4-8 for better quality.")
+    p.add_argument("--tabpfn_memory_saving", default="auto",
+                   choices=["auto", "true", "false"],
+                   help="TabPFN memory_saving_mode. 'auto' chunks attention on small GPUs "
+                        "(causes ~50%% VRAM); 'false' uses full VRAM per call.")
+    p.add_argument("--wandb_project", default="patch_icl_feature_similarity",
                    help="W&B project name. Set to 'null' to disable logging.")
     p.add_argument("--run_name", default=None,
                    help="W&B run name (auto-generated if None).")
@@ -85,18 +137,45 @@ def parse_args() -> argparse.Namespace:
 # Core prediction
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
+@torch.inference_mode()
 def encode_image_only(
     encoder: STUNetEncoder,
     imgs: torch.Tensor,
 ) -> list[torch.Tensor]:
-    """Run only the image encoder, skipping the mask branch entirely.
+    """STUNet image-only encoding (skips mask branch).
 
-    Returns [s0, …, s_{n-2}, bottleneck] — same layout as the full forward,
-    but the bottleneck is pure image features with no mask fusion.
+    Returns [s0, …, s_{n-2}, bottleneck] ordered high-res → low-res.
     """
     bottleneck, skips = encoder.image_encoder(imgs, num_stages=encoder._num_stages)
     return skips + [bottleneck]
+
+
+@torch.inference_mode()
+def encode_image_generic(
+    encoder: nn.Module,
+    imgs: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Image-only encoding for encoders whose forward(imgs, masks=None) ignores masks."""
+    return encoder(imgs, None)
+
+
+@torch.inference_mode()
+def encode_target_nnint(
+    encoder: NNInteractiveEncoder,
+    imgs: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Encode target with a zero mask (no prior segmentation available)."""
+    return encoder(imgs, torch.zeros_like(imgs))
+
+
+@torch.inference_mode()
+def encode_context_nnint(
+    encoder: NNInteractiveEncoder,
+    ctx_imgs: torch.Tensor,   # (1, 1, D, H, W)
+    ctx_masks: torch.Tensor,  # (1, 1, D, H, W) float
+) -> list[torch.Tensor]:
+    """Encode context image conditioned on its GT mask."""
+    return encoder(ctx_imgs, ctx_masks)
 
 
 def predict_similarity(
@@ -137,24 +216,16 @@ def predict_tabpfn(
     tgt_feat: torch.Tensor,    # (C, D, H, W)
     ctx_feats: torch.Tensor,   # (K, C, D, H, W)
     ctx_masks: torch.Tensor,   # (K, D, H, W)  float
+    clf,                       # pre-instantiated TabPFNClassifier (reused across calls)
 ) -> torch.Tensor:
+    """Predict a soft mask using TabPFN in-context classification.
+
+    Each context patch is a training sample (features = encoder embedding,
+    label = 0/1). TabPFN fits a classifier in one forward pass, then returns
+    class-1 probabilities for every target patch.
+
+    Falls back to context positive rate when all context labels are the same class.
     """
-    Predict a soft mask for the target using TabPFN in-context classification.
-
-    Each context patch (position × context image) is a training sample with
-    features = encoder embedding and label = 0/1 (any labeled voxel → 1).
-    TabPFN fits a non-linear classifier from these examples in a single forward
-    pass, then returns class-1 probabilities for every target patch.
-
-    Falls back to the context positive rate if all context labels are the same
-    class (TabPFN requires at least one sample of each class).
-
-    Returns
-    -------
-    pred : (D, H, W) float tensor in [0, 1].
-    """
-    from tabpfn import TabPFNClassifier
-
     C, D, H, W = tgt_feat.shape
     K = ctx_feats.shape[0]
     N = D * H * W
@@ -167,7 +238,12 @@ def predict_tabpfn(
         fill = float(y_ctx.mean())
         return torch.full((D, H, W), fill, dtype=torch.float32, device=tgt_feat.device)
 
-    clf = TabPFNClassifier(ignore_pretraining_limits=True)
+    # Per-feature z-score so TabPFN receives standardized input (matches pretraining)
+    mu  = X_ctx.mean(axis=0, keepdims=True)
+    sig = X_ctx.std(axis=0, keepdims=True) + 1e-8
+    X_ctx = (X_ctx - mu) / sig
+    X_tgt = (X_tgt - mu) / sig
+
     clf.fit(X_ctx, y_ctx)
     proba = clf.predict_proba(X_tgt)   # (N, 2)
     return torch.from_numpy(proba[:, 1]).float().reshape(D, H, W).to(tgt_feat.device)
@@ -178,8 +254,16 @@ def predict_tabpfn(
 # ---------------------------------------------------------------------------
 
 def downsample_feat(feat: torch.Tensor, size: tuple[int, int, int]) -> torch.Tensor:
-    """feat: (1, C, d, h, w) → (C, D, H, W)."""
-    return F.interpolate(feat, size=size, mode="trilinear", align_corners=False).squeeze(0)
+    """feat: (1, C, d, h, w) → (C, D, H, W) in float32.
+
+    Uses avg-pool for downsampling (preserves activation energy) and
+    trilinear interpolation for upsampling only.
+    """
+    x = feat.float()   # ensure fp32 before spatial ops
+    d, h, w = x.shape[2:]
+    if d >= size[0] and h >= size[1] and w >= size[2]:
+        return F.adaptive_avg_pool3d(x, output_size=size).squeeze(0)
+    return F.interpolate(x, size=size, mode="trilinear", align_corners=False).squeeze(0)
 
 
 def extract_features(
@@ -190,9 +274,9 @@ def extract_features(
 ) -> torch.Tensor:
     """Downsample and return features at the chosen level(s).
 
-    level="all"  → all levels interpolated to out_size and concatenated on C dim.
+    level="all"  → all levels resampled to out_size and concatenated on C dim.
     level="-1"   → single level (int index, negative indexing supported).
-    Returns (C, D', H', W').
+    Returns (C, D', H', W') float32.
     """
     if level == "all":
         return torch.cat([downsample_feat(f, out_size) for f in feats], dim=0)
@@ -239,6 +323,66 @@ def auroc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
     if gt_np.sum() == 0 or gt_np.sum() == len(gt_np):
         return float("nan")
     return roc_auc_score(gt_np, pred_np)
+
+
+def hard_dice_score(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
+    """Binary Dice after thresholding pred at `threshold`."""
+    p = (pred >= threshold).float()
+    g = (gt   >  0        ).float()
+    num = 2 * (p * g).sum()
+    den = p.sum() + g.sum()
+    if den < 1e-6:
+        return float("nan")
+    return (num / den).item()
+
+
+def spearman_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Spearman rank correlation ρ ∈ [-1, 1].
+    Fully invariant to any monotone rescaling of pred — answers
+    'does the spatial ranking match GT regardless of amplitude?'"""
+    from scipy.stats import spearmanr
+    if gt.float().std() < 1e-8:
+        return float("nan")
+    return float(spearmanr(pred.cpu().numpy().ravel(), gt.cpu().numpy().ravel()).statistic)
+
+
+def ncc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Normalized cross-correlation ∈ [-1, 1].
+    Invariant to linear rescaling and offset of pred — measures
+    whether pred and GT co-vary spatially in a linear sense."""
+    p = pred.float().ravel()
+    g = gt.float().ravel()
+    sp, sg = p.std(), g.std()
+    if sp < 1e-8 or sg < 1e-8:
+        return float("nan")
+    return float(((p - p.mean()) * (g - g.mean())).mean() / (sp * sg))
+
+
+def recall_at_k(pred: torch.Tensor, gt: torch.Tensor, k_frac: float) -> float:
+    """Fraction of GT foreground captured by the top-k_frac predicted patches.
+    Directly models zone-of-interest selection: 'if I keep the top K% patches
+    by predicted score, how much of the GT organ do I cover?'"""
+    gt_np   = (gt.cpu().numpy().ravel() > 0).astype(int)
+    pred_np = pred.cpu().numpy().ravel()
+    n_fg = int(gt_np.sum())
+    if n_fg == 0:
+        return float("nan")
+    k = max(1, int(k_frac * len(pred_np)))
+    top_idx = pred_np.argsort()[::-1][:k]
+    return float(gt_np[top_idx].sum() / n_fg)
+
+
+def js_divergence(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Jensen-Shannon divergence ∈ [0, 1] between spatial probability distributions.
+    Both pred and GT are L1-normalised to sum to 1 before comparison — measures
+    whether probability mass is placed in the same spatial region."""
+    from scipy.spatial.distance import jensenshannon
+    p = pred.float().cpu().numpy().ravel()
+    g = gt.float().cpu().numpy().ravel()
+    p_sum, g_sum = p.sum(), g.sum()
+    if p_sum < 1e-8 or g_sum < 1e-8:
+        return float("nan")
+    return float(jensenshannon(p / p_sum, g / g_sum, base=2))
 
 
 # ---------------------------------------------------------------------------
@@ -336,188 +480,364 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_size = tuple(args.output_size)
 
     # ---- Dataset -----------------------------------------------------------
+    # args.classes may be a single-token list like ["benchmark"] — resolve to actual names
+    classes = resolve_classes(
+        args.classes[0] if len(args.classes) == 1 else args.classes,
+        totalseg_root=args.data_root,
+    )
     ds = TotalSegInContextDataset(
         root=args.data_root,
-        classes=args.classes,
+        classes=classes,
         image_size=tuple(args.image_size),
         split="val",
         context_size=args.context_size,
         max_subjects=args.max_subjects,
+        use_crop=args.use_crop,
     )
 
     # ---- Encoder -----------------------------------------------------------
-    encoder = STUNetEncoder(
-        in_channels=1,
-        variant=args.stunet_variant,
-        pretrained=args.stunet_pretrained,
-        freeze_encoder=True,
-    ).to(device).eval()
+    if args.encoder == "stunet":
+        encoder = STUNetEncoder(
+            in_channels=1,
+            variant=args.stunet_variant,
+            pretrained=args.stunet_pretrained,
+            freeze_encoder=True,
+        ).to(device).eval()
+    elif args.encoder == "nninteractive":
+        encoder = NNInteractiveEncoder(
+            ckpt_dir=args.nnint_ckpt,
+            mask_injection=args.nnint_mask_injection,
+            freeze_encoder=True,
+            num_stages=args.nnint_num_stages,
+            device="cpu",
+        ).to(device).eval()
+    elif args.encoder == "threedino":
+        encoder = ThreeDINOEncoder(
+            ckpt_path=args.dino_ckpt,
+            n_last_blocks=args.dino_n_blocks,
+            freeze_encoder=True,
+            compile_model=False,
+            device="cpu",
+        ).to(device).eval()
+    elif args.encoder == "vocomni":
+        encoder = VoComniEncoder(
+            ckpt_path=args.vocomni_ckpt,
+            feature_size=args.vocomni_feature_size,
+            freeze_encoder=True,
+            compile_model=args.vocomni_compile,
+        ).to(device).eval()
+    else:  # vocomni_nnunet
+        encoder = VoComniNNUNetEncoder(
+            ckpt_path=args.vocomni_nnunet_ckpt,
+            freeze_encoder=True,
+            compile_model=args.vocomni_nnunet_compile,
+        ).to(device).eval()
 
     num_levels = len(encoder.skip_channels) + 1  # skips + bottleneck
     level = args.feature_level  # "all" or int string; resolved in extract_features
-    level_desc = "all" if level == "all" else f"index {int(level) % num_levels}"
-    print(f"Feature level: {level_desc} of {num_levels} | "
+    if level == "all":
+        level_desc = "all"
+    else:
+        resolved = int(level) % num_levels
+        label = "bottleneck" if resolved == num_levels - 1 else f"skip {resolved}"
+        level_desc = f"{resolved} ({label}, levels 0–{num_levels - 1})"
+    print(f"Encoder: {args.encoder} | "
+          f"Feature level: {level_desc} | "
           f"output_size={out_size} | temperature={args.temperature}\n")
 
     # ---- W&B ---------------------------------------------------------------
     use_wandb = args.wandb_project and args.wandb_project.lower() != "null"
     if use_wandb:
         import wandb
+        auto_name = (
+            f"{args.encoder}_{args.image_size[0]}_{args.output_size[0]}"
+            f"_lvl{args.feature_level}_{args.method}"
+        )
         wandb.init(
             project=args.wandb_project,
-            name=args.run_name,
+            name=args.run_name or auto_name,
             config={
-                "method":           args.method,
-                "feature_level":    args.feature_level,
-                "output_size":      args.output_size,
-                "temperature":      args.temperature,
-                "mask_pool":        args.mask_pool,
-                "context_size":     args.context_size,
-                "image_size":       args.image_size,
-                "stunet_variant":   args.stunet_variant,
+                "method":            args.method,
+                "encoder":           args.encoder,
+                "feature_level":     args.feature_level,
+                "output_size":       args.output_size,
+                "temperature":       args.temperature,
+                "mask_pool":         args.mask_pool,
+                "context_size":      args.context_size,
+                "image_size":        args.image_size,
+                "use_crop":          args.use_crop,
+                "stunet_variant":    args.stunet_variant,
                 "stunet_pretrained": str(args.stunet_pretrained),
+                "nnint_ckpt":        str(args.nnint_ckpt),
+                "nnint_mask_injection": args.nnint_mask_injection,
+                "nnint_num_stages":  args.nnint_num_stages,
+                "vocomni_ckpt":      str(args.vocomni_ckpt),
+                "vocomni_feature_size": args.vocomni_feature_size,
+                "vocomni_nnunet_ckpt": str(args.vocomni_nnunet_ckpt),
                 "samples_per_class": args.samples_per_class,
-                "classes":          args.classes,
+                "classes":           args.classes,
             },
         )
 
-    # ---- Build per-class sample index --------------------------------------
-    from collections import defaultdict
-    cls_to_indices: dict[str, list[int]] = defaultdict(list)
-    for i, (subj, cls) in enumerate(ds.samples):
-        cls_to_indices[cls].append(i)
+    # ---- TabPFN classifier (instantiated once, reused across all samples) ----
+    tabpfn_clf = None
+    if args.method == "tabpfn":
+        from tabpfn import TabPFNClassifier
+        _mem_mode: bool | str = {"auto": "auto", "true": True, "false": False}[
+            args.tabpfn_memory_saving
+        ]
+        tabpfn_clf = TabPFNClassifier(
+            n_estimators=args.tabpfn_n_estimators,
+            device=args.device,
+            ignore_pretraining_limits=True,
+            memory_saving_mode=_mem_mode,
+        )
+        print(
+            f"TabPFN ready  n_estimators={args.tabpfn_n_estimators}  "
+            f"memory_saving_mode={_mem_mode}  device={args.device}\n"
+        )
 
-    # ---- Evaluation loop (per class) ---------------------------------------
+    # ---- Build eval DataLoader (pre-select samples_per_class per class) -----
+    _per_cls: dict[str, int] = {}
+    eval_indices: list[int] = []
+    for i, (_, cls) in enumerate(ds.samples):
+        cnt = _per_cls.get(cls, 0)
+        if cnt < args.samples_per_class:
+            eval_indices.append(i)
+            _per_cls[cls] = cnt + 1
+    print(f"Evaluating {len(eval_indices)} samples | "
+          f"{len(_per_cls)} classes | batch_size={args.batch_size}")
+
+    eval_loader = DataLoader(
+        Subset(ds, eval_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=incontext_collate_fn,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
+
+    # ---- Evaluation loop ---------------------------------------------------
+    amp     = device.type == "cuda"
     results: list[dict] = []
     fig_idx = 0
 
-    for cls in ds.classes:
-        indices = cls_to_indices[cls]
-        collected = 0
+    for batch in eval_loader:
+        images  = batch["image"].to(device, non_blocking=True)        # (B, 1, D, H, W)
+        labels  = batch["label"].to(device, non_blocking=True)         # (B, D, H, W)
+        ctx_in  = batch["context_in"].to(device, non_blocking=True)    # (B, K, 1, D, H, W)
+        ctx_out = batch["context_out"].to(device, non_blocking=True)   # (B, K, D, H, W)
+        subjects    = batch["subjects"]
+        label_names = batch["label_names"]
+        B, K = ctx_in.shape[:2]
 
-        for sample_idx in indices:
-            if collected >= args.samples_per_class:
-                break
+        ctx_imgs_flat  = ctx_in.reshape(B * K, 1, *ctx_in.shape[3:])
+        ctx_masks_flat = ctx_out.reshape(B * K, *ctx_out.shape[2:]).unsqueeze(1).float()
 
-            try:
-                item = ds[sample_idx]
-            except Exception:
-                continue  # no context candidates for this subject — skip
+        # ── Batch encode: one pass for all B targets, one for all B*K contexts ──
+        with torch.autocast(device_type=device.type, enabled=amp):
+            if args.encoder == "stunet":
+                # Targets and contexts use the same image-only path — combine into one call
+                all_imgs   = torch.cat([images, ctx_imgs_flat], dim=0)  # (B + B*K, 1, D, H, W)
+                all_feats  = encode_image_only(encoder, all_imgs)
+                tgt_feats_b = [f[:B]  for f in all_feats]               # (B, C, d, h, w)
+                ctx_feats_b = [f[B:]  for f in all_feats]               # (B*K, C, d, h, w)
+            elif args.encoder in ("threedino", "vocomni", "vocomni_nnunet"):
+                # Image-only encoders: combine targets + contexts into one batch call.
+                all_imgs    = torch.cat([images, ctx_imgs_flat], dim=0)
+                all_feats   = encode_image_generic(encoder, all_imgs)
+                tgt_feats_b = [f[:B] for f in all_feats]
+                ctx_feats_b = [f[B:] for f in all_feats]
+            else:  # nninteractive
+                tgt_feats_b = encode_target_nnint(encoder, images)
+                ctx_feats_b = encode_context_nnint(encoder, ctx_imgs_flat, ctx_masks_flat)
 
-            subj    = item["subject"]
-            image   = item["image"].unsqueeze(0).to(device)           # (1, 1, D, H, W)
-            label   = item["label"].to(device)                        # (D, H, W) int64
-            ctx_in  = item["context_in"].to(device)                   # (K, 1, D, H, W)
-            ctx_out = item["context_out"].to(device)                   # (K, D, H, W) int64
-            K = ctx_in.shape[0]
+        # ── Per-sample prediction ──────────────────────────────────────────────
+        for b in range(B):
+            subj = subjects[b]
+            cls  = label_names[b]
 
-            # Encode images only — mask branch skipped so features are comparable
-            tgt_feats = encode_image_only(encoder, image)
+            tgt_feats    = [f[b : b + 1]                   for f in tgt_feats_b]
             ctx_all_feats = [
-                encode_image_only(encoder, ctx_in[k : k + 1]) for k in range(K)
+                [f[b * K + k : b * K + k + 1] for f in ctx_feats_b]
+                for k in range(K)
             ]
 
-            # Extract and downsample to out_size (concat across C if level="all")
-            tgt_feat_ds = extract_features(tgt_feats, level, out_size, num_levels)
+            tgt_feat_ds = extract_features(tgt_feats, level, out_size, num_levels).float()
             ctx_feat_ds = torch.stack([
                 extract_features(f, level, out_size, num_levels) for f in ctx_all_feats
-            ])                                                                     # (K, C, D', H', W')
+            ]).float()
 
-            # Downsample GT masks
-            tgt_mask_ds = downsample_mask(label, out_size, args.mask_pool)
+            label_b   = labels[b]
+            ctx_out_b = ctx_out[b]
+            tgt_mask_ds = downsample_mask(label_b, out_size, args.mask_pool)
             ctx_mask_ds = torch.stack([
-                downsample_mask(ctx_out[k], out_size, args.mask_pool) for k in range(K)
+                downsample_mask(ctx_out_b[k], out_size, args.mask_pool) for k in range(K)
             ])
 
             t0 = time.perf_counter()
             if args.method == "tabpfn":
-                pred = predict_tabpfn(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds)
+                pred = predict_tabpfn(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, tabpfn_clf)
             else:
                 pred = predict_similarity(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, args.temperature)
             inference_time = time.perf_counter() - t0
+
             gt_ds   = tgt_mask_ds.float()
             d_soft  = soft_dice_score(pred, gt_ds)
             d_norm  = norm_dice_score(pred, gt_ds)
             auc     = auroc_score(pred, gt_ds)
+            hd      = hard_dice_score(pred, gt_ds)
+            rho     = spearman_score(pred, gt_ds)
+            ncc     = ncc_score(pred, gt_ds)
+            r05     = recall_at_k(pred, gt_ds, 0.05)
+            r10     = recall_at_k(pred, gt_ds, 0.10)
+            r20     = recall_at_k(pred, gt_ds, 0.20)
+            js      = js_divergence(pred, gt_ds)
+
+            pred_fullres = F.interpolate(
+                pred.reshape(1, 1, *out_size),
+                size=tuple(args.image_size), mode="trilinear", align_corners=False,
+            ).squeeze()
+            hd_full = hard_dice_score(pred_fullres, label_b.float())
+
             pred_np = pred.cpu().numpy()
 
             print(f"[{cls:<30s}] subj={subj}  "
-                  f"soft_dice={d_soft:.3f}  norm_dice={d_norm:.3f}  auroc={auc:.3f}  "
+                  f"hd={hd:.3f}  hd_full={hd_full:.3f}  auroc={auc:.3f}  "
+                  f"spearman={rho:.3f}  ncc={ncc:.3f}  "
+                  f"r@5={r05:.3f}  r@10={r10:.3f}  r@20={r20:.3f}  js={js:.3f}  "
                   f"pred[{pred_np.min():.3f}…{pred_np.max():.3f}]")
-            results.append({"soft_dice": d_soft, "norm_dice": d_norm, "auroc": auc, "class": cls,
-                            "inference_time": inference_time})
+            results.append({
+                "soft_dice": d_soft, "norm_dice": d_norm,
+                "hard_dice": hd, "hard_dice_full": hd_full,
+                "auroc": auc, "spearman": rho, "ncc": ncc,
+                "recall_05": r05, "recall_10": r10, "recall_20": r20,
+                "js_div": js,
+                "class": cls, "subject": subj, "inference_time": inference_time,
+            })
 
             fig_path = out_dir / f"{fig_idx:03d}_{cls}_{subj}.png"
             save_slice_figure(
-                tgt_image=item["image"].squeeze(0).cpu().numpy(),
-                tgt_gt=label.cpu().numpy(),
+                tgt_image=batch["image"][b].squeeze(0).cpu().numpy(),
+                tgt_gt=label_b.cpu().numpy(),
                 tgt_gt_ds=gt_ds.cpu().numpy(),
                 pred=pred_np,
-                ctx_images=[ctx_in[k].squeeze(0).cpu().numpy() for k in range(K)],
-                ctx_gts=[ctx_out[k].cpu().numpy() for k in range(K)],
+                ctx_images=[ctx_in[b, k].squeeze(0).cpu().numpy() for k in range(K)],
+                ctx_gts=[ctx_out_b[k].cpu().numpy() for k in range(K)],
                 ctx_gts_ds=[ctx_mask_ds[k].cpu().numpy() for k in range(K)],
                 out_path=fig_path,
                 title=f"{cls} | {subj} | norm_dice={d_norm:.3f}  auroc={auc:.3f}",
             )
             if use_wandb:
                 wandb.log({
-                    "sample/soft_dice":     d_soft,
-                    "sample/norm_dice":     d_norm,
-                    "sample/auroc":         auc,
+                    "sample/soft_dice":      d_soft,
+                    "sample/norm_dice":      d_norm,
+                    "sample/hard_dice":      hd,
+                    "sample/hard_dice_full": hd_full,
+                    "sample/auroc":          auc,
+                    "sample/spearman":       rho,
+                    "sample/ncc":            ncc,
+                    "sample/recall_05":      r05,
+                    "sample/recall_10":      r10,
+                    "sample/recall_20":      r20,
+                    "sample/js_div":         js,
                     "sample/inference_time": inference_time,
-                    "sample/class":         cls,
-                    "sample/subject":       subj,
-                    "sample/figure":        wandb.Image(str(fig_path)),
+                    "sample/class":          cls,
+                    "sample/subject":        subj,
+                    "sample/figure":         wandb.Image(str(fig_path)),
                 })
-            collected += 1
-            fig_idx  += 1
-
-        if collected == 0:
-            print(f"[{cls:<30s}] no valid samples (not enough context subjects)")
+            fig_idx += 1
 
     # ---- Summary -----------------------------------------------------------
     if results:
         per_cls: dict[str, list[dict]] = defaultdict(list)
         for r in results:
             per_cls[r["class"]].append(r)
-        print(f"\n{'─'*70}")
-        print(f"  {'class':<30s} {'soft_dice':>10} {'norm_dice':>10} {'auroc':>8}  n")
-        print(f"  {'─'*66}")
+        def _m(key):
+            return np.nanmean([r[key] for r in results])
+        def _mc(key, rs):
+            return np.nanmean([r[key] for r in rs])
+
+        print(f"\n{'─'*110}")
+        print(f"  {'class':<30s} {'hd':>6} {'hd_f':>6} {'auroc':>7} {'spear':>7} {'ncc':>7} "
+              f"{'r@5':>6} {'r@10':>6} {'r@20':>6} {'js↓':>6}  n")
+        print(f"  {'─'*106}")
         for cls, rs in per_cls.items():
             print(f"  {cls:<30s} "
-                  f"{np.nanmean([r['soft_dice'] for r in rs]):>10.3f} "
-                  f"{np.nanmean([r['norm_dice'] for r in rs]):>10.3f} "
-                  f"{np.nanmean([r['auroc']     for r in rs]):>8.3f}  {len(rs)}")
-        print(f"  {'─'*66}")
-        overall_soft = np.nanmean([r['soft_dice'] for r in results])
-        overall_norm = np.nanmean([r['norm_dice'] for r in results])
-        overall_auc  = np.nanmean([r['auroc']     for r in results])
+                  f"{_mc('hard_dice',      rs):>6.3f} "
+                  f"{_mc('hard_dice_full', rs):>6.3f} "
+                  f"{_mc('auroc',          rs):>7.3f} "
+                  f"{_mc('spearman',       rs):>7.3f} "
+                  f"{_mc('ncc',            rs):>7.3f} "
+                  f"{_mc('recall_05',      rs):>6.3f} "
+                  f"{_mc('recall_10',      rs):>6.3f} "
+                  f"{_mc('recall_20',      rs):>6.3f} "
+                  f"{_mc('js_div',         rs):>6.3f}  {len(rs)}")
+        print(f"  {'─'*106}")
         print(f"  {'overall':<30s} "
-              f"{overall_soft:>10.3f} "
-              f"{overall_norm:>10.3f} "
-              f"{overall_auc:>8.3f}")
+              f"{_m('hard_dice'):>6.3f} "
+              f"{_m('hard_dice_full'):>6.3f} "
+              f"{_m('auroc'):>7.3f} "
+              f"{_m('spearman'):>7.3f} "
+              f"{_m('ncc'):>7.3f} "
+              f"{_m('recall_05'):>6.3f} "
+              f"{_m('recall_10'):>6.3f} "
+              f"{_m('recall_20'):>6.3f} "
+              f"{_m('js_div'):>6.3f}")
         print(f"\n  Figures : {out_dir}/")
-
-        overall_time = np.mean([r['inference_time'] for r in results])
-        print(f"  avg inference time : {overall_time*1000:.1f} ms/item")
+        print(f"  avg inference time : {_m('inference_time')*1000:.1f} ms/item")
 
         if use_wandb:
             summary: dict = {
-                "overall/soft_dice":      overall_soft,
-                "overall/norm_dice":      overall_norm,
-                "overall/auroc":          overall_auc,
-                "overall/inference_time": overall_time,
+                "overall/hard_dice":      _m("hard_dice"),
+                "overall/hard_dice_full": _m("hard_dice_full"),
+                "overall/auroc":          _m("auroc"),
+                "overall/spearman":       _m("spearman"),
+                "overall/ncc":            _m("ncc"),
+                "overall/recall_05":      _m("recall_05"),
+                "overall/recall_10":      _m("recall_10"),
+                "overall/recall_20":      _m("recall_20"),
+                "overall/js_div":         _m("js_div"),
+                "overall/soft_dice":      _m("soft_dice"),
+                "overall/norm_dice":      _m("norm_dice"),
+                "overall/inference_time": _m("inference_time"),
             }
             for cls, rs in per_cls.items():
-                summary[f"class/{cls}/soft_dice"] = np.nanmean([r['soft_dice'] for r in rs])
-                summary[f"class/{cls}/norm_dice"]  = np.nanmean([r['norm_dice'] for r in rs])
-                summary[f"class/{cls}/auroc"]      = np.nanmean([r['auroc']     for r in rs])
+                for key in ("hard_dice", "hard_dice_full", "auroc", "spearman", "ncc",
+                            "recall_05", "recall_10", "recall_20", "js_div"):
+                    summary[f"class/{cls}/{key}"] = _mc(key, rs)
+
+            _metric_cols = [
+                "hard_dice", "hard_dice_full", "auroc", "spearman",
+                "ncc", "recall_05", "recall_10", "recall_20", "js_div",
+            ]
+
+            # Per-subject table (one row per evaluated sample)
+            subj_table = wandb.Table(columns=["class", "subject"] + _metric_cols)
+            for r in results:
+                subj_table.add_data(
+                    r["class"], r.get("subject", ""),
+                    *[r[k] for k in _metric_cols],
+                )
+
+            # Per-class table (mean metrics per class + overall row)
+            cls_table = wandb.Table(columns=["class", "n"] + _metric_cols)
+            for cls, rs in per_cls.items():
+                cls_table.add_data(cls, len(rs), *[_mc(k, rs) for k in _metric_cols])
+            cls_table.add_data("__overall__", len(results), *[_m(k) for k in _metric_cols])
+
+            summary["tables/per_subject"] = subj_table
+            summary["tables/per_class"]   = cls_table
             wandb.log(summary)
             wandb.finish()
 
