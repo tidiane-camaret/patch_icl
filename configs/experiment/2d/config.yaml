@@ -1,0 +1,16 @@
+model: universeg       # model name tag for wandb run name
+
+data:
+  image_size: 128      # loads {dataset}_{image_size}.npz files
+  context_size: 1
+  split: val
+  dataset: null        # null = all datasets; or e.g. abdomenus
+
+eval:
+  batch_size: 8
+  workers: 20
+  seed: 0
+
+wandb:
+  project: patch_icl_2d_exps
+  name: null           # null = auto: "{model}_s{image_size}_k{context_size}"

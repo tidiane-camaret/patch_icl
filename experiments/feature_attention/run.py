@@ -129,6 +129,16 @@ def auroc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return roc_auc_score(gt_np, pred_np)
 
 
+def auprc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Area under the Precision-Recall curve — more sensitive than AUROC for small organs."""
+    from sklearn.metrics import average_precision_score
+    gt_np   = (gt.cpu().numpy().ravel() > 0).astype(int)
+    pred_np = pred.cpu().numpy().ravel()
+    if gt_np.sum() == 0 or gt_np.sum() == len(gt_np):
+        return float("nan")
+    return float(average_precision_score(gt_np, pred_np))
+
+
 # ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
@@ -308,12 +318,13 @@ def main() -> None:
             d_soft = soft_dice_score(pred_3d, gt_3d)
             d_norm = norm_dice_score(pred_3d, gt_3d)
             auc    = auroc_score(pred_3d, gt_3d)
+            aprc   = auprc_score(pred_3d, gt_3d)
             pred_np = pred_3d.cpu().numpy()
 
             print(f"[{cls:<30s}] subj={subj}  "
-                  f"soft_dice={d_soft:.3f}  norm_dice={d_norm:.3f}  auroc={auc:.3f}  "
+                  f"soft_dice={d_soft:.3f}  norm_dice={d_norm:.3f}  auroc={auc:.3f}  auprc={aprc:.3f}  "
                   f"pred[{pred_np.min():.3f}…{pred_np.max():.3f}]")
-            results.append({"soft_dice": d_soft, "norm_dice": d_norm, "auroc": auc,
+            results.append({"soft_dice": d_soft, "norm_dice": d_norm, "auroc": auc, "auprc": aprc,
                             "class": cls, "inference_time": inference_time})
 
             fig_path = out_dir / f"{fig_idx:03d}_{cls}_{subj}.png"
@@ -334,6 +345,7 @@ def main() -> None:
                     "sample/soft_dice":     d_soft,
                     "sample/norm_dice":     d_norm,
                     "sample/auroc":         auc,
+                    "sample/auprc":         aprc,
                     "sample/inference_time":inference_time,
                     "sample/class":         cls,
                     "sample/figure":        wandb.Image(str(fig_path)),
@@ -350,20 +362,22 @@ def main() -> None:
         for r in results:
             per_cls[r["class"]].append(r)
 
-        print(f"\n{'─'*70}")
-        print(f"  {'class':<30s} {'soft_dice':>10} {'norm_dice':>10} {'auroc':>8}  n")
-        print(f"  {'─'*66}")
+        print(f"\n{'─'*80}")
+        print(f"  {'class':<30s} {'soft_dice':>10} {'norm_dice':>10} {'auroc':>8} {'auprc':>8}  n")
+        print(f"  {'─'*76}")
         for cls, rs in per_cls.items():
             print(f"  {cls:<30s} "
                   f"{np.nanmean([r['soft_dice'] for r in rs]):>10.3f} "
                   f"{np.nanmean([r['norm_dice'] for r in rs]):>10.3f} "
-                  f"{np.nanmean([r['auroc']     for r in rs]):>8.3f}  {len(rs)}")
-        print(f"  {'─'*66}")
+                  f"{np.nanmean([r['auroc']     for r in rs]):>8.3f} "
+                  f"{np.nanmean([r['auprc']     for r in rs]):>8.3f}  {len(rs)}")
+        print(f"  {'─'*76}")
         overall_soft = np.nanmean([r['soft_dice']      for r in results])
         overall_norm = np.nanmean([r['norm_dice']      for r in results])
         overall_auc  = np.nanmean([r['auroc']          for r in results])
+        overall_aprc = np.nanmean([r['auprc']          for r in results])
         overall_time = np.mean(  [r['inference_time']  for r in results])
-        print(f"  {'overall':<30s} {overall_soft:>10.3f} {overall_norm:>10.3f} {overall_auc:>8.3f}")
+        print(f"  {'overall':<30s} {overall_soft:>10.3f} {overall_norm:>10.3f} {overall_auc:>8.3f} {overall_aprc:>8.3f}")
         print(f"\n  avg inference time : {overall_time*1000:.1f} ms/item")
         print(f"  Figures : {out_dir}/")
 
@@ -373,12 +387,14 @@ def main() -> None:
                 "overall/soft_dice":      overall_soft,
                 "overall/norm_dice":      overall_norm,
                 "overall/auroc":          overall_auc,
+                "overall/auprc":          overall_aprc,
                 "overall/inference_time": overall_time,
             }
             for cls, rs in per_cls.items():
                 summary[f"class/{cls}/soft_dice"] = np.nanmean([r['soft_dice'] for r in rs])
                 summary[f"class/{cls}/norm_dice"]  = np.nanmean([r['norm_dice'] for r in rs])
                 summary[f"class/{cls}/auroc"]      = np.nanmean([r['auroc']     for r in rs])
+                summary[f"class/{cls}/auprc"]      = np.nanmean([r['auprc']     for r in rs])
             wandb.log(summary)
             wandb.finish()
 

@@ -1,0 +1,28 @@
+model: universeg_featuresim
+
+data:
+  image_size: 128      # loads {dataset}_{image_size}.npz files
+  context_size: 1
+  split: val
+  dataset: null        # null = all datasets
+
+feature:
+  level: "all"            # encoder level: 0..3 or -1 (bottleneck). "all" concatenates all levels
+  output_size: 16      # spatial grid for patch classification (H'=W'=output_size)
+  mask_pool: avg       # how to downsample GT masks: avg or max
+  context_mask: false  # if true, pass GT mask as support label channel when encoding context images
+
+tabpfn:
+  n_estimators: 4
+  balance_ratio: null  # float to subsample background patches (e.g. 3.0); null = disabled
+  memory_saving: false  # auto (chunk attention, ~50% VRAM), true (max saving), false (full VRAM)
+
+eval:
+  batch_size: 64        # process one target at a time (TabPFN fits per sample)
+  workers: 20
+  seed: 0
+  out_dir: results/2d/outputs
+
+wandb:
+  project: patch_icl_2d_exps
+  name: null           # null = auto

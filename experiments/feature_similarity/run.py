@@ -64,15 +64,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_pool", default="avg", choices=["max", "avg"],
                    help="How to downsample GT masks: 'max' (patch=1 if any voxel labeled) "
                         "or 'avg' (patch = fraction of labeled voxels).")
-    p.add_argument("--feature_level", type=str, default="-1",
-                   help="Encoder level to use: int index (-1 = bottleneck) or 'all' "
-                        "to concatenate all levels along the channel dim.")
+    p.add_argument("--feature_level", type=str, nargs="+", default=["-1"],
+                   help="Encoder level(s) to use. Pass one or more int indices "
+                        "(-1 = bottleneck), or the single token 'all' to use all levels. "
+                        "Multiple indices are concatenated on the channel dim, e.g. "
+                        "--feature_level -1 -2 -3")
     p.add_argument("--output_size", type=int, nargs=3, default=[8, 8, 8],
                    help="Spatial resolution for similarity computation.")
     p.add_argument("--temperature", type=float, default=0.05,
                    help="Softmax temperature for similarity weights.")
-    p.add_argument("--method", default="cosine", choices=["cosine", "tabpfn"],
-                   help="Prediction method: cosine-similarity retrieval or TabPFN classifier.")
+    p.add_argument("--method", default="cosine", choices=["cosine", "tabpfn", "prototype"],
+                   help="Prediction method: cosine-similarity retrieval, TabPFN classifier, "
+                        "or prototype (masked-avg-pool foreground/background prototypes).")
     p.add_argument("--encoder", default="stunet",
                    choices=["stunet", "nninteractive", "threedino", "vocomni", "vocomni_nnunet"],
                    help="Encoder backbone.")
@@ -126,6 +129,10 @@ def parse_args() -> argparse.Namespace:
                    choices=["auto", "true", "false"],
                    help="TabPFN memory_saving_mode. 'auto' chunks attention on small GPUs "
                         "(causes ~50%% VRAM); 'false' uses full VRAM per call.")
+    p.add_argument("--balance_ratio", type=float, default=None,
+                   help="If set, subsample background context patches to this multiple of "
+                        "the foreground count (e.g. 3.0 keeps 3 bg per fg patch). "
+                        "None disables balancing.")
     p.add_argument("--wandb_project", default="patch_icl_feature_similarity",
                    help="W&B project name. Set to 'null' to disable logging.")
     p.add_argument("--run_name", default=None,
@@ -178,11 +185,43 @@ def encode_context_nnint(
     return encoder(ctx_imgs, ctx_masks)
 
 
+def balance_context(
+    ctx_flat: torch.Tensor,    # (K*N, C)
+    labels_flat: torch.Tensor, # (K*N,)  float in [0, 1]
+    bg_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Subsample background patches to bg_ratio × effective_foreground_count.
+
+    Uses soft label values directly — no hard threshold.
+    effective_fg = round(sum(labels)), i.e. the expected number of fully-labeled
+    foreground patches implied by the soft labels. The top effective_fg patches
+    by label value are treated as foreground; the rest are randomly subsampled
+    to bg_ratio * effective_fg patches.
+
+    This works correctly for small organs with avg-pooled labels where
+    foreground patches may have values like 0.02–0.15.
+    """
+    n_eff_fg = max(1, round(labels_flat.sum().item()))
+    order = labels_flat.argsort(descending=True)   # high label → foreground
+    keep_fg  = order[:n_eff_fg]
+    bg_cands = order[n_eff_fg:]
+    if len(bg_cands) == 0:
+        print(f"  [balance] fg={n_eff_fg}  bg=0 (all patches are fg)")
+        return ctx_flat, labels_flat
+    n_bg = min(len(bg_cands), max(1, int(n_eff_fg * bg_ratio)))
+    perm = torch.randperm(len(bg_cands), device=bg_cands.device)[:n_bg]
+    keep = torch.cat([keep_fg, bg_cands[perm]]).sort().values
+    print(f"  [balance] fg={n_eff_fg}  bg={n_bg}  total={n_eff_fg + n_bg}"
+          f"  (of {len(labels_flat)} patches, ratio={bg_ratio})")
+    return ctx_flat[keep], labels_flat[keep]
+
+
 def predict_similarity(
     tgt_feat: torch.Tensor,    # (C, D, H, W)
     ctx_feats: torch.Tensor,   # (K, C, D, H, W)
     ctx_masks: torch.Tensor,   # (K, D, H, W)  float in {0, 1}
     temperature: float,
+    balance_ratio: float | None = None,
 ) -> torch.Tensor:
     """
     Predict a soft mask for the target by cosine-similarity retrieval.
@@ -203,6 +242,9 @@ def predict_similarity(
     ctx_flat = ctx_feats.reshape(K, C, N).permute(0, 2, 1).reshape(K * N, C)  # (K*N, C)
     ctx_labels = ctx_masks.reshape(K * N).float()                # (K*N,)
 
+    if balance_ratio is not None:
+        ctx_flat, ctx_labels = balance_context(ctx_flat, ctx_labels, balance_ratio)
+
     tgt_norm = F.normalize(tgt_flat, dim=-1)   # (N, C)
     ctx_norm = F.normalize(ctx_flat, dim=-1)   # (K*N, C)
     sim = tgt_norm @ ctx_norm.T                # (N, K*N)
@@ -217,6 +259,7 @@ def predict_tabpfn(
     ctx_feats: torch.Tensor,   # (K, C, D, H, W)
     ctx_masks: torch.Tensor,   # (K, D, H, W)  float
     clf,                       # pre-instantiated TabPFNClassifier (reused across calls)
+    balance_ratio: float | None = None,
 ) -> torch.Tensor:
     """Predict a soft mask using TabPFN in-context classification.
 
@@ -230,8 +273,14 @@ def predict_tabpfn(
     K = ctx_feats.shape[0]
     N = D * H * W
 
-    X_ctx = ctx_feats.reshape(K, C, N).permute(0, 2, 1).reshape(K * N, C).cpu().numpy()
-    y_ctx = (ctx_masks.reshape(K * N) > 0).cpu().numpy().astype(int)
+    ctx_flat = ctx_feats.reshape(K, C, N).permute(0, 2, 1).reshape(K * N, C)
+    ctx_labels = (ctx_masks.reshape(K * N) > 0).float()
+
+    if balance_ratio is not None:
+        ctx_flat, ctx_labels = balance_context(ctx_flat, ctx_labels, balance_ratio)
+
+    X_ctx = ctx_flat.cpu().numpy()
+    y_ctx = ctx_labels.cpu().numpy().astype(int)
     X_tgt = tgt_feat.reshape(C, N).T.cpu().numpy()
 
     if y_ctx.sum() == 0 or y_ctx.sum() == len(y_ctx):
@@ -247,6 +296,55 @@ def predict_tabpfn(
     clf.fit(X_ctx, y_ctx)
     proba = clf.predict_proba(X_tgt)   # (N, 2)
     return torch.from_numpy(proba[:, 1]).float().reshape(D, H, W).to(tgt_feat.device)
+
+
+def predict_prototype(
+    tgt_feat: torch.Tensor,    # (C, D, H, W)
+    ctx_feats: torch.Tensor,   # (K, C, D, H, W)
+    ctx_masks: torch.Tensor,   # (K, D, H, W)  float in [0, 1]
+    temperature: float,
+    balance_ratio: float | None = None,
+) -> torch.Tensor:
+    """Predict a soft mask using masked-average-pooling prototypes.
+
+    Computes one foreground prototype P+ and one background prototype P- by
+    averaging context features weighted by the context mask and its inverse.
+    Each target position is scored by cos_sim(x, P+) - cos_sim(x, P-), passed
+    through a sigmoid scaled by temperature.
+
+    Advantages over per-position cosine retrieval:
+      - O(C) instead of O(K*N*C) — much faster with large K or output grids.
+      - Noise from individual ambiguous patches is averaged out.
+      - Principled few-shot learning baseline (PANet / CANet lineage).
+
+    Returns
+    -------
+    pred : (D, H, W) float tensor in [0, 1].
+    """
+    C = tgt_feat.shape[0]
+
+    fg_w = ctx_masks.reshape(-1)                   # (K*N,) soft weights
+    bg_w = (1.0 - ctx_masks).reshape(-1)
+    ctx_flat = ctx_feats.reshape(-1, C)            # (K*N, C)
+
+    if balance_ratio is not None:
+        ctx_flat, fg_w_bal = balance_context(ctx_flat, fg_w, balance_ratio)
+        bg_w = 1.0 - fg_w_bal
+        fg_w = fg_w_bal
+
+    fg_sum = fg_w.sum().clamp(min=1e-6)
+    bg_sum = bg_w.sum().clamp(min=1e-6)
+    P_pos = (ctx_flat * fg_w.unsqueeze(1)).sum(dim=0) / fg_sum   # (C,)
+    P_neg = (ctx_flat * bg_w.unsqueeze(1)).sum(dim=0) / bg_sum   # (C,)
+
+    P_pos = F.normalize(P_pos, dim=0)
+    P_neg = F.normalize(P_neg, dim=0)
+
+    N = tgt_feat.shape[1] * tgt_feat.shape[2] * tgt_feat.shape[3]
+    tgt_flat = F.normalize(tgt_feat.reshape(C, N).T, dim=-1)     # (N, C)
+
+    score = (tgt_flat @ P_pos - tgt_flat @ P_neg) / temperature  # (N,)
+    return torch.sigmoid(score).reshape(*tgt_feat.shape[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -268,19 +366,22 @@ def downsample_feat(feat: torch.Tensor, size: tuple[int, int, int]) -> torch.Ten
 
 def extract_features(
     feats: list[torch.Tensor],
-    level: str,
+    levels: list[str],
     out_size: tuple[int, int, int],
     num_levels: int,
 ) -> torch.Tensor:
     """Downsample and return features at the chosen level(s).
 
-    level="all"  → all levels resampled to out_size and concatenated on C dim.
-    level="-1"   → single level (int index, negative indexing supported).
+    levels=["all"]      → all levels concatenated on C dim.
+    levels=["-1"]       → single bottleneck level.
+    levels=["-1","-2"]  → two levels concatenated.
     Returns (C, D', H', W') float32.
     """
-    if level == "all":
+    if levels == ["all"]:
         return torch.cat([downsample_feat(f, out_size) for f in feats], dim=0)
-    return downsample_feat(feats[int(level) % num_levels], out_size)
+    return torch.cat(
+        [downsample_feat(feats[int(l) % num_levels], out_size) for l in levels], dim=0
+    )
 
 
 def downsample_mask(mask: torch.Tensor, size: tuple[int, int, int], mode: str = "max") -> torch.Tensor:
@@ -323,6 +424,18 @@ def auroc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
     if gt_np.sum() == 0 or gt_np.sum() == len(gt_np):
         return float("nan")
     return roc_auc_score(gt_np, pred_np)
+
+
+def auprc_score(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Area under the Precision-Recall curve.
+    More sensitive than AUROC for small organs (class imbalance): measures
+    whether high-scoring voxels are truly foreground, not just ranked above bg."""
+    from sklearn.metrics import average_precision_score
+    gt_np   = (gt.cpu().numpy().ravel() > 0).astype(int)
+    pred_np = pred.cpu().numpy().ravel()
+    if gt_np.sum() == 0 or gt_np.sum() == len(gt_np):
+        return float("nan")
+    return float(average_precision_score(gt_np, pred_np))
 
 
 def hard_dice_score(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
@@ -543,24 +656,25 @@ def main() -> None:
         ).to(device).eval()
 
     num_levels = len(encoder.skip_channels) + 1  # skips + bottleneck
-    level = args.feature_level  # "all" or int string; resolved in extract_features
-    if level == "all":
+    levels = args.feature_level  # list of str; e.g. ["-1"] or ["all"] or ["-1", "-2"]
+    if levels == ["all"]:
         level_desc = "all"
     else:
-        resolved = int(level) % num_levels
-        label = "bottleneck" if resolved == num_levels - 1 else f"skip {resolved}"
-        level_desc = f"{resolved} ({label}, levels 0–{num_levels - 1})"
+        level_desc = "+".join(str(int(l) % num_levels) for l in levels)
     print(f"Encoder: {args.encoder} | "
-          f"Feature level: {level_desc} | "
+          f"Feature level: {level_desc} (of 0–{num_levels - 1}) | "
           f"output_size={out_size} | temperature={args.temperature}\n")
 
     # ---- W&B ---------------------------------------------------------------
     use_wandb = args.wandb_project and args.wandb_project.lower() != "null"
     if use_wandb:
         import wandb
+        _ckpt_tag = ""
+        if args.encoder == "vocomni":
+            _ckpt_tag = "_" + Path(args.vocomni_ckpt).stem
         auto_name = (
-            f"{args.encoder}_{args.image_size[0]}_{args.output_size[0]}"
-            f"_lvl{args.feature_level}_{args.method}"
+            f"{args.encoder}{_ckpt_tag}_{args.image_size[0]}_{args.output_size[0]}"
+            f"_lvl{level_desc}_K{args.context_size}_{args.method}"
         )
         wandb.init(
             project=args.wandb_project,
@@ -568,7 +682,7 @@ def main() -> None:
             config={
                 "method":            args.method,
                 "encoder":           args.encoder,
-                "feature_level":     args.feature_level,
+                "feature_level":     level_desc,
                 "output_size":       args.output_size,
                 "temperature":       args.temperature,
                 "mask_pool":         args.mask_pool,
@@ -673,9 +787,9 @@ def main() -> None:
                 for k in range(K)
             ]
 
-            tgt_feat_ds = extract_features(tgt_feats, level, out_size, num_levels).float()
+            tgt_feat_ds = extract_features(tgt_feats, levels, out_size, num_levels).float()
             ctx_feat_ds = torch.stack([
-                extract_features(f, level, out_size, num_levels) for f in ctx_all_feats
+                extract_features(f, levels, out_size, num_levels) for f in ctx_all_feats
             ]).float()
 
             label_b   = labels[b]
@@ -687,15 +801,21 @@ def main() -> None:
 
             t0 = time.perf_counter()
             if args.method == "tabpfn":
-                pred = predict_tabpfn(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, tabpfn_clf)
+                pred = predict_tabpfn(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, tabpfn_clf,
+                                      balance_ratio=args.balance_ratio)
+            elif args.method == "prototype":
+                pred = predict_prototype(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, args.temperature,
+                                         balance_ratio=args.balance_ratio)
             else:
-                pred = predict_similarity(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, args.temperature)
+                pred = predict_similarity(tgt_feat_ds, ctx_feat_ds, ctx_mask_ds, args.temperature,
+                                          balance_ratio=args.balance_ratio)
             inference_time = time.perf_counter() - t0
 
             gt_ds   = tgt_mask_ds.float()
             d_soft  = soft_dice_score(pred, gt_ds)
             d_norm  = norm_dice_score(pred, gt_ds)
             auc     = auroc_score(pred, gt_ds)
+            aprc    = auprc_score(pred, gt_ds)
             hd      = hard_dice_score(pred, gt_ds)
             rho     = spearman_score(pred, gt_ds)
             ncc     = ncc_score(pred, gt_ds)
@@ -713,14 +833,14 @@ def main() -> None:
             pred_np = pred.cpu().numpy()
 
             print(f"[{cls:<30s}] subj={subj}  "
-                  f"hd={hd:.3f}  hd_full={hd_full:.3f}  auroc={auc:.3f}  "
+                  f"hd={hd:.3f}  hd_full={hd_full:.3f}  auroc={auc:.3f}  auprc={aprc:.3f}  "
                   f"spearman={rho:.3f}  ncc={ncc:.3f}  "
                   f"r@5={r05:.3f}  r@10={r10:.3f}  r@20={r20:.3f}  js={js:.3f}  "
                   f"pred[{pred_np.min():.3f}…{pred_np.max():.3f}]")
             results.append({
                 "soft_dice": d_soft, "norm_dice": d_norm,
                 "hard_dice": hd, "hard_dice_full": hd_full,
-                "auroc": auc, "spearman": rho, "ncc": ncc,
+                "auroc": auc, "auprc": aprc, "spearman": rho, "ncc": ncc,
                 "recall_05": r05, "recall_10": r10, "recall_20": r20,
                 "js_div": js,
                 "class": cls, "subject": subj, "inference_time": inference_time,
@@ -745,6 +865,7 @@ def main() -> None:
                     "sample/hard_dice":      hd,
                     "sample/hard_dice_full": hd_full,
                     "sample/auroc":          auc,
+                    "sample/auprc":          aprc,
                     "sample/spearman":       rho,
                     "sample/ncc":            ncc,
                     "sample/recall_05":      r05,
@@ -768,26 +889,28 @@ def main() -> None:
         def _mc(key, rs):
             return np.nanmean([r[key] for r in rs])
 
-        print(f"\n{'─'*110}")
-        print(f"  {'class':<30s} {'hd':>6} {'hd_f':>6} {'auroc':>7} {'spear':>7} {'ncc':>7} "
+        print(f"\n{'─'*120}")
+        print(f"  {'class':<30s} {'hd':>6} {'hd_f':>6} {'auroc':>7} {'auprc':>7} {'spear':>7} {'ncc':>7} "
               f"{'r@5':>6} {'r@10':>6} {'r@20':>6} {'js↓':>6}  n")
-        print(f"  {'─'*106}")
+        print(f"  {'─'*116}")
         for cls, rs in per_cls.items():
             print(f"  {cls:<30s} "
                   f"{_mc('hard_dice',      rs):>6.3f} "
                   f"{_mc('hard_dice_full', rs):>6.3f} "
                   f"{_mc('auroc',          rs):>7.3f} "
+                  f"{_mc('auprc',          rs):>7.3f} "
                   f"{_mc('spearman',       rs):>7.3f} "
                   f"{_mc('ncc',            rs):>7.3f} "
                   f"{_mc('recall_05',      rs):>6.3f} "
                   f"{_mc('recall_10',      rs):>6.3f} "
                   f"{_mc('recall_20',      rs):>6.3f} "
                   f"{_mc('js_div',         rs):>6.3f}  {len(rs)}")
-        print(f"  {'─'*106}")
+        print(f"  {'─'*116}")
         print(f"  {'overall':<30s} "
               f"{_m('hard_dice'):>6.3f} "
               f"{_m('hard_dice_full'):>6.3f} "
               f"{_m('auroc'):>7.3f} "
+              f"{_m('auprc'):>7.3f} "
               f"{_m('spearman'):>7.3f} "
               f"{_m('ncc'):>7.3f} "
               f"{_m('recall_05'):>6.3f} "
@@ -802,6 +925,7 @@ def main() -> None:
                 "overall/hard_dice":      _m("hard_dice"),
                 "overall/hard_dice_full": _m("hard_dice_full"),
                 "overall/auroc":          _m("auroc"),
+                "overall/auprc":          _m("auprc"),
                 "overall/spearman":       _m("spearman"),
                 "overall/ncc":            _m("ncc"),
                 "overall/recall_05":      _m("recall_05"),
@@ -813,12 +937,12 @@ def main() -> None:
                 "overall/inference_time": _m("inference_time"),
             }
             for cls, rs in per_cls.items():
-                for key in ("hard_dice", "hard_dice_full", "auroc", "spearman", "ncc",
+                for key in ("hard_dice", "hard_dice_full", "auroc", "auprc", "spearman", "ncc",
                             "recall_05", "recall_10", "recall_20", "js_div"):
                     summary[f"class/{cls}/{key}"] = _mc(key, rs)
 
             _metric_cols = [
-                "hard_dice", "hard_dice_full", "auroc", "spearman",
+                "hard_dice", "hard_dice_full", "auroc", "auprc", "spearman",
                 "ncc", "recall_05", "recall_10", "recall_20", "js_div",
             ]
 
