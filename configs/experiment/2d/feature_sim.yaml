@@ -18,7 +18,7 @@ tabpfn:
   memory_saving: false  # auto (chunk attention, ~50% VRAM), true (max saving), false (full VRAM)
 
 eval:
-  batch_size: 64        # process one target at a time (TabPFN fits per sample)
+  batch_size: 16        # process one target at a time (TabPFN fits per sample)
   workers: 20
   seed: 0
   out_dir: results/2d/outputs

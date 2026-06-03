@@ -188,6 +188,67 @@ def predict_tabpfn(
     return torch.from_numpy(proba[:, 1]).float().reshape(H, W)
 
 
+def batch_tabpfn(
+    tgt_feats:  torch.Tensor,   # (B, C, H', W')
+    ctx_feats:  torch.Tensor,   # (B, K, C, H', W')
+    ctx_masks:  torch.Tensor,   # (B, K, H', W') float — may be on CPU
+    model,                      # clf.models_[0]
+    n_estimators: int,
+    n_classes: int = 2,
+) -> torch.Tensor:
+    """
+    Batched TabPFN prediction: calls the underlying transformer once per
+    estimator with all B samples stacked on the batch dimension.
+
+    Returns (B, H', W') float tensor in [0, 1].
+    Falls back to constant (context positive rate) per sample when all
+    context labels are one class.
+    """
+    B, C, H, W = tgt_feats.shape
+    K  = ctx_feats.shape[1]
+    N  = H * W
+    dev = next(model.parameters()).device
+
+    # Reshape to (B, N_ctx/N_tgt, C)
+    X_ctx = ctx_feats.reshape(B, K, C, N).permute(0, 1, 3, 2).reshape(B, K * N, C)
+    y_ctx = (ctx_masks.reshape(B, K * N) > 0).float()
+    X_tgt = tgt_feats.reshape(B, C, N).permute(0, 2, 1)  # (B, N, C)
+
+    # Per-sample z-score using context stats
+    mu  = X_ctx.mean(dim=1, keepdim=True)   # (B, 1, C)
+    sig = X_ctx.std( dim=1, keepdim=True) + 1e-8
+    X_ctx = (X_ctx - mu) / sig
+    X_tgt = (X_tgt - mu) / sig
+
+    # Identify samples with degenerate labels; will fill after
+    label_sums = y_ctx.sum(dim=1)                          # (B,)
+    degenerate = (label_sums == 0) | (label_sums == K * N)
+
+    # Build (N_ctx + N_tgt, B, C) and (N_ctx, B) for model
+    X_all = torch.cat([X_ctx, X_tgt], dim=1).permute(1, 0, 2).to(dev)  # (N_ctx+N_tgt, B, C)
+    Y_all = y_ctx.permute(1, 0).to(dev)                                  # (N_ctx, B)
+
+    # n_estimators calls with different column permutations → average logits
+    logits_sum = None
+    with torch.inference_mode():
+        for _ in range(n_estimators):
+            perm = torch.randperm(C, device=dev)
+            out = model(X_all[:, :, perm], Y_all, only_return_standard_out=True)
+            # out: (N_tgt, B, 160) — only test rows, first n_classes cols matter
+            logits = out[-N:, :, :n_classes]
+            logits_sum = logits if logits_sum is None else logits_sum + logits
+
+    proba = torch.softmax(logits_sum / n_estimators, dim=-1)  # (N, B, 2)
+    preds = proba[..., 1].permute(1, 0).reshape(B, H, W)      # (B, H, W)
+
+    # Overwrite degenerate samples with their context positive rate
+    for b in range(B):
+        if degenerate[b]:
+            preds[b] = float(y_ctx[b].mean())
+
+    return preds.cpu()
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
 def hard_dice(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
@@ -362,15 +423,13 @@ def main(cfg: DictConfig):
         ignore_pretraining_limits=True,
         memory_saving_mode=_mem_mode,
     )
-    print(f"TabPFN ready  n_estimators={cfg.tabpfn.n_estimators}")
-
-    # Measure TabPFN FLOPs on a dummy call with correct dimensions.
-    # FlopCounterMode captures PyTorch ops dispatched inside fit+predict_proba.
-    # TabPFN converts numpy→tensor internally (leaf tensors, no grad_fn), so
-    # FlopCounterMode's autograd hooks fail. We skip and rely on inference_time_mean_s.
-    tabpfn_flops = None
-    flops_total  = flops
-    print("TabPFN FLOPs: not measurable via FlopCounterMode (numpy→tensor interface)")
+    # Initialize model weights with a tiny dummy fit
+    _C = 4 * 64 if str(cfg.feature.level) == "all" else 64  # rough feature dim
+    _rng = np.random.default_rng(0)
+    clf.fit(_rng.standard_normal((4, _C)).astype(np.float32), np.array([0, 0, 1, 1]))
+    tabpfn_model  = clf.models_[0]
+    tabpfn_n_est  = cfg.tabpfn.n_estimators
+    print(f"TabPFN ready  n_estimators={tabpfn_n_est}  (batched inference)")
 
     # ── wandb ─────────────────────────────────────────────────────────────────
     level_tag = str(cfg.feature.level).replace("-", "m")
@@ -441,35 +500,49 @@ def main(cfg: DictConfig):
 
             batch_encode_time = time.perf_counter() - t0
 
-            # ── Per-sample TabPFN ─────────────────────────────────────────────
+            # ── Batched feature extraction (cast to fp32 for TabPFN) ──────────
+            tgt_feats_all = torch.stack([
+                extract_features([f[b : b + 1] for f in tgt_feats_b],
+                                 cfg.feature.level, cfg.feature.output_size)
+                for b in range(B)
+            ]).float()  # (B, C, os, os) — on GPU, fp32
+
+            ctx_feats_all = torch.stack([
+                torch.stack([
+                    extract_features([f[b * K + k : b * K + k + 1] for f in ctx_feats_b],
+                                     cfg.feature.level, cfg.feature.output_size)
+                    for k in range(K)
+                ])
+                for b in range(B)
+            ]).float()  # (B, K, C, os, os) — on GPU, fp32
+
+            ctx_masks_all = torch.stack([
+                torch.stack([
+                    downsample_mask(context_outs[b, k, 0],
+                                    cfg.feature.output_size, cfg.feature.mask_pool)
+                    for k in range(K)
+                ])
+                for b in range(B)
+            ])  # (B, K, os, os) — on CPU
+
+            # ── Batched TabPFN (one model call per estimator) ─────────────────
+            t1 = time.perf_counter()
+            if cfg.tabpfn.balance_ratio is None:
+                preds_all = batch_tabpfn(
+                    tgt_feats_all, ctx_feats_all, ctx_masks_all,
+                    tabpfn_model, tabpfn_n_est,
+                )  # (B, os, os) on CPU
+            else:
+                # balance_ratio requires per-sample subsampling → fall back
+                preds_all = torch.stack([
+                    predict_tabpfn(tgt_feats_all[b], ctx_feats_all[b], ctx_masks_all[b],
+                                   clf, cfg.tabpfn.balance_ratio)
+                    for b in range(B)
+                ])  # (B, os, os)
+            inference_times.append(batch_encode_time / B + (time.perf_counter() - t1) / B)
+
             for b in range(B):
-                tgt_feat = extract_features(
-                    [f[b : b + 1] for f in tgt_feats_b],
-                    cfg.feature.level, cfg.feature.output_size,
-                )  # (C, os, os) — on GPU
-
-                ctx_feats = torch.stack([
-                    extract_features(
-                        [f[b * K + k : b * K + k + 1] for f in ctx_feats_b],
-                        cfg.feature.level, cfg.feature.output_size,
-                    )
-                    for k in range(K)
-                ])  # (K, C, os, os) — on GPU
-
-                ctx_masks = torch.stack([
-                    downsample_mask(
-                        context_outs[b, k, 0], cfg.feature.output_size, cfg.feature.mask_pool
-                    )
-                    for k in range(K)
-                ])  # (K, os, os) — on CPU
-
-                t1 = time.perf_counter()
-                pred_ds = predict_tabpfn(
-                    tgt_feat, ctx_feats, ctx_masks, clf,
-                    balance_ratio=cfg.tabpfn.balance_ratio,
-                )  # (os, os)
-                inference_times.append(batch_encode_time / B + (time.perf_counter() - t1))
-
+                pred_ds     = preds_all[b]
                 label       = labels[b, 0]
                 ds_name     = batch["dataset"][b]
                 sample_idx  = int(batch["sample_idx"][b])
