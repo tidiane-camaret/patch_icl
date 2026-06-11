@@ -160,8 +160,13 @@ class MedSegBenchDataset(Dataset):
             (d, i) for d, i in self.label_index.get(label_value, [])
             if d == ds and i != sample_idx
         ]
-        k = min(self.context_size, len(candidates))
-        context_samples = random.sample(candidates, k) if k > 0 else []
+        if not candidates:
+            context_samples = []
+        elif len(candidates) >= self.context_size:
+            context_samples = random.sample(candidates, self.context_size)
+        else:
+            # Fewer unique candidates than K — sample with replacement
+            context_samples = random.choices(candidates, k=self.context_size)
 
         context_in = torch.stack([
             _to_tensor(self.images[d][i]) for d, i in context_samples

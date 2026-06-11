@@ -27,3 +27,4 @@ results/eval/**/*.json
 experiments/synth_labels/*.png
 results/datasets/*.png
 results/aug_benchmark/*.png
+docs/tabpfn/*.pdf

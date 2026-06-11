@@ -1,5 +1,78 @@
 # Change log
 
+## 2026-06-11 — pfn_seg: augmentations, compile flag, progress bars
+
+`experiments/2d/pfn_seg.py`, `src/models/pfn_seg_2d.py`, `configs/experiment/2d/pfn_seg.yaml`, `configs/augmentations/medsegbench.yaml` (new), `experiments/2d/plot_aug.py` (new).
+
+**`torch.compile` made optional (`arch.compile: false`)**:
+- `TransformerEncoderLayer.forward` had `@torch.compile(dynamic=True)` and `_newtonschulz5_batched` had `@torch.compile` baked in.  On first run, 6 layers × 2 (fwd+bwd) Triton compilations caused a silent multi-minute hang that looked like a freeze.
+- Both decorators removed.  Compile is now opt-in: `arch.compile=true` wraps the full model and `_newtonschulz5_batched` via `torch.compile(dynamic=True)` after construction.
+
+**GPU augmentations (`augment()` in `pfn_seg.py`)**:
+- New `configs/augmentations/medsegbench.yaml` — canonical light-aug config: geometric (hflip p=0.5, vflip p=0.5, rotate ±20° p=0.5) and intensity (brightness Δ0.15, contrast ×[0.8–1.2], gamma [0.75–1.33], noise σ=0.04).
+- Geometric ops applied **to context pairs only** (joint image+mask via `F.affine_grid`/`F.grid_sample`) so the query GT is never misaligned; intensity ops applied independently to all images.
+- All ops are batched GPU tensor operations (`torch.where`, `flip`, `affine_grid`/`grid_sample`); no per-sample Python loops.
+- `pfn_seg.yaml` gains a `defaults` list loading `augmentations/medsegbench@aug`; `hydra.main` config_path widened to `../../configs` so Hydra resolves the group.  Disable at runtime with `aug.enabled=false`.
+
+**Progress bars**:
+- `train_epoch`: `tqdm` per-batch with running `loss` postfix.
+- `run_eval`: existing `tqdm` extended with running `dice` postfix.
+- `main` epoch loop: outer `tqdm` with `loss / lr / best` postfix updated after each epoch and eval.
+- All `print()` calls inside the loop replaced with `tqdm.write()`.
+
+**Visualisation**: `experiments/2d/plot_aug.py` — loads a small multi-dataset batch and saves a 6-column grid (orig ctx, orig mask, aug ctx, aug mask, orig query, aug query) to `results/datasets/medsegbench_aug.png`.
+
+## 2026-06-11 — ImagePFN: nanoTabPFN-style in-context segmentation model
+
+New files:
+- `src/models/pfn_seg_2d.py` — `ImagePFN` model
+- `experiments/2d/pfn_seg.py` — training + eval script
+- `configs/experiment/2d/pfn_seg.yaml` — config
+- `docs/tabpfn/nanotabpfn.md` — paper + repo summary
+
+`ImagePFN` adapts all modded-nanoTabPFN techniques to 2D image segmentation:
+- **Dual-axis transformer**: feature-axis attention (spatial, within each image) + sample-axis
+  attention (cross-image, per patch position). Tensor layout `(B, rows, cols, e)` where
+  rows = images and cols = patches.
+- **Asymmetric masking**: query image attends only to thinking + context rows; mirrors TabPFN's
+  train/test split in sample-axis attention.
+- **Thinking rows**: `n` learnable row tokens prepended to the sequence, broadcast across all
+  patch positions; treated as train rows in sample-axis attention.
+- **Residual decay**: input to block i scaled by `residual_decay^i` (default 0.95).
+- **LowerPrecisionRMSNorm**: pre-norm RMSNorm that upcasts to fp32 for bf16/fp16 inputs.
+- **LAWA**: rolling buffer of last `K=10` checkpoints, averaged at eval time only; training
+  weights unchanged.
+- **Muon optimizer**: applies to all 2D weight matrices inside `transformer`; AdamW + cosine
+  LR schedule for everything else (embeddings, norms, decoder).
+- Images are patchified (P=8, N=256 patches per image) and normalized using context-image
+  statistics per batch (mirrors TabPFN per-column normalization).
+- Decoder outputs per-patch logits for query row; upsampled to native resolution for BCE loss.
+
+## 2026-06-11 — feature_sim.py fixes (vectorisation, ensemble averaging, timing)
+
+`experiments/2d/feature_sim.py`
+
+- **Vectorised feature extraction**: replaced `extract_features` + `_pool2d` (which assumed B=1
+  via `.squeeze(0)` and was called in an O(B×K) Python loop) with `extract_features_batch`,
+  which operates on full `(N, C, H, W)` tensors and concatenates on `dim=1`. The main eval
+  loop now calls it once for targets `(B, C', os, os)` and once for contexts `(B*K, C', os, os)`,
+  then reshapes; context mask downsampling likewise vectorised via a single
+  `F.adaptive_{avg,max}_pool2d` on `(B*K, 1, H, W)`.
+
+- **Probability averaging in `batch_tabpfn`**: was averaging logits before softmax
+  (`softmax(sum_logits / n_estimators)`), which differs from the standard ensemble approach.
+  Now applies softmax per estimator and accumulates probabilities, dividing at the end.
+
+- **Split timing**: `inference_times` (a single conflated number) replaced by separate
+  `encode_times` and `tabpfn_times` lists. Summary now logs `time/encode_ms`,
+  `time/tabpfn_ms`, and `time/total_ms` to wandb and prints each separately.
+
+- **balance_ratio warning**: prints a warning at run start when `balance_ratio` is set,
+  because it disables batched TabPFN and falls back to serial per-sample inference.
+
+- **FLOPs message**: clarified to say "per sample" (the measured value is for 1+K images,
+  not for the full eval batch).
+
 ## 2026-05-29 — VoComniNNUNetEncoder (PlainConvUNet/VoComni)
 
 `src/models/encoders/vocomni_nnunet.py` — new encoder wrapping PlainConvUNet

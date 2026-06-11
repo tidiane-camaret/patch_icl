@@ -1,0 +1,66 @@
+model: pfn_seg_2d
+
+data:
+  image_size: 128
+  context_size: 3
+  dataset: null       # null = all datasets; or e.g. "abdomenus"
+  max_train_samples: null  # null = full dataset; int = random subset per epoch
+
+arch:
+  patch_size: 8       # P; N = (image_size//P)² = 256 patches per image
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 8
+  residual_decay: 0.95
+  compile: true      # torch.compile (slow first batch due to Triton kernel compilation)
+
+train:
+  epochs: 200
+  batch_size: 32
+  lr: 1.0e-3
+  grad_clip: 2.0
+  lawa_k: 10          # LAWA checkpoint buffer size
+  muon_lr_scale: 0.1  # Muon lr = muon_lr_scale * lr
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  adam_wd: 0.01
+  warmup_epochs: 5
+  eval_every: 1      # run val eval every N epochs
+  workers: 16
+  seed: 42
+
+eval:
+  batch_size: 16
+  workers: 8
+  max_per_label: 20
+  out_dir: results/2d/pfn_seg
+
+wandb:
+  project: patch_icl_2d_exps_train
+  name: null          # null = auto-generated
+  enabled: true
+
+# mirrors configs/augmentations/medsegbench.yaml
+aug:
+  enabled: true
+  geometric:
+    hflip_p: 0.5
+    vflip_p: 0.5
+    rotate:
+      p: 0.5
+      max_angle_deg: 20.0
+  intensity:
+    brightness:
+      p: 0.5
+      max_delta: 0.15
+    contrast:
+      p: 0.5
+      range: [0.8, 1.2]
+    gamma:
+      p: 0.3
+      range: [0.75, 1.33]
+    noise:
+      p: 0.3
+      std: 0.04

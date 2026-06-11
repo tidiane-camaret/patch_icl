@@ -1,6 +1,6 @@
 # patch_icl — Results Summary
 
-*Last updated: 2026-05-27 (attention compile benchmark; feature_level list; torch.compile integration)*
+*Last updated: 2026-06-11 (2D MedSegBench: feature_sim vs UniverSeg baseline)*
 
 ---
 
@@ -142,3 +142,64 @@ Source: `results/benchmarks/eval/eval_20260524_*.json` — TotalSegmentator test
 | pancreas | 0.224 | 0.037 |
 | adrenal_gland_left | 0.009 | 0.005 |
 | common_carotid_artery_left | 0.014 | 0.008 |
+
+---
+
+## 2D MedSegBench: UniverSeg encoder + TabPFN vs UniverSeg baseline
+
+Runs: `wandb/run-20260603_191202-vnnhsldm` (feature_sim), `wandb/run-20260603_171003-37xdo361` (universeg).  
+Scripts: `experiments/2d/feature_sim.py`, `experiments/2d/universeg.py`.  
+Setup: MedSegBench val split, 13 237 samples, 35 datasets, K=1, image_size=128.
+
+### Summary
+
+| Model | dice/mean | Inference | FLOPs/sample | Runtime (total) |
+|-------|-----------|-----------|--------------|-----------------|
+| UniverSeg (full model) | 0.242 | ~2.2 ms | 13.57 GFLOPs | 29 s |
+| **UniverSeg encoder + TabPFN** | **0.267** | ~495 ms | 8.12 GFLOPs (enc only) | 6 601 s |
+
+Feature-sim is **+2.5% mean Dice** at **228× higher latency**.
+
+feature_sim config: `feature_level=all` (4 levels → C=256), `output_size=16` (16×16=256 patches/image), `n_estimators=4`, `balance_ratio=null`, `context_mask=false`.
+
+### Per-dataset comparison (selected)
+
+**UniverSeg baseline wins (Δ > +0.10)**
+
+| Dataset | feat_sim | universeg | Δ (useg) |
+|---------|----------|-----------|----------|
+| promise12 | 0.114 | **0.369** | +0.255 |
+| usforkidney | 0.345 | **0.501** | +0.156 |
+| bbbc010 | 0.306 | **0.454** | +0.148 |
+| chuac | 0.293 | **0.428** | +0.135 |
+| ultrasoundnerve | 0.156 | **0.281** | +0.125 |
+
+**feature_sim wins (Δ > +0.10)**
+
+| Dataset | feat_sim | universeg | Δ (fsim) |
+|---------|----------|-----------|----------|
+| brifiseg | **0.363** | 0.135 | +0.228 |
+| deepbacs | **0.244** | 0.089 | +0.155 |
+| dynamicnuclear | **0.350** | 0.206 | +0.144 |
+| isic2016 | **0.603** | 0.470 | +0.133 |
+| cellnuclei | **0.357** | 0.225 | +0.132 |
+| isic2018 | **0.574** | 0.466 | +0.108 |
+| dca1 | **0.316** | 0.209 | +0.107 |
+| kvasir | **0.317** | 0.213 | +0.104 |
+
+feature_sim wins 25/35 datasets, UniverSeg wins 10/35.
+
+### Interpretation
+
+UniverSeg's cross-conv attention wins on **shape-defined** structures (prostate, kidney, nerve) where the cross-image interaction propagates a global shape prior that local patch features cannot replicate at 16×16 resolution. The promise12 gap (+0.255) is the clearest example.
+
+feature_sim wins on **texture/appearance-defined** objects: microscopy cells (deepbacs, dynamicnuclear, cellnuclei), retinal vessels, dermoscopy. Here the UniverSeg encoder's per-patch features carry a distinctive statistical signature and TabPFN as a discriminative classifier exploits it better than the cross-conv decoder.
+
+### Suggested next experiments
+
+| Change | Expected effect |
+|--------|----------------|
+| `context_size=4` | Most impactful — 4× more TabPFN training points per image |
+| `context_mask=true` | Upper bound: mask-conditioned encoder features |
+| `output_size=8`, `level=-1` | Faster; tests whether bottleneck alone suffices |
+| `n_estimators=8` | Modest accuracy gain, ~2× TabPFN time |

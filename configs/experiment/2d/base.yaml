@@ -1,0 +1,18 @@
+model: ???           # required — overridden per experiment
+
+data:
+  image_size: 128      # loads {dataset}_{image_size}.npz files
+  context_size: 1
+  split: val
+  dataset: null        # null = all datasets; or e.g. abdomenus
+
+eval:
+  batch_size: 16
+  workers: 20
+  seed: 0
+  out_dir: results/2d/outputs
+  max_per_label: 20  # max samples per (dataset, label_value); null = all
+
+wandb:
+  project: patch_icl_2d_exps
+  name: null           # null = auto

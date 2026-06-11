@@ -17,12 +17,13 @@ Usage:
     python experiments/2d/feature_sim.py data.dataset=abdomenus data.context_size=5
 """
 
+import random
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 import hydra
-import time
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,18 +32,10 @@ import torch
 import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, "/home/dpxuser/ic_segmentation")
-sys.path.insert(0, "/home/dpxuser/repos/UniverSeg")
-
-from src.datasets.medsegbench import MedSegBenchDataset
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-NUM_ENCODER_LEVELS = 4  # UniverSeg v1: 4 CrossBlocks
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import DEVICE, build_loader, hard_dice, downsample_mask, log_summary
 
 
 # ── UniverSeg image-only encoding ────────────────────────────────────────────
@@ -67,7 +60,7 @@ def encode_images(
                 support label channel (second channel of dummy support).
 
     Returns:
-        list of NUM_ENCODER_LEVELS tensors, each (B, 64, H/2^i, W/2^i)
+        list of 4 tensors, each (B, 64, H/2^i, W/2^i)
     """
     B, _, H, W = images.shape
     target  = images.unsqueeze(1)                                # (B, 1, 1, H, W)
@@ -90,43 +83,31 @@ def encode_images(
     return feats  # index 0 = highest res, -1 = bottleneck
 
 
-# ── Feature / mask helpers ────────────────────────────────────────────────────
+# ── Feature helpers ───────────────────────────────────────────────────────────
 
-def extract_features(
+def extract_features_batch(
     feats: list[torch.Tensor],
     level: str | int,
     output_size: int,
 ) -> torch.Tensor:
     """
-    Pick encoder level(s), pool/upsample to output_size, return (C, H', W').
+    Pool encoder feature maps to output_size x output_size.
 
+    feats: list of (N, C, H', W') tensors where N = B or B*K.
     level="all" concatenates all levels on the channel dim.
-    level=int (or str int) picks a single level (negative indexing supported).
+    level=int picks a single level (negative indexing supported).
+    Returns (N, C', os, os).
     """
     size = (output_size, output_size)
     if str(level) == "all":
-        maps = [_pool2d(f, size) for f in feats]
+        maps = [F.adaptive_avg_pool2d(f.float(), size) for f in feats]
     else:
         idx = int(level) % len(feats)
-        maps = [_pool2d(feats[idx], size)]
-    return torch.cat(maps, dim=0)   # (C, H', W')
+        maps = [F.adaptive_avg_pool2d(feats[idx].float(), size)]
+    return torch.cat(maps, dim=1)   # (N, C', os, os)
 
 
-def _pool2d(feat: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-    """feat: (B, C, H, W) with B=1 → avg-pool to size → (C, H', W')."""
-    return F.adaptive_avg_pool2d(feat.float(), size).squeeze(0)
-
-
-def downsample_mask(mask: torch.Tensor, output_size: int, mode: str = "avg") -> torch.Tensor:
-    """mask: (H, W) → (H', W') using avg or max pool."""
-    x = mask.float().unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
-    size = (output_size, output_size)
-    if mode == "max":
-        return F.adaptive_max_pool2d(x, size).squeeze()
-    return F.adaptive_avg_pool2d(x, size).squeeze()
-
-
-# ── TabPFN prediction (same logic as 3D, 2D spatial) ─────────────────────────
+# ── TabPFN prediction ─────────────────────────────────────────────────────────
 
 def balance_context(
     ctx_flat: torch.Tensor,
@@ -228,17 +209,18 @@ def batch_tabpfn(
     X_all = torch.cat([X_ctx, X_tgt], dim=1).permute(1, 0, 2).to(dev)  # (N_ctx+N_tgt, B, C)
     Y_all = y_ctx.permute(1, 0).to(dev)                                  # (N_ctx, B)
 
-    # n_estimators calls with different column permutations → average logits
-    logits_sum = None
+    # n_estimators calls with different column permutations → average probabilities
+    proba_sum = None
     with torch.inference_mode():
         for _ in range(n_estimators):
             perm = torch.randperm(C, device=dev)
             out = model(X_all[:, :, perm], Y_all, only_return_standard_out=True)
             # out: (N_tgt, B, 160) — only test rows, first n_classes cols matter
             logits = out[-N:, :, :n_classes]
-            logits_sum = logits if logits_sum is None else logits_sum + logits
+            p = torch.softmax(logits, dim=-1)
+            proba_sum = p if proba_sum is None else proba_sum + p
 
-    proba = torch.softmax(logits_sum / n_estimators, dim=-1)  # (N, B, 2)
+    proba = proba_sum / n_estimators                           # (N, B, 2)
     preds = proba[..., 1].permute(1, 0).reshape(B, H, W)      # (B, H, W)
 
     # Overwrite degenerate samples with their context positive rate
@@ -250,14 +232,6 @@ def batch_tabpfn(
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
-
-def hard_dice(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
-    p = (pred >= threshold).float()
-    g = (gt    >  0       ).float()
-    num = 2 * (p * g).sum()
-    den = p.sum() + g.sum()
-    return float(num / den) if den > 1e-6 else float("nan")
-
 
 def dice_at_native(
     pred_ds: torch.Tensor, gt_native: torch.Tensor, native_size: int
@@ -271,7 +245,7 @@ def dice_at_native(
     return hard_dice(pred_up, gt_native)
 
 
-# ── Visualisation ────────────────────────────────────────────────────────────
+# ── Visualisation ─────────────────────────────────────────────────────────────
 
 def _overlay_ax(ax, image: np.ndarray, mask: np.ndarray, title: str) -> None:
     """Grayscale image with red mask overlay."""
@@ -333,65 +307,17 @@ def save_figure(
     plt.close(fig)
 
 
-# ── Collate ───────────────────────────────────────────────────────────────────
-
-def collate(batch):
-    batch = [b for b in batch if b["context_in"].shape[0] > 0]
-    if not batch:
-        return None
-    return {
-        "image":       torch.stack([b["image"]       for b in batch]),
-        "label":       torch.stack([b["label"]       for b in batch]),
-        "context_in":  torch.stack([b["context_in"]  for b in batch]),
-        "context_out": torch.stack([b["context_out"] for b in batch]),
-        "dataset":     [b["dataset"]     for b in batch],
-        "sample_idx":  [b["sample_idx"]  for b in batch],
-        "label_value": [b["label_value"] for b in batch],
-    }
-
-
-class TaggedDataset(torch.utils.data.Dataset):
-    def __init__(self, inner):
-        self.inner = inner
-
-    def __len__(self):
-        return len(self.inner)
-
-    def __getitem__(self, idx):
-        item = self.inner[idx]
-        ds_name, sample_idx, label_value = self.inner.samples[idx]
-        item["dataset"]     = ds_name
-        item["sample_idx"]  = sample_idx
-        item["label_value"] = label_value
-        return item
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="feature_sim", version_base=None)
 def main(cfg: DictConfig):
+    random.seed(cfg.eval.seed)
     torch.manual_seed(cfg.eval.seed)
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    # ── dataset ───────────────────────────────────────────────────────────────
-    datasets = [cfg.data.dataset] if cfg.data.dataset else None
-    ds = MedSegBenchDataset(
-        split=cfg.data.split,
-        context_size=cfg.data.context_size,
-        image_size=cfg.data.image_size,
-        datasets=datasets,
-    )
-    loader = DataLoader(
-        TaggedDataset(ds),
-        batch_size=cfg.eval.batch_size,
-        shuffle=False,
-        num_workers=cfg.eval.workers,
-        collate_fn=collate,
-        pin_memory=DEVICE.type == "cuda",
-        persistent_workers=cfg.eval.workers > 0,
-    )
+    loader = build_loader(cfg)
 
     # ── model ─────────────────────────────────────────────────────────────────
     from src.models.universeg_baseline import UniverSegBaseline
@@ -409,10 +335,10 @@ def main(cfg: DictConfig):
         with torch.no_grad():
             encode_images(useg, _dummy)
     flops = _fc.get_total_flops()
-    print(f"Encoder FLOPs (1+{cfg.data.context_size} images, {cfg.data.image_size}²): {flops/1e9:.2f} GFLOPs")
+    print(f"Encoder FLOPs per sample (1+{cfg.data.context_size} images, {cfg.data.image_size}²): {flops/1e9:.2f} GFLOPs")
     del _dummy
 
-    # ── TabPFN + its flops ────────────────────────────────────────────────────
+    # ── TabPFN ────────────────────────────────────────────────────────────────
     from tabpfn import TabPFNClassifier
     _mem_mode: bool | str = {"auto": "auto", "true": True, "false": False}[
         str(cfg.tabpfn.memory_saving).lower()
@@ -441,16 +367,16 @@ def main(cfg: DictConfig):
         project=cfg.wandb.project,
         name=run_name,
         config={
-            "model":          cfg.model,
-            "image_size":     cfg.data.image_size,
-            "context_size":   cfg.data.context_size,
-            "split":          cfg.data.split,
-            "feature_level":  str(cfg.feature.level),
-            "output_size":    cfg.feature.output_size,
-            "mask_pool":      cfg.feature.mask_pool,
-            "n_estimators":    cfg.tabpfn.n_estimators,
-            "balance_ratio":   cfg.tabpfn.balance_ratio,
-            "memory_saving":   cfg.tabpfn.memory_saving,
+            "model":         cfg.model,
+            "image_size":    cfg.data.image_size,
+            "context_size":  cfg.data.context_size,
+            "split":         cfg.data.split,
+            "feature_level": str(cfg.feature.level),
+            "output_size":   cfg.feature.output_size,
+            "mask_pool":     cfg.feature.mask_pool,
+            "n_estimators":  cfg.tabpfn.n_estimators,
+            "balance_ratio": cfg.tabpfn.balance_ratio,
+            "memory_saving": cfg.tabpfn.memory_saving,
             "flops_encoder": flops,
         },
     )
@@ -465,8 +391,12 @@ def main(cfg: DictConfig):
     # ── eval loop ─────────────────────────────────────────────────────────────
     per_ds:    dict[str, list[float]] = defaultdict(list)
     per_label: dict[str, list[float]] = defaultdict(list)
-    inference_times: list[float] = []
-    saved_figures: set[tuple[str, int]] = set()   # (dataset, label_value) already saved
+    encode_times: list[float] = []
+    tabpfn_times: list[float] = []
+    saved_figures: set[tuple[str, int]] = set()
+
+    if cfg.tabpfn.balance_ratio is not None:
+        print("WARNING: balance_ratio is set — batched TabPFN is disabled; inference will be slower.")
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="eval"):
@@ -498,32 +428,19 @@ def main(cfg: DictConfig):
                     ctx_masks_enc = context_outs.reshape(B * K, 1, H, W).to(DEVICE, non_blocking=True)
                     ctx_feats_b = encode_images(useg, ctx_imgs_flat, masks=ctx_masks_enc)
 
-            batch_encode_time = time.perf_counter() - t0
+            encode_times.append((time.perf_counter() - t0) / B)
 
-            # ── Batched feature extraction (cast to fp32 for TabPFN) ──────────
-            tgt_feats_all = torch.stack([
-                extract_features([f[b : b + 1] for f in tgt_feats_b],
-                                 cfg.feature.level, cfg.feature.output_size)
-                for b in range(B)
-            ]).float()  # (B, C, os, os) — on GPU, fp32
+            # ── Batched feature extraction (vectorized, fp32 for TabPFN) ─────
+            os = cfg.feature.output_size
+            tgt_feats_all = extract_features_batch(tgt_feats_b, cfg.feature.level, os)
+            ctx_feats_raw = extract_features_batch(ctx_feats_b, cfg.feature.level, os)
+            C_feat = tgt_feats_all.shape[1]
+            ctx_feats_all = ctx_feats_raw.reshape(B, K, C_feat, os, os)
 
-            ctx_feats_all = torch.stack([
-                torch.stack([
-                    extract_features([f[b * K + k : b * K + k + 1] for f in ctx_feats_b],
-                                     cfg.feature.level, cfg.feature.output_size)
-                    for k in range(K)
-                ])
-                for b in range(B)
-            ]).float()  # (B, K, C, os, os) — on GPU, fp32
-
-            ctx_masks_all = torch.stack([
-                torch.stack([
-                    downsample_mask(context_outs[b, k, 0],
-                                    cfg.feature.output_size, cfg.feature.mask_pool)
-                    for k in range(K)
-                ])
-                for b in range(B)
-            ])  # (B, K, os, os) — on CPU
+            ctx_outs_flat = context_outs.reshape(B * K, 1, H, W).float()
+            _pool = F.adaptive_max_pool2d if cfg.feature.mask_pool == "max" \
+                    else F.adaptive_avg_pool2d
+            ctx_masks_all = _pool(ctx_outs_flat, (os, os)).squeeze(1).reshape(B, K, os, os)
 
             # ── Batched TabPFN (one model call per estimator) ─────────────────
             t1 = time.perf_counter()
@@ -533,13 +450,13 @@ def main(cfg: DictConfig):
                     tabpfn_model, tabpfn_n_est,
                 )  # (B, os, os) on CPU
             else:
-                # balance_ratio requires per-sample subsampling → fall back
+                # balance_ratio requires per-sample subsampling → falls back to serial
                 preds_all = torch.stack([
                     predict_tabpfn(tgt_feats_all[b], ctx_feats_all[b], ctx_masks_all[b],
                                    clf, cfg.tabpfn.balance_ratio)
                     for b in range(B)
                 ])  # (B, os, os)
-            inference_times.append(batch_encode_time / B + (time.perf_counter() - t1) / B)
+            tabpfn_times.append((time.perf_counter() - t1) / B)
 
             for b in range(B):
                 pred_ds     = preds_all[b]
@@ -584,33 +501,17 @@ def main(cfg: DictConfig):
                     })
 
     # ── aggregate & log ───────────────────────────────────────────────────────
-    summary = {}
+    mean_enc = float(np.mean(encode_times)) if encode_times else float("nan")
+    mean_pfn = float(np.mean(tabpfn_times)) if tabpfn_times else float("nan")
+    print(f"\n  avg encode:  {mean_enc * 1000:.1f} ms/item")
+    print(f"  avg tabpfn:  {mean_pfn * 1000:.1f} ms/item")
+    print(f"  avg total:   {(mean_enc + mean_pfn) * 1000:.1f} ms/item")
 
-    print(f"\n{'Dataset':>25}  {'N':>5}  {'Dice (native)':>14}")
-    print("-" * 50)
-    all_scores = []
-    for name in sorted(per_ds):
-        scores = [s for s in per_ds[name] if not np.isnan(s)]
-        mean   = float(np.mean(scores)) if scores else float("nan")
-        all_scores.extend(scores)
-        summary[f"dice/dataset/{name}"] = mean
-        print(f"{name:>25}  {len(per_ds[name]):>5}  {mean:>14.4f}")
-    print("-" * 50)
-    valid = [s for s in all_scores if not np.isnan(s)]
-    overall = float(np.mean(valid)) if valid else float("nan")
-    summary["dice/mean"] = overall
-    print(f"{'MEAN':>25}  {len(all_scores):>5}  {overall:>14.4f}")
-
-    for key, scores in per_label.items():
-        valid_cls = [s for s in scores if not np.isnan(s)]
-        if valid_cls:
-            summary[f"dice/class/{key}"] = float(np.mean(valid_cls))
-
-    mean_t = float(np.mean(inference_times)) if inference_times else float("nan")
-    summary["inference_time_mean_s"] = mean_t
-    print(f"\n  avg inference time: {mean_t * 1000:.1f} ms/item")
-
-    summary["samples"] = sample_table
+    summary = log_summary(per_ds, per_label, sample_table, extra={
+        "time/encode_ms": mean_enc * 1000,
+        "time/tabpfn_ms": mean_pfn * 1000,
+        "time/total_ms":  (mean_enc + mean_pfn) * 1000,
+    })
     wandb.log(summary)
     run.finish()
 
