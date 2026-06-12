@@ -1,4 +1,4 @@
-model: ???           # required — overridden per experiment
+model: universeg
 
 data:
   image_size: 128      # loads {dataset}_{image_size}.npz files

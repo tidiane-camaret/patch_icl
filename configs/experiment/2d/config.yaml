@@ -1,5 +1,0 @@
-defaults:
-  - base
-  - _self_
-
-model: universeg       # model name tag for wandb run name
