@@ -389,6 +389,16 @@ def main(cfg: DictConfig):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"ImagePFN: {total_params:,} parameters")
 
+    # Optional warm-start. Accepts a bare state_dict (old format) or the new
+    # {"model": ...} dict; strips the _orig_mod. prefix left by torch.compile.
+    # Load before compile so keys match the raw module.
+    if cfg.train.get("checkpoint", None):
+        raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
+        sd  = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
+        sd  = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        model.load_state_dict(sd)
+        print(f"Loaded weights from {cfg.train.checkpoint}")
+
     if cfg.arch.compile:
         model = torch.compile(model, dynamic=True)
         global _newtonschulz5_batched
@@ -465,9 +475,17 @@ def main(cfg: DictConfig):
             dice = run_eval(model, val_loader, lawa_queue, cfg, epoch)
             if dice > best_dice:
                 best_dice = dice
-                # Save LAWA-averaged weights as best checkpoint
+                # Save LAWA-averaged weights as best checkpoint.
+                # Embed arch + image_size so eval can rebuild the model from the
+                # checkpoint alone (state_dict keys may carry a _orig_mod. prefix
+                # when compiled — eval strips it on load).
                 saved = lawa_average(lawa_queue, model, DEVICE)
-                torch.save(model.state_dict(), ckpt_dir / "best.pt")
+                torch.save({
+                    "model":        model.state_dict(),
+                    "arch":         dict(cfg.arch),
+                    "image_size":   cfg.data.image_size,
+                    "context_size": cfg.data.context_size,
+                }, ckpt_dir / "best.pt")
                 if saved:
                     model.load_state_dict(saved)
                 tqdm.write(f"  [best] dice={best_dice:.4f} → {ckpt_dir}/best.pt")

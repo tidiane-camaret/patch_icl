@@ -30,6 +30,7 @@ train:
   eval_every: 1      # run val eval every N epochs
   workers: 16
   seed: 42
+  checkpoint: null   # path to warm-start weights (bare state_dict or {"model": ...})
 
 eval:
   batch_size: 16

@@ -4,12 +4,14 @@ Unified 2D evaluation script for MedSegBench.
 Dispatches on cfg.model:
   universeg             → full UniverSeg forward (encoder + cross-conv + decoder)
   universeg_featuresim  → UniverSeg encoder features classified by TabPFN
+  pfn_seg_2d            → trained ImagePFN checkpoint (arch read from the .pt)
 
 Usage:
     python experiments/2d/eval.py                                     # universeg
     python experiments/2d/eval.py --config-name feature_sim           # feature_sim
     python experiments/2d/eval.py data.dataset=abdomenus data.context_size=5
     python experiments/2d/eval.py --config-name feature_sim feature.level=-1 feature.output_size=8
+    python experiments/2d/eval.py model=pfn_seg_2d eval.checkpoint=results/2d/pfn_seg/<run>/best.pt
 """
 
 import random
@@ -28,6 +30,14 @@ import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig
 from tqdm import tqdm
+
+# For the pfn_seg backend, patch_icl's `src` package must win over ic_segmentation's
+# shadowing copy (common.py puts the latter on sys.path). Cache patch_icl's src
+# package before common imports from it — mirrors pfn_seg.py. Skipped for the
+# universeg backends, which rely on ic_segmentation's src.models.universeg_baseline.
+if any("pfn_seg" in _a for _a in sys.argv):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import src.datasets.medsegbench  # noqa: F401  (caches patch_icl's src)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_loader, hard_dice, downsample_mask, log_summary
@@ -279,14 +289,25 @@ def main(cfg: DictConfig):
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    loader = build_loader(cfg)
     is_feat_sim = cfg.model == "universeg_featuresim"
+    is_pfn_seg  = cfg.model == "pfn_seg_2d"
 
-    from src.models.universeg_baseline import UniverSegBaseline
+    # pfn_seg: arch + image_size live in the checkpoint. Load it up front and sync
+    # image_size into cfg so the loader serves matching-resolution data.
+    pfn_ckpt = None
+    if is_pfn_seg:
+        from omegaconf import open_dict
+        pfn_ckpt = torch.load(cfg.eval.checkpoint, map_location="cpu")
+        with open_dict(cfg):
+            cfg.data.image_size = pfn_ckpt["image_size"]
+
+    loader = build_loader(cfg)
+
     from torch.utils.flop_counter import FlopCounterMode
 
     # ── model setup ───────────────────────────────────────────────────────────
     if is_feat_sim:
+        from src.models.universeg_baseline import UniverSegBaseline
         print("Loading UniverSeg encoder...")
         wrapper = UniverSegBaseline(pretrained=True, input_size=cfg.data.image_size)
         useg    = wrapper.model.to(DEVICE).eval()
@@ -340,7 +361,57 @@ def main(cfg: DictConfig):
             "flops_encoder": flops,
         }
 
+    elif is_pfn_seg:
+        # pfn_seg_2d lives in patch_icl's src, but common.py puts ic_segmentation
+        # (which has its own shadowing src/) ahead on sys.path, so a plain
+        # `import src.models.pfn_seg_2d` resolves to the wrong package. The module
+        # only depends on torch, so load it directly by file path.
+        import importlib.util
+        _pfn_path = Path(__file__).resolve().parents[2] / "src" / "models" / "pfn_seg_2d.py"
+        _spec = importlib.util.spec_from_file_location("pfn_seg_2d", _pfn_path)
+        _pfn_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_pfn_mod)
+        ImagePFN = _pfn_mod.ImagePFN
+        arch = pfn_ckpt["arch"]
+        print(f"Loading ImagePFN from {cfg.eval.checkpoint} "
+              f"(size={cfg.data.image_size}, P={arch['patch_size']})...")
+        model = ImagePFN(
+            patch_size     = arch["patch_size"],
+            image_size     = pfn_ckpt["image_size"],
+            e              = arch["e"],
+            h              = arch["h"],
+            l              = arch["l"],
+            a              = arch["a"],
+            thinking_rows  = arch["thinking_rows"],
+            residual_decay = arch["residual_decay"],
+        ).to(DEVICE)
+        state = {k.removeprefix("_orig_mod."): v for k, v in pfn_ckpt["model"].items()}
+        model.load_state_dict(state)
+        model.eval()
+
+        _n = cfg.data.context_size
+        _imgs = torch.zeros(1, _n + 1, 1, cfg.data.image_size, cfg.data.image_size, device=DEVICE)
+        _msks = torch.zeros_like(_imgs)
+        with FlopCounterMode(display=False) as _fc:
+            with torch.no_grad():
+                model(_imgs, _msks, sep=_n)
+        flops = _fc.get_total_flops()
+        del _imgs, _msks
+        print(f"FLOPs (K={cfg.data.context_size}, {cfg.data.image_size}²): {flops/1e9:.2f} GFLOPs")
+
+        run_name = cfg.wandb.name or f"{cfg.model}_s{cfg.data.image_size}_k{cfg.data.context_size}"
+        run_cfg  = {
+            "model":        cfg.model,
+            "image_size":   cfg.data.image_size,
+            "context_size": cfg.data.context_size,
+            "split":        cfg.data.split,
+            "checkpoint":   str(cfg.eval.checkpoint),
+            "arch":         dict(arch),
+            "flops":        flops,
+        }
+
     else:
+        from src.models.universeg_baseline import UniverSegBaseline
         print(f"Loading UniverSeg (size={cfg.data.image_size})...")
         model = UniverSegBaseline(pretrained=True, input_size=cfg.data.image_size).to(DEVICE).eval()
 
@@ -430,6 +501,28 @@ def main(cfg: DictConfig):
                     ])
                 tabpfn_times.append((time.perf_counter() - t1) / B)
 
+            elif is_pfn_seg:
+                # Stack context + query: (B, K+1, 1, H, W); query mask is zeros
+                # (model fills it with the context-mask mean internally).
+                all_images = torch.cat([context_in, images.unsqueeze(1)], dim=1)
+                all_masks  = torch.cat([
+                    context_out.to(DEVICE, non_blocking=True),
+                    torch.zeros_like(images.unsqueeze(1)),
+                ], dim=1)
+
+                t0 = time.perf_counter()
+                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
+                                    enabled=DEVICE.type == "cuda"):
+                    logits = model(all_images, all_masks, sep=K)   # (B, Hp, Hp)
+                Hp = logits.shape[-1]
+                preds_lowres = torch.sigmoid(logits.float()).cpu()  # (B, Hp, Hp)
+                if Hp != H:
+                    preds = F.interpolate(preds_lowres.unsqueeze(1), size=(H, W),
+                                          mode="bilinear", align_corners=False).squeeze(1)
+                else:
+                    preds = preds_lowres                            # (B, H, W)
+                inference_times.append((time.perf_counter() - t0) / B)
+
             else:
                 t0 = time.perf_counter()
                 with torch.autocast(device_type=DEVICE.type, enabled=DEVICE.type == "cuda"):
@@ -469,6 +562,9 @@ def main(cfg: DictConfig):
                                         f"  dice_native={d_native:.3f}"),
                         )
                         wandb.log({f"figures/{ds_name}/label_{label_value}": wandb.Image(str(fig_path))})
+                elif is_pfn_seg:
+                    d_native = hard_dice(preds[b], label)
+                    d_ds     = hard_dice(preds_lowres[b], downsample_mask(label, Hp))
                 else:
                     d_ds = d_native = hard_dice(preds[b, 0], label)
 

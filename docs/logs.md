@@ -1,5 +1,38 @@
 # Change log
 
+## 2026-06-12 — pfn_seg_2d eval backend: fixes, config consolidation, warm-start, comparison
+
+`experiments/2d/eval.py`, `experiments/2d/pfn_seg.py`, `configs/experiment/2d/base.yaml`,
+`configs/experiment/2d/pfn_seg.yaml`. Deleted `configs/experiment/2d/pfn_seg_eval.yaml`.
+
+Finished and validated the `pfn_seg_2d` eval backend added on 2026-06-11.
+
+**`src` package-shadowing fixes** — `common.py` puts `/home/dpxuser/ic_segmentation` on
+`sys.path`, whose `src` package shadows patch_icl's. Both are regular packages, so only
+one wins per process. Two failures resolved (pfn_seg runs only):
+- `ModuleNotFoundError: src.datasets` — `common`'s `from src.datasets.medsegbench` import
+  resolved to ic_segmentation (no `datasets`). Fix: when `"pfn_seg"` is in `sys.argv`,
+  pre-import patch_icl's `src.datasets.medsegbench` before `common`, caching the right `src`.
+- `ModuleNotFoundError: src.models.pfn_seg_2d` — ic_segmentation's `src.models` lacks it.
+  Fix: load `pfn_seg_2d.py` directly by file path via `importlib.util` (torch-only deps).
+- Both guards key off `"pfn_seg"` in argv, so universeg / feature_sim runs are untouched.
+
+**Config consolidation** — deleted the 3-line `pfn_seg_eval.yaml`; eval now reads
+`base.yaml` with overrides. Added `eval.checkpoint: null` to `base.yaml` (Hydra rejects
+undeclared CLI keys). New invocation:
+```bash
+python experiments/2d/eval.py model=pfn_seg_2d eval.checkpoint=results/2d/<run>.pt
+```
+
+**Warm-start / resume** — `pfn_seg.py` gains `train.checkpoint`: loads weights (bare
+state_dict or `{"model": ...}`, strips `_orig_mod.`) into a fresh model before training.
+Used to resume the pre-format-change `results/2d/best.pt` for one epoch (54 741 samples,
+val Dice 0.4348), resaved in the new format as `results/2d/pfn_seg_resumed.pt`.
+
+**Validation** — full val eval of `pfn_seg_resumed.pt`: mean Dice 0.4393 over 1141 samples
+(matches trainer within sampling noise), 68.20 GFLOPs, ~3.6 ms/item. See `results/report.md`
+for the pfn_seg_2d vs UniverSeg comparison (mean Dice 0.524 vs 0.334 over 35 datasets).
+
 ## 2026-06-11 — pfn_seg: augmentations, compile flag, progress bars
 
 `experiments/2d/pfn_seg.py`, `src/models/pfn_seg_2d.py`, `configs/experiment/2d/pfn_seg.yaml`, `configs/augmentations/medsegbench.yaml` (new), `experiments/2d/plot_aug.py` (new).
@@ -584,3 +617,24 @@ python scripts/train.py \
   model.stunet_pretrained=/path/to/stunet_base.model \
   data.image_size=[128,128,128]
 ```
+
+## ImagePFN checkpoint eval in experiments/2d/eval.py
+
+Added a third backend (`cfg.model=pfn_seg_2d`) to the unified 2D eval script so a
+trained `ImagePFN` checkpoint can be evaluated alongside `universeg` and
+`universeg_featuresim`.
+
+- `pfn_seg.py` now saves `{model, arch, image_size, context_size}` (was a bare
+  `state_dict`) so eval rebuilds the model from the checkpoint alone — no arch
+  config to keep in sync. `_orig_mod.` prefix (torch.compile) is stripped on load.
+- `eval.py` loads the checkpoint up front, syncs `data.image_size` into cfg before
+  building the loader, reconstructs `ImagePFN`, and runs the same recipe as the
+  trainer's `run_eval`: bf16 forward → sigmoid → bilinear upsample to native →
+  `hard_dice` (native = headline `d_native`, low-res = `d_ds`). Timing reuses the
+  shared `inference_times` path.
+- Invoked via `base.yaml` + overrides: `model=pfn_seg_2d eval.checkpoint=<path>`.
+  (A short-lived `pfn_seg_eval.yaml` was added here then removed on 2026-06-12 — see
+  the config-consolidation entry above.)
+
+Note: existing pfn_seg checkpoints saved before this change lack the arch dict and
+must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 2026-06-12).

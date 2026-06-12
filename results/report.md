@@ -1,6 +1,6 @@
 # patch_icl — Results Summary
 
-*Last updated: 2026-06-11 (2D MedSegBench: feature_sim vs UniverSeg baseline)*
+*Last updated: 2026-06-12 (2D MedSegBench: pfn_seg_2d vs UniverSeg baseline)*
 
 ---
 
@@ -142,6 +142,72 @@ Source: `results/benchmarks/eval/eval_20260524_*.json` — TotalSegmentator test
 | pancreas | 0.224 | 0.037 |
 | adrenal_gland_left | 0.009 | 0.005 |
 | common_carotid_artery_left | 0.014 | 0.008 |
+
+---
+
+## 2D MedSegBench: ImagePFN (pfn_seg_2d) vs UniverSeg baseline
+
+Runs: `wandb/run-20260612_112405-m7h3y374` (pfn_seg_2d), `wandb/run-20260612_112538-h6nwbvyd` (universeg).
+Scripts: `experiments/2d/pfn_seg.py`, `experiments/2d/eval.py`.
+Setup: MedSegBench **val** split, 13 237 samples, 35 datasets, **K=3**, image_size=128.
+Checkpoint: `results/2d/pfn_seg_resumed.pt` — the pre-format-change `best.pt` warm-started for **1 epoch** (substantial training headroom remains).
+
+### Summary
+
+| Model | dice/mean | Inference | FLOPs/sample | Datasets won |
+|-------|-----------|-----------|--------------|--------------|
+| UniverSeg (full model) | 0.334 | 1.78 ms | 34.3 GFLOPs | 9 / 35 |
+| **ImagePFN (pfn_seg_2d)** | **0.524** | 3.59 ms | 68.2 GFLOPs | **26 / 35** |
+
+ImagePFN is **+0.190 mean Dice** at ~2× the FLOPs and latency, and is the stronger generalist (wins 26/35 datasets).
+
+### Per-dataset comparison (selected)
+
+**ImagePFN wins (Δ > +0.30)** — larger, contiguous structures (endoscopy, dermoscopy, radiology, ultrasound)
+
+| Dataset | pfn_seg | universeg | Δ (pfn) |
+|---------|---------|-----------|---------|
+| yeaz | **0.873** | 0.428 | +0.445 |
+| busi | **0.649** | 0.208 | +0.441 |
+| mosmedplus | **0.505** | 0.085 | +0.420 |
+| ultrasoundnerve | **0.718** | 0.321 | +0.398 |
+| polypgen | **0.525** | 0.150 | +0.375 |
+| promise12 | **0.831** | 0.474 | +0.356 |
+| kvasir | **0.661** | 0.309 | +0.352 |
+| isic2016 | **0.933** | 0.607 | +0.326 |
+| nuset | **0.651** | 0.333 | +0.318 |
+| fhpsaop | **0.832** | 0.517 | +0.315 |
+| robotool | **0.534** | 0.224 | +0.310 |
+
+**UniverSeg wins** — thin / small / dense structures (vessels, microscopy nuclei)
+
+| Dataset | pfn_seg | universeg | Δ (useg) |
+|---------|---------|-----------|----------|
+| bbbc010 | 0.091 | **0.611** | +0.520 |
+| chuac | 0.112 | **0.428** | +0.316 |
+| chasedb1 | 0.000 | **0.271** | +0.271 |
+| tnbcnuclei | 0.181 | **0.309** | +0.128 |
+| drive | 0.004 | **0.112** | +0.107 |
+| deepbacs | 0.000 | **0.089** | +0.089 |
+| monusac | 0.107 | **0.158** | +0.051 |
+| nuclei | 0.000 | **0.037** | +0.037 |
+| dca1 | 0.349 | **0.378** | +0.029 |
+
+### Interpretation
+
+ImagePFN dominates on medium/large contiguous objects but collapses (often to ~0 Dice)
+on **thin or sparse structures** — retinal vessels (`chasedb1`, `drive`) and microscopy
+nuclei (`bbbc010`, `deepbacs`, `nuclei`). The likely cause is the `patch_size=8` decoder:
+predictions are made at 16×16 (128/8) then bilinearly upsampled, so 1–2 px vessels and
+small nuclei are blurred away, whereas UniverSeg's full-resolution CNN preserves them.
+
+### Suggested next experiments
+
+| Change | Expected effect |
+|--------|----------------|
+| `arch.patch_size=4` | Most impactful — 32×32 prediction grid; should recover the thin-structure failures |
+| Full training (vs 1-epoch warm-start) | Large headroom; current 0.524 is from a single resumed epoch |
+| Heavier aug on vessel/microscopy datasets | Targets the specific loss modes above |
 
 ---
 
