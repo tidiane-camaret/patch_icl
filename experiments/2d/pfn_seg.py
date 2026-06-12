@@ -42,7 +42,7 @@ from src.datasets.medsegbench import MedSegBenchDataset
 from src.models.pfn_seg_2d import ImagePFN
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, log_summary
+from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, soft_dice, log_summary
 
 
 # ── Muon optimizer ────────────────────────────────────────────────────────────
@@ -294,7 +294,8 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
 
     per_ds:       dict[str, list[float]] = defaultdict(list)
     per_label:    dict[str, list[float]] = defaultdict(list)
-    per_ds_lowres: dict[str, list[float]] = defaultdict(list)
+    per_ds_ds:      dict[str, list[float]] = defaultdict(list)  # low-res hard dice
+    per_ds_ds_soft: dict[str, list[float]] = defaultdict(list)  # low-res soft (shape) dice
     sample_rows = []
     H = cfg.data.image_size
     running_dice, nd = 0.0, 0
@@ -330,8 +331,13 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
             if not np.isnan(d):
                 running_dice += d
                 nd += 1
-            gt_lowres = downsample_mask(gt, Hp)
-            per_ds_lowres[ds_name].append(hard_dice(preds_lowres[b], gt_lowres))
+            # Binarize the avg-pooled GT at >= 0.5 (majority vote) so the low-res
+            # target isn't OR-dilated by partially-covered boundary cells — makes
+            # this comparable to the native-res metric.
+            gt_lowres = (downsample_mask(gt, Hp) >= 0.5).float()
+            per_ds_ds[ds_name].append(hard_dice(preds_lowres[b], gt_lowres))
+            # soft (shape) dice: continuous low-res pred vs soft (un-binarized) GT
+            per_ds_ds_soft[ds_name].append(soft_dice(preds_lowres[b], downsample_mask(gt, Hp)))
         pbar.set_postfix(dice=f"{running_dice / max(nd, 1):.4f}")
 
     if saved is not None:
@@ -346,15 +352,23 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
         sc = [s for s in per_ds[name] if not np.isnan(s)]
         tqdm.write(f"    {name:>25}  {float(np.mean(sc)) if sc else float('nan'):.4f}")
 
-    valid_lowres = [s for scores in per_ds_lowres.values() for s in scores if not np.isnan(s)]
-    mean_dice_lowres = float(np.mean(valid_lowres)) if valid_lowres else float("nan")
+    valid_ds = [s for scores in per_ds_ds.values() for s in scores if not np.isnan(s)]
+    mean_dice_ds = float(np.mean(valid_ds)) if valid_ds else float("nan")
 
-    wandb.log({"epoch": epoch, "dice/mean": mean_dice,
-               **{f"dice/{k}": float(np.mean([s for s in v if not np.isnan(s)]))
-                  for k, v in per_ds.items() if v},
-               "dice_lowres/mean": mean_dice_lowres,
-               **{f"dice_lowres/{k}": float(np.mean([s for s in v if not np.isnan(s)]))
-                  for k, v in per_ds_lowres.items() if v}})
+    valid_ds_soft = [s for scores in per_ds_ds_soft.values() for s in scores if not np.isnan(s)]
+    mean_dice_ds_soft = float(np.mean(valid_ds_soft)) if valid_ds_soft else float("nan")
+
+    # Metric naming mirrors experiments/2d/eval.py: <prefix>/mean and
+    # <prefix>/dataset/<name> for dice (native), dice_ds (low-res hard),
+    # dice_ds_soft (low-res soft/shape).
+    _dsmean = lambda v: float(np.mean([s for s in v if not np.isnan(s)]))
+    wandb.log({"epoch": epoch,
+               "dice/mean": mean_dice,
+               **{f"dice/dataset/{k}": _dsmean(v) for k, v in per_ds.items() if v},
+               "dice_ds/mean": mean_dice_ds,
+               **{f"dice_ds/dataset/{k}": _dsmean(v) for k, v in per_ds_ds.items() if v},
+               "dice_ds_soft/mean": mean_dice_ds_soft,
+               **{f"dice_ds_soft/dataset/{k}": _dsmean(v) for k, v in per_ds_ds_soft.items() if v}})
     return mean_dice
 
 

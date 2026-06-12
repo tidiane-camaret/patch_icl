@@ -40,7 +40,7 @@ if any("pfn_seg" in _a for _a in sys.argv):
     import src.datasets.medsegbench  # noqa: F401  (caches patch_icl's src)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEVICE, build_loader, hard_dice, downsample_mask, log_summary
+from common import DEVICE, build_loader, hard_dice, soft_dice, downsample_mask, log_summary
 
 
 # ── UniverSeg encoder (feature_sim backend) ───────────────────────────────────
@@ -437,13 +437,18 @@ def main(cfg: DictConfig):
     # ── wandb ─────────────────────────────────────────────────────────────────
     run = wandb.init(project=cfg.wandb.project, name=run_name, config=run_cfg)
     wandb.log({"flops_giga": flops / 1e9})
-    sample_table = wandb.Table(columns=["dataset", "sample_idx", "label", "dice_ds", "dice_native"])
+    sample_table = wandb.Table(columns=["dataset", "sample_idx", "label",
+                                         "dice_ds", "dice_native", "dice_ds_soft"])
     out_dir = Path(cfg.eval.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── eval loop ─────────────────────────────────────────────────────────────
     per_ds:    dict[str, list[float]] = defaultdict(list)
     per_label: dict[str, list[float]] = defaultdict(list)
+    per_ds_ds:    dict[str, list[float]] = defaultdict(list)  # downsampled (low-res) hard dice
+    per_label_ds: dict[str, list[float]] = defaultdict(list)
+    per_ds_ds_soft:    dict[str, list[float]] = defaultdict(list)  # low-res soft (shape) dice
+    per_label_ds_soft: dict[str, list[float]] = defaultdict(list)
     encode_times:    list[float] = []
     tabpfn_times:    list[float] = []
     inference_times: list[float] = []
@@ -541,6 +546,8 @@ def main(cfg: DictConfig):
                     pred_ds  = preds_all[b]
                     d_ds     = hard_dice(pred_ds, downsample_mask(label, os_))
                     d_native = dice_at_native(pred_ds, label, cfg.data.image_size)
+                    # shape: continuous low-res pred vs soft (avg-pooled, un-binarized) GT
+                    d_ds_soft = soft_dice(pred_ds, downsample_mask(label, os_))
 
                     fig_key = (ds_name, label_value)
                     if fig_key not in saved_figures:
@@ -564,13 +571,23 @@ def main(cfg: DictConfig):
                         wandb.log({f"figures/{ds_name}/label_{label_value}": wandb.Image(str(fig_path))})
                 elif is_pfn_seg:
                     d_native = hard_dice(preds[b], label)
-                    d_ds     = hard_dice(preds_lowres[b], downsample_mask(label, Hp))
+                    # Binarize the avg-pooled GT at >= 0.5 (majority vote) so the
+                    # low-res target isn't OR-dilated by partially-covered cells.
+                    d_ds     = hard_dice(preds_lowres[b], (downsample_mask(label, Hp) >= 0.5).float())
+                    # shape: continuous low-res sigmoid map vs soft (un-binarized) GT
+                    d_ds_soft = soft_dice(preds_lowres[b], downsample_mask(label, Hp))
                 else:
                     d_ds = d_native = hard_dice(preds[b, 0], label)
+                    # universeg has no low-res map; binary preds → equals hard dice
+                    d_ds_soft = soft_dice(preds[b, 0], label)
 
                 per_ds[ds_name].append(d_native)
                 per_label[f"{ds_name}/label_{label_value}"].append(d_native)
-                sample_table.add_data(ds_name, sample_idx, label_value, d_ds, d_native)
+                per_ds_ds[ds_name].append(d_ds)
+                per_label_ds[f"{ds_name}/label_{label_value}"].append(d_ds)
+                per_ds_ds_soft[ds_name].append(d_ds_soft)
+                per_label_ds_soft[f"{ds_name}/label_{label_value}"].append(d_ds_soft)
+                sample_table.add_data(ds_name, sample_idx, label_value, d_ds, d_native, d_ds_soft)
 
     # ── aggregate & log ───────────────────────────────────────────────────────
     if is_feat_sim:
@@ -593,6 +610,10 @@ def main(cfg: DictConfig):
         }
 
     summary = log_summary(per_ds, per_label, sample_table, extra=extra)
+    summary.update(log_summary(per_ds_ds, per_label_ds,
+                               prefix="dice_ds", metric_label="downsampled"))
+    summary.update(log_summary(per_ds_ds_soft, per_label_ds_soft,
+                               prefix="dice_ds_soft", metric_label="low-res soft/shape"))
     wandb.log(summary)
     run.finish()
 

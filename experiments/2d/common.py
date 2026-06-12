@@ -96,6 +96,20 @@ def hard_dice(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> f
     return float(num / den) if den > 1e-6 else float("nan")
 
 
+def soft_dice(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """Continuous (threshold-free) Dice: 2·Σ(p·g) / (Σp + Σg).
+
+    Both inputs are soft maps in [0, 1] (a probability map and an avg-pooled GT).
+    Measures whether the predicted mass lands where the GT mass is — a "shape"
+    score that ignores hard thresholds (but still reflects magnitude/calibration).
+    Returns NaN when both maps are empty.
+    """
+    p = pred.float()
+    g = gt.float()
+    den = p.sum() + g.sum()
+    return float(2 * (p * g).sum() / den) if den > 1e-6 else float("nan")
+
+
 def downsample_mask(mask: torch.Tensor, output_size: int, mode: str = "avg") -> torch.Tensor:
     """mask: (H, W) → (H', W') using avg or max pool."""
     x = mask.float().unsqueeze(0).unsqueeze(0)
@@ -110,33 +124,40 @@ def downsample_mask(mask: torch.Tensor, output_size: int, mode: str = "avg") -> 
 def log_summary(
     per_ds: dict,
     per_label: dict,
-    sample_table,
+    sample_table=None,
     extra: dict | None = None,
+    prefix: str = "dice",
+    metric_label: str = "native",
 ) -> dict:
-    """Aggregate NaN-filtered Dice scores, print table, return wandb summary dict."""
+    """Aggregate NaN-filtered Dice scores, print table, return wandb summary dict.
+
+    Keys are emitted under `prefix` (e.g. "dice" → dice/mean, dice/dataset/*,
+    dice/class/*), so the same routine can log both native and downsampled metrics.
+    """
     summary = {}
 
-    print(f"\n{'Dataset':>25}  {'N':>5}  {'Dice (native)':>14}")
+    print(f"\n{'Dataset':>25}  {'N':>5}  {f'Dice ({metric_label})':>14}")
     print("-" * 50)
     all_scores = []
     for name in sorted(per_ds):
         scores = [s for s in per_ds[name] if not np.isnan(s)]
         mean   = float(np.mean(scores)) if scores else float("nan")
         all_scores.extend(scores)
-        summary[f"dice/dataset/{name}"] = mean
+        summary[f"{prefix}/dataset/{name}"] = mean
         print(f"{name:>25}  {len(per_ds[name]):>5}  {mean:>14.4f}")
     print("-" * 50)
     valid   = [s for s in all_scores if not np.isnan(s)]
     overall = float(np.mean(valid)) if valid else float("nan")
-    summary["dice/mean"] = overall
+    summary[f"{prefix}/mean"] = overall
     print(f"{'MEAN':>25}  {len(all_scores):>5}  {overall:>14.4f}")
 
     for key, scores in per_label.items():
         valid_cls = [s for s in scores if not np.isnan(s)]
         if valid_cls:
-            summary[f"dice/class/{key}"] = float(np.mean(valid_cls))
+            summary[f"{prefix}/class/{key}"] = float(np.mean(valid_cls))
 
     if extra:
         summary.update(extra)
-    summary["samples"] = sample_table
+    if sample_table is not None:
+        summary["samples"] = sample_table
     return summary
