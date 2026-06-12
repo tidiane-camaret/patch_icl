@@ -75,10 +75,10 @@ def encode_images(
     feats = []
     for i, block in enumerate(useg.enc_blocks):
         target, dummy_s = block(target, dummy_s)
-        feats.append(target.squeeze(1))  # (B, C, H', W')
+        feats.append(target[:, 0])  # (B, C, H', W')
         if i < len(useg.enc_blocks) - 1:
-            target  = F.max_pool2d(target .squeeze(1), 2).unsqueeze(1)
-            dummy_s = F.max_pool2d(dummy_s.squeeze(1), 2).unsqueeze(1)
+            target  = F.max_pool2d(target[:, 0], 2).unsqueeze(1)
+            dummy_s = F.max_pool2d(dummy_s[:, 0], 2).unsqueeze(1)
 
     return feats  # index 0 = highest res, -1 = bottleneck
 
@@ -201,32 +201,33 @@ def batch_tabpfn(
     X_ctx = (X_ctx - mu) / sig
     X_tgt = (X_tgt - mu) / sig
 
-    # Identify samples with degenerate labels; will fill after
+    # Identify degenerate samples (all-bg or all-fg); fill constants immediately
     label_sums = y_ctx.sum(dim=1)                          # (B,)
     degenerate = (label_sums == 0) | (label_sums == K * N)
+    nd_idx = (~degenerate).nonzero(as_tuple=True)[0]       # non-degenerate indices
 
-    # Build (N_ctx + N_tgt, B, C) and (N_ctx, B) for model
-    X_all = torch.cat([X_ctx, X_tgt], dim=1).permute(1, 0, 2).to(dev)  # (N_ctx+N_tgt, B, C)
-    Y_all = y_ctx.permute(1, 0).to(dev)                                  # (N_ctx, B)
+    preds = torch.zeros(B, H, W)
+    for b in degenerate.nonzero(as_tuple=True)[0]:
+        preds[b] = float(y_ctx[b].mean())
 
-    # n_estimators calls with different column permutations → average probabilities
-    proba_sum = None
-    with torch.inference_mode():
-        for _ in range(n_estimators):
-            perm = torch.randperm(C, device=dev)
-            out = model(X_all[:, :, perm], Y_all, only_return_standard_out=True)
-            # out: (N_tgt, B, 160) — only test rows, first n_classes cols matter
-            logits = out[-N:, :, :n_classes]
-            p = torch.softmax(logits, dim=-1)
-            proba_sum = p if proba_sum is None else proba_sum + p
+    if len(nd_idx) > 0:
+        # Build (N_ctx + N_tgt, B_nd, C) for non-degenerate samples only
+        X_all = torch.cat([X_ctx[nd_idx], X_tgt[nd_idx]], dim=1).permute(1, 0, 2).to(dev)
+        Y_all = y_ctx[nd_idx].permute(1, 0).to(dev)
 
-    proba = proba_sum / n_estimators                           # (N, B, 2)
-    preds = proba[..., 1].permute(1, 0).reshape(B, H, W)      # (B, H, W)
+        # n_estimators calls with different column permutations → average probabilities
+        proba_sum = None
+        with torch.inference_mode():
+            for _ in range(n_estimators):
+                perm = torch.randperm(C, device=dev)
+                out = model(X_all[:, :, perm], Y_all, only_return_standard_out=True)
+                # out: (N_tgt, B_nd, 160) — only test rows, first n_classes cols matter
+                logits = out[-N:, :, :n_classes]
+                p = torch.softmax(logits, dim=-1)
+                proba_sum = p if proba_sum is None else proba_sum + p
 
-    # Overwrite degenerate samples with their context positive rate
-    for b in range(B):
-        if degenerate[b]:
-            preds[b] = float(y_ctx[b].mean())
+        proba = proba_sum / n_estimators                                    # (N, B_nd, 2)
+        preds[nd_idx] = proba[..., 1].permute(1, 0).reshape(len(nd_idx), H, W).cpu()
 
     return preds.cpu()
 

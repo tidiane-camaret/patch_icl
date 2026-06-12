@@ -2,7 +2,7 @@ model: ???           # required — overridden per experiment
 
 data:
   image_size: 128      # loads {dataset}_{image_size}.npz files
-  context_size: 1
+  context_size: 3
   split: val
   dataset: null        # null = all datasets; or e.g. abdomenus
 
