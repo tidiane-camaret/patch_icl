@@ -453,6 +453,9 @@ def main(cfg: DictConfig):
     tabpfn_times:    list[float] = []
     inference_times: list[float] = []
     saved_figures:   set[tuple[str, int]] = set()
+    # per-patch error analysis (pfn_seg only, opt-in via eval.patch_csv)
+    patch_csv = cfg.eval.get("patch_csv", None) if is_pfn_seg else None
+    patch_rows: list[tuple] | None = [] if patch_csv else None
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="eval"):
@@ -576,6 +579,23 @@ def main(cfg: DictConfig):
                     d_ds     = hard_dice(preds_lowres[b], (downsample_mask(label, Hp) >= 0.5).float())
                     # shape: continuous low-res sigmoid map vs soft (un-binarized) GT
                     d_ds_soft = soft_dice(preds_lowres[b], downsample_mask(label, Hp))
+
+                    if patch_rows is not None:
+                        # one row per low-res patch: pred, soft GT, signed error,
+                        # plus per-sample gt_size and mean target↔context Dice.
+                        pred_p = preds_lowres[b].numpy()                  # (Hp, Hp) sigmoid
+                        gt_p   = downsample_mask(label, Hp).numpy()       # (Hp, Hp) soft frac
+                        err_p  = pred_p - gt_p
+                        gt_size = float((label > 0).sum())                # native fg pixels
+                        ctx_d = [hard_dice(label, context_out[b, k, 0]) for k in range(K)]
+                        ctx_dice = float(np.nanmean(ctx_d)) if ctx_d else float("nan")
+                        for i in range(Hp):
+                            for j in range(Hp):
+                                patch_rows.append((
+                                    ds_name, label_value, sample_idx, i, j,
+                                    float(pred_p[i, j]), float(gt_p[i, j]),
+                                    float(err_p[i, j]), gt_size, ctx_dice,
+                                ))
                 else:
                     d_ds = d_native = hard_dice(preds[b, 0], label)
                     # universeg has no low-res map; binary preds → equals hard dice
@@ -615,6 +635,18 @@ def main(cfg: DictConfig):
     summary.update(log_summary(per_ds_ds_soft, per_label_ds_soft,
                                prefix="dice_ds_soft", metric_label="low-res soft/shape"))
     wandb.log(summary)
+
+    if patch_rows is not None:
+        import csv
+        csv_path = Path(patch_csv)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["dataset", "label_value", "sample_idx", "patch_i", "patch_j",
+                        "pred", "gt", "error", "gt_size", "ctx_dice"])
+            w.writerows(patch_rows)
+        print(f"Wrote {len(patch_rows)} patch records to {csv_path}")
+
     run.finish()
 
 

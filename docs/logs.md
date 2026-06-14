@@ -638,3 +638,14 @@ trained `ImagePFN` checkpoint can be evaluated alongside `universeg` and
 
 Note: existing pfn_seg checkpoints saved before this change lack the arch dict and
 must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 2026-06-12).
+
+## 2026-06-14 — pfn_seg eval: per-patch error analysis CSV
+
+- Added opt-in `eval.patch_csv` (base.yaml, null = off). When set, the `pfn_seg_2d`
+  eval path dumps one CSV row per low-res patch (the `Hp×Hp` grid,
+  `Hp = image_size // patch_size`): `dataset, label_value, sample_idx, patch_i,
+  patch_j, pred` (sigmoid), `gt` (avg-pool soft fraction), `error` (pred−gt, signed),
+  `gt_size` (native fg pixel count), `ctx_dice` (mean native `hard_dice` of target
+  GT vs each of the K context masks). Last two are per-sample, replicated per row.
+- Zero cost unless `eval.patch_csv` is set; collection reuses tensors already in
+  scope and writes once at end via stdlib `csv` (no new deps).

@@ -13,6 +13,7 @@ eval:
   out_dir: results/2d/outputs
   max_per_label: null #20  # max samples per (dataset, label_value); null = all
   checkpoint: null   # pfn_seg_2d only: path to a trained best.pt (arch read from it)
+  patch_csv: null    # pfn_seg_2d only: path to dump per-patch error analysis CSV; null = off
 
 wandb:
   project: patch_icl_2d_exps
