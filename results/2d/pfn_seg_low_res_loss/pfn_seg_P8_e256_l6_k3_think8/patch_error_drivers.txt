@@ -1,0 +1,126 @@
+patch error-driver analysis  |  results/2d/pfn_seg_low_res_loss/pfn_seg_P8_e256_l6_k3_think8/patch_analysis.csv
+3,388,672 patches
+
+── error budget by patch type (gt<.05 / >.95 / between) ──
+      bg(0): mean|err|=0.0048  count=  2769033 (81.7%)  error-mass=15.5%
+   boundary: mean|err|=0.1471  count=   421777 (12.4%)  error-mass=72.0%
+      fg(1): mean|err|=0.0542  count=   197862 ( 5.8%)  error-mass=12.4%
+
+── mean |error| vs each factor (binned) ──
+              gt | mean|err|  count
+   (-0.001, 0.1] | 0.0058    2814474
+      (0.1, 0.2] | 0.0921      69087
+      (0.2, 0.3] | 0.1307      69772
+      (0.3, 0.4] | 0.1799      55180
+      (0.4, 0.5] | 0.2004      50172
+      (0.5, 0.6] | 0.2053      32924
+      (0.6, 0.7] | 0.2073      29605
+      (0.7, 0.8] | 0.1858      30483
+      (0.8, 0.9] | 0.1450      25977
+      (0.9, 1.0] | 0.0575     210998
+            pred | mean|err|  count
+   (-0.001, 0.1] | 0.0100    2875544
+      (0.1, 0.2] | 0.1085      52952
+      (0.2, 0.3] | 0.1012      35396
+      (0.3, 0.4] | 0.1092      26284
+      (0.4, 0.5] | 0.1330      23285
+      (0.5, 0.6] | 0.1669      28742
+      (0.6, 0.7] | 0.2043      30495
+      (0.7, 0.8] | 0.2293      30075
+      (0.8, 0.9] | 0.2284      38137
+      (0.9, 1.0] | 0.0626     247762
+    boundaryness | mean|err|  count
+   (-0.001, 0.1] | 0.0072    2904785
+      (0.1, 0.2] | 0.0498      62110
+      (0.2, 0.3] | 0.0685      40590
+      (0.3, 0.4] | 0.0853      33235
+      (0.4, 0.5] | 0.1016      36281
+      (0.5, 0.6] | 0.1134      28947
+      (0.6, 0.7] | 0.1269      42327
+      (0.7, 0.8] | 0.1482      45317
+      (0.8, 0.9] | 0.1727      54532
+      (0.9, 1.0] | 0.1989     140548
+     pred_uncert | mean|err|  count
+   (-0.001, 0.1] | 0.0086    2979249
+      (0.1, 0.2] | 0.1178      70077
+      (0.2, 0.3] | 0.1380      50104
+      (0.3, 0.4] | 0.1513      37663
+      (0.4, 0.5] | 0.1585      34512
+      (0.5, 0.6] | 0.1601      31178
+      (0.6, 0.7] | 0.1606      30029
+      (0.7, 0.8] | 0.1601      32433
+      (0.8, 0.9] | 0.1602      38965
+      (0.9, 1.0] | 0.1550      84462
+      gt_size(q) | mean|err|  count
+  (0.692, 2.565] | 0.0019     451072
+  (2.565, 3.434] | 0.0025     396288
+  (3.434, 6.043] | 0.0114     423424
+  (6.043, 7.088] | 0.0275     423936
+  (7.088, 7.638] | 0.0390     423936
+  (7.638, 8.025] | 0.0422     422912
+  (8.025, 8.333] | 0.0350     423936
+  (8.333, 9.688] | 0.0440     423168
+     ctx_dice(q) | mean|err|  count
+  (-0.001, 0.00753] | 0.0085     847360
+  (0.00753, 0.0714] | 0.0214     423424
+  (0.0714, 0.15] | 0.0482     423680
+   (0.15, 0.312] | 0.0458     423680
+  (0.312, 0.505] | 0.0321     423424
+  (0.505, 0.646] | 0.0216     423680
+  (0.646, 0.999] | 0.0174     423424
+
+── Spearman ρ(|error|, factor)  [+ = factor raises error] ──
+    boundaryness: +0.627
+     pred_uncert: +0.988
+              gt: +0.590
+            pred: +0.922
+         gt_size: +0.139
+     log_gt_size: +0.139
+        ctx_dice: -0.087
+
+── mean |error| by modality (sorted hardest first) ──
+   microscopy: mean|err|=0.0550  n=   564224  err-mass=36.0%
+   dermoscopy: mean|err|=0.0415  n=    53504  err-mass= 2.6%
+         xray: mean|err|=0.0261  n=   667392  err-mass=20.2%
+    endoscopy: mean|err|=0.0177  n=  1516544  err-mass=31.2%
+   ultrasound: mean|err|=0.0165  n=   446720  err-mass= 8.5%
+       fundus: mean|err|=0.0139  n=     7168  err-mass= 0.1%
+          mri: mean|err|=0.0101  n=    37632  err-mass= 0.4%
+           ct: mean|err|=0.0090  n=    69632  err-mass= 0.7%
+          oct: mean|err|=0.0049  n=    25856  err-mass= 0.1%
+
+── 10 hardest datasets by mean |error| ──
+              robotool: mean|err|=0.1078  n=   12800
+            tnbcnuclei: mean|err|=0.1013  n=    1280
+                kvasir: mean|err|=0.0932  n=   25600
+              brifiseg: mean|err|=0.0856  n=   35328
+               monusac: mean|err|=0.0785  n=    8960
+              chasedb1: mean|err|=0.0651  n=     512
+              isic2018: mean|err|=0.0627  n=   25600
+                 drive: mean|err|=0.0598  n=     512
+            cellnuclei: mean|err|=0.0572  n=   17152
+        dynamicnuclear: mean|err|=0.0565  n=  362752
+
+── HistGBR predicting |error|  [OBSERVABLE-only (no GT, what a refiner sees)]  test R²=0.334 ──
+     pred_uncert: 0.58342
+        modality: 0.08190
+            pred: 0.07212
+         patch_j: 0.00733
+         patch_i: 0.00410
+
+── HistGBR predicting |error|  [INTRINSIC difficulty (oracle, excludes pred)]  test R²=0.461 ──
+              gt: 1.76972
+        ctx_dice: 1.47211
+    boundaryness: 0.45393
+         gt_size: 0.34324
+        modality: 0.12858
+
+  → from inference-observable signals alone, |error| is predictable to R²=0.334; intrinsic oracle difficulty reaches R²=0.461.
+
+── error captured by selecting top-k% patches (for refinement) ──
+    score \ top-k%       5%     10%     20%     30%     50%
+    pred_uncert (obs)  31.0%   60.7%   88.3%   96.0%   99.4%
+    |pred-0.5| inv     31.0%   60.7%   88.3%   96.0%   99.4%
+    boundaryness(orac)  38.4%   64.4%   78.1%   81.7%   87.6%
+    oracle |error|      69.8%   89.9%   99.6%  100.0%  100.0%
+    random               5.0%    9.9%   19.9%   30.0%   49.9%

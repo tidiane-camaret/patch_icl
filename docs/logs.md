@@ -649,3 +649,51 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   GT vs each of the K context masks). Last two are per-sample, replicated per row.
 - Zero cost unless `eval.patch_csv` is set; collection reuses tensors already in
   scope and writes once at end via stdlib `csv` (no new deps).
+
+## 2026-06-14 — pfn_seg training: patch-level soft-target loss
+
+- Switched the training objective from native-res binary BCE (on the bilinearly
+  upsampled logit grid) to **patch-resolution soft-target supervision**, computed
+  directly at the `Hp×Hp` head grid (no upsample):
+  `target = adaptive_avg_pool2d(binary_mask, Hp)` (per-patch fg fraction ∈ [0,1]);
+  `loss = BCE_with_logits(logits, target) + dice_weight · soft_dice_loss(σ(logits), target)`.
+  Soft-target BCE is a proper scoring rule → calibrated to the true patch fraction;
+  the soft-Dice term (new `soft_dice_loss`, smoothing eps=1.0) counters background
+  imbalance. New config `train.dice_weight` (default 1.0).
+- Inference paths (`run_eval`, `eval.py`) still upsample for native-res Dice
+  *reporting* only — not a training signal. `dice_ds_soft` now mirrors the objective.
+- Architecture unchanged → existing checkpoints resume via the warm-start path
+  (`train.checkpoint=...`); verified strict state_dict load on
+  `results/2d/pfn_seg_resumed.pt`.
+- Soft context masks (symmetric input-side representation) deliberately deferred to
+  isolate the loss-term effect first.
+
+- `pfn_seg.py`: set node-local `TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` (under
+  `/tmp/<user>_compile_<hostname>`) before importing torch. `~/.triton` and
+  `~/.cache` are on shared NFS, so a `cuda_utils.so` compiled on a GLIBC-2.34 node
+  poisoned the cache for GLIBC-2.31 nodes (`GLIBC_2.34 not found` at compile time).
+  Keying the cache by hostname makes each node compile its own artifacts.
+
+## 2026-06-14 — pfn_seg patch error-driver analysis
+
+- New script `experiments/2d/patch_error_drivers.py` analyses what drives per-patch
+  error in a `patch_analysis.csv` dump, oriented to the refinement-sampling goal
+  (separates inference-observable drivers from oracle/GT-only ones). Outputs a text
+  report + figures (`patch_error_drivers.txt`, `err_gt_pred_heatmap.png`,
+  `err_uncert_modality.png`) next to the CSV. Attaches a best-effort dataset→modality
+  map (from MedSegBench identities; not in the data).
+- Findings on the soft-loss run (`results/2d/pfn_seg_low_res_loss/.../`):
+  - **Error concentrates in boundary patches**: 12.4% of patches (0.05<gt<0.95) hold
+    72% of total error mass; pure-bg (81.7%) only 15.5%. Dominant driver = partial
+    coverage (boundaryness 4·gt·(1−gt)).
+  - **Findable without GT**: `pred_uncert`=4p(1−p) (≡|pred−0.5|) ranks error almost
+    perfectly (Spearman ρ=0.988). Top-10/20/30% patches by uncertainty capture
+    61/88/96% of error → validates uncertainty-based patch sampling for the refiner.
+  - **Blind spot**: confidently-wrong patches (extreme pred, opposite gt) have ~0
+    uncertainty → uncertainty sampling misses them; reserve a small quota.
+  - Secondary: modality matters (hardest microscopy>dermoscopy>xray; easiest oct/ct/mri;
+    hardest datasets robotool/tnbcnuclei/kvasir/brifiseg/monusac — thin/many-object).
+    `gt_size` weak (+), `ctx_dice` weak & oracle-only, patch position negligible.
+  - Error magnitude only ~⅓–½ predictable (observable R²=0.334, intrinsic R²=0.461):
+    rankable, not precisely weightable. NB error≡pred−gt, so a model given both is
+    circular (excluded) — drivers come from observable-only and intrinsic models.

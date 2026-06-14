@@ -21,6 +21,7 @@ train:
   batch_size: 32
   lr: 1.0e-3
   grad_clip: 2.0
+  dice_weight: 1.0    # weight of soft-Dice term added to patch-level soft BCE
   lawa_k: 10          # LAWA checkpoint buffer size
   muon_lr_scale: 0.1  # Muon lr = muon_lr_scale * lr
   muon_momentum: 0.96

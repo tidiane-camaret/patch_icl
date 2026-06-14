@@ -17,10 +17,21 @@ Usage:
 
 import collections
 import math
+import os
 import random
+import socket
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
+
+# Node-local compile caches: ~/.triton and ~/.cache live on shared NFS, so a
+# cuda_utils.so compiled on a node with a newer GLIBC poisons the cache for
+# nodes with an older GLIBC ("GLIBC_2.34 not found"). Key the cache by hostname
+# on local /tmp so each node compiles its own artifacts. Must be set before torch.
+_cache_root = os.path.join(tempfile.gettempdir(), f"{os.environ.get('USER', 'user')}_compile_{socket.gethostname()}")
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "inductor"))
 
 import hydra
 import numpy as np
@@ -243,6 +254,21 @@ def lawa_average(queue: collections.deque, model: nn.Module, device: torch.devic
     return saved
 
 
+# ── Loss ──────────────────────────────────────────────────────────────────────
+
+def soft_dice_loss(p: torch.Tensor, t: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+    """Per-sample soft Dice loss between probability map p and soft target t.
+
+    Both (B, Hp, Hp) in [0, 1]; smoothing eps stabilises (near-)empty samples.
+    Returns 1 − Dice averaged over the batch.
+    """
+    p = p.flatten(1).float()
+    t = t.flatten(1).float()
+    num = 2 * (p * t).sum(1) + eps
+    den = p.sum(1) + t.sum(1) + eps
+    return (1 - num / den).mean()
+
+
 # ── Training epoch ────────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
@@ -256,7 +282,6 @@ def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
         if cfg.aug.enabled:
             all_images, all_masks = augment(all_images, all_masks, K, cfg.aug)
         gt = batch["label"].squeeze(1).float().to(DEVICE, non_blocking=True)
-        H  = gt.shape[-1]
 
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -265,12 +290,13 @@ def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
                             enabled=DEVICE.type == "cuda"):
             logits = model(all_images, all_masks, sep=K)          # (B, Hp, Hp)
             Hp = logits.shape[-1]
-            if Hp != H:
-                logits = F.interpolate(
-                    logits.unsqueeze(1).float(), size=(H, H),
-                    mode="bilinear", align_corners=False,
-                ).squeeze(1)
-            loss = F.binary_cross_entropy_with_logits(logits, gt)
+            # Soft patch-level target: avg-pool the native binary mask to the patch
+            # grid → per-patch foreground fraction in [0, 1]. Supervise directly at
+            # Hp (no upsample) so the objective matches the head's resolution.
+            target = F.adaptive_avg_pool2d(gt.unsqueeze(1), (Hp, Hp)).squeeze(1)
+            bce  = F.binary_cross_entropy_with_logits(logits, target)
+            dice = soft_dice_loss(torch.sigmoid(logits.float()), target)
+            loss = bce + cfg.train.dice_weight * dice
 
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
