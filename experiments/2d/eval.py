@@ -379,12 +379,26 @@ def main(cfg: DictConfig):
         resolution = arch.get("resolution", img_size // arch["patch_size"]
                               if "patch_size" in arch else None)
         input_patch_size = arch.get("input_patch_size", img_size // resolution)
+        # Rebuild the frozen image encoder if the checkpoint used one (injected,
+        # mirroring training). Encoder weights are also in the state_dict, so the
+        # subsequent strict load just overwrites these fresh (identical) weights.
+        image_encoder, feature_dim = None, None
+        if arch.get("image_encoder", "patch") == "universeg":
+            from src.models.pretrained_encoders import UniverSegFeatureEncoder
+            image_encoder = UniverSegFeatureEncoder(
+                level=arch.get("feature_level", "all"), input_size=128,
+                resize_to_input=arch.get("encoder_resize_to_input", False),
+            ).to(DEVICE)
+            feature_dim = image_encoder.feature_dim
         print(f"Loading ImagePFN from {cfg.eval.checkpoint} "
-              f"(size={img_size}, resolution={resolution}, Q={input_patch_size})...")
+              f"(size={img_size}, resolution={resolution}, Q={input_patch_size}, "
+              f"encoder={arch.get('image_encoder', 'patch')})...")
         model = ImagePFN(
             resolution       = resolution,
             image_size       = img_size,
             input_patch_size = input_patch_size,
+            image_encoder    = image_encoder,
+            feature_dim      = feature_dim,
             e              = arch["e"],
             h              = arch["h"],
             l              = arch["l"],

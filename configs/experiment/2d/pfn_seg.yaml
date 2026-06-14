@@ -7,9 +7,12 @@ data:
   max_train_samples: null  # null = full dataset; int = random subset per epoch
 
 arch:
+  image_encoder: patch  # image path: "patch" (raw pixels) or "universeg" (frozen pretrained features)
+  feature_level: all    # universeg encoder level: 0..3, -1 (bottleneck), or "all" (concat → 256ch). Used only when image_encoder=universeg
+  encoder_resize_to_input: false  # if true, resize images to 128² before the (fully-conv) UniverSeg encoder; false = encode at native size
   resolution: 16        # patches per side; output grid Hp = resolution, N = resolution² patches.
                         # Effective patch size P = image_size // resolution (128//16 = 8).
-  input_patch_size: 8   # Q; every native P×P patch is resized to Q×Q before embedding.
+  input_patch_size: 8   # Q; every native P×P patch is resized to Q×Q before embedding (mask path; image path when image_encoder=patch).
   e: 256
   h: 512
   l: 6

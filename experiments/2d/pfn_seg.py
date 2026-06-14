@@ -415,10 +415,24 @@ def main(cfg: DictConfig):
     val_loader   = build_split_loader(cfg, "val",   shuffle=False)
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    # Optional frozen pretrained image encoder (injected so pfn_seg_2d stays
+    # dependency-light). Built on DEVICE; its params stay requires_grad=False.
+    image_encoder, feature_dim = None, None
+    if cfg.arch.get("image_encoder", "patch") == "universeg":
+        from src.models.pretrained_encoders import UniverSegFeatureEncoder
+        image_encoder = UniverSegFeatureEncoder(
+            level=cfg.arch.feature_level, input_size=128,
+            resize_to_input=cfg.arch.get("encoder_resize_to_input", False),
+        ).to(DEVICE)
+        feature_dim = image_encoder.feature_dim
+        print(f"Image encoder: UniverSeg (level={cfg.arch.feature_level}, feature_dim={feature_dim}, frozen)")
+
     model = ImagePFN(
         resolution       = cfg.arch.resolution,
         image_size       = cfg.data.image_size,
         input_patch_size = cfg.arch.input_patch_size,
+        image_encoder    = image_encoder,
+        feature_dim      = feature_dim,
         e             = cfg.arch.e,
         h             = cfg.arch.h,
         l             = cfg.arch.l,
@@ -427,18 +441,36 @@ def main(cfg: DictConfig):
         residual_decay= cfg.arch.residual_decay,
     ).to(DEVICE)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"ImagePFN: {total_params:,} parameters")
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"ImagePFN: {total_params:,} parameters ({trainable_params:,} trainable)")
 
     # Optional warm-start. Accepts a bare state_dict (old format) or the new
     # {"model": ...} dict; strips the _orig_mod. prefix left by torch.compile.
     # Load before compile so keys match the raw module.
+    #
+    # Tolerant load: keep only tensors whose name AND shape match the current model,
+    # so a checkpoint from before the resolution/encoder changes still warm-starts.
+    # Notably, switching to a pretrained encoder changes image_embed (Q²→feature_dim)
+    # and adds frozen image_encoder.* weights — those keep their fresh/pretrained
+    # values rather than blocking the load.
     if cfg.train.get("checkpoint", None):
         raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
         sd  = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
         sd  = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
-        model.load_state_dict(sd)
-        print(f"Loaded weights from {cfg.train.checkpoint}")
+        model_sd   = model.state_dict()
+        compatible = {k: v for k, v in sd.items()
+                      if k in model_sd and v.shape == model_sd[k].shape}
+        skipped    = [k for k in sd if k not in compatible]
+        fresh      = [k for k in model_sd if k not in compatible
+                      and not k.startswith("image_encoder.")]
+        model.load_state_dict(compatible, strict=False)
+        print(f"Warm-start from {cfg.train.checkpoint}: "
+              f"loaded {len(compatible)}/{len(model_sd)} tensors")
+        if skipped:
+            print(f"  skipped (shape mismatch / not in model): {skipped}")
+        if fresh:
+            print(f"  kept freshly initialized (not in checkpoint): {fresh}")
 
     if cfg.arch.compile:
         model = torch.compile(model, dynamic=True)
@@ -446,10 +478,11 @@ def main(cfg: DictConfig):
         _newtonschulz5_batched = torch.compile(_newtonschulz5_batched)
 
     # ── Optimizers (Muon for transformer 2D weights, AdamW for rest) ──────────
+    # Frozen image-encoder params (requires_grad=False) are excluded from both groups.
     muon_params = [p for n, p in model.named_parameters()
-                   if p.ndim == 2 and "transformer" in n]
+                   if p.requires_grad and p.ndim == 2 and "transformer" in n]
     adam_params = [p for n, p in model.named_parameters()
-                   if not (p.ndim == 2 and "transformer" in n)]
+                   if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
 
     optimizer_muon = Muon(
         muon_params,
@@ -476,8 +509,9 @@ def main(cfg: DictConfig):
     lawa_queue: collections.deque = collections.deque(maxlen=cfg.train.lawa_k)
 
     # ── W&B ───────────────────────────────────────────────────────────────────
+    _enc_tag = f"USeg{cfg.arch.feature_level}" if cfg.arch.get("image_encoder", "patch") == "universeg" else "patch"
     run_name = cfg.wandb.name or (
-        f"pfn_seg_R{cfg.arch.resolution}q{cfg.arch.input_patch_size}_e{cfg.arch.e}_l{cfg.arch.l}"
+        f"pfn_seg_{_enc_tag}_R{cfg.arch.resolution}q{cfg.arch.input_patch_size}_e{cfg.arch.e}_l{cfg.arch.l}"
         f"_k{cfg.data.context_size}_think{cfg.arch.thinking_rows}"
     )
     if cfg.wandb.enabled:

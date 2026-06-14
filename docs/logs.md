@@ -1,5 +1,35 @@
 # Change log
 
+## 2026-06-14 — pfn_seg_2d: optional frozen pretrained image encoder (UniverSeg features)
+
+`src/models/pretrained_encoders.py` (new), `src/models/pfn_seg_2d.py`,
+`experiments/2d/pfn_seg.py`, `experiments/2d/eval.py`, `configs/experiment/2d/pfn_seg.yaml`.
+
+New `arch.image_encoder: patch | universeg`. With `universeg`, the image path becomes a
+frozen UniverSeg encoder → `resolution×resolution` feature grid → `Linear(feature_dim, e)`,
+replacing the raw-pixel patchify+embed. Mirrors the `feature_sim` eval backend
+(`encode_images` + `extract_features_batch`); `arch.feature_level` selects the level
+(`all` → 256ch). The mask path is unchanged (raw P×P patches → Q×Q → `Linear(Q², e)`).
+
+Design: the encoder is **injected** into `ImagePFN` (new `image_encoder`/`feature_dim` args),
+not imported by it, so `pfn_seg_2d.py` stays torch-only and free of the `src`-package
+shadowing (UniverSeg loads from its own `/home/dpxuser/repos/UniverSeg` checkout). It runs
+under `no_grad` and is frozen — gradients reach `image_embed` but not the encoder; its params
+are filtered out of the Muon/Adam groups via `requires_grad`. Image features are normalized
+**per channel** with context-image stats (vs. the single-scalar norm on raw pixels). `eval.py`
+rebuilds + injects the encoder when the checkpoint's arch says `universeg`.
+`encoder_resize_to_input` (default false) gates resizing inputs to 128² before the fully-conv encoder.
+The encoder's `forward` is wrapped in `torch.compiler.disable` (frozen/no_grad — nothing to compile):
+under `torch.compile(dynamic=True)` its `adaptive_avg_pool2d` otherwise gets symbolic window sizes
+inductor can't lower (`cannot determine truth value of Relational`). Dynamo graph-breaks there; the
+transformer still compiles.
+
+`pfn_seg.py` warm-start (`train.checkpoint`) is now **tolerant**: it loads only tensors whose
+name+shape match the current model (`strict=False`), so a checkpoint from before these changes
+still warm-starts. Switching to a pretrained encoder changes `image_embed` (Q²→feature_dim) and
+adds frozen `image_encoder.*` weights — those keep their fresh/pretrained values; shared weights
+(mask_embed, pos_embed, thinking, transformer, decoder) transfer. Logs loaded/skipped/fresh counts.
+
 ## 2026-06-14 — pfn_seg_2d: `resolution` param decouples output grid from encoder input dim
 
 `src/models/pfn_seg_2d.py`, `experiments/2d/pfn_seg.py`, `experiments/2d/eval.py`,

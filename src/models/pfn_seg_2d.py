@@ -161,6 +161,13 @@ class ImagePFN(nn.Module):
         a: number of attention heads
         thinking_rows: prepended learnable row tokens
         residual_decay: per-layer decay factor (input to block i scaled by decay^i)
+        image_encoder: optional frozen feature encoder (e.g. UniverSegFeatureEncoder).
+            When given, the image path becomes encoder → resolution×resolution feature
+            grid → Linear(feature_dim, e) instead of raw-pixel patchify. The mask path
+            is unchanged (raw P×P patches resized to Q×Q). The encoder is injected (not
+            imported here) so this module stays dependency-light.
+        feature_dim: channel count of the encoder's pooled features; required when
+            image_encoder is provided (sets the image_embed input dim).
     """
     def __init__(
         self,
@@ -173,6 +180,8 @@ class ImagePFN(nn.Module):
         a: int = 4,
         thinking_rows: int = 8,
         residual_decay: float = 0.95,
+        image_encoder: nn.Module | None = None,
+        feature_dim: int | None = None,
     ):
         super().__init__()
         assert image_size % resolution == 0, "image_size must be divisible by resolution"
@@ -183,8 +192,13 @@ class ImagePFN(nn.Module):
         self.input_patch_size = Q
         self.N = N
 
-        self.image_embed = nn.Linear(Q * Q, e)
-        self.mask_embed  = nn.Linear(Q * Q, e)
+        self.image_encoder = image_encoder
+        if image_encoder is not None:
+            assert feature_dim is not None, "feature_dim required with image_encoder"
+            self.image_embed = nn.Linear(feature_dim, e)   # embed pretrained features
+        else:
+            self.image_embed = nn.Linear(Q * Q, e)         # embed raw pixel patches
+        self.mask_embed  = nn.Linear(Q * Q, e)             # mask path always raw patches
         # Shared positional embedding applied to both image and mask col groups
         self.pos_embed   = nn.Parameter(torch.zeros(1, 1, N, e))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -204,14 +218,24 @@ class ImagePFN(nn.Module):
         P, N, Q = self.patch_size, self.N, self.input_patch_size
         Hp = H // P
 
-        # Patchify into native P×P patches, each resized to Q×Q: (B, T, N, Q²)
-        img_p  = patchify(images.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
-        mask_p = patchify(masks .reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
-
-        # Normalize image patches with context-image statistics
-        mu  = img_p[:, :sep].mean(dim=(1, 2, 3), keepdim=True)
-        sig = img_p[:, :sep].std( dim=(1, 2, 3), keepdim=True) + 1e-8
+        # ── Image cols ─────────────────────────────────────────────────────────
+        if self.image_encoder is not None:
+            # Pretrained features: encode each image → Hp×Hp feature grid → (B,T,N,C).
+            # Patch order (row-major over the grid) matches pos_embed and the decoder
+            # reshape. Normalize per channel using context-image statistics.
+            feat  = self.image_encoder(images.reshape(B * T, 1, H, W), Hp)  # (B*T, C, Hp, Hp)
+            img_p = feat.flatten(2).transpose(1, 2).reshape(B, T, N, feat.shape[1])
+            mu  = img_p[:, :sep].mean(dim=(1, 2), keepdim=True)            # (B,1,1,C) per-channel
+            sig = img_p[:, :sep].std( dim=(1, 2), keepdim=True) + 1e-8
+        else:
+            # Raw pixels: native P×P patches each resized to Q×Q → (B,T,N,Q²).
+            img_p = patchify(images.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
+            mu  = img_p[:, :sep].mean(dim=(1, 2, 3), keepdim=True)         # (B,1,1,1) scalar
+            sig = img_p[:, :sep].std( dim=(1, 2, 3), keepdim=True) + 1e-8
         img_p = ((img_p - mu) / sig).clamp(-10, 10)
+
+        # ── Mask cols (always raw P×P patches resized to Q×Q) ──────────────────
+        mask_p = patchify(masks.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
 
         # TargetEncoder trick: replace query mask patches with mean of context masks
         ctx_mask_mean = mask_p[:, :sep].mean(dim=1, keepdim=True)           # (B, 1, N, Q²)
