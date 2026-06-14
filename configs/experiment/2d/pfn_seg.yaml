@@ -7,7 +7,9 @@ data:
   max_train_samples: null  # null = full dataset; int = random subset per epoch
 
 arch:
-  patch_size: 8       # P; N = (image_size//P)² = 256 patches per image
+  resolution: 16        # patches per side; output grid Hp = resolution, N = resolution² patches.
+                        # Effective patch size P = image_size // resolution (128//16 = 8).
+  input_patch_size: 8   # Q; every native P×P patch is resized to Q×Q before embedding.
   e: 256
   h: 512
   l: 6

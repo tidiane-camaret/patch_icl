@@ -3,7 +3,7 @@ ImagePFN: in-context 2D image segmentation via dual-axis transformer.
 
 Tensor layout throughout: (batch, rows, cols, e)
   rows = n_thinking + K context images + 1 query image
-  cols = 2N = 2 × (image_size // patch_size)²
+  cols = 2N = 2 × resolution²  (effective patch size P = image_size // resolution)
          first N cols  = image patch embeddings
          last  N cols  = mask  patch embeddings
 
@@ -28,11 +28,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def patchify(x: torch.Tensor, P: int) -> torch.Tensor:
-    """(B, 1, H, W) → (B, N, P²), N = (H//P)*(W//P)."""
+def patchify(x: torch.Tensor, P: int, out: int | None = None,
+             mode: str = "bilinear") -> torch.Tensor:
+    """(B, 1, H, W) → (B, N, Q²), N = (H//P)*(W//P).
+
+    Splits into native P×P patches; if ``out`` is given and differs from P, each
+    patch is resized to out×out (Q=out) so the embedding input dim is decoupled
+    from the effective patch size. With ``out=None`` (or out==P) Q=P (no resize).
+    """
     B, C, H, W = x.shape
-    x = x.reshape(B, C, H // P, P, W // P, P).permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (H // P) * (W // P), C * P * P)
+    nh, nw = H // P, W // P
+    x = x.reshape(B, C, nh, P, nw, P).permute(0, 2, 4, 1, 3, 5)  # (B, nh, nw, C, P, P)
+    if out is not None and out != P:
+        x = x.reshape(B * nh * nw, C, P, P)
+        x = F.interpolate(x, size=(out, out), mode=mode, align_corners=False)
+        return x.reshape(B, nh * nw, C * out * out)
+    return x.reshape(B, nh * nw, C * P * P)
 
 
 class LowerPrecisionRMSNorm(nn.RMSNorm):
@@ -138,8 +149,12 @@ class ImagePFN(nn.Module):
     patches before embedding — providing a class-frequency prior rather than zeros.
 
     Args:
-        patch_size: side length P; images split into N = (H//P)² patches, 2N total cols
+        resolution: patches per side; output grid Hp = resolution, total
+            N = resolution² patches. Effective patch size P = image_size // resolution.
         image_size: expected spatial resolution (H = W)
+        input_patch_size: side length Q every patch is resized to before embedding.
+            Each native P×P patch is interpolated to Q×Q so the embedding input dim
+            (Q²) is fixed regardless of the effective patch size P.
         e: embedding dimension
         h: MLP hidden size
         l: number of transformer layers
@@ -149,8 +164,9 @@ class ImagePFN(nn.Module):
     """
     def __init__(
         self,
-        patch_size: int = 8,
+        resolution: int = 16,
         image_size: int = 128,
+        input_patch_size: int = 8,
         e: int = 256,
         h: int = 512,
         l: int = 6,
@@ -159,13 +175,16 @@ class ImagePFN(nn.Module):
         residual_decay: float = 0.95,
     ):
         super().__init__()
-        P = patch_size
-        N = (image_size // P) ** 2
+        assert image_size % resolution == 0, "image_size must be divisible by resolution"
+        P = image_size // resolution            # effective (native) patch size
+        Q = input_patch_size                    # fixed embedding input size
+        N = resolution ** 2
         self.patch_size = P
+        self.input_patch_size = Q
         self.N = N
 
-        self.image_embed = nn.Linear(P * P, e)
-        self.mask_embed  = nn.Linear(P * P, e)
+        self.image_embed = nn.Linear(Q * Q, e)
+        self.mask_embed  = nn.Linear(Q * Q, e)
         # Shared positional embedding applied to both image and mask col groups
         self.pos_embed   = nn.Parameter(torch.zeros(1, 1, N, e))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -182,12 +201,12 @@ class ImagePFN(nn.Module):
         sep:    int,           # K = number of context images
     ) -> torch.Tensor:         # (B, H//P, W//P) logits
         B, T, _, H, W = images.shape
-        P, N = self.patch_size, self.N
+        P, N, Q = self.patch_size, self.N, self.input_patch_size
         Hp = H // P
 
-        # Patchify: (B, T, N, P²)
-        img_p  = patchify(images.reshape(B * T, 1, H, W), P).reshape(B, T, N, P * P)
-        mask_p = patchify(masks .reshape(B * T, 1, H, W), P).reshape(B, T, N, P * P)
+        # Patchify into native P×P patches, each resized to Q×Q: (B, T, N, Q²)
+        img_p  = patchify(images.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
+        mask_p = patchify(masks .reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
 
         # Normalize image patches with context-image statistics
         mu  = img_p[:, :sep].mean(dim=(1, 2, 3), keepdim=True)
@@ -195,11 +214,11 @@ class ImagePFN(nn.Module):
         img_p = ((img_p - mu) / sig).clamp(-10, 10)
 
         # TargetEncoder trick: replace query mask patches with mean of context masks
-        ctx_mask_mean = mask_p[:, :sep].mean(dim=1, keepdim=True)           # (B, 1, N, P²)
+        ctx_mask_mean = mask_p[:, :sep].mean(dim=1, keepdim=True)           # (B, 1, N, Q²)
         mask_p = torch.cat(
-            [mask_p[:, :sep], ctx_mask_mean.expand(B, T - sep, N, P * P)],
+            [mask_p[:, :sep], ctx_mask_mean.expand(B, T - sep, N, Q * Q)],
             dim=1,
-        )                                                                     # (B, T, N, P²)
+        )                                                                     # (B, T, N, Q²)
 
         # Separate col groups; cat along col dim → (B, T, 2N, e)
         x_img  = self.image_embed(img_p)  + self.pos_embed   # (B, T, N, e)

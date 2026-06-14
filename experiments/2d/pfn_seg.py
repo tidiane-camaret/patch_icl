@@ -416,8 +416,9 @@ def main(cfg: DictConfig):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = ImagePFN(
-        patch_size    = cfg.arch.patch_size,
-        image_size    = cfg.data.image_size,
+        resolution       = cfg.arch.resolution,
+        image_size       = cfg.data.image_size,
+        input_patch_size = cfg.arch.input_patch_size,
         e             = cfg.arch.e,
         h             = cfg.arch.h,
         l             = cfg.arch.l,
@@ -476,7 +477,7 @@ def main(cfg: DictConfig):
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     run_name = cfg.wandb.name or (
-        f"pfn_seg_P{cfg.arch.patch_size}_e{cfg.arch.e}_l{cfg.arch.l}"
+        f"pfn_seg_R{cfg.arch.resolution}q{cfg.arch.input_patch_size}_e{cfg.arch.e}_l{cfg.arch.l}"
         f"_k{cfg.data.context_size}_think{cfg.arch.thinking_rows}"
     )
     if cfg.wandb.enabled:

@@ -373,11 +373,18 @@ def main(cfg: DictConfig):
         _spec.loader.exec_module(_pfn_mod)
         ImagePFN = _pfn_mod.ImagePFN
         arch = pfn_ckpt["arch"]
+        img_size = pfn_ckpt["image_size"]
+        # New checkpoints store `resolution` (+ `input_patch_size`); old ones store
+        # `patch_size`. Derive the new params from the old field for back-compat.
+        resolution = arch.get("resolution", img_size // arch["patch_size"]
+                              if "patch_size" in arch else None)
+        input_patch_size = arch.get("input_patch_size", img_size // resolution)
         print(f"Loading ImagePFN from {cfg.eval.checkpoint} "
-              f"(size={cfg.data.image_size}, P={arch['patch_size']})...")
+              f"(size={img_size}, resolution={resolution}, Q={input_patch_size})...")
         model = ImagePFN(
-            patch_size     = arch["patch_size"],
-            image_size     = pfn_ckpt["image_size"],
+            resolution       = resolution,
+            image_size       = img_size,
+            input_patch_size = input_patch_size,
             e              = arch["e"],
             h              = arch["h"],
             l              = arch["l"],

@@ -1,5 +1,20 @@
 # Change log
 
+## 2026-06-14 — pfn_seg_2d: `resolution` param decouples output grid from encoder input dim
+
+`src/models/pfn_seg_2d.py`, `experiments/2d/pfn_seg.py`, `experiments/2d/eval.py`,
+`configs/experiment/2d/pfn_seg.yaml`.
+
+Replaced `arch.patch_size` with `arch.resolution` (+ `arch.input_patch_size`, default 8).
+`resolution` = patches per side = output grid `Hp`; effective patch size `P = image_size //
+resolution` (128//16 = 8). Each native `P×P` patch is now resized to `Q×Q` (`input_patch_size`)
+via `F.interpolate` in `patchify` before embedding, so `image_embed`/`mask_embed` always take a
+fixed `Q²` input regardless of `P`. This lets the output resolution change (e.g. res 8→32, P
+16→4) while the patch encoder stays fixed at 8×8.
+
+`eval.py` derives `resolution`/`input_patch_size` from old `patch_size` checkpoints for
+back-compat. Run name now `pfn_seg_R{res}q{Q}_...`.
+
 ## 2026-06-12 — pfn_seg_2d eval backend: fixes, config consolidation, warm-start, comparison
 
 `experiments/2d/eval.py`, `experiments/2d/pfn_seg.py`, `configs/experiment/2d/base.yaml`,
