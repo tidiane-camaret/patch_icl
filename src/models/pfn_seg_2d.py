@@ -90,7 +90,7 @@ class TransformerEncoderLayer(nn.Module):
         self.norm3 = LowerPrecisionRMSNorm(e)
         self.mlp = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
 
-    def forward(self, src: torch.Tensor, sep: int) -> torch.Tensor:
+    def forward(self, src: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         b, r, c, e = src.shape
         a, d = self.a, self.d
 
@@ -104,15 +104,20 @@ class TransformerEncoderLayer(nn.Module):
         src = (res + x).reshape(b, r, c, e)
 
         # ── Sample-axis: cross-image attention per patch position ───────────────
-        # All rows (context + query) attend to the same k_t/v_t (thinking+context
-        # rows only) — single SDPA call covers both; avoids the split+cat.
+        # Default: every row (context + query) attends only to the train set
+        # (thinking+context rows, k_t/v_t = [:sep]). With an explicit attn_mask, the
+        # connectivity is given as an (r×r) bool table instead (e.g. queries also
+        # attending to queries for within-image spatial reasoning).
         x = src.permute(0, 2, 1, 3).reshape(b * c, r, e)
         res = x
         x = self.norm2(x)
         qkv = self.qkv_row(x).reshape(b * c, r, 3, a, d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        k_t, v_t = k[:, :, :sep, :], v[:, :, :sep, :]
-        x = F.scaled_dot_product_attention(q, k_t, v_t).transpose(1, 2).reshape(b * c, r, e)
+        if attn_mask is None:
+            x = F.scaled_dot_product_attention(q, k[:, :, :sep, :], v[:, :, :sep, :])
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = x.transpose(1, 2).reshape(b * c, r, e)
         # contiguous() here ensures the next layer's feature-axis reshape is a view
         src = (res + x).reshape(b, c, r, e).permute(0, 2, 1, 3).contiguous()
 
@@ -126,10 +131,10 @@ class TransformerEncoderStack(nn.Module):
         self.residual_decay = residual_decay
         self.blocks = nn.ModuleList([TransformerEncoderLayer(a, e, h) for _ in range(l)])
 
-    def forward(self, x: torch.Tensor, sep: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         for i, block in enumerate(self.blocks):
             x = x * (self.residual_decay ** i)
-            x = block(x, sep)
+            x = block(x, sep, attn_mask=attn_mask)
         return x
 
 
@@ -213,7 +218,8 @@ class ImagePFN(nn.Module):
         images: torch.Tensor,  # (B, K+1, 1, H, W) — last row is query
         masks:  torch.Tensor,  # (B, K+1, 1, H, W) — query mask is replaced below
         sep:    int,           # K = number of context images
-    ) -> torch.Tensor:         # (B, H//P, W//P) logits
+        return_thinking: bool = False,
+    ):                         # (B, H//P, W//P) logits, or (logits, thinking) if return_thinking
         B, T, _, H, W = images.shape
         P, N, Q = self.patch_size, self.N, self.input_patch_size
         Hp = H // P
@@ -256,4 +262,10 @@ class ImagePFN(nn.Module):
         # Decode from image cols only (first N) of the query row
         query  = x[:, sep_t:, :N, :].squeeze(1)              # (B, N, e)
         logits = self.decoder(query).squeeze(-1).reshape(B, Hp, Hp)
+
+        if return_thinking:
+            # Post-transformer thinking rows, mean-pooled over the 2N columns →
+            # a compact per-row latent summary of the coarse task. (B, n_think, e)
+            think = x[:, :self.thinking.n].mean(dim=2)
+            return logits, think
         return logits

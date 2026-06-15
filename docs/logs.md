@@ -1,5 +1,78 @@
 # Change log
 
+## 2026-06-14 — multilevel: log native `dice/mean` for direct comparison to pfn_seg
+
+`experiments/2d/multilevel/train.py`. `run_eval` now also logs `dice/mean` — native-resolution
+hard Dice over the whole val set, aggregated identically to `pfn_seg.py` (mean over all samples,
+plus `dice/dataset/<name>`). The stage-2 "final" map = coarse res-32 map with sampled cells
+overwritten by stage-2 preds, upsampled to native (128). `dice_coarse/mean` logs the coarse-only
+baseline (≈ the stage-1 model's own dice/mean) so the lift is visible in one place. This makes the
+2-stage pipeline directly comparable to the single-stage ImagePFN number in `results/report.md`.
+
+## 2026-06-14 — multilevel: within-image spatial reasoning (query↔query attention)
+
+`src/models/pfn_seg_2d.py`, `src/models/patchset_pfn.py`, `experiments/2d/multilevel/train.py`,
+`configs/experiment/2d/multilevel.yaml`.
+
+`arch.query_self_attn` (default true): lets stage-2 query patches attend to **each other**
+(keyed by Fourier PE), restoring within-image spatial coherence that the patch-set form
+otherwise lacks (each query was classified independently given the support). No label leak —
+query mask-tokens carry the coarse prior, not GT. Implemented as an asymmetric sample-axis
+mask: support rows attend only to the train set `[:sep_t]`; query rows attend to train set +
+all queries. `TransformerEncoderLayer`/`Stack` gained an optional `attn_mask` (default None =
+prior behavior, so `ImagePFN` stage-1 is untouched). Memory cost ~0 (+0.01 GB) since the
+sample axis is batched over only 2 columns. Verified: a coupling test (perturbing one query's
+feature moves another query's output only when enabled), ImagePFN regression, and compiled
+(`torch.compile(dynamic=True)`) forward+backward — the dynamic (r×r) bool mask lowers cleanly.
+
+## 2026-06-14 — multilevel: critical target-leak fix + soft-dice / full-image metrics
+
+`experiments/2d/multilevel/pipeline.py`, `experiments/2d/multilevel/train.py`.
+
+**Bug fix (critical):** `build_patch_batch` derived the target fraction `gt32` from
+`all_masks[:, -1]`, but the query mask is zeroed there (so stage-1 doesn't see the answer)
+— so the supervision target was **all zeros**. Symptoms: train loss collapsed to 0.0000,
+a spurious large positive `Δerr`, and NaN dice. Now `gt32` is pooled from the real `label`.
+
+**Metrics:** `run_eval` now reports, per scope `{uncertain (192), sampled (256), full (1024
+via compositing stage-2 preds into the coarse map at sampled cells)}`: `delta_err`,
+hard `dice_stage2/coarse`, and **soft** `soft_dice_stage2/coarse` (vs the coarse baseline).
+Pipeline returns `qry_idx`, `coarse_full`, `gt_full` to support this. Robust `nanmean`
+removes the `Mean of empty slice` warning. Headline for checkpointing stays
+`refine/uncertain/delta_err`.
+
+## 2026-06-14 — multilevel patch refinement (stage-2 PatchSetPFN)
+
+New experiment `experiments/2d/multilevel/`. A frozen res-16 ImagePFN (stage 1) +
+frozen UniverSeg encoder produce a coarse target prediction and res-32 features; we
+sample 256 patches/image (192 closest-to-0.5 + 64 most-certain) — target→query,
+context→support — and train `src/models/patchset_pfn.py:PatchSetPFN` (nanoTabPFN-shaped:
+rows=patches, cols=[img|mask], 2-D Fourier PE, query-attends-to-support) to refine the
+query patches. Metric: `refine/delta_err_uncertain` = |error| reduction on the uncertain
+target region vs the stage-1 coarse value (64 certain patches kept as a regression check).
+`arch.coarse_prior` toggles using the coarse pred as the query mask prior (else neutral 0).
+
+**Stage-1 thinking memory** (`arch.use_stage1_thinking`, default true): `ImagePFN.forward`
+gains `return_thinking` → its post-transformer thinking rows mean-pooled over columns
+`(B, n_think, e1)`. `PatchSetPFN` projects these `e1→e` (+ a learned type token) and prepends
+them as extra **support** rows (inside `sep`), so query patches attend to stage-1's latent
+task summary via the existing sample-axis attention. `stage1_dim`=stage-1's `e`, read from
+`stage1.thinking.tokens` at construction; new proj/type params are fresh (warm-start-safe).
+
+Files: `src/models/patchset_pfn.py` (FourierPositionalEncoding + PatchSetPFN),
+`experiments/2d/multilevel/{sampling,pipeline,train}.py` (+ `test_*.py`),
+`configs/experiment/2d/multilevel.yaml`. Reuses the shared utils in `pfn_train.py`.
+Run: `python experiments/2d/multilevel/train.py [arch.coarse_prior=false]`.
+Spec/plan: `docs/superpowers/{specs,plans}/2026-06-14-multilevel-patch-refinement*.md`.
+
+## 2026-06-14 — Factor shared training utils into pfn_train.py
+
+`experiments/2d/pfn_train.py` (new), `experiments/2d/pfn_seg.py`.
+
+Extracted `_newtonschulz5_batched`, `Muon`, `augment`, `lawa_average`, `soft_dice_loss` from
+`pfn_seg.py` into a new shared module `pfn_train.py`. `pfn_seg.py` now imports them from there.
+No behaviour change; prepares for reuse in `experiments/2d/multilevel/train.py`.
+
 ## 2026-06-14 — pfn_seg_2d: optional frozen pretrained image encoder (UniverSeg features)
 
 `src/models/pretrained_encoders.py` (new), `src/models/pfn_seg_2d.py`,

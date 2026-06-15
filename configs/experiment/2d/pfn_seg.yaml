@@ -41,7 +41,7 @@ train:
 eval:
   batch_size: 16
   workers: 8
-  max_per_label: 20
+  max_per_label: null #20
   out_dir: results/2d/pfn_seg
 
 wandb:

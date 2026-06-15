@@ -1,0 +1,65 @@
+model: patchset_pfn
+
+data:
+  image_size: 128
+  context_size: 3
+  dataset: null
+  max_train_samples: null
+
+sample:
+  grid_res: 32        # res-32 grid (32×32 = 1024 cells per image)
+  n_uncertain: 192    # cells closest to 0.5
+  n_certain: 64       # most-certain cells
+
+arch:
+  feature_level: all  # UniverSeg encoder level → feature_dim 256
+  coarse_prior: true  # query mask-token = stage-1 coarse pred (else neutral 0)
+  use_stage1_thinking: true  # attend to stage-1's post-transformer thinking rows (pooled → memory tokens)
+  query_self_attn: true      # let query patches attend to each other (within-image spatial reasoning via Fourier PE)
+  fourier_bands: 8
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 8
+  residual_decay: 0.95
+  compile: true       # graph-breaks at the frozen encoder (as in pfn_seg)
+
+train:
+  epochs: 200
+  batch_size: 32
+  lr: 1.0e-3
+  grad_clip: 2.0
+  dice_weight: 1.0
+  lawa_k: 10
+  muon_lr_scale: 0.1
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  adam_wd: 0.01
+  warmup_epochs: 5
+  eval_every: 1
+  workers: 16
+  seed: 42
+  checkpoint: null    # warm-start for PatchSetPFN (not the stage-1 model)
+  stage1_checkpoint: results/2d/pfn_seg_low_res_loss/pfn_seg_P8_e256_l6_k3_think8/best.pt
+
+eval:
+  batch_size: 16
+  workers: 8
+  max_per_label: 20
+  out_dir: results/2d/multilevel
+
+wandb:
+  project: patch_icl_2d_exps_train
+  name: null
+  enabled: true
+
+# mirrors configs/augmentations/medsegbench.yaml
+aug:
+  enabled: true
+  geometric: { hflip_p: 0.5, vflip_p: 0.5, rotate: { p: 0.5, max_angle_deg: 20.0 } }
+  intensity:
+    brightness: { p: 0.5, max_delta: 0.15 }
+    contrast:   { p: 0.5, range: [0.8, 1.2] }
+    gamma:      { p: 0.3, range: [0.75, 1.33] }
+    noise:      { p: 0.3, std: 0.04 }
