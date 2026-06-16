@@ -1,5 +1,27 @@
 # Change log
 
+## 2026-06-15 — pfn_seg: fix CUDA grid-limit crash at resolution≥32
+
+`src/models/pfn_seg_2d.py`. Running with `arch.resolution=32` crashed in the
+sample-axis attention with `CUDA error: invalid configuration argument`.
+
+- **Root cause**: the sample-axis (cross-image) attention flattens to a batch of
+  `B·2·resolution²` independent tiny (seq=12) attention problems. Flash /
+  mem-efficient SDPA launch one CUDA grid-Y block per batch element, and
+  `gridDim.y` is hardware-capped at 65535. At R32 with `batch_size=32` the batch
+  is `32·2·1024 = 65536`, exactly one over the cap (R16 was 16384, fine).
+  Confirmed by minimal repro: flash SDPA OK at batch 65535, crashes at 65536.
+- **Fix**: `batched_sdpa()` helper splits the batch into equal chunks under the
+  cap when needed. Keeps the fused kernel (the math backend works but materializes
+  the full score tensor at ~2× memory). `int()` pins the symbolic batch to a
+  concrete value so the chunk count is a Python int that `torch.compile`
+  (`dynamic=True`) unrolls statically — a plain `range(0, B, step)` over a
+  symbolic `B` fails to compile.
+- **Note (separate constraint, not a bug)**: R32 + UniverSeg encoder + 6 layers
+  at `batch_size=32` OOMs on a 24 GB card (~23 GB needed); R32 has 4× the tokens
+  of R16. Use a smaller `batch_size` (verified training proceeds end-to-end at
+  `batch_size=8`) or gradient accumulation for the full run.
+
 ## 2026-06-14 — multilevel: log native `dice/mean` for direct comparison to pfn_seg
 
 `experiments/2d/multilevel/train.py`. `run_eval` now also logs `dice/mean` — native-resolution

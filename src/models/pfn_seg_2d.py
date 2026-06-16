@@ -46,6 +46,34 @@ def patchify(x: torch.Tensor, P: int, out: int | None = None,
     return x.reshape(B, nh * nw, C * P * P)
 
 
+# Flash / mem-efficient SDPA launch one CUDA grid-Y block per batch element, and
+# gridDim.y is hardware-capped at 65535. The sample-axis attention flattens to a
+# batch of B·2·resolution², which crosses the cap at resolution≥32 (B=32 → 65536),
+# raising "CUDA error: invalid configuration argument". Splitting the batch into
+# equal chunks that each stay under the cap keeps the fused kernel (math backend
+# would materialize the full score tensor and cost ~2× memory). int() pins the
+# (symbolic) batch to a concrete value so the loop count is a Python int and
+# torch.compile can unroll it statically.
+_SDPA_MAX_BATCH = 65535
+
+
+def batched_sdpa(q, k, v, attn_mask=None):
+    """scaled_dot_product_attention that survives batches over the grid-Y cap."""
+    B = q.shape[0]
+    if B <= _SDPA_MAX_BATCH:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    n = int((B + _SDPA_MAX_BATCH - 1) // _SDPA_MAX_BATCH)
+    cs = (B + n - 1) // n
+    return torch.cat(
+        [F.scaled_dot_product_attention(q[i * cs:(i + 1) * cs],
+                                        k[i * cs:(i + 1) * cs],
+                                        v[i * cs:(i + 1) * cs],
+                                        attn_mask=attn_mask)
+         for i in range(n)],
+        dim=0,
+    )
+
+
 class LowerPrecisionRMSNorm(nn.RMSNorm):
     """RMSNorm that upcasts to fp32 when the input is bf16/fp16."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,9 +142,9 @@ class TransformerEncoderLayer(nn.Module):
         qkv = self.qkv_row(x).reshape(b * c, r, 3, a, d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         if attn_mask is None:
-            x = F.scaled_dot_product_attention(q, k[:, :, :sep, :], v[:, :, :sep, :])
+            x = batched_sdpa(q, k[:, :, :sep, :], v[:, :, :sep, :])
         else:
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            x = batched_sdpa(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2).reshape(b * c, r, e)
         # contiguous() here ensures the next layer's feature-axis reshape is a view
         src = (res + x).reshape(b, c, r, e).permute(0, 2, 1, 3).contiguous()
