@@ -8,8 +8,18 @@ data:
 
 sample:
   grid_res: 32        # res-32 grid (32×32 = 1024 cells per image)
-  n_uncertain: 192    # cells closest to 0.5
-  n_certain: 64       # most-certain cells
+  n_total: 320       # M: total patches sampled per image (constant)
+  # Patch selection: threshold boundary core + fixed fg-core quota + blurred neighbor fill.
+  tau: 0.30           # boundary core: cells with |value-0.5| < tau  (tuned; see spec Tuning)
+  n_fg_core: 94       # fixed quota of random foreground cells forced into the core (target)
+  n_fg_core_ctx: 160  # context support: heavier fg quota — context relies on TRUE GT, so we
+                      #   want a large share of the foreground sampled for good class info.
+                      #   (~80% fg coverage at 160 vs ~72% at 64; boundary stays covered for
+                      #   free on GT — see diagnostic ds_gt sweep). Falls back to n_fg_core if absent.
+  blur_sigma: 1.0     # neighbor proximity field width (grid cells)
+  floor: 0.005        # uniform floor → far cells keep a chance
+  temperature: 1.0    # gumbel temperature for the neighbor fill
+  eval_deterministic: true   # drop gumbel at eval for reproducible metrics
   # Sampling map: which signal ranks cells for query selection (|value-0.5|).
   #   prev_pred : previous-level (stage-1 coarse) prediction — deployable, no label access
   #   ds_gt     : downsampled target GT — oracle, leaks labels (upper-bound study only)
@@ -18,7 +28,11 @@ sample:
 
 arch:
   feature_level: all  # UniverSeg encoder level → feature_dim 256
-  coarse_prior: true  # query mask-token = stage-1 coarse pred (else neutral 0)
+  mask_prior: patch  # false | scalar | patch — mask-token form.
+                      #   false : scalar; query prior = support-mean (neutral)
+                      #   scalar: scalar; query prior = stage-1 coarse pred
+                      #   patch : p×p mask tile (p = image_size//grid_res, auto); support =
+                      #           native GT tile, query = upsampled coarse tile
   use_stage1_thinking: true  # attend to stage-1's post-transformer thinking rows (pooled → memory tokens)
   query_self_attn: true      # let query patches attend to each other (within-image spatial reasoning via Fourier PE)
   fourier_bands: 8
@@ -46,13 +60,13 @@ train:
   workers: 16
   seed: 42
   checkpoint: null    # warm-start for PatchSetPFN (not the stage-1 model)
-  stage1_checkpoint: results/2d/pfn_seg_low_res_loss/pfn_seg_P8_e256_l6_k3_think8/best.pt
+  stage1_checkpoint: results/2d/pfn_seg_universeg/pfn_seg_USegall_R16q8_e256_l6_k3_think8/best.pt
 
 eval:
   batch_size: 16
   workers: 8
   max_per_label: 20
-  out_dir: results/2d/multilevel
+  out_dir: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d
 
 wandb:
   project: patch_icl_2d_exps_train

@@ -5,8 +5,12 @@ A nanoTabPFN-shaped transformer: rows = sampled patches, cols = [img-token | mas
 Reuses ImagePFN's dual-axis TransformerEncoderStack and ThinkingRows.
 
   - img-token  = Linear(feature_dim → e) on the patch's frozen-encoder feature
-  - mask-token = Linear(1 → e) on the patch's mask value (support: true fraction;
-                 query: coarse prediction if coarse_prior else support-mean prior)
+  - mask-token = Linear(mask_dim → e) on the patch's mask, per mask_prior:
+                 false  : scalar; query prior = support-mean (neutral, TargetEncoder analog)
+                 scalar : scalar; query prior = coarse prediction
+                 patch  : p×p mask tile (p auto); support = native GT tile,
+                          query = upsampled coarse-prior tile (no detail below the
+                          stage-1 resolution, but boundary geometry is exact for support)
   - 2-D Fourier positional encoding of the patch's (i,j) grid cell, added to both
     tokens (resolution-generalizable: normalized coords + fixed frequencies)
   - optional stage-1 memory: the frozen stage-1 model's post-transformer thinking
@@ -54,15 +58,18 @@ class PatchSetPFN(nn.Module):
         thinking_rows: int = 8,
         residual_decay: float = 0.95,
         fourier_bands: int = 8,
-        coarse_prior: bool = True,
+        mask_prior: str = "scalar",      # false | scalar | patch
+        mask_patch_size: int = 1,        # p; mask-token input dim = p² (p=1 ⇒ scalar)
         stage1_dim: int | None = None,
         query_self_attn: bool = False,
     ):
         super().__init__()
-        self.coarse_prior = coarse_prior
+        assert mask_prior in ("false", "scalar", "patch"), mask_prior
+        self.mask_prior = mask_prior
+        self.mask_patch_size = mask_patch_size if mask_prior == "patch" else 1
         self.query_self_attn = query_self_attn
         self.img_embed  = nn.Linear(feature_dim, e)
-        self.mask_embed = nn.Linear(1, e)
+        self.mask_embed = nn.Linear(self.mask_patch_size ** 2, e)
         self.pos        = FourierPositionalEncoding(e, fourier_bands)
         self.thinking   = ThinkingRows(thinking_rows, e)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
@@ -75,11 +82,13 @@ class PatchSetPFN(nn.Module):
             self.stage1_type = nn.Parameter(torch.zeros(e))
             nn.init.normal_(self.stage1_type, std=0.02)
 
-    def _tokens(self, feat, label, ij, grid_res):
-        # feat (B,R,F), label (B,R), ij (B,R,2) → (B,R,2,e)
+    def _tokens(self, feat, mask, ij, grid_res):
+        # feat (B,R,F); mask (B,R) scalar or (B,R,p²); ij (B,R,2) → (B,R,2,e)
         p   = self.pos(ij, grid_res)                        # (B,R,e)
         img = self.img_embed(feat) + p
-        msk = self.mask_embed(label.unsqueeze(-1)) + p
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(-1)                        # (B,R,1)
+        msk = self.mask_embed(mask) + p
         return torch.stack([img, msk], dim=2)               # (B,R,2,e)
 
     def forward(self, sup_feat, sup_label, sup_ij,
@@ -93,9 +102,10 @@ class PatchSetPFN(nn.Module):
         sup_feat = ((sup_feat - mu) / sig).clamp(-10, 10)
         qry_feat = ((qry_feat - mu) / sig).clamp(-10, 10)
 
-        # Query mask prior: coarse pred, or the support-mean fraction (TargetEncoder analog).
-        if not self.coarse_prior:
-            qry_prior = sup_label.mean(dim=1, keepdim=True).expand(B, Q)
+        # Query mask prior: coarse pred ("scalar"/"patch"), or support-mean ("false").
+        if self.mask_prior == "false":
+            m = sup_label.mean(dim=1, keepdim=True)          # (B,1) or (B,1,p²)
+            qry_prior = m.expand(B, Q, *m.shape[2:])
 
         sup_tok = self._tokens(sup_feat, sup_label, sup_ij, grid_res)   # (B,S,2,e)
         qry_tok = self._tokens(qry_feat, qry_prior, qry_ij, grid_res)   # (B,Q,2,e)

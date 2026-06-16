@@ -173,6 +173,32 @@ Key points:
 - Not directly comparable to old runs' `uncertain` numbers (different denominator). The
   `sampled` and native `dice/mean` scopes remain comparable.
 
+## Mask-token form (`arch.mask_prior`)
+
+PatchSetPFN's mask-token is configurable (replaces the old boolean `arch.coarse_prior`):
+
+- **`false`** — scalar mask-token; query prior = support-mean (neutral; TargetEncoder analog).
+- **`scalar`** — scalar mask-token; query prior = stage-1 coarse prediction (previous default,
+  `coarse_prior=true`).
+- **`patch`** — the mask-token is a `p×p` mask **tile** (`mask_embed = Linear(p², e)`) instead
+  of a scalar. `p = image_size // grid_res` (auto). Support tiles are the native GT region
+  under each cell (exact boundary geometry — richer than the avg-pooled fraction, on the
+  boundary cells we sample). Query tiles are the upsampled coarse prior.
+
+Implementation: `pipeline._mask_tiles` reshapes a mask map into per-cell `p×p` tiles
+(row-major, matching the cell index order); `build_patch_batch` gathers tiles by the sampled
+indices when `mask_prior=="patch"`. `qry_coarse` (scalar) is always kept as the metrics
+baseline. The model handles `"false"` (overrides the query prior with the support-mean);
+the pipeline passes the coarse-derived prior for both `false` and `scalar`.
+
+Caveats:
+- **Information asymmetry**: support tiles carry real sub-cell GT geometry, but the query tile
+  is an upsampled res-16 coarse prior — no detail finer than the stage-1 resolution, so it is
+  ≈ the scalar prior smeared over `p²`. The win is on the support side.
+- **Not cross-resolution generalizable**: `patch` ties `mask_embed`'s input dim to `p`(grid_res),
+  so a `patch`-mode checkpoint is bound to its training `grid_res` (unlike the Fourier-PE image
+  path). `scalar`/`false` remain grid-agnostic.
+
 ## Out of scope
 
 - No change to `PatchSetPFN`, the stage-1 model, or the fusion/compositing logic.

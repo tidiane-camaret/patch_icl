@@ -62,19 +62,31 @@ def gaussian_blur(x_flat: torch.Tensor, grid_res: int, sigma: float) -> torch.Te
 
 
 def sample_patches(values, n_total, tau, blur_sigma, floor, grid_res,
-                   temperature=1.0, stochastic=True, n_fg_core=0):
+                   temperature=1.0, stochastic=True, n_fg_core=0, boundary_tier=True,
+                   n_boundary_core=0):
     """values: (B, N) in [0,1]. Returns (idx, is_core, is_fg_core), each (B, n_total).
 
     Core priority tiers (all above the neighbor tier, so a single top-k selects them):
-      1. boundary core : cells with |value-0.5| < tau (ranked by closeness to 0.5)
+      1. boundary core : cells with |value-0.5| < tau (ranked by closeness to 0.5).
+                         Disabled when boundary_tier=False (tau→0, no boundary core).
+                         When n_boundary_core>0, the tau band is CAPPED to the
+                         n_boundary_core cells closest to 0.5 — a distribution-invariant
+                         quota so the boundary budget no longer balloons on thin-structure
+                         datasets (tau still gates out pure 0/1 cells).
       2. fg core       : a fixed quota of n_fg_core foreground cells (value>=0.5) chosen
                          uniformly at random, to cover object interiors the boundary
-                         misses — independent of the neighbor field.
-    The remaining budget is filled by cells sampled near the boundary core via a blurred
-    proximity field + Gumbel-top-k (uniform `floor` keeps far cells in play).
+                         misses.
+    The remaining budget is filled by cells sampled near BOTH core tiers via a blurred
+    proximity field + Gumbel-top-k (uniform `floor` keeps far cells in play): the field
+    diffuses from boundary core ∪ fg core, so foreground neighbors also fill the budget.
     """
     d = (values - 0.5).abs()
-    core_b = d < tau                                   # boundary core (variable count)
+    core_b = (d < tau) if boundary_tier else torch.zeros_like(values, dtype=torch.bool)
+    if boundary_tier and n_boundary_core > 0:
+        # Cap the tau band at the n_boundary_core cells closest to 0.5 (per row).
+        masked_d = torch.where(core_b, d, torch.full_like(d, 2.0))   # non-core → large
+        keep = masked_d.topk(min(n_boundary_core, d.shape[1]), dim=1, largest=False).indices
+        core_b = torch.zeros_like(core_b).scatter_(1, keep, True) & core_b   # guard: real core only
 
     # ── Tier 2: forced foreground quota (random fg, excluding boundary core) ──
     fg_core = torch.zeros_like(core_b)
@@ -84,8 +96,8 @@ def sample_patches(values, n_total, tau, blur_sigma, floor, grid_res,
         take = key.topk(n_fg_core, dim=1).indices
         fg_core = torch.zeros_like(core_b).scatter_(1, take, True) & fg_pool  # guard: <n_fg_core fg
 
-    # ── Neighbor proximity field (around the boundary core only) ──
-    g = gaussian_blur(core_b.float(), grid_res, blur_sigma)
+    # ── Neighbor proximity field (around boundary core ∪ fg core) ──
+    g = gaussian_blur((core_b | fg_core).float(), grid_res, blur_sigma)
     w = g + floor
     if stochastic:
         u = torch.rand_like(w).clamp(1e-6, 1 - 1e-6)
@@ -255,14 +267,17 @@ def compute_stats(ds, args, stage1, device):
         n, N = values.shape
         idx, is_core, _ = sample_patches(values, args.n_total, args.tau, args.sigma,
                                          args.floor, R, args.temperature, stochastic=True,
-                                         n_fg_core=args.n_fg_core)
+                                         n_fg_core=args.n_fg_core,
+                                         boundary_tier=not args.no_boundary,
+                                         n_boundary_core=args.n_boundary_core)
 
-        # Full-grid selection masks (n, N); fg/bg from the TRUE gt32.
+        # Full-grid selection masks (n, N); fg/bg/boundary from the TRUE gt32.
         sel  = torch.zeros(n, N, dtype=torch.bool).scatter_(1, idx, True)
         core = torch.zeros(n, N, dtype=torch.bool).scatter_(1, idx, is_core)
         nb   = sel & ~core
         fg   = gt32 >= 0.5
         bg   = ~fg
+        bnd  = (gt32 > 0) & (gt32 < 1)                  # true boundary: fractional occupancy
 
         A[dsn] = {
             "core_fg": int((fg & core).sum()), "core": int(core.sum()),
@@ -271,6 +286,7 @@ def compute_stats(ds, args, stage1, device):
         Bc[dsn] = {
             "fg": int(fg.sum()), "fg_core": int((fg & core).sum()), "fg_nb": int((fg & nb).sum()),
             "bg": int(bg.sum()), "bg_core": int((bg & core).sum()), "bg_nb": int((bg & nb).sum()),
+            "bnd": int(bnd.sum()), "bnd_core": int((bnd & core).sum()), "bnd_nb": int((bnd & nb).sum()),
         }
         per_img[dsn] = (n, int(core.sum()) / n)
 
@@ -322,6 +338,21 @@ def compute_stats(ds, args, stage1, device):
           f"{pct(t['bg_core'], t['bg']):>7.1f}%  {pct(t['bg_nb'], t['bg']):>8.1f}%  "
           f"{pct(bg_miss, t['bg']):>7.1f}%")
 
+    # ── Table C: true-boundary coverage ─────────────────────────────────────
+    hdr3 = (f"{'dataset':>16}  {'bnd→core':>8}  {'bnd→neigh':>9}  {'bnd→miss':>8}")
+    print("\n[C] boundary coverage: of true-boundary cells (0<gt<1), where do they go")
+    print(hdr3); print("-" * len(hdr3))
+    for dsn in sorted(by_ds):
+        b = Bc[dsn]
+        bnd_miss = b["bnd"] - b["bnd_core"] - b["bnd_nb"]
+        print(f"{dsn:>16}  {pct(b['bnd_core'], b['bnd']):>7.1f}%  {pct(b['bnd_nb'], b['bnd']):>8.1f}%  "
+              f"{pct(bnd_miss, b['bnd']):>7.1f}%")
+    t = _agg(Bc, ["bnd", "bnd_core", "bnd_nb"])
+    bnd_miss = t["bnd"] - t["bnd_core"] - t["bnd_nb"]
+    print("-" * len(hdr3))
+    print(f"{'TOTAL':>16}  {pct(t['bnd_core'], t['bnd']):>7.1f}%  {pct(t['bnd_nb'], t['bnd']):>8.1f}%  "
+          f"{pct(bnd_miss, t['bnd']):>7.1f}%")
+
 
 def compute_sweep(ds, args, stage1, device):
     """Sweep tau × sigma × floor over the full val set, pooled across all images.
@@ -356,7 +387,9 @@ def compute_sweep(ds, args, stage1, device):
             for floor in floors:
                 idx, is_core, _ = sample_patches(values, args.n_total, tau, sigma, floor,
                                                  R, args.temperature, stochastic=True,
-                                                 n_fg_core=args.n_fg_core)
+                                                 n_fg_core=args.n_fg_core,
+                                                 boundary_tier=not args.no_boundary,
+                                                 n_boundary_core=args.n_boundary_core)
                 sel  = torch.zeros(n, N, dtype=torch.bool).scatter_(1, idx, True)
                 core = torch.zeros(n, N, dtype=torch.bool).scatter_(1, idx, is_core)
                 nb   = sel & ~core
@@ -366,6 +399,88 @@ def compute_sweep(ds, args, stage1, device):
                 print(f"{tau:>5.2f} {sigma:>6.1f} {floor:>6.3f}   "
                       f"{pct(core_fg, core_t):>7.1f}% {pct(core_fg + nb_fg, core_t + nb_t):>6.1f}%   "
                       f"{pct(core_fg, fg_t):>7.1f}% {pct(nb_fg, fg_t):>8.1f}% {pct(fg_miss, fg_t):>7.1f}%")
+
+
+def compute_hist(ds, args, stage1, device):
+    """Per-cell value distribution over the val set, for GT and the source map.
+
+    The boundary core selects cells by |value-0.5| < tau, which is only meaningful
+    relative to how values are actually distributed. Grid-cell values are strongly
+    bimodal — mass piled at 0 (pure bg) and 1 (fg interior) — so a fixed tau-band
+    captures a small, non-uniform slice. This reports that density explicitly.
+    With --source prev_pred, build_maps returns the TRUE GT and the stage-1 prediction
+    in one pass, so both distributions are reported together.
+    """
+    R = args.grid_res
+    by_ds: dict[str, list[int]] = defaultdict(list)
+    for i, (dsn, _, _) in enumerate(ds.samples):
+        by_ds[dsn].append(i)
+
+    bins = 10
+    taus = [0.15, 0.30, 0.45]
+    EPS  = 0.02
+
+    def new_acc():
+        return {"n": 0, "at0": 0, "at1": 0, "sum": 0.0,
+                "hist": torch.zeros(bins), "band": {t: 0 for t in taus}}
+
+    def accumulate(acc, x):
+        flat = x.reshape(-1).float()
+        acc["n"]   += flat.numel()
+        acc["at0"] += int((flat < EPS).sum())
+        acc["at1"] += int((flat > 1 - EPS).sum())
+        acc["sum"] += float(flat.sum())
+        acc["hist"] += torch.histc(flat, bins=bins, min=0.0, max=1.0)
+        for t in taus:
+            acc["band"][t] += int(((flat - 0.5).abs() < t).sum())
+
+    has_pred = args.source == "prev_pred"
+    G = {dsn: new_acc() for dsn in by_ds}
+    P = {dsn: new_acc() for dsn in by_ds} if has_pred else None
+    for dsn in sorted(by_ds):
+        gt32, values = build_maps(ds, by_ds[dsn], args, stage1, device)
+        accumulate(G[dsn], gt32)
+        if has_pred:
+            accumulate(P[dsn], values)
+
+    pct = lambda a, b: 100 * a / max(b, 1)
+
+    def print_table(label, acc_by_ds):
+        print(f"\n[{label}] per-cell value distribution  "
+              f"(%@0 = v<{EPS}, %@1 = v>{1 - EPS}, %mid = the rest)")
+        hdr = (f"{'dataset':>16}  {'%@0':>6}  {'%@1':>6}  {'%mid':>6}  {'mean':>5}   "
+               + "  ".join(f"|.5|<{t:.2f}" for t in taus))
+        print(hdr); print("-" * len(hdr))
+        tot = new_acc()
+        for dsn in sorted(acc_by_ds):
+            a = acc_by_ds[dsn]
+            mid = a["n"] - a["at0"] - a["at1"]
+            print(f"{dsn:>16}  {pct(a['at0'], a['n']):>5.1f}%  {pct(a['at1'], a['n']):>5.1f}%  "
+                  f"{pct(mid, a['n']):>5.1f}%  {a['sum'] / max(a['n'], 1):>5.2f}   "
+                  + "  ".join(f"{pct(a['band'][t], a['n']):>7.1f}%" for t in taus))
+            for k in ("n", "at0", "at1", "sum"):
+                tot[k] += a[k]
+            tot["hist"] += a["hist"]
+            for t in taus:
+                tot["band"][t] += a["band"][t]
+        mid = tot["n"] - tot["at0"] - tot["at1"]
+        print("-" * len(hdr))
+        print(f"{'TOTAL':>16}  {pct(tot['at0'], tot['n']):>5.1f}%  {pct(tot['at1'], tot['n']):>5.1f}%  "
+              f"{pct(mid, tot['n']):>5.1f}%  {tot['sum'] / max(tot['n'], 1):>5.2f}   "
+              + "  ".join(f"{pct(tot['band'][t], tot['n']):>7.1f}%" for t in taus))
+        edges = [f"{i / bins:.1f}-{(i + 1) / bins:.1f}" for i in range(bins)]
+        print("  TOTAL histogram (% of cells per 0.1-wide bin):")
+        print("   " + "".join(f"{e:>10}" for e in edges))
+        print("   " + "".join(f"{pct(int(tot['hist'][i]), tot['n']):>9.1f}%" for i in range(bins)))
+
+    print(f"\nsource={args.source}  grid={R}  (GT = avg-pooled true mask; "
+          f"pred = stage-1 prev_pred upsampled to grid)")
+    print_table("GT", G)
+    if has_pred:
+        print_table("PRED (prev_pred)", P)
+    else:
+        print("\n(--source ds_gt: the sampling map IS the GT — "
+              "run --source prev_pred for the prediction distribution.)")
 
 
 def main():
@@ -381,19 +496,28 @@ def main():
                     default="results/2d/pfn_seg_universeg/pfn_seg_USegall_R16q8_e256_l6_k3_think8/best.pt")
     ap.add_argument("--context_size", type=int, default=3, help="K context pairs for stage-1")
     ap.add_argument("--s1_chunk", type=int, default=64, help="stage-1 forward batch size")
-    ap.add_argument("--n_images", type=int, default=6)
+    ap.add_argument("--n_images", type=int, default=10)
     ap.add_argument("--n_total", type=int, default=256)
     ap.add_argument("--tau", type=float, default=0.30)
     ap.add_argument("--sigma", type=float, default=1.0)
     ap.add_argument("--floor", type=float, default=0.005)
     ap.add_argument("--n_fg_core", type=int, default=64,
                     help="fixed quota of random foreground cells forced into the core")
+    ap.add_argument("--no_boundary", action="store_true",
+                    help="disable the boundary core tier (tau→0); neighbor field then "
+                         "diffuses from fg_core only — the fg-sourced-neighbors test")
+    ap.add_argument("--n_boundary_core", type=int, default=0,
+                    help="cap the tau boundary band at the N cells closest to 0.5 (0=uncapped, "
+                         "current behaviour); a distribution-invariant boundary-core quota")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stats", action="store_true",
                     help="compute per-dataset fg/bg core/neighbor stats over the val set (no plot)")
     ap.add_argument("--sweep", action="store_true",
                     help="sweep tau×sigma×floor over the val set (maps computed once); no plot")
+    ap.add_argument("--hist", action="store_true",
+                    help="report the per-cell value distribution (GT and prev_pred) over the "
+                         "val set — exposes how non-uniform the map is around 0.5; no plot")
     ap.add_argument("--out", default="results/2d/multilevel/sampling_viz.png")
     args = ap.parse_args()
 
@@ -402,12 +526,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stage1 = load_stage1(args.stage1_checkpoint, device) if args.source == "prev_pred" else None
 
-    # ---- Stats / sweep modes: full val set, no plotting ----
-    if args.stats or args.sweep:
+    # ---- Stats / sweep / hist modes: full val set, no plotting ----
+    if args.stats or args.sweep or args.hist:
         names = [args.dataset] if args.dataset else None     # None → all datasets
         ds = MedSegBenchDataset(split=args.split, context_size=args.context_size,
                                 image_size=args.image_size, datasets=names)
-        (compute_sweep if args.sweep else compute_stats)(ds, args, stage1, device)
+        fn = compute_hist if args.hist else (compute_sweep if args.sweep else compute_stats)
+        fn(ds, args, stage1, device)
         return
 
     # Choose which datasets to load: a single one, or n_images distinct ones.
@@ -456,7 +581,9 @@ def main():
     gt32, values = build_maps(ds, pick, args, stage1, device)
     idx, is_core, is_fg_core = sample_patches(values, args.n_total, args.tau, args.sigma,
                                               args.floor, R, args.temperature,
-                                              stochastic=True, n_fg_core=args.n_fg_core)
+                                              stochastic=True, n_fg_core=args.n_fg_core,
+                                              boundary_tier=not args.no_boundary,
+                                              n_boundary_core=args.n_boundary_core)
 
     fig, axes = plt.subplots(n, 2, figsize=(7, 3.2 * n), squeeze=False)
     for r in range(n):

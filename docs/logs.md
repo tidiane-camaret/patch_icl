@@ -1,5 +1,121 @@
 # Change log
 
+## 2026-06-16 — 2d/multilevel: dice/mean checkpoint selection + pfn_seg-matched coarse baseline
+
+Stage-2 `train.py` now selects the best checkpoint on native `dice/mean` (the deployment
+metric, pfn_seg-comparable) instead of `refine/uncertain/delta_err` (kept as diagnostic;
+it's a local L1-reduction on boundary cells that can diverge from native Dice and ignores
+certain-cell regression). `run_eval` returns `dice/mean` for selection.
+
+Metric naming made resolution-honest (a `_r16`/`_r32` suffix now means the dice is
+computed AT that resolution, verified: dice@r16 0.896 ≠ s1@128 0.782, dice@r32 0.093 ≠
+s2@128 0.139):
+  - `dice_r16/mean` = stage-1 pred @res-16 vs GT@16 (== pfn_seg low-res dice).
+  - `dice_r32/mean` = refined map @res-32 vs GT@32 (new).
+  - `dice/mean` = stage-2 refined 32→128 @128 (checkpoint/headline, pfn_seg-comparable).
+  - `dice_s1/mean` = stage-1 16→128 @128 (pfn_seg headline baseline); `dice/margin_vs_s1`.
+  - refine scopes are res-32 stage comparisons → suffixed by STAGE: `refine/{scope}/dice_s1`
+    vs `dice_s2`, `soft_dice_s1/s2`, `refine/certain_err_s1/s2`. Also log per-sample
+    improvements `refine/{scope}/dice_delta` and `soft_dice_delta` (s2-s1, >0=better,
+    nanmean of paired diffs like delta_err).
+Rationale: r16/r32 reserved strictly for true-resolution dices; where two maps are
+compared at one shared resolution (native-128 pair, res-32 refine scopes) resolution
+can't distinguish them, so they carry s1/s2.
+Resolution numbers in the metric keys are derived, not hardcoded: R1 = stage-1 native
+res (`round(stage1.N**0.5)`), R2 = `cfg.sample.grid_res`, H = `cfg.data.image_size`;
+keys built as `f"dice_r{R1}/mean"` etc.
+Fixed the coarse baseline: `dice_coarse/mean` was computing stage-1 via res-16→32→128
+(double upsample); now uses the stage-1 res-16 map upsampled 16→128 DIRECTLY, exactly as
+pfn_seg.py (same bilinear/align_corners/hard_dice), so it equals pfn_seg's stage-1 number.
+Pipeline `coarse_predict` now also returns `coarse_lowres` (B,R1,R1) for this. Smoke-tested
+1 epoch on busi: plumbing OK, coarse baseline 0.78.
+
+## 2026-06-16 — 2d/multilevel: target n_fg_core sweep (weak lever)
+
+prev_pred --stats, n_fg_core 64/128/192: fg captured 66.2%→69.1%→69.5% (saturates at
+128), bnd→miss FLAT 31.5% throughout (fg_core takes budget from neighbors, never the
+top-priority boundary core). Gain lands only on easy datasets with spare budget; hard
+thin-structure datasets unchanged (tnbcnuclei fg→miss 51.9→53.4, monusac 52.8→54.5) —
+already budget-saturated by their large boundary band, residual fg→miss is structural
+(objects > 256 patches at res-32). Much weaker than the context lever (64→160 gave +9pts
+on ds_gt) because prev_pred under-confidence already puts fg interior in the boundary
+band (fg→core 60% at nfg=64), making the explicit fg quota partly redundant on target.
+**Decision: keep context heavy (160), target light — leave target 64 or nudge to 96
+(~+2pts free, keeps neighbor budget; >128 the neighbor tier vanishes for no gain).**
+
+## 2026-06-16 — plot_sampling.py: --hist value-distribution diagnostic
+
+Added `--hist` mode: per-cell value distribution (per-dataset + total) for GT and the
+source map, with `%@0`/`%@1`/`%mid`, mean, and `|v-0.5|<tau` band fractions + a 10-bin
+histogram. Run with `--source prev_pred` to get both GT and prediction in one pass.
+**Findings (full val, res-32):** distribution is extremely bimodal. GT: 84.6%@0 /
+7.8%mid / 7.6%@1 — the boundary band ≈ all fractional cells (`%mid`≈`|.5|<0.45`).
+prev_pred: 75.6%@0 / 21.2%mid / 3.2%@1 — same mean (0.11) but `%@1` HALVED and `%mid`
+2.7×: the stage-1 model is under-confident on fg (interiors predicted ~0.7-0.9), so
+the 0.5-band is biased inward and mixes true edge with under-predicted interior →
+mechanism behind the ~31% target boundary-miss floor. Fixed `tau` gives a ~70×-variable
+boundary-core size across datasets (idrib 0.5% → tnbcnuclei 35% at |.5|<0.30), so the
+boundary/fg/neighbor budget split is set by the data, not by config (tnbcnuclei's
+boundary core alone > n_total).
+
+**Quota-cap experiment (tested → REJECTED).** Added opt-in `--n_boundary_core` (caps the
+tau band at the N cells closest to 0.5; default 0 = uncapped = unchanged). prev_pred
+--stats, cap 0/96/64: capping WORSENS bnd→miss (31.5%→37.6%→40.8%) and barely moves
+fg→miss (33.9%→33.2%) — net negative, even on the thin-structure datasets it targeted
+(tnbcnuclei fg→miss 54→62, bnd→miss 62→64). Two reasons: (1) freed budget flows to
+NEIGHBORS not fg_core (fixed 64), trading high-value boundary cells for low-value
+neighbor fill; (2) on prev_pred the under-confident prediction puts fg interior (0.7-0.9)
+INSIDE the tau band, so it covers boundary AND fg at once — capping loses both. The
+variable tau allocation is a feature: high-boundary datasets need more boundary budget.
+Kept the arg as a diagnostic only; real sampling.py unchanged.
+
+## 2026-06-16 — 2d/multilevel: per-role fg quota (context n_fg_core)
+
+Split `n_fg_core` by sampler role. Target and context both call `sample_patches`, but
+with opposite goals: target ranks cells by the stage-1 `coarse_flat` (prev_pred,
+uncertainty regime), context ranks by the TRUE GT mask fraction (`ctx_frac`). Context
+wants a large share of the foreground sampled for class info, not boundary recall.
+Added `sample.n_fg_core_ctx: 160` (`configs/experiment/2d/multilevel.yaml`);
+`pipeline.py` context call now uses `s.get("n_fg_core_ctx", s.n_fg_core)` (target call
+unchanged at 64). Backward-compatible — absent key falls back to `n_fg_core`. Motivated
+by the ds_gt fg-coverage sweep: fg captured 72%→81% going 64→160, boundary miss flat
+~28% (heavy fg costs the boundary nothing on the GT map). Diagnostic: `--source ds_gt`
+in plot_sampling.py.
+
+## 2026-06-16 — plot_sampling.py: fg-sourced neighbor diagnostic
+
+`sample_patches` neighbor field now diffuses from `boundary_core ∪ fg_core` (was
+boundary core only), and gained a `boundary_tier` arg + `--no_boundary` CLI flag to
+disable the tau tier (tau→0). Added `[C] boundary coverage` block to `--stats`:
+of true-boundary cells (`0<gt<1`), the % reaching core / neighbor / missed. Lets the
+head-to-head run by invoking the script with different flags (no `--compare` mode):
+`--n_fg_core 0` = boundary-only baseline, `--n_fg_core N` = union,
+`--n_fg_core N --no_boundary` = pure fg-sourced neighbors. Spec:
+`docs/superpowers/specs/2026-06-16-fg-sourced-neighbor-experiment-design.md`.
+**Result (prev_pred, full val, pooled):** dropping the boundary tier (fg-sourced
+neighbors only) raises bnd→miss 31.4%→47.8% — unanimous across all 35 datasets;
+worst on compact/sharp objects (covid19radio 3.8→42.7, isic2016 5.7→40.1,
+pandental 16.4→68.6). The `core_b ∪ fg_core` neighbor-union does NOT help the
+boundary: union bnd→miss 31.6% ≈ baseline 31.4%, and union's bnd→neigh (4.7%) is
+LOWER than baseline's (6.4%) — boundary is held up entirely by the boundary-core
+tier. The fg_core quota's value is interior coverage (fg→miss 45.7%→30.6%), not
+boundary. **Conclusion: boundary tier is load-bearing; fg-sourced neighbors are
+not. The res-16 map (offset 0.5-band) is the ~31% boundary-miss floor, not the
+sampler.**
+
+## 2026-06-16 — 2d/multilevel: configurable mask-token form (arch.mask_prior)
+
+Replaced `arch.coarse_prior` (bool) with `arch.mask_prior: false | scalar | patch` in
+`PatchSetPFN` + pipeline. `false`/`scalar` keep the scalar mask-token (neutral support-mean
+vs coarse-pred query prior). `patch` makes the mask-token a `p×p` mask tile
+(`mask_embed=Linear(p²,e)`, `p=image_size//grid_res` auto): support tiles = native GT under
+each cell (exact boundary geometry, richer than the avg-pooled fraction), query tiles =
+upsampled coarse prior. New `pipeline._mask_tiles` helper; `qry_coarse` scalar kept as the
+metrics baseline. Caveat: patch mode ties `mask_embed` to grid_res (not cross-resolution
+generalizable); query tile carries no detail below the res-16 stage-1. Tests
+(`test_patchset.py`, `test_pipeline.py`) updated + patch-mode cases added; 1-epoch smoke run
+in patch mode verified (params +3840 = (p²-1)·e).
+
 ## 2026-06-16 — 2d/multilevel: sampling-procedure redesign + diagnostic
 
 Designed a new stage-2 patch sampler (spec:
@@ -13,8 +129,17 @@ prediction (res-16→32) at the correct resolutions.
 Sweep findings (full val, 13,237 imgs, fg from true GT): tuned defaults `tau=0.30,
 sigma=1.0, floor=0.005, n_fg_core=64` (M=256, grid=32) → fg→miss ~36%, matching the GT
 oracle. `tau` cannot be read off the oracle (0.45 best for ds_gt but regresses under
-prev_pred as the neighbor fill collapses on the misplaced predicted boundary). Diagnostic
-only — no change yet to the training pipeline.
+prev_pred as the neighbor fill collapses on the misplaced predicted boundary).
+
+Implemented: `sampling.py` now exposes `sample_patches` + `gaussian_blur` (old
+`sample_patch_indices` retired); `pipeline.build_patch_batch` uses it for both query and
+support paths with `qry_is_uncertain` = boundary core (excludes fg-core), plus a
+`stochastic` flag (train True, eval `not eval_deterministic`); config `sample.*` replaced
+`n_uncertain/n_certain` with `n_total/tau/n_fg_core/blur_sigma/floor/temperature/
+eval_deterministic`; `train.py` threads `stochastic`. Run name now comes from wandb
+(auto-generated); checkpoints save under `{date}_{run_name}` (e.g. `2026-05-22_deft-field-72`).
+Tests (`test_sampling.py`, `test_pipeline.py`) updated and passing; 1-epoch smoke run of
+`train.py` train+eval+checkpoint verified.
 
 ## 2026-06-16 — 2d/multilevel: configurable query sampling map (prev_pred | ds_gt)
 
