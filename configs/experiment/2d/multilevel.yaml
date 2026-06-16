@@ -10,6 +10,11 @@ sample:
   grid_res: 32        # res-32 grid (32×32 = 1024 cells per image)
   n_uncertain: 192    # cells closest to 0.5
   n_certain: 64       # most-certain cells
+  # Sampling map: which signal ranks cells for query selection (|value-0.5|).
+  #   prev_pred : previous-level (stage-1 coarse) prediction — deployable, no label access
+  #   ds_gt     : downsampled target GT — oracle, leaks labels (upper-bound study only)
+  train: prev_pred    # prev_pred | ds_gt
+  eval: prev_pred     # prev_pred | ds_gt
 
 arch:
   feature_level: all  # UniverSeg encoder level → feature_dim 256

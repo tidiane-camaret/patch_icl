@@ -128,7 +128,7 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
             imgs, msks = augment(imgs, msks, K, cfg.aug)
             batch = {**batch, "context_in": imgs[:, :K].cpu(), "image": imgs[:, K, 0:1].cpu(),
                      "context_out": msks[:, :K].cpu(), "label": msks[:, K, 0:1].cpu()}
-        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE)
+        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE, cfg.sample.train)
 
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -182,7 +182,7 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     for batch in pbar:
         if batch is None:
             continue
-        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE)
+        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE, cfg.sample.eval)
         with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
             logits = model(pb["sup_feat"], pb["sup_label"], pb["sup_ij"],
                            pb["qry_feat"], pb["qry_prior"], pb["qry_ij"], cfg.sample.grid_res,
@@ -299,7 +299,8 @@ def main(cfg: DictConfig):
 
     lawa_queue = collections.deque(maxlen=cfg.train.lawa_k)
     run_name = cfg.wandb.name or (f"multilevel_{'coarse' if cfg.arch.coarse_prior else 'scratch'}"
-                                  f"_R{cfg.sample.grid_res}_k{cfg.data.context_size}_l{cfg.arch.l}")
+                                  f"_R{cfg.sample.grid_res}_k{cfg.data.context_size}_l{cfg.arch.l}"
+                                  f"_smp-{cfg.sample.train}-{cfg.sample.eval}")
     wandb.init(project=cfg.wandb.project, name=run_name,
                config={"arch": dict(cfg.arch), "train": dict(cfg.train),
                        "data": dict(cfg.data), "sample": dict(cfg.sample)},

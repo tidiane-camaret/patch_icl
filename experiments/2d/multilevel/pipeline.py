@@ -42,8 +42,12 @@ def _grid_fractions(masks, grid_res):
 
 
 @torch.no_grad()
-def build_patch_batch(batch, stage1, encoder, cfg, device):
+def build_patch_batch(batch, stage1, encoder, cfg, device, sampling_source="prev_pred"):
     """Returns a dict of tensors on `device` for PatchSetPFN + metrics.
+
+    sampling_source selects the query sampling map only (prior + fusion stay coarse):
+      "prev_pred" : rank cells by the stage-1 coarse prediction (deployable).
+      "ds_gt"     : rank cells by the downsampled target GT (oracle — leaks labels).
 
     Keys: sup_feat (B,K*M,Cf), sup_label (B,K*M), sup_ij (B,K*M,2),
           qry_feat (B,M,Cf), qry_prior (B,M), qry_ij (B,M,2),
@@ -75,8 +79,9 @@ def build_patch_batch(batch, stage1, encoder, cfg, device):
     # mask (so stage-1 never sees the answer), so fracs[:, -1] would be all zeros.
     gt32  = F.adaptive_avg_pool2d(label.float(), (R2, R2)).reshape(B, R2 * R2)  # (B,N) real target GT
 
-    # ── Query (target) patches: rank by coarse pred ──────────────────────────
-    qidx = sample_patch_indices(coarse_flat, n_unc, n_cer)                      # (B,M)
+    # ── Query (target) patches: rank by the sampling map ─────────────────────
+    sampling_map = gt32 if sampling_source == "ds_gt" else coarse_flat
+    qidx = sample_patch_indices(sampling_map, n_unc, n_cer)                     # (B,M)
     qry_feat   = gather_grid(feats[:, -1], qidx)                                # (B,M,Cf)
     qry_coarse = gather_grid(coarse_flat, qidx)                                 # (B,M)
     qry_gt     = gather_grid(gt32, qidx)                                        # (B,M)

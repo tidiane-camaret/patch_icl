@@ -1,5 +1,32 @@
 # Change log
 
+## 2026-06-16 — 2d/multilevel: sampling-procedure redesign + diagnostic
+
+Designed a new stage-2 patch sampler (spec:
+`docs/superpowers/specs/2026-06-16-multilevel-patch-sampling-design.md`): threshold
+boundary core + fixed random-fg-core quota + blurred-field Gumbel-top-k neighbor fill,
+replacing the fixed n_uncertain/n_certain split. Built `experiments/2d/multilevel/plot_sampling.py`
+to visualize and measure it on MedSegBench val (`--stats`, `--sweep`), with a `--source
+ds_gt|prev_pred` toggle that samples from either res-32 GT or the real frozen stage-1
+prediction (res-16→32) at the correct resolutions.
+
+Sweep findings (full val, 13,237 imgs, fg from true GT): tuned defaults `tau=0.30,
+sigma=1.0, floor=0.005, n_fg_core=64` (M=256, grid=32) → fg→miss ~36%, matching the GT
+oracle. `tau` cannot be read off the oracle (0.45 best for ds_gt but regresses under
+prev_pred as the neighbor fill collapses on the misplaced predicted boundary). Diagnostic
+only — no change yet to the training pipeline.
+
+## 2026-06-16 — 2d/multilevel: configurable query sampling map (prev_pred | ds_gt)
+
+Isolate the stage-2 patch-selection signal from the model. Added `sample.train` and
+`sample.eval` (`prev_pred` | `ds_gt`) to `configs/experiment/2d/multilevel.yaml`.
+`build_patch_batch` now takes `sampling_source`: `prev_pred` ranks query cells by the
+stage-1 coarse prediction (current/deployable behaviour, default), `ds_gt` ranks by the
+downsampled target GT (oracle upper-bound — leaks labels, eval numbers optimistic).
+Only query selection changes; `qry_prior` and the eval fusion base stay on the coarse
+map, so the model input is held fixed across the two modes. Run name gains a
+`_smp-{train}-{eval}` tag. Files: `pipeline.py`, `train.py`, `multilevel.yaml`.
+
 ## 2026-06-15 — pfn_seg: fix CUDA grid-limit crash at resolution≥32
 
 `src/models/pfn_seg_2d.py`. Running with `arch.resolution=32` crashed in the
