@@ -9,11 +9,13 @@ data:
 
 eval:
   batch_size: 16
-  workers: 20
+  workers: 30
   seed: 0
   out_dir: results/2d/outputs
   max_per_label: null #20  # max samples per (dataset, label_value); null = all
-  checkpoint: null   # pfn_seg_2d only: path to a trained best.pt (arch read from it)
+  checkpoint: null   # pfn_seg_2d / patchset_pfn: path to a trained best.pt (arch read from it)
+  stage1_checkpoint: null  # patchset_pfn only: frozen stage-1 ImagePFN best.pt (fallback if not stored in checkpoint)
+  encode_size: null  # pfn_seg_2d / patchset_pfn: feed images at this size, token grids stay at ckpt size (Strategy A); null = ckpt size
   patch_csv: null    # pfn_seg_2d only: path to dump per-patch error analysis CSV; null = off
 
 wandb:

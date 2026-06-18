@@ -103,7 +103,11 @@ def refine_level(model, batch, feats, coarse_grid, prev_think, grid_res, s,
 
     # ── Mask-token: scalar or p×p tile ──
     if s.mask_prior == "patch":
-        p = label.shape[-1] // grid_res
+        # p follows the model's baked tile size, not the input image — so a larger
+        # eval image (Strategy A) is resized down inside _mask_tiles rather than
+        # producing a p×p that mismatches mask_embed. At the training size these are
+        # equal (p = image_size//grid_res), so this is a no-op for training.
+        p = model.mask_patch_size
         ctx_tiles = torch.stack([_mask_tiles(context_out[:, k], grid_res, p) for k in range(K)],
                                 dim=1).reshape(B * K, N, p * p)
         sup_label = gather_grid(ctx_tiles, sidx).reshape(B, K * M, p * p)

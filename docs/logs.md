@@ -1,5 +1,146 @@
 # Change log
 
+## 2026-06-18 — Cheap channel-dim reduction for DINOv3 features
+
+`DINOv3FeatureEncoder` gained an `encoder_reduce` knob (applied after pooling, so the
+reported `feature_dim` — and thus the downstream `image_embed` input — shrinks):
+- `none` (default), `grouppool:<d>` (adaptive_avg_pool1d over channels, zero params,
+  no fit), `random:<d>` (frozen Gaussian / Johnson–Lindenstrauss projection, no fit),
+  `pca:<d>` (PCA fit once on data, cached to disk).
+- `encoder_stage_l2norm` L2-normalizes each stage map before the `all` concat, fixing
+  the channel-count/scale imbalance between stages (zero params).
+- PCA: `ensure_pca(image_iter)` loads the cached projection
+  (`<hf_cache>/reductions/dinov3_<variant>_l<level>_<raw|l2>_pca<d>.pt`) or fits + caches
+  it. `reduce_proj`/`reduce_mean`/`reduce_fitted` are registered buffers → for the
+  ImagePFN path they ride in the checkpoint state_dict; the multilevel chain encoder
+  (not in the checkpoint) re-loads from the disk cache at eval. Fit is wired into
+  `pfn_seg.py` and `multilevel/train.py` (guarded by `needs_pca_fit`) and the
+  `eval.py` chain branch (cache-hit, iterator untouched).
+- Cost is negligible — all reductions add ~1–2 ms to the ~39 ms encode (B=64, 128px,
+  bf16); the backbone dominates. The savings are downstream: `image_embed` input
+  1920→d, smaller cached/transferred features, and less overfit on a 1920-wide input.
+  Select via e.g. `arch.image_encoder=dinov3 arch.encoder_reduce=pca:256`.
+
+## 2026-06-18 — Encoder benchmark: UniverSeg vs DINOv3 (FLOPs / VRAM / latency)
+
+`experiments/2d/bench_encoders.py` times the frozen encoders under matched conditions
+(same batch / image size / token grid, same precision, same compile) reporting forward
+GFLOPs (FlopCounterMode), peak VRAM, ms/iter. RTX A4000, level=`all`, B=64.
+- **128px → grid 16**, bf16: UniverSeg 260 GFLOPs / 657 MiB / 21.8 ms ;
+  DINOv3-cnvnxt-base 642 GFLOPs / 658 MiB / 39.0 ms. DINOv3 ≈ 2.5× FLOPs, 1.8× latency.
+- All four ConvNeXt variants (`all`, B=64, 128px, bf16): added `tiny`/`small` to `_DIMS`
+  (both dims 96/192/384/768 → 1440ch; differ only in stage-2 depth 27 vs 9):
+
+  | variant | feat_dim | GFLOPs | VRAM MiB | ms/iter |
+  |---|---|---|---|---|
+  | dinov3-tiny  | 1440 | 186  | 356  | 17.5 |
+  | dinov3-small | 1440 | 363  | 439  | 27.3 |
+  | dinov3-base  | 1920 | 642  | 658  | 39.1 |
+  | dinov3-large | 2880 | 1436 | 1223 | 63.0 |
+  | (universeg)  | 256  | 260  | 657  | 21.8 |
+
+  **dinov3-tiny is both faster (17.5 vs 21.8 ms) and lighter (356 vs 657 MiB) than
+  UniverSeg** while giving a 1440-dim feature — an attractive default. tiny vs small is
+  same feature_dim at ~half the FLOPs (stage-2 depth).
+- **256px → grid 32**, bf16: UniverSeg 1039 GFLOPs / **2613 MiB** / 86.7 ms ;
+  DINOv3 2567 GFLOPs / **1606 MiB** / 142 ms. VRAM **crosses over**: UniverSeg keeps
+  high-res 64-ch feature maps through all stages (activation-heavy), while DINOv3's stem
+  downsamples /4 immediately → param-heavy but activation-light, so it scales better in
+  memory with resolution despite more FLOPs.
+- `compile bf16` == `eager bf16` to within noise: both encoders are `@torch.compiler.disable`
+  (the pipeline runs them eager; adaptive_avg_pool with symbolic windows can't lower), so
+  `torch.compile` graph-breaks at the encoder and gives no speedup. Compute lives in the
+  frozen backbone, not in launch overhead.
+- feature_dim asymmetry at `all`: UniverSeg 256 vs DINOv3 1920 — inherent to the concat;
+  for a compute-matched A/B pick a single `feature_level` per encoder.
+
+## 2026-06-18 — DINOv3 ConvNeXt feature encoder + `image_encoder` factory
+
+Added `DINOv3FeatureEncoder` (`src/models/pretrained_encoders.py`) to study the impact
+of encoder architecture/pretraining on the in-context segmentation model. Frozen
+`facebook/dinov3-convnext-{base,large}-pretrain-lvd1689m` backbone (ConvNeXt CNN, DINOv3
+SSL on LVD-1689M), matching `UniverSegFeatureEncoder`'s interface exactly:
+`forward(images, out_size) → (N, feature_dim, out_size, out_size)`, so it drops into the
+existing `image_encoder` injection seam in `ImagePFN` / the multilevel chain.
+- Fully convolutional → size-agnostic (runs at native H, pooled to the token grid),
+  same property the Strategy-A eval relies on. Stage maps: channels
+  `[128,256,512,1024]` (base) at strides `[4,8,16,32]`; `level` picks a stage (0=highest
+  res) or `"all"` → concat (feature_dim 1920 base / 2880 large).
+- Adapts DINOv3's input contract: 1-ch grayscale → repeated ×3, optional ImageNet
+  normalization (`encoder_imagenet_norm`, default on; off to let ImagePFN's own
+  per-context standardization be the sole norm). Loaded `local_files_only` from the NFS
+  HF cache (`…/ANALYSIS_20251122/checkpoints`).
+- New `build_image_encoder(arch, device)` factory dispatches on `arch.image_encoder`
+  (`patch`→none, `universeg`, `dinov3`/`dinov3-base`/`dinov3-large`) and returns
+  `(encoder, feature_dim)`. Replaced all 5 hand-rolled encoder-construction branches
+  (`pfn_seg.py`, `multilevel/train.py` ×2, `eval.py` ×3). The multilevel **chain**
+  encoder defaults to `universeg` (back-compat) and is overridable via
+  `arch.image_encoder=dinov3`.
+- Select at train/eval time, e.g. `arch.image_encoder=dinov3 arch.feature_level=2`.
+  Note feature_dim changes (UniverSeg `all`=256 vs DINOv3 `all`=1920), which sets the
+  `image_embed`/PatchSetPFN input dim — a fresh checkpoint, not warm-startable from a
+  UniverSeg one.
+
+## 2026-06-18 — Strategy-A eval: encode at a different resolution, grids fixed
+
+New `eval.encode_size` knob (`base.yaml`, `null` = checkpoint size) lets `pfn_seg_2d`
+and `patchset_pfn` eval **feed images at a different size while keeping every token grid
+fixed**. Only the frozen, fully-convolutional UniverSeg encoder runs at the new size,
+then pools into the unchanged grids; the output is upsampled to native for scoring.
+Decouples *encoder input resolution* from the baked patch/token grid.
+- `eval.py`: model is built at the checkpoint's `model_size`; the loader serves
+  `encode_size`. Stage-1 (and the pfn_seg model) get `patch_size` rescaled to
+  `encode_size // resolution` so `Hp = H//P` stays == `resolution` (else the patch
+  count ≠ `self.N` and the forward reshape crashes — see the H=256 probe). The chain
+  builds `PatchSetPFN.mask_patch_size` from `model_size`, not the served size. Final
+  prediction upsampled from the model grid (128) to native before Dice.
+- `multilevel/pipeline.py`: `refine_level` takes the patch-tile size `p` from
+  `model.mask_patch_size` instead of `label.shape[-1] // grid_res`, so a larger eval
+  image is resized down inside `_mask_tiles` rather than producing a `p×p` that
+  mismatches `mask_embed`. No-op at the training size (the two are equal).
+- wandb config now logs **`encoder_input_size`** (served pixels) and **`model_size`**
+  (the resolution the token grids were built at) instead of the ambiguous `image_size`,
+  across all four backends. Run name appends the encoder size only when it differs:
+  `patchset_pfn_s128e256_k3` (model 128, encoder 256) vs `patchset_pfn_s128_k3` default.
+- `encode_size` must be divisible by the stage-1 resolution (16). Attention sequence
+  lengths are identical to default; only the conv encode scale (and thus FLOPs/time)
+  changes — this measures feature-scale robustness, not higher-res output (output grid
+  stays 128). Caveat: feature normalization uses support stats, which shift off the
+  training scale, so expect small ± rather than a guaranteed gain.
+- Verified on `fast-microwave-31` / `busi val` (same 4 samples, seed 0):
+  chain 128→`dice 0.9002`, 257 GFLOPs, 234 ms ; chain 256→`dice 0.9225`, 452 GFLOPs,
+  532 ms. pfn_seg 128→`0.8318`, 85 GFLOPs ; pfn_seg 256→`0.8692`, 133 GFLOPs. Default
+  (`encode_size=null`) is a bit-for-bit no-op.
+
+Launch: `… model=patchset_pfn eval.checkpoint=<run>/best.pt
+eval.stage1_checkpoint=<stage1>/best.pt eval.encode_size=256`
+
+## 2026-06-18 — `patchset_pfn` (multilevel chain) backend in the 2D eval
+
+`experiments/2d/eval.py` gains a 4th backend, `model=patchset_pfn`, so the multilevel
+coarse→fine chain is benchmarked under the **same conditions** as the other models
+(per-dataset Dice, inference ms/item, FLOPs). Final native-resolution Dice only.
+- Reconstructs the full system the way `multilevel/train.py` does: frozen stage-1 ImagePFN
+  (`load_stage1`, duplicated from train) + frozen `UniverSegFeatureEncoder` + a `ModuleList`
+  of trained `PatchSetPFN` hops. `arch` + `sample` (ladder/budgets) are read from the
+  checkpoint and injected into `cfg`; the chain runs via `pipeline.run_chain` with
+  `cfg.sample.eval` and `eval_deterministic`. Prediction = `outputs[-1]["refined_grid"]`
+  reshaped to native (final hop grid == image_size), i.e. exactly training's
+  `dice_r{native}/mean`.
+- State-dict load uses `.replace("_orig_mod.", "")` (compiled `ModuleList` buries the prefix
+  mid-key). FLOPs counted over the whole chain (stage-1 + encoder + all hops).
+- The stage-1 path isn't in older checkpoints → new `eval.stage1_checkpoint` fallback
+  (`base.yaml`); `train.py` now also records `stage1_checkpoint` in `best.pt` for future runs.
+- `src`-shadowing guard (patch_icl src must beat ic_segmentation's) extended to fire on
+  `patchset_pfn` too. image_size + context_size synced from the checkpoint.
+- Verified end-to-end on `fast-microwave-31` (ladder 16→32→64→128): `busi val` →
+  `dice/mean=0.9002`, 285 ms/item, FLOPs logged.
+
+Launch:
+`.venv311/bin/python experiments/2d/eval.py model=patchset_pfn
+eval.checkpoint=<run>/best.pt eval.stage1_checkpoint=<stage1>/best.pt
+data.split=val eval.max_per_label=20`
+
 ## 2026-06-18 — Wired BiomedParse into the 2D eval + macro-average
 
 `experiments/2d/eval.py` can now run on BiomedParse (non-breaking for MedSegBench):

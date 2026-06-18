@@ -50,7 +50,7 @@ sys.path.insert(0, _ROOT)
 from src.datasets.medsegbench import MedSegBenchDataset   # noqa: F401
 from src.models.pfn_seg_2d import ImagePFN
 from src.models.patchset_pfn import PatchSetPFN
-from src.models.pretrained_encoders import UniverSegFeatureEncoder
+from src.models.pretrained_encoders import build_image_encoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # experiments/2d
 from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, soft_dice
@@ -93,12 +93,7 @@ def load_stage1(cfg):
     arch, img_size = ckpt["arch"], ckpt["image_size"]
     resolution = arch.get("resolution", img_size // arch["patch_size"] if "patch_size" in arch else None)
     input_patch_size = arch.get("input_patch_size", img_size // resolution)
-    image_encoder, feature_dim = None, None
-    if arch.get("image_encoder", "patch") == "universeg":
-        image_encoder = UniverSegFeatureEncoder(
-            level=arch.get("feature_level", "all"), input_size=128,
-            resize_to_input=arch.get("encoder_resize_to_input", False)).to(DEVICE)
-        feature_dim = image_encoder.feature_dim
+    image_encoder, feature_dim = build_image_encoder(arch, DEVICE)
     model = ImagePFN(resolution=resolution, image_size=img_size,
                      input_patch_size=input_patch_size,
                      image_encoder=image_encoder, feature_dim=feature_dim,
@@ -237,8 +232,24 @@ def main(cfg: DictConfig):
     val_loader   = build_split_loader(cfg, "val",   shuffle=False)
 
     stage1  = load_stage1(cfg)
-    encoder = UniverSegFeatureEncoder(level=cfg.arch.feature_level, input_size=128).to(DEVICE)
-    feature_dim = encoder.feature_dim
+    # Chain encoder defaults to UniverSeg (back-compat); override with arch.image_encoder=dinov3.
+    encoder, feature_dim = build_image_encoder(
+        {"image_encoder": cfg.arch.get("image_encoder", "universeg"),
+         "feature_level": cfg.arch.feature_level,
+         "encoder_resize_to_input": cfg.arch.get("encoder_resize_to_input", False),
+         "encoder_imagenet_norm": cfg.arch.get("encoder_imagenet_norm", True),
+         "encoder_reduce": cfg.arch.get("encoder_reduce", "none"),
+         "encoder_stage_l2norm": cfg.arch.get("encoder_stage_l2norm", False)}, DEVICE)
+    # Fit/load the PCA reduction once if reduce='pca:…' (other reductions need no fit).
+    if getattr(encoder, "needs_pca_fit", False):
+        def _img_iter():
+            for batch in train_loader:
+                if batch is None:
+                    continue
+                img = batch["image"].to(DEVICE)            # (B, 1, H, W)
+                ctx = batch["context_in"].to(DEVICE)       # (B, K, 1, H, W)
+                yield torch.cat([ctx.flatten(0, 1), img], dim=0)
+        encoder.ensure_pca(_img_iter(), fit_out_size=list(cfg.sample.resolutions)[1])
 
     # Stage-1 thinking memory: dim e1 read from the frozen stage-1's thinking tokens.
     if cfg.arch.use_stage1_thinking:
@@ -320,7 +331,9 @@ def main(cfg: DictConfig):
                 saved = lawa_average(lawa_queue, model, DEVICE)
                 torch.save({"model": model.state_dict(), "arch": dict(cfg.arch),
                             "sample": dict(cfg.sample), "image_size": cfg.data.image_size,
-                            "context_size": cfg.data.context_size}, ckpt_dir / "best.pt")
+                            "context_size": cfg.data.context_size,
+                            "stage1_checkpoint": cfg.train.stage1_checkpoint},
+                           ckpt_dir / "best.pt")
                 if saved:
                     model.load_state_dict(saved)
                 tqdm.write(f"  [best] dice/mean={best:.4f} → {ckpt_dir}/best.pt")

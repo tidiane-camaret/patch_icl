@@ -258,15 +258,22 @@ def main(cfg: DictConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     # Optional frozen pretrained image encoder (injected so pfn_seg_2d stays
     # dependency-light). Built on DEVICE; its params stay requires_grad=False.
-    image_encoder, feature_dim = None, None
-    if cfg.arch.get("image_encoder", "patch") == "universeg":
-        from src.models.pretrained_encoders import UniverSegFeatureEncoder
-        image_encoder = UniverSegFeatureEncoder(
-            level=cfg.arch.feature_level, input_size=128,
-            resize_to_input=cfg.arch.get("encoder_resize_to_input", False),
-        ).to(DEVICE)
-        feature_dim = image_encoder.feature_dim
-        print(f"Image encoder: UniverSeg (level={cfg.arch.feature_level}, feature_dim={feature_dim}, frozen)")
+    from src.models.pretrained_encoders import build_image_encoder
+    image_encoder, feature_dim = build_image_encoder(cfg.arch, DEVICE)
+    if image_encoder is not None:
+        print(f"Image encoder: {cfg.arch.image_encoder} "
+              f"(level={cfg.arch.get('feature_level', 'all')}, feature_dim={feature_dim}, frozen)")
+        # PCA reduction (reduce='pca:…') is data-fit: load the cached projection or
+        # fit it once on train images before the model needs it. Other reductions
+        # (none/grouppool/random) need no fitting.
+        if getattr(image_encoder, "needs_pca_fit", False):
+            def _img_iter():
+                for batch in train_loader:
+                    if batch is None:
+                        continue
+                    ai, _, _ = make_model_inputs(batch, DEVICE)   # (B, T, 1, H, W)
+                    yield ai.reshape(-1, 1, *ai.shape[-2:])
+            image_encoder.ensure_pca(_img_iter(), fit_out_size=cfg.arch.resolution)
 
     model = ImagePFN(
         resolution       = cfg.arch.resolution,
