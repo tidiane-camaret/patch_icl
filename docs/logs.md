@@ -1,5 +1,146 @@
 # Change log
 
+## 2026-06-18 — Wired BiomedParse into the 2D eval + macro-average
+
+`experiments/2d/eval.py` can now run on BiomedParse (non-breaking for MedSegBench):
+- New `data.source: medsegbench | biomedparse` knob (`configs/experiment/2d/base.yaml`);
+  `common.build_loader` branches on it. BiomedParse has only `train`/`test`, so pass
+  `data.split=test`.
+- `common.log_summary` now also emits **`{prefix}/macro`** — the mean over per-`(dataset,
+  label_value)` cell means (for BiomedParse = `(dataset, target)`). Weights every cell equally
+  so multi-label datasets can't dominate the headline like the per-sample micro-average lets
+  them (the original m2caiseg 0.33-vs-0.55 weighting bug). Additive: `dice/mean` (micro) still
+  printed alongside `dice/macro`.
+- Verified end-to-end: `eval.py data.source=biomedparse data.split=test data.dataset=DRIVE
+  data.image_size=128` → UniverSeg 0.385 Dice (DRIVE retinal vessel; thin tubular, low as
+  expected); loader→model→metrics→summary all run, wandb offline.
+
+Launch (all datasets, capped, macro-averaged):
+`.venv311/bin/python experiments/2d/eval.py data.source=biomedparse data.split=test
+data.image_size=128 eval.max_per_label=20`
+
+## 2026-06-18 — BiomedParse: cells keyed by (dataset, modality, target)
+
+`cell_of` now returns `(dataset, modality, target)` (was `(modality, target)`) — added
+`dataset_of`. Keeps each source separate (no cross-dataset pooling): e.g. amos22 CT-liver and
+another CT dataset's liver are distinct cells. Dataset key carries sublevels (`amos22/CT`,
+`Radiography/COVID`, `MSD/Task01_*`), so those are already first-class cells. Real 6-dataset
+subset: 26 → 27 cells. This is the unit a macro-averaged eval should weight equally.
+
+## 2026-06-18 — BiomedParse dataloader speed: benchmark + ~3x lazy-path optimization
+
+Benchmarked dataloading throughput vs MedSegBench (`experiments/2d/bench_dataloader.py`,
+batch_size=32, workers=16, steady-state samples/s after warmup batch):
+
+| image_size | MedSegBench | BiomedParse (before) | BiomedParse (after) |
+|-----------:|------------:|---------------------:|--------------------:|
+| 128        | ~2160       | ~28 (cold) / ~40     | **~99**             |
+| 256        | ~580        | ~41                  | **~92**             |
+| 512        | ~161        | ~41                  | **~89**             |
+
+Root cause of the gap: MedSegBench loads pre-resized npz into RAM (per-item = just `/255`),
+while BiomedParse decodes a **1024×1024 RGBA PNG per image off NFS**. Micro-bench: decode alone
+= **39 ms/img** (irreducible for PNG); the old path added ~27 ms (np channel-mean + torch
+interpolate). Optimizations in `src/datasets/biomedparse.py`:
+- Decode→gray→resize **inside PIL** (`convert("L")` + `resize`) instead of full-array mean +
+  `F.interpolate` (66→45 ms/img).
+- **Cache the small resized tensors** (not the 1024² source) keyed by path — context images are
+  reused heavily across samples, so hits skip the decode entirely. → ~2.5–3.5× overall.
+- Cache budget is now **size-aware** (`cache_size=None` → ~64 MB/worker) so 512px × 16 workers
+  doesn't OOM.
+
+BiomedParse is now flat ~90/s (decode-bound). Still ~20× under MedSegBench because each unique
+image is a fresh 1024² NFS decode. **Real fix if needed (e.g. for training): pre-resized packed
+cache** (one npz/npy per source in RAM, mirroring MedSegBench's fast path) — deferred; for *eval*
+~90/s overlapped with GPU forward is likely sufficient.
+
+## 2026-06-18 — BiomedParseData dataloader: reconciled with real extracted layout
+
+Inspected the extracted data at `.../ANALYSIS_20251122/data/biomedparse` (29 datasets;
+amos22/MSD still populating) and fixed `src/datasets/biomedparse.py` to match reality — the
+prototype's flat-path assumption would have found **zero** data. Findings + changes:
+- **Double-nesting:** real layout is `<root>/<DATASET>/<DATASET>/{train,test,...}`, and three
+  datasets add one sublevel — `amos22/amos22/CT/…` (modality), `MSD/MSD/Task01_*/…` (task),
+  `Radiography/Radiography/{Normal,COVID,Viral_Pneumonia,Lung_Opacity}/…` (class). Added
+  `_discover_sources` (depth-bounded glob, depths 1–4) + `_collapse_key` → dataset keys like
+  `ACDC`, `amos22/CT`, `Radiography/COVID` (context never mixes across sublevels).
+- **`absent.png` sentinel** ("target not present") in PanNuke/kits23/amos22 mask dirs — now
+  skipped explicitly.
+- `DATA_ROOT` corrected `biomedparse_datasets` → `biomedparse`.
+- Filename parsing **confirmed correct** against real names: target = last `_`-token (`+`→space,
+  e.g. `left+heart+ventricle`); modalities use `-` internally (`MRI-T1-Gd`) so `_`-split is safe.
+- Self-test fixture rewritten to mirror double-nest + a modality sublevel + sentinel + orphan
+  mask; passes (20 samples, 5 cells). Real-data smoke test over DRIVE/GlaS/ISIC/REFUGE/amos22/
+  Radiography: 41,272 samples, **26 (modality×target) cells** (CT/X-Ray/dermoscopy/fundus/
+  pathology), shapes/range/context all correct.
+- **Still open:** wire into `experiments/2d/eval.py` `build_loader`; add macro-average over
+  `cell_of` cells in the eval aggregation.
+
+## 2026-06-17 — BiomedParseData in-context dataloader (prototype)
+
+`src/datasets/biomedparse.py` (new). `BiomedParseDataset` mirrors `MedSegBenchDataset`'s
+contract (`samples` = `(dataset, image_idx, target_int)` 3-tuples; `__getitem__` →
+`image/label/context_in/context_out`) so it drops into the 2D eval via `common.TaggedDataset`/
+`collate`. Reads the official on-disk layout `<root>/<DATASET>/{train,train_mask,test,test_mask}/*.png`
+(populate with `huggingface-cli download microsoft/BiomedParseData`); each `*_mask/` PNG =
+one (image, modality, site, target) eval unit, parsed from the filename
+(`[IMAGE]_[MODALITY]_[SITE]_[TARGET].png`, `+`→space). PNGs loaded lazily with an LRU cache;
+images grayscaled + resized (bilinear) and `/255`, masks `!=0`→fg (nearest). Context = K others
+sharing `(dataset, target)`, with-replacement if scarce.
+Exposes `modality_of/target_of/cell_of` → the `(modality × target)` grid for macro-averaging
+(the point vs MedSegBench's flat micro-average; see prior entry). Ships a synthetic-fixture
+`__main__` self-test (no download needed) — passes: 14 samples, 3 cells, shapes/dtype/range
+asserted. **Follow-up:** one-line branch in `experiments/2d/eval.py` `build_loader` to select it.
+
+## 2026-06-17 — 2d eval: UniverSeg MedSegBench Dice gap diagnosed (weighting, not model); benchmark research
+
+Investigated why `experiments/2d/eval.py` reports UniverSeg Dice 0.33 on MedSegBench while
+`ic_segmentation/scripts/eval.py` reports 0.55 on the same model+data. **Root cause: eval-set
+sample weighting, not the model or preprocessing.** Both paths build the *same* `UniverSegBaseline`
+(input_size=128) and read the *same* npz directory; per-(dataset,label) Dice agrees between them.
+The divergence is aggregation:
+- `src/datasets/medsegbench.py` emits one sample per **(image, label_value)**, so the 18-organ
+  `m2caiseg` dataset alone = **5,501 / 13,237 samples (42%)** of the eval, mostly near-zero rare
+  organs → drags the micro-average to 0.33.
+- ic emits one **random label per image** and caps per-dataset → those empty classes are
+  down-weighted → 0.55.
+Reproduced on a matched capped subset: patch_icl **0.25** vs ic **0.42** (same ~1.6× ratio).
+- **Ruled out (A/B tested):** image normalization. Swapping patch_icl's plain `/255` `_to_tensor`
+  for ic's percentile-[1,99] clip gave **0.233 vs 0.249** on the identical subset — slightly worse,
+  not the cause. Change reverted. (Note: both pipelines also pass through the wrapper's per-sample
+  min-max, which masks most of the normalization difference.)
+- **Secondary (open):** RGB dermoscopy datasets genuinely differ beyond weighting (isic2016
+  0.50 vs 0.73, isic2018 0.49 vs 0.70) — likely the RGB→gray path (patch_icl averages channels to
+  uint8 at load vs ic per-sample float) and/or small-N context-sampling variance.
+- **Takeaways:** (1) score in-context eval with **macro-average per (modality × shape-class)** +
+  per-task sample cap, not flat per-sample micro-average; (2) move to a diverse, balanced
+  multi-modality 2D benchmark. Candidate datasets researched and specced in `docs/datasets.md`.
+
+## 2026-06-17 — 2d/multilevel: N-level resolution chain (16→32→64→128)
+
+Extended the 2-level (res-16→res-32) refinement into a configurable coarse-to-fine chain
+with per-level weights. Spec/plan: `docs/superpowers/specs/2026-06-17-multilevel-resolution-chain-design.md`,
+`docs/superpowers/plans/2026-06-17-multilevel-resolution-chain.md`.
+- `pipeline.py`: new `composite_predictions`, `refine_level` (one hop: sample→gather→
+  forward→composite), `run_chain` (driver: seeds from stage-1, loops `sample.resolutions`,
+  upsamples + DETACHES `refined_grid`/`this_think` between levels, no_grads frozen
+  stage-1/encoder). `build_patch_batch` retired.
+- `patchset_pfn.py`: `forward(..., return_thinking=True)` returns post-transformer thinking
+  pooled over columns → chained as the next level's memory.
+- `train.py`: models are now an `nn.ModuleList` (one `PatchSetPFN` per hop, own
+  `mask_patch_size` 4→2→1 and `stage1_proj`); per-hop weighted losses; `run_eval` loops a
+  true-resolution Dice ladder (`dice_r16/r32/r64/r128/mean`, `dice/mean`=final native) +
+  per-hop `refine/hop{L}/{delta_err,dice_delta,soft_dice_delta}`. Checkpoint on `dice/mean`.
+  Asserts `resolutions[0] == stage-1 res`. Compile wraps each submodule.
+- config: `sample.resolutions`, per-hop `n_total/n_fg_core/n_fg_core_ctx`, `train.loss_weights`.
+- Training detached per-level (each hop refines the detached composite below it). Verified:
+  unit tests green; full 4-level run trains (no NaN, ckpt saves); `resolutions=[16,32]`
+  reduces exactly to the old single hop (`dice/mean==dice_r32/mean`).
+- Fix: `train.checkpoint` warm-start used `removeprefix("_orig_mod.")`, but a compiled
+  ModuleList saves keys as `"{L}._orig_mod...."` (prefix is mid-key, not leading) → it
+  matched 0 tensors silently for default `compile=true` chain checkpoints. Switched to
+  `replace("_orig_mod.","")` (verified 0/74 → 74/74) + a warning when 0 tensors load.
+
 ## 2026-06-16 — 2d/multilevel: dice/mean checkpoint selection + pfn_seg-matched coarse baseline
 
 Stage-2 `train.py` now selects the best checkpoint on native `dice/mean` (the deployment

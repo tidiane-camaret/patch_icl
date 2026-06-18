@@ -298,8 +298,14 @@ def main(cfg: DictConfig):
     if is_pfn_seg:
         from omegaconf import open_dict
         pfn_ckpt = torch.load(cfg.eval.checkpoint, map_location="cpu")
+        ckpt_size = pfn_ckpt["image_size"]
+        if cfg.data.image_size != ckpt_size:
+            print(f"WARNING: data.image_size={cfg.data.image_size} ignored — pfn_seg_2d is "
+                  f"fixed to its checkpoint's training size ({ckpt_size}). The ImagePFN patch "
+                  f"grid is baked into the weights; eval at {ckpt_size}. Train a "
+                  f"{cfg.data.image_size}px checkpoint to evaluate at that resolution.")
         with open_dict(cfg):
-            cfg.data.image_size = pfn_ckpt["image_size"]
+            cfg.data.image_size = ckpt_size
 
     loader = build_loader(cfg)
 
@@ -349,6 +355,7 @@ def main(cfg: DictConfig):
         )
         run_cfg = {
             "model":         cfg.model,
+            "source":        cfg.data.get("source", "medsegbench"),
             "image_size":    cfg.data.image_size,
             "context_size":  cfg.data.context_size,
             "split":         cfg.data.split,
@@ -423,6 +430,7 @@ def main(cfg: DictConfig):
         run_name = cfg.wandb.name or f"{cfg.model}_s{cfg.data.image_size}_k{cfg.data.context_size}"
         run_cfg  = {
             "model":        cfg.model,
+            "source":       cfg.data.get("source", "medsegbench"),
             "image_size":   cfg.data.image_size,
             "context_size": cfg.data.context_size,
             "split":        cfg.data.split,
@@ -449,6 +457,7 @@ def main(cfg: DictConfig):
         run_name = cfg.wandb.name or f"{cfg.model}_s{cfg.data.image_size}_k{cfg.data.context_size}"
         run_cfg  = {
             "model":        cfg.model,
+            "source":       cfg.data.get("source", "medsegbench"),
             "image_size":   cfg.data.image_size,
             "context_size": cfg.data.context_size,
             "split":        cfg.data.split,

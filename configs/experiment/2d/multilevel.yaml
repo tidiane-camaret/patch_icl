@@ -7,15 +7,14 @@ data:
   max_train_samples: null
 
 sample:
-  grid_res: 32        # res-32 grid (32×32 = 1024 cells per image)
-  n_total: 320       # M: total patches sampled per image (constant)
+  resolutions: [16, 32, 64, 128]   # coarse→fine ladder; resolutions[0] MUST equal stage-1 res (asserted)
+  grid_res: 32        # DEPRECATED single-level alias; kept only for the diagnostic scripts
   # Patch selection: threshold boundary core + fixed fg-core quota + blurred neighbor fill.
-  tau: 0.30           # boundary core: cells with |value-0.5| < tau  (tuned; see spec Tuning)
-  n_fg_core: 94       # fixed quota of random foreground cells forced into the core (target)
-  n_fg_core_ctx: 160  # context support: heavier fg quota — context relies on TRUE GT, so we
-                      #   want a large share of the foreground sampled for good class info.
-                      #   (~80% fg coverage at 160 vs ~72% at 64; boundary stays covered for
-                      #   free on GT — see diagnostic ds_gt sweep). Falls back to n_fg_core if absent.
+  # Budgets are PER HOP (len == len(resolutions)-1). Coverage fraction shrinks with resolution.
+  n_total:       [320, 320, 320]    # M: total patches sampled per image, per hop
+  n_fg_core:     [94, 94, 94]       # fg-core quota (target) per hop
+  n_fg_core_ctx: [160, 160, 160]    # context support: heavier fg quota (context relies on TRUE GT)
+  tau: 0.30           # boundary core: cells with |value-0.5| < tau  (shared across hops)
   blur_sigma: 1.0     # neighbor proximity field width (grid cells)
   floor: 0.005        # uniform floor → far cells keep a chance
   temperature: 1.0    # gumbel temperature for the neighbor fill
@@ -50,6 +49,7 @@ train:
   lr: 1.0e-3
   grad_clip: 2.0
   dice_weight: 1.0
+  loss_weights: [1.0, 1.0, 1.0]   # per hop (len == len(resolutions)-1)
   lawa_k: 10
   muon_lr_scale: 0.1
   muon_momentum: 0.96

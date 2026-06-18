@@ -92,7 +92,7 @@ class PatchSetPFN(nn.Module):
         return torch.stack([img, msk], dim=2)               # (B,R,2,e)
 
     def forward(self, sup_feat, sup_label, sup_ij,
-                qry_feat, qry_prior, qry_ij, grid_res, stage1_think=None):
+                qry_feat, qry_prior, qry_ij, grid_res, stage1_think=None, return_thinking=False):
         B, S, _ = sup_feat.shape
         Q = qry_feat.shape[1]
 
@@ -137,4 +137,8 @@ class PatchSetPFN(nn.Module):
         x = self.transformer(x, sep_t, attn_mask=attn_mask)
 
         q = x[:, sep_t:, 0, :]                  # query rows, img-col → (B,Q,e)
-        return self.decoder(q).squeeze(-1)      # (B,Q)
+        out = self.decoder(q).squeeze(-1)       # (B,Q)
+        if return_thinking:
+            think = x[:, :self.thinking.n].mean(dim=2)   # (B, n_think, e)
+            return out, think
+        return out

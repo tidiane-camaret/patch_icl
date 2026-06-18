@@ -1,6 +1,7 @@
 model: universeg
 
 data:
+  source: medsegbench  # medsegbench | biomedparse (biomedparse has only train/test splits)
   image_size: 128      # loads {dataset}_{image_size}.npz files
   context_size: 3
   split: val

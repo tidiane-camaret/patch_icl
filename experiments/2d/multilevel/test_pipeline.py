@@ -1,6 +1,5 @@
 import sys; sys.path.insert(0, "."); sys.path.insert(0, "experiments/2d/multilevel")
 import torch
-from pipeline import build_patch_batch
 
 class StubStage1:
     """Returns res-16 logits; here a fixed gradient so |pred-0.5| ranking is well-defined.
@@ -23,71 +22,105 @@ class StubEncoder:
         return torch.randn(N, self.feature_dim, out_size, out_size)
     def eval(self): return self
 
-class Cfg:
-    class sample:
-        grid_res = 32; n_total = 256; tau = 0.30; n_fg_core = 64
-        blur_sigma = 1.0; floor = 0.005; temperature = 1.0
-    class arch:   mask_prior = "scalar"
 
-def test_build_patch_batch_shapes():
-    B, K, H = 2, 3, 128
+def test_refine_level_shapes_and_composite():
+    import torch
+    import sys; sys.path.insert(0, "experiments/2d/multilevel")
+    from pipeline import refine_level
+    from src.models.patchset_pfn import PatchSetPFN
+    from types import SimpleNamespace
+    torch.manual_seed(0)
+    dev = torch.device("cpu")
+    B, K, R, Cf, e, nth = 2, 2, 8, 8, 16, 4
+    N, T = R * R, K + 1
+    H = 32                                   # native image size for this toy (p = H//R = 4)
     batch = {
         "image":       torch.rand(B, 1, H, H),
         "label":       (torch.rand(B, 1, H, H) > 0.5).float(),
         "context_in":  torch.rand(B, K, 1, H, H),
         "context_out": (torch.rand(B, K, 1, H, H) > 0.5).float(),
     }
-    out = build_patch_batch(batch, StubStage1(), StubEncoder(), Cfg, torch.device("cpu"))
-    M = 256
-    assert out["qry_feat"].shape  == (B, M, 5)
-    assert out["sup_feat"].shape  == (B, K * M, 5)
-    assert out["qry_ij"].shape    == (B, M, 2)
-    assert out["sup_ij"].shape    == (B, K * M, 2)
-    assert out["qry_gt"].shape    == (B, M)
-    assert out["qry_coarse"].shape == (B, M)
-    assert out["qry_prior"].shape == (B, M)
-    # uncertain flag = boundary core: boolean, variable count, and the selected query
-    # cells it marks have coarse value within tau of 0.5.
-    assert out["qry_is_uncertain"].shape == (B, M)
-    assert out["qry_is_uncertain"].dtype == torch.bool
-    d = (out["qry_coarse"] - 0.5).abs()
-    assert torch.all(d[out["qry_is_uncertain"]] < Cfg.sample.tau)
-    # support labels/coords in valid ranges
-    assert out["sup_label"].min() >= 0 and out["sup_label"].max() <= 1
-    assert out["qry_ij"].max() < 32
-    # stage-1 thinking memory passed through
-    assert out["stage1_think"].shape == (B, 8, 64)
-    # full-image metric tensors + flat query indices
-    N = 32 * 32
-    assert out["qry_idx"].shape == (B, M)
-    assert out["coarse_full"].shape == (B, N)
-    assert out["gt_full"].shape == (B, N)
-    # flat query indices match the (i,j) coords: idx == i*R + j
-    assert torch.equal(out["qry_idx"], out["qry_ij"][..., 0] * 32 + out["qry_ij"][..., 1])
+    feats = torch.randn(B, T, N, Cf)
+    coarse_grid = torch.rand(B, N)
+    model = PatchSetPFN(feature_dim=Cf, e=e, h=32, l=2, a=2, thinking_rows=nth,
+                        mask_prior="scalar", mask_patch_size=H // R, stage1_dim=e,
+                        query_self_attn=True)
+    s = SimpleNamespace(n_total=10, n_fg_core=2, n_fg_core_ctx=4, tau=0.3,
+                        blur_sigma=1.0, floor=0.01, temperature=1.0, mask_prior="scalar")
+    prev_think = torch.randn(B, nth, e)
+    out = refine_level(model, batch, feats, coarse_grid, prev_think, R, s,
+                       "prev_pred", True, dev)
+    assert out["logits"].shape == (B, s.n_total)
+    assert out["refined_grid"].shape == (B, N)
+    assert out["this_think"].shape == (B, nth, e)
+    assert out["qidx"].shape == (B, s.n_total)
+    sel = torch.zeros(B, N, dtype=torch.bool).scatter_(1, out["qidx"], True)
+    assert torch.allclose(out["refined_grid"][~sel], coarse_grid[~sel])  # unsampled = input
 
-class CfgPatch(Cfg):
-    class arch:   mask_prior = "patch"
 
-def test_build_patch_batch_patch_mode():
-    B, K, H, R = 2, 3, 128, 32
-    p = H // R                                  # auto p = 4 → p² = 16
-    batch = {
-        "image":       torch.rand(B, 1, H, H),
-        "label":       (torch.rand(B, 1, H, H) > 0.5).float(),
-        "context_in":  torch.rand(B, K, 1, H, H),
-        "context_out": (torch.rand(B, K, 1, H, H) > 0.5).float(),
-    }
-    out = build_patch_batch(batch, StubStage1(), StubEncoder(), CfgPatch, torch.device("cpu"))
-    M = 256
-    # mask-token is now a p×p tile per patch on both sides
-    assert out["sup_label"].shape == (B, K * M, p * p)
-    assert out["qry_prior"].shape == (B, M, p * p)
-    # support tiles come from the real binary GT → values in {0,1}
-    assert set(torch.unique(out["sup_label"]).tolist()) <= {0.0, 1.0}
-    # query coarse scalar (metrics baseline) is unchanged
-    assert out["qry_coarse"].shape == (B, M)
+def test_composite_predictions():
+    import torch
+    import sys; sys.path.insert(0, "experiments/2d/multilevel")
+    from pipeline import composite_predictions
+    B, N, M = 2, 16, 5
+    coarse = torch.rand(B, N)
+    qidx = torch.stack([torch.randperm(N)[:M] for _ in range(B)])
+    vals = torch.rand(B, M)
+    out = composite_predictions(coarse, qidx, vals)
+    assert out.shape == (B, N)
+    for b in range(B):
+        sel = set(qidx[b].tolist())
+        for j in range(N):
+            if j in sel:
+                pos = (qidx[b] == j).nonzero()[0, 0]
+                assert torch.allclose(out[b, j], vals[b, pos])     # overwritten
+            else:
+                assert torch.allclose(out[b, j], coarse[b, j])     # untouched
+    assert out is not coarse                                       # no in-place mutation
+
+
+def test_run_chain_detaches_and_shapes():
+    import torch
+    import sys; sys.path.insert(0, "experiments/2d/multilevel")
+    from pipeline import run_chain
+    from src.models.patchset_pfn import PatchSetPFN
+    from omegaconf import OmegaConf
+    torch.manual_seed(0)
+    dev = torch.device("cpu")
+    B, K, H, Cf, e, nth = 2, 2, 32, 8, 16, 4
+    R0, ladder = 16, [16, 32]                          # single hop → grid 32
+    batch = {"image": torch.rand(B, 1, H, H),
+             "label": (torch.rand(B, 1, H, H) > 0.5).float(),
+             "context_in": torch.rand(B, K, 1, H, H),
+             "context_out": (torch.rand(B, K, 1, H, H) > 0.5).float()}
+
+    class StubStage1:        # mimics ImagePFN: stage1(imgs, masks, sep=K, return_thinking=True)
+        def __call__(self_, all_images, all_masks, sep, return_thinking=False):
+            b = all_images.shape[0]
+            logits = torch.rand(b, R0, R0)              # res-16 logits
+            think = torch.randn(b, nth, e)
+            return (logits, think) if return_thinking else logits
+    def stub_encoder(images, grid):                    # encode_grid calls encoder(imgs, grid)
+        bT = images.shape[0]
+        return torch.randn(bT, Cf, grid, grid)
+
+    cfg = OmegaConf.create({"sample": {
+        "resolutions": ladder, "n_total": [10], "n_fg_core": [2], "n_fg_core_ctx": [4],
+        "tau": 0.3, "blur_sigma": 1.0, "floor": 0.01, "temperature": 1.0},
+        "arch": {"mask_prior": "scalar"}, "data": {"image_size": H}})
+    models = torch.nn.ModuleList([
+        PatchSetPFN(feature_dim=Cf, e=e, h=32, l=2, a=2, thinking_rows=nth,
+                    mask_prior="scalar", mask_patch_size=H // 32, stage1_dim=e,
+                    query_self_attn=True)])
+    outputs, coarse_lr = run_chain(batch, StubStage1(), stub_encoder, models, cfg,
+                                   "prev_pred", True, dev)
+    assert len(outputs) == 1
+    assert outputs[0]["refined_grid"].shape == (B, 32 * 32)
+    assert coarse_lr.shape == (B, R0, R0)
+
 
 if __name__ == "__main__":
-    test_build_patch_batch_shapes()
-    test_build_patch_batch_patch_mode()
+    test_composite_predictions()
+    test_refine_level_shapes_and_composite()
+    test_run_chain_detaches_and_shapes()
     print("ALL PIPELINE TESTS PASSED")

@@ -1,23 +1,20 @@
 """
 Stage-2 multilevel patch refinement training.
 
-Frozen res-16 ImagePFN (stage 1) + frozen UniverSeg encoder produce coarse target
-predictions and res-32 features; we sample 256 patches/image and train a PatchSetPFN
-to refine the uncertain target patches. Checkpoint selection: native-resolution
-`dice/mean` (the refined res-32 map upsampled to 128), aggregated exactly like pfn_seg.py.
+A frozen res-16 ImagePFN (stage 1) + frozen UniverSeg encoder seed a coarse-to-fine
+CHAIN over `cfg.sample.resolutions` (e.g. 16→32→64→128). Each hop is its own PatchSetPFN
+(an nn.ModuleList): it samples patches on the previous level's (detached) composite,
+refines them, and composites back. Levels train independently — each hop's loss only
+touches its own weights — and each hop's "thinking" memory is chained (detached) into the
+next. See pipeline.run_chain / refine_level and the spec/plan in docs/superpowers.
 
-Metric naming convention (resolutions are read from the model/config, not hardcoded —
-R1 = stage-1 native res, R2 = cfg.sample.grid_res, H = cfg.data.image_size; the defaults
-below are R1=16, R2=32, H=128):
-  `dice_r{R1}` / `dice_r{R2}` — dice computed AT that resolution: `dice_r16/mean` =
-      stage-1 pred @R1 vs GT@R1 (== pfn_seg's low-res dice); `dice_r32/mean` = refined
-      map @R2 vs GT@R2.
-  `_s1` / `_s2`   — stage-1 (coarse) / stage-2 (refined) compared at a SHARED resolution
-      (resolution can't distinguish them there): the native-@H pair `dice_s1/mean`
-      (stage-1 R1→H, == pfn_seg headline baseline) vs `dice/mean` (stage-2 R2→H), and
-      the @R2 `refine/{scope}/*_s1` vs `*_s2`.
-`refine/uncertain/delta_err` (|error| reduction on the sampled boundary region, s2 vs s1)
-is kept as a diagnostic.
+Metrics (resolutions read from config, not hardcoded; final hop's grid == native H):
+  `dice_r{res}/mean` — Dice of each level's composite computed AT that resolution
+      (res = resolutions[0] is the stage-1 baseline; the rest are the per-hop composites).
+  `dice/mean` — alias of `dice_r{final}/mean` (the native-resolution output); CHECKPOINT
+      selection metric.
+  `refine/hop{L}/{delta_err, dice_delta, soft_dice_delta}` — hop L's marginal improvement
+      over its immediate input (the previous level upsampled), on its sampled cells.
 
 Usage:
     python experiments/2d/multilevel/train.py
@@ -60,7 +57,7 @@ from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, s
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))       # multilevel
-from pipeline import build_patch_batch
+from pipeline import run_chain
 
 from torch.utils.data import DataLoader, RandomSampler
 
@@ -142,16 +139,14 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
             imgs, msks = augment(imgs, msks, K, cfg.aug)
             batch = {**batch, "context_in": imgs[:, :K].cpu(), "image": imgs[:, K, 0:1].cpu(),
                      "context_out": msks[:, :K].cpu(), "label": msks[:, K, 0:1].cpu()}
-        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE, cfg.sample.train,
-                               stochastic=True)
-
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
-            logits = model(pb["sup_feat"], pb["sup_label"], pb["sup_ij"],
-                           pb["qry_feat"], pb["qry_prior"], pb["qry_ij"], cfg.sample.grid_res,
-                           stage1_think=pb["stage1_think"] if cfg.arch.use_stage1_thinking else None)
-            loss = patch_loss(logits, pb, cfg)
+            outputs, _ = run_chain(batch, stage1, encoder, model, cfg, cfg.sample.train,
+                                   stochastic=True, device=DEVICE)
+            weights = list(cfg.train.loss_weights)
+            loss = sum(w * patch_loss(o["logits"], {"qry_gt": o["qry_gt"]}, cfg)
+                       for w, o in zip(weights, outputs))
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
         for opt in optimizers:
@@ -161,139 +156,73 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
     return total / max(n, 1)
 
 
-def _accum(d, pred_v, coarse_v, gt_v):
-    """Append per-sample metrics (s2 refined vs s1 coarse, against gt_v) to accumulator d.
-
-    s1 = stage-1 coarse value, s2 = stage-2 refined prediction. Both are scored on the
-    SAME res-32 cells (the s1 value is the stage-1 map upsampled to res-32), so the suffix
-    is the STAGE, not a resolution. pred_v/coarse_v/gt_v are 1-D tensors over a cell set.
-    delta_err > 0 = s2 beats s1. Hard Dice binarizes gt at >=0.5 (majority vote); soft
-    Dice uses the raw soft fractions (shape, no thresh)."""
-    gt_bin = (gt_v >= 0.5).float()
-    d["derr"].append((coarse_v - gt_v).abs().mean().item() - (pred_v - gt_v).abs().mean().item())
-    hd2, hd1 = hard_dice(pred_v, gt_bin), hard_dice(coarse_v, gt_bin)
-    sd2, sd1 = soft_dice(pred_v, gt_v),   soft_dice(coarse_v, gt_v)
-    d["hd_s2"].append(hd2);     d["hd_s1"].append(hd1)
-    d["sd_s2"].append(sd2);     d["sd_s1"].append(sd1)
-    d["dd"].append(hd2 - hd1);  d["sdd"].append(sd2 - sd1)   # per-sample improvement (s2 - s1, >0 = better)
-
-
 @torch.no_grad()
 def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     saved = lawa_average(lawa_queue, model, DEVICE)
-    model.eval()
-    # Three scopes: the boundary-core (uncertain) queries, all M sampled queries, and the
-    # full res-32 image (coarse map with the sampled cells overwritten by stage-2).
-    scopes = ("uncertain", "sampled", "full")
-    acc = {s: {k: [] for k in ("derr", "hd_s2", "hd_s1", "sd_s2", "sd_s1", "dd", "sdd")} for s in scopes}
-    cert_err_s2, cert_err_s1 = [], []
-    # Resolutions, all derived (not hardcoded): R1 = stage-1 native res (from the frozen
-    # model, N = R1²); R2 = grid/refined res (config); H = native image size (config).
-    H, R2 = cfg.data.image_size, cfg.sample.grid_res
-    R1 = int(round(stage1.N ** 0.5))
-    K_R1, K_R2 = f"dice_r{R1}/mean", f"dice_r{R2}/mean"   # true-resolution dice metric keys
-    # Per-resolution Dice over the whole val set, each computed AT its named resolution
-    # (no cross-res upsampling fudge):
-    #   {K_R1} : stage-1 pred @R1 vs GT@R1          (== pfn_seg.py's low-res dice)
-    #   {K_R2} : refined map @R2 vs GT@R2
-    #   dice/mean   : refined upsampled to native @H vs GT@H   (pfn_seg headline)
-    #   dice_s1/mean: stage-1 upsampled to native @H vs GT@H   (s1 deployed; pfn_seg baseline)
-    per_ds_native:    dict[str, list[float]] = defaultdict(list)  # s2 refined @H (headline)
-    per_ds_s1_native: dict[str, list[float]] = defaultdict(list)  # s1 @H (pfn_seg baseline)
-    per_ds_r16:       dict[str, list[float]] = defaultdict(list)  # s1 @R1 (true low res)
-    per_ds_r32:       dict[str, list[float]] = defaultdict(list)  # s2 @R2 (true grid res)
+    for m in model: m.eval()
+    H = cfg.data.image_size
+    resolutions = list(cfg.sample.resolutions)
+    hops = resolutions[1:]
+    per_ds = {r: defaultdict(list) for r in resolutions}
+    acc = {L: {k: [] for k in ("derr", "dd", "sdd")} for L in range(len(hops))}
 
-    def _to_native(flat):  # (N,) res-32 logits/probs → (H, H)
-        return F.interpolate(flat.reshape(1, 1, R2, R2).float(), size=(H, H),
-                             mode="bilinear", align_corners=False).reshape(H, H)
-
-    pbar = tqdm(loader, desc=f"eval e{epoch}", leave=False, dynamic_ncols=True)
-    for batch in pbar:
-        if batch is None:
-            continue
-        pb = build_patch_batch(batch, stage1, encoder, cfg, DEVICE, cfg.sample.eval,
-                               stochastic=not cfg.sample.eval_deterministic)
+    for batch in loader:
+        if batch is None: continue
         with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
-            logits = model(pb["sup_feat"], pb["sup_label"], pb["sup_ij"],
-                           pb["qry_feat"], pb["qry_prior"], pb["qry_ij"], cfg.sample.grid_res,
-                           stage1_think=pb["stage1_think"] if cfg.arch.use_stage1_thinking else None)
-        pred = torch.sigmoid(logits.float())
-        gt, coarse, unc = pb["qry_gt"], pb["qry_coarse"], pb["qry_is_uncertain"]
-        qidx, coarse_full, gt_full = pb["qry_idx"], pb["coarse_full"], pb["gt_full"]
-        coarse_lr = pb["coarse_lowres"]                                   # (B, R1, R1) native stage-1 res
-        B = gt.shape[0]
+            outputs, coarse_lr = run_chain(batch, stage1, encoder, model, cfg,
+                                           cfg.sample.eval,
+                                           stochastic=not cfg.sample.eval_deterministic,
+                                           device=DEVICE)
+        B = coarse_lr.shape[0]
         for b in range(B):
-            # full image: composite stage-2 predictions into the coarse map at sampled cells
-            refined = coarse_full[b].clone()
-            refined[qidx[b]] = pred[b]
-            _accum(acc["full"], refined, coarse_full[b], gt_full[b])
-            _accum(acc["sampled"], pred[b], coarse[b], gt[b])
-            u = unc[b]
-            if u.any():
-                _accum(acc["uncertain"], pred[b][u], coarse[b][u], gt[b][u])
-            c = ~u
-            if c.any():
-                cert_err_s2.append((pred[b][c] - gt[b][c]).abs().mean().item())
-                cert_err_s1.append((coarse[b][c] - gt[b][c]).abs().mean().item())
-
             ds_name   = batch["dataset"][b]
-            gt_native = batch["label"][b, 0]                                  # (H,W) cpu
-
-            # ── true-resolution dices (each scored AT its own resolution) ──
-            #   @R1: stage-1 pred vs GT pooled to R1 (majority) — same as pfn_seg's low-res dice
-            gt_r1 = (downsample_mask(gt_native, R1) >= 0.5).float()
-            per_ds_r16[ds_name].append(hard_dice(coarse_lr[b].cpu(), gt_r1))
-            #   @R2: refined map vs GT@R2 (majority)
-            gt_r2_bin = (gt_full[b] >= 0.5).float()
-            per_ds_r32[ds_name].append(hard_dice(refined.cpu(), gt_r2_bin.cpu()))
-
-            # ── native @128 dices (stage comparison at the deployment resolution) ──
-            #   s2: refined res-32 → 128.   s1: stage-1 res-16 → 128 DIRECTLY (pfn_seg path).
-            coarse_native = F.interpolate(coarse_lr[b][None, None].float(), size=(H, H),
-                                          mode="bilinear", align_corners=False).reshape(H, H)
-            per_ds_native[ds_name].append(hard_dice(_to_native(refined).cpu(), gt_native))
-            per_ds_s1_native[ds_name].append(hard_dice(coarse_native.cpu(), gt_native))
+            gt_native = batch["label"][b, 0]
+            R0 = resolutions[0]
+            gt_r0 = (downsample_mask(gt_native, R0) >= 0.5).float()
+            per_ds[R0][ds_name].append(hard_dice(coarse_lr[b].cpu(), gt_r0))
+            prev_grid = coarse_lr[b].reshape(1, 1, R0, R0).float()
+            for L, grid in enumerate(hops):
+                o = outputs[L]
+                refined = o["refined_grid"][b]
+                gt_g = (o["gt_grid"][b] >= 0.5).float()
+                per_ds[grid][ds_name].append(hard_dice(refined.cpu(), gt_g.cpu()))
+                up = F.interpolate(prev_grid, size=(grid, grid), mode="bilinear",
+                                   align_corners=False).reshape(-1)
+                qg, qi = o["qry_gt"][b], o["qidx"][b]
+                pred_q = torch.sigmoid(o["logits"][b].float())
+                coarse_q = up[qi]
+                acc[L]["derr"].append((coarse_q - qg).abs().mean().item()
+                                      - (pred_q - qg).abs().mean().item())
+                acc[L]["dd"].append(hard_dice(pred_q, (qg >= 0.5).float())
+                                    - hard_dice(coarse_q, (qg >= 0.5).float()))
+                acc[L]["sdd"].append(soft_dice(pred_q, qg) - soft_dice(coarse_q, qg))
+                prev_grid = refined.reshape(1, 1, grid, grid).float()
     if saved is not None:
         model.load_state_dict(saved)
 
-    # Robust nanmean: returns NaN (no warning) for empty / all-NaN inputs.
     def nanmean(xs):
-        vals = [v for v in xs if not np.isnan(v)]
-        return float(np.mean(vals)) if vals else float("nan")
+        v = [x for x in xs if not np.isnan(x)]
+        return float(np.mean(v)) if v else float("nan")
+    flat = lambda d: [x for sc in d.values() for x in sc if not np.isnan(x)]
 
-    # Refine scopes: s1 (stage-1 coarse) vs s2 (stage-2 refined), both on res-32 cells.
-    metrics = {"epoch": epoch,
-               "refine/certain_err_s2": nanmean(cert_err_s2),
-               "refine/certain_err_s1": nanmean(cert_err_s1)}
-    for s in scopes:
-        d = acc[s]
-        metrics[f"refine/{s}/delta_err"]       = nanmean(d["derr"])   # >0 = improvement (all res-32)
-        metrics[f"refine/{s}/dice_s2"]         = nanmean(d["hd_s2"])
-        metrics[f"refine/{s}/dice_s1"]         = nanmean(d["hd_s1"])
-        metrics[f"refine/{s}/dice_delta"]      = nanmean(d["dd"])      # s2 - s1, per-sample, >0 = better
-        metrics[f"refine/{s}/soft_dice_s2"]    = nanmean(d["sd_s2"])
-        metrics[f"refine/{s}/soft_dice_s1"]    = nanmean(d["sd_s1"])
-        metrics[f"refine/{s}/soft_dice_delta"] = nanmean(d["sdd"])     # s2 - s1, per-sample, >0 = better
+    metrics = {"epoch": epoch}
+    for r in resolutions:
+        metrics[f"dice_r{r}/mean"] = (float(np.mean(flat(per_ds[r])))
+                                      if flat(per_ds[r]) else float("nan"))
+    metrics["dice/mean"] = metrics[f"dice_r{resolutions[-1]}/mean"]
+    for L in range(len(hops)):
+        metrics[f"refine/hop{L}/delta_err"]       = nanmean(acc[L]["derr"])
+        metrics[f"refine/hop{L}/dice_delta"]      = nanmean(acc[L]["dd"])
+        metrics[f"refine/hop{L}/soft_dice_delta"] = nanmean(acc[L]["sdd"])
+    for r in resolutions:
+        for k, v in per_ds[r].items():
+            metrics[f"dice/dataset_r{r}/{k}"] = nanmean(v)
 
-    # Per-resolution mean Dice, aggregated like pfn_seg.py (mean over all samples).
-    _flat = lambda d: [x for sc in d.values() for x in sc if not np.isnan(x)]
-    f_native, f_s1, f_r16, f_r32 = _flat(per_ds_native), _flat(per_ds_s1_native), _flat(per_ds_r16), _flat(per_ds_r32)
-    metrics["dice/mean"]    = float(np.mean(f_native)) if f_native else float("nan")  # ← s2 @H (checkpoint; compare to pfn_seg)
-    metrics["dice_s1/mean"] = float(np.mean(f_s1))     if f_s1     else float("nan")  # s1 @H (pfn_seg headline baseline)
-    metrics[K_R1]           = float(np.mean(f_r16))    if f_r16    else float("nan")  # s1 @R1 (true low res; pfn_seg low-res dice)
-    metrics[K_R2]           = float(np.mean(f_r32))    if f_r32    else float("nan")  # s2 @R2 (true grid res)
-    if not (np.isnan(metrics["dice/mean"]) or np.isnan(metrics["dice_s1/mean"])):
-        metrics["dice/margin_vs_s1"] = metrics["dice/mean"] - metrics["dice_s1/mean"]  # both @128
-    for k, v in per_ds_native.items():
-        metrics[f"dice/dataset/{k}"] = nanmean(v)
-
-    tqdm.write(
-        f"  [e{epoch}] dice @r{R1} {metrics[K_R1]:.4f}  @r{R2} {metrics[K_R2]:.4f}  "
-        f"@{H} s1 {metrics['dice_s1/mean']:.4f}→s2 {metrics['dice/mean']:.4f}  |  "
-        f"Δerr unc={metrics['refine/uncertain/delta_err']:.4f} full={metrics['refine/full/delta_err']:.4f}  "
-        f"soft-dice full {metrics['refine/full/soft_dice_s1']:.3f}→{metrics['refine/full/soft_dice_s2']:.3f}")
+    tqdm.write(f"  [e{epoch}] " + "  ".join(
+        f"r{r}={metrics[f'dice_r{r}/mean']:.4f}" for r in resolutions))
     wandb.log(metrics)
-    return metrics["dice/mean"]   # ← checkpoint selection metric (native, pfn_seg-comparable)
+    for m in model: m.train()
+    return metrics["dice/mean"]
 
 
 @hydra.main(config_path="../../../configs/experiment/2d", config_name="multilevel", version_base=None)
@@ -312,31 +241,46 @@ def main(cfg: DictConfig):
     feature_dim = encoder.feature_dim
 
     # Stage-1 thinking memory: dim e1 read from the frozen stage-1's thinking tokens.
-    stage1_dim = stage1.thinking.tokens.shape[-1] if cfg.arch.use_stage1_thinking else None
     if cfg.arch.use_stage1_thinking:
+        stage1_dim = stage1.thinking.tokens.shape[-1]
         print(f"Stage-1 thinking memory enabled (e1={stage1_dim}, n_think={stage1.thinking.n})")
+    else:
+        stage1_dim = None
 
-    model = PatchSetPFN(feature_dim=feature_dim, e=cfg.arch.e, h=cfg.arch.h, l=cfg.arch.l,
-                        a=cfg.arch.a, thinking_rows=cfg.arch.thinking_rows,
-                        residual_decay=cfg.arch.residual_decay, fourier_bands=cfg.arch.fourier_bands,
-                        mask_prior=cfg.arch.mask_prior,
-                        mask_patch_size=cfg.data.image_size // cfg.sample.grid_res,
-                        stage1_dim=stage1_dim,
-                        query_self_attn=cfg.arch.query_self_attn).to(DEVICE)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"PatchSetPFN: {trainable:,} trainable params")
+    resolutions = list(cfg.sample.resolutions)
+    assert resolutions[0] == int(round(stage1.N ** 0.5)), \
+        f"resolutions[0]={resolutions[0]} must equal stage-1 res {int(round(stage1.N ** 0.5))}"
+    # Chained thinking: hop L>0 receives the previous PatchSetPFN's thinking (dim e).
+    model = nn.ModuleList([
+        PatchSetPFN(feature_dim=feature_dim, e=cfg.arch.e, h=cfg.arch.h, l=cfg.arch.l,
+                    a=cfg.arch.a, thinking_rows=cfg.arch.thinking_rows,
+                    residual_decay=cfg.arch.residual_decay, fourier_bands=cfg.arch.fourier_bands,
+                    mask_prior=cfg.arch.mask_prior,
+                    mask_patch_size=cfg.data.image_size // grid,
+                    stage1_dim=(stage1_dim if L == 0 else cfg.arch.e),
+                    query_self_attn=cfg.arch.query_self_attn).to(DEVICE)
+        for L, grid in enumerate(resolutions[1:])])
+    print(f"PatchSetPFN chain: {len(model)} hops, "
+          f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} params")
 
     if cfg.train.get("checkpoint", None):
         raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
         sd = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
-        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        # `replace` (not `removeprefix`): a compiled ModuleList saves keys like
+        # "0._orig_mod.transformer..." — the _orig_mod. prefix is mid-key, not leading.
+        sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         msd = model.state_dict()
         compat = {k: v for k, v in sd.items() if k in msd and v.shape == msd[k].shape}
         model.load_state_dict(compat, strict=False)
         print(f"Warm-start PatchSetPFN: loaded {len(compat)}/{len(msd)} tensors")
+        if not compat:
+            print(f"  WARNING: warm-start loaded 0 tensors — checkpoint keys do not match "
+                  f"the current chain (e.g. pre-chain/unprefixed or different ladder). "
+                  f"Sample ckpt key: {next(iter(sd), '<empty>')!r}  vs model key: "
+                  f"{next(iter(msd), '<empty>')!r}")
 
     if cfg.arch.compile:
-        model = torch.compile(model, dynamic=True)
+        model = nn.ModuleList([torch.compile(m, dynamic=True) for m in model])
 
     muon_params = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim == 2 and "transformer" in n]
     adam_params = [p for n, p in model.named_parameters() if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]

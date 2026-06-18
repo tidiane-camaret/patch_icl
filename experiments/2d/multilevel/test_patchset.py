@@ -80,6 +80,26 @@ def test_query_self_attn_couples_queries():
         changed = (o1[:, 1] - o2[:, 1]).abs().max().item() > 1e-6
         assert changed == expect_change, f"query_self_attn={qsa}: changed={changed}"
 
+def test_return_thinking_shape():
+    import torch
+    from src.models.patchset_pfn import PatchSetPFN
+    torch.manual_seed(0)
+    B, S, Q, Fdim, e, nthink = 2, 12, 6, 8, 16, 4
+    m = PatchSetPFN(feature_dim=Fdim, e=e, h=32, l=2, a=2, thinking_rows=nthink,
+                    mask_prior="scalar", mask_patch_size=1, stage1_dim=None,
+                    query_self_attn=True)
+    sup_feat = torch.randn(B, S, Fdim); sup_label = torch.rand(B, S)
+    sup_ij = torch.randint(0, 8, (B, S, 2))
+    qry_feat = torch.randn(B, Q, Fdim); qry_prior = torch.rand(B, Q)
+    qry_ij = torch.randint(0, 8, (B, Q, 2))
+    logits, think = m(sup_feat, sup_label, sup_ij, qry_feat, qry_prior, qry_ij,
+                      grid_res=8, return_thinking=True)
+    assert logits.shape == (B, Q), logits.shape
+    assert think.shape == (B, nthink, e), think.shape
+    # default path unchanged: returns only logits
+    out = m(sup_feat, sup_label, sup_ij, qry_feat, qry_prior, qry_ij, grid_res=8)
+    assert out.shape == (B, Q), out.shape
+
 if __name__ == "__main__":
     test_fourier_pe_shape_and_resolution_generalizes()
     test_forward_shapes_and_query_grad_only()
@@ -87,4 +107,5 @@ if __name__ == "__main__":
     test_mask_prior_patch_runs()
     test_stage1_thinking_memory()
     test_query_self_attn_couples_queries()
+    test_return_thinking_shape()
     print("ALL PATCHSET TESTS PASSED")

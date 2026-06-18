@@ -57,12 +57,24 @@ class TaggedDataset(torch.utils.data.Dataset):
 def build_loader(cfg) -> DataLoader:
     """Build a tagged, collated DataLoader from a Hydra eval config."""
     datasets = [cfg.data.dataset] if cfg.data.dataset else None
-    ds = MedSegBenchDataset(
-        split=cfg.data.split,
-        context_size=cfg.data.context_size,
-        image_size=cfg.data.image_size,
-        datasets=datasets,
-    )
+    source = cfg.data.get("source", "medsegbench")
+    if source == "biomedparse":
+        from src.datasets.biomedparse import BiomedParseDataset
+        ds = BiomedParseDataset(
+            split=cfg.data.split,          # biomedparse: only 'train' / 'test'
+            context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size,
+            datasets=datasets,
+        )
+    elif source == "medsegbench":
+        ds = MedSegBenchDataset(
+            split=cfg.data.split,
+            context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size,
+            datasets=datasets,
+        )
+    else:
+        raise ValueError(f"unknown data.source {source!r} (medsegbench | biomedparse)")
     max_per_label = cfg.eval.get("max_per_label", None)
     if max_per_label:
         groups: dict[tuple, list[int]] = {}
@@ -151,10 +163,20 @@ def log_summary(
     summary[f"{prefix}/mean"] = overall
     print(f"{'MEAN':>25}  {len(all_scores):>5}  {overall:>14.4f}")
 
+    # Per-cell means + a macro-average over them. A "cell" = one per_label group,
+    # i.e. (dataset, label_value) — for BiomedParse this is (dataset, target).
+    # Macro weights every cell equally, so multi-label datasets (m2caiseg etc.)
+    # can't dominate the headline the way the per-sample micro-average lets them.
+    cell_means = []
     for key, scores in per_label.items():
         valid_cls = [s for s in scores if not np.isnan(s)]
         if valid_cls:
-            summary[f"{prefix}/class/{key}"] = float(np.mean(valid_cls))
+            m = float(np.mean(valid_cls))
+            summary[f"{prefix}/class/{key}"] = m
+            cell_means.append(m)
+    macro = float(np.mean(cell_means)) if cell_means else float("nan")
+    summary[f"{prefix}/macro"] = macro
+    print(f"{'MACRO (per cell)':>25}  {len(cell_means):>5}  {macro:>14.4f}")
 
     if extra:
         summary.update(extra)
