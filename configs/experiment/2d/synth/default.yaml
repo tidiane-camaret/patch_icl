@@ -1,0 +1,41 @@
+# controlSynth generator (only used when data.source=synthetic). See
+# docs/datasets/controlSynth.md. Difficulty axes: build (frozen geometry) vs live
+# (per-subject). Sweep one factor with the rest pinned for the difficulty study.
+# Shared across pfn_seg / multilevel / eval configs via `defaults: [synth: default]`.
+# @package synth
+diversity:
+  num_tasks: 1000       # task diversity axis
+  num_labels: 16        # distractor/background regions behind the foreground
+  master_seed: 42
+  splits: [0.8, 0.1, 0.1]  # train / val / test task pools (held-out anatomies)
+build:                  # build-time difficulty (frozen into base geometry)
+  mode: fixed           # fixed | per_task_sampled (draw factors per task from `sampled`)
+  morphology: {blob: 1, elongated: 1, annular: 1, tubular: 1, scattered: 1} # blob | elongated | annular | tubular | scattered (or {type: weight})
+  thinness: 0.5
+  tortuosity: 0.5
+  branching_density: 0.5
+  region_size: 0.15
+  boundary_complexity: 0.3
+  scattered_count: 8
+  scattered_clustering: 0.0
+  task_ambiguity: 0.0   # primary ICL knob (geometry side)
+  # per_task_sampled: {factor: [lo, hi]} ranges each task draws from (others fixed).
+  # e.g. {task_ambiguity: [0.0, 0.8], region_size: [0.1, 0.6]}
+  sampled: {}
+  n_bins: 5             # val grid bins `bin_factor` into this many difficulty buckets
+  bin_factor: task_ambiguity  # factor that labels the val metric keys (difficulty curve)
+live:                   # live difficulty (per subject in the loader)
+  support_query_shift: 0.3
+  support_query_translate: 0.0  # per-subject centroid shift std (within-set position spread); 0=off
+  support_query_scale: 0.0      # per-subject log2 zoom std (within-set size spread); 0=off
+  foreground_contrast: 0.5
+  texture_heterogeneity: 0.2
+  noise_level: 0.3
+  context_copy_fraction: 0.0
+  context_consistency: 1.0
+  task_ambiguity_intensity: 0.0  # ambiguity intensity side
+sampling:
+  epoch_length: 10000   # quantity axis (train samples per epoch)
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+noise_bank_size: 256

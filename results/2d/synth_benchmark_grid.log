@@ -1,0 +1,52 @@
+Output -> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_233046
+Loading UniverSeg (size=128)...
+Grid: build:task_ambiguity=[0.0, 0.3, 0.6, 0.9] × live:task_ambiguity_intensity=[0.0, 0.5, 1.0]  (baseline=easy)
+task_ambiguity:   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                     task_ambiguity:   0%|          | 0/4 [00:06<?, ?it/s]  task_ambiguity=0.0   task_ambiguity_intensity=0.0   n=144  dice=0.805
+                                                     task_ambiguity:   0%|          | 0/4 [00:08<?, ?it/s]  task_ambiguity=0.0   task_ambiguity_intensity=0.5   n=144  dice=0.805
+                                                     task_ambiguity:   0%|          | 0/4 [00:09<?, ?it/s]task_ambiguity:  25%|██▌       | 1/4 [00:09<00:28,  9.46s/it]  task_ambiguity=0.0   task_ambiguity_intensity=1.0   n=144  dice=0.805
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:13<00:28,  9.46s/it]  task_ambiguity=0.3   task_ambiguity_intensity=0.0   n=144  dice=0.754
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:14<00:28,  9.46s/it]  task_ambiguity=0.3   task_ambiguity_intensity=0.5   n=144  dice=0.749
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:15<00:28,  9.46s/it]task_ambiguity:  50%|█████     | 2/4 [00:15<00:15,  7.68s/it]  task_ambiguity=0.3   task_ambiguity_intensity=1.0   n=144  dice=0.748
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:19<00:15,  7.68s/it]  task_ambiguity=0.6   task_ambiguity_intensity=0.0   n=144  dice=0.760
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:21<00:15,  7.68s/it]  task_ambiguity=0.6   task_ambiguity_intensity=0.5   n=144  dice=0.737
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:22<00:15,  7.68s/it]task_ambiguity:  75%|███████▌  | 3/4 [00:22<00:07,  7.11s/it]  task_ambiguity=0.6   task_ambiguity_intensity=1.0   n=144  dice=0.741
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [00:26<00:07,  7.11s/it]  task_ambiguity=0.9   task_ambiguity_intensity=0.0   n=144  dice=0.745
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [00:27<00:07,  7.11s/it]  task_ambiguity=0.9   task_ambiguity_intensity=0.5   n=144  dice=0.728
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [00:28<00:07,  7.11s/it]task_ambiguity: 100%|██████████| 4/4 [00:28<00:00,  6.92s/it]task_ambiguity: 100%|██████████| 4/4 [00:28<00:00,  7.24s/it]
+  task_ambiguity=0.9   task_ambiguity_intensity=1.0   n=144  dice=0.728
+controlSynth interaction grid — task_ambiguity (rows) × task_ambiguity_intensity (cols)
+  N=1728 subjects
+
+mean Dice:
+ax2_value    0.0    0.5    1.0
+ax1_value                     
+0.0        0.805  0.805  0.805
+0.3        0.754  0.749  0.748
+0.6        0.760  0.737  0.741
+0.9        0.745  0.728  0.728
+
+fail rate (Dice<0.1):
+ax2_value    0.0    0.5    1.0
+ax1_value                     
+0.0        0.007  0.007  0.007
+0.3        0.000  0.007  0.014
+0.6        0.000  0.007  0.007
+0.9        0.014  0.000  0.000
+
+baseline           (task_ambiguity=0, task_ambiguity_intensity=0): 0.805
+task_ambiguity alone (=0.9):  0.745  (Δ=-0.061)
+task_ambiguity_intensity alone (=1):  0.805  (Δ=+0.000)
+both high          (=0.9, =1): 0.728  (Δ=-0.077)
+
+INTERACTION (joint − sum of marginals) = -0.017  (negative => super-additive difficulty only when combined = real identification axis)
+
+Wrote: per_sample_grid.csv (1728 rows), grid_dice.csv, grid_heatmap.png, grid_report.txt
+-> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_233046

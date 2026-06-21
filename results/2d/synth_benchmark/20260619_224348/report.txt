@@ -1,0 +1,41 @@
+controlSynth difficulty benchmark — UniverSeg baseline
+  image_size=128  context_size=3  num_tasks=12  subjects/task=4  N=64 subjects
+  baseline build={'morphology': 'blob', 'thinness': 0.5, 'tortuosity': 0.4, 'branching_density': 0.5, 'region_size': 0.3, 'boundary_complexity': 0.2, 'scattered_count': 8, 'scattered_clustering': 0.0, 'task_ambiguity': 0.0}
+  baseline live ={'support_query_shift': 0.3, 'foreground_contrast': 0.7, 'texture_heterogeneity': 0.2, 'noise_level': 0.2, 'context_copy_fraction': 0.0, 'context_consistency': 1.0, 'task_ambiguity_intensity': 0.0}
+
+==============================================================================
+KNOB SENSITIVITY (ranked by Dice spread across swept values)
+==============================================================================
+knob                    kind     Δdice  easiest -> hardest
+morphology              build    0.595  scattered=0.817  ->  annular=0.222
+region_size             build    0.446  0.7=0.745  ->  0.3=0.299
+noise_level             live     0.137  0.75=0.369  ->  0.0=0.233
+
+==============================================================================
+WHY: per-knob Spearman(Dice, driver) within each sweep
+==============================================================================
+knob                     rho(fg_frac) rho(ctx_dice)  note
+morphology                      0.020        -0.202  
+region_size                     0.398         0.198  
+noise_level                     0.233        -0.473  inverse-ctx
+
+==============================================================================
+GLOBAL drivers (pooled across all sweeps; directional, confounded by OFAT)
+==============================================================================
+  rho(Dice, fg_frac                 ) = 0.333
+  rho(Dice, ctx_dice                ) = -0.023
+  rho(Dice, foreground_contrast     ) = nan
+  rho(Dice, noise_level             ) = -0.060
+  rho(Dice, task_ambiguity          ) = nan
+  rho(Dice, task_ambiguity_intensity) = nan
+  rho(Dice, region_size             ) = 0.367
+  rho(Dice, texture_heterogeneity   ) = nan
+  rho(Dice, support_query_shift     ) = nan
+  rho(Dice, boundary_complexity     ) = nan
+
+MORPHOLOGY mean Dice:
+  scattered    dice=0.817  fail=0.00  fg=0.012  ctx=0.347
+  elongated    dice=0.430  fail=0.25  fg=0.011  ctx=0.496
+  tubular      dice=0.366  fail=0.00  fg=0.075  ctx=0.338
+  blob         dice=0.299  fail=0.25  fg=0.012  ctx=0.573
+  annular      dice=0.222  fail=0.25  fg=0.012  ctx=0.369

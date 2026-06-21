@@ -9,10 +9,13 @@ touches its own weights — and each hop's "thinking" memory is chained (detache
 next. See pipeline.run_chain / refine_level and the spec/plan in docs/superpowers.
 
 Metrics (resolutions read from config, not hardcoded; final hop's grid == native H):
-  `dice_r{res}/mean` — Dice of each level's composite computed AT that resolution
+  `dice_r{res}/mean` — hard Dice of each level's composite computed AT that resolution
       (res = resolutions[0] is the stage-1 baseline; the rest are the per-hop composites).
-  `dice/mean` — alias of `dice_r{final}/mean` (the native-resolution output); CHECKPOINT
-      selection metric.
+  `dice_soft_r{res}/mean` — continuous (shape) Dice of the same composites vs the soft
+      (avg-pooled, un-binarized) GT at that resolution.
+  `dice/mean` — alias of `dice_r{final}/mean` (the native-resolution hard Dice).
+  `dice_soft/mean` — alias of `dice_soft_r{final}/mean`; CHECKPOINT selection metric
+      (soft Dice at the last computed level, no upsample/threshold).
   `refine/hop{L}/{delta_err, dice_delta, soft_dice_delta}` — hop L's marginal improvement
       over its immediate input (the previous level upsampled), on its sampled cells.
 
@@ -41,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 _ROOT = str(Path(__file__).resolve().parents[3])
@@ -53,38 +56,16 @@ from src.models.patchset_pfn import PatchSetPFN
 from src.models.pretrained_encoders import build_image_encoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # experiments/2d
-from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, soft_dice
+from common import DEVICE, build_dataset, downsample_mask, hard_dice, make_loader, soft_dice
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))       # multilevel
 from pipeline import run_chain
 
-from torch.utils.data import DataLoader, RandomSampler
-
 
 def build_split_loader(cfg, split, shuffle):
-    datasets = [cfg.data.dataset] if cfg.data.dataset else None
-    ds = MedSegBenchDataset(split=split, context_size=cfg.data.context_size,
-                            image_size=cfg.data.image_size, datasets=datasets)
-    if split == "val" and cfg.eval.max_per_label:
-        import random
-        groups = {}
-        for i, (name, _, lv) in enumerate(ds.samples):
-            groups.setdefault((name, lv), []).append(i)
-        keep = []
-        for idxs in groups.values():
-            keep.extend(random.sample(idxs, min(cfg.eval.max_per_label, len(idxs))))
-        ds.samples = [ds.samples[i] for i in sorted(keep)]
-    bs = cfg.train.batch_size if split == "train" else cfg.eval.batch_size
-    nw = cfg.train.workers   if split == "train" else cfg.eval.workers
-    max_train = cfg.data.get("max_train_samples", None)
-    sampler = (RandomSampler(ds, replacement=False, num_samples=max_train)
-               if split == "train" and max_train is not None else None)
-    return DataLoader(TaggedDataset(ds), batch_size=bs,
-                      shuffle=(shuffle and sampler is None), sampler=sampler,
-                      num_workers=nw, collate_fn=collate,
-                      pin_memory=DEVICE.type == "cuda",
-                      persistent_workers=nw > 0, prefetch_factor=4 if nw > 0 else None)
+    """Tagged, collated loader for `split`; source dispatch + policy live in common."""
+    return make_loader(build_dataset(cfg, split), cfg, split, shuffle)
 
 
 def load_stage1(cfg):
@@ -158,7 +139,8 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     H = cfg.data.image_size
     resolutions = list(cfg.sample.resolutions)
     hops = resolutions[1:]
-    per_ds = {r: defaultdict(list) for r in resolutions}
+    per_ds = {r: defaultdict(list) for r in resolutions}             # hard dice
+    per_ds_soft = {r: defaultdict(list) for r in resolutions}        # soft (shape) dice
     acc = {L: {k: [] for k in ("derr", "dd", "sdd")} for L in range(len(hops))}
 
     for batch in loader:
@@ -173,14 +155,17 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
             ds_name   = batch["dataset"][b]
             gt_native = batch["label"][b, 0]
             R0 = resolutions[0]
-            gt_r0 = (downsample_mask(gt_native, R0) >= 0.5).float()
+            gt_r0_soft = downsample_mask(gt_native, R0)
+            gt_r0 = (gt_r0_soft >= 0.5).float()
             per_ds[R0][ds_name].append(hard_dice(coarse_lr[b].cpu(), gt_r0))
+            per_ds_soft[R0][ds_name].append(soft_dice(coarse_lr[b].cpu(), gt_r0_soft))
             prev_grid = coarse_lr[b].reshape(1, 1, R0, R0).float()
             for L, grid in enumerate(hops):
                 o = outputs[L]
                 refined = o["refined_grid"][b]
                 gt_g = (o["gt_grid"][b] >= 0.5).float()
                 per_ds[grid][ds_name].append(hard_dice(refined.cpu(), gt_g.cpu()))
+                per_ds_soft[grid][ds_name].append(soft_dice(refined.cpu(), o["gt_grid"][b].cpu()))
                 up = F.interpolate(prev_grid, size=(grid, grid), mode="bilinear",
                                    align_corners=False).reshape(-1)
                 qg, qi = o["qry_gt"][b], o["qidx"][b]
@@ -204,7 +189,10 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     for r in resolutions:
         metrics[f"dice_r{r}/mean"] = (float(np.mean(flat(per_ds[r])))
                                       if flat(per_ds[r]) else float("nan"))
-    metrics["dice/mean"] = metrics[f"dice_r{resolutions[-1]}/mean"]
+        metrics[f"dice_soft_r{r}/mean"] = (float(np.mean(flat(per_ds_soft[r])))
+                                           if flat(per_ds_soft[r]) else float("nan"))
+    metrics["dice/mean"]      = metrics[f"dice_r{resolutions[-1]}/mean"]
+    metrics["dice_soft/mean"] = metrics[f"dice_soft_r{resolutions[-1]}/mean"]
     for L in range(len(hops)):
         metrics[f"refine/hop{L}/delta_err"]       = nanmean(acc[L]["derr"])
         metrics[f"refine/hop{L}/dice_delta"]      = nanmean(acc[L]["dd"])
@@ -212,12 +200,17 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     for r in resolutions:
         for k, v in per_ds[r].items():
             metrics[f"dice/dataset_r{r}/{k}"] = nanmean(v)
+        for k, v in per_ds_soft[r].items():
+            metrics[f"dice_soft/dataset_r{r}/{k}"] = nanmean(v)
 
-    tqdm.write(f"  [e{epoch}] " + "  ".join(
-        f"r{r}={metrics[f'dice_r{r}/mean']:.4f}" for r in resolutions))
+    tqdm.write(f"  [e{epoch}] hard " + "  ".join(
+        f"r{r}={metrics[f'dice_r{r}/mean']:.4f}" for r in resolutions)
+        + "  | soft " + "  ".join(
+        f"r{r}={metrics[f'dice_soft_r{r}/mean']:.4f}" for r in resolutions))
     wandb.log(metrics)
     for m in model: m.train()
-    return metrics["dice/mean"]
+    # Checkpoint selection on soft Dice at the last computed level (no upsample/threshold).
+    return metrics["dice_soft/mean"]
 
 
 @hydra.main(config_path="../../../configs/experiment/2d", config_name="multilevel", version_base=None)
@@ -325,22 +318,30 @@ def main(cfg: DictConfig):
         wandb.log({"epoch": epoch, "train/loss": loss, "train/lr": scheduler.get_last_lr()[0]})
         lawa_queue.append({k: v.cpu().clone() for k, v in model.state_dict().items()})
         if epoch % cfg.train.eval_every == 0 or epoch == cfg.train.epochs:
-            dice_mean = run_eval(model, val_loader, stage1, encoder, lawa_queue, cfg, epoch)
-            if dice_mean > best:
-                best = dice_mean
+            # Best on soft Dice at the last computed level (dice_soft/mean), not the
+            # hard native-resolution dice/mean.
+            dice_soft = run_eval(model, val_loader, stage1, encoder, lawa_queue, cfg, epoch)
+            if dice_soft > best:
+                best = dice_soft
                 saved = lawa_average(lawa_queue, model, DEVICE)
+                # Embed training data provenance (full data config + synth knobs when
+                # synthetic) alongside arch/sample so eval can report what the chain was
+                # trained on; at eval time cfg.data reflects the *eval* dataset instead.
                 torch.save({"model": model.state_dict(), "arch": dict(cfg.arch),
                             "sample": dict(cfg.sample), "image_size": cfg.data.image_size,
                             "context_size": cfg.data.context_size,
-                            "stage1_checkpoint": cfg.train.stage1_checkpoint},
+                            "stage1_checkpoint": cfg.train.stage1_checkpoint,
+                            "data": OmegaConf.to_container(cfg.data, resolve=True),
+                            "synth": (OmegaConf.to_container(cfg.synth, resolve=True)
+                                      if cfg.data.get("source") == "synthetic" else None)},
                            ckpt_dir / "best.pt")
                 if saved:
                     model.load_state_dict(saved)
-                tqdm.write(f"  [best] dice/mean={best:.4f} → {ckpt_dir}/best.pt")
+                tqdm.write(f"  [best] dice_soft/mean={best:.4f} → {ckpt_dir}/best.pt")
 
-    wandb.log({"best_dice_mean": best})
+    wandb.log({"best_dice_soft_mean": best})
     wandb.finish()
-    print(f"\nDone. Best dice/mean: {best:.4f}")
+    print(f"\nDone. Best dice_soft/mean: {best:.4f}")
 
 
 if __name__ == "__main__":

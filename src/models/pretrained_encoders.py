@@ -85,19 +85,33 @@ class UniverSegFeatureEncoder(nn.Module):
     # compiles. The decorator is a no-op when the model isn't compiled.
     @torch.compiler.disable
     @torch.no_grad()
-    def forward(self, images: torch.Tensor, out_size: int) -> torch.Tensor:
+    def encode_maps(self, images: torch.Tensor) -> list[torch.Tensor]:
+        """Encode → selected pre-pool stage maps (independent of the output grid).
+
+        Returns the feature map(s) for the configured level(s) at the encoder's
+        native resolution; pool them with pool_maps. Splitting encode from pool lets
+        a caller encode ONCE and pool to several grids (the multilevel chain re-pools
+        the same maps at 32/64/128) instead of re-running the encoder per grid."""
         if self.resize_to_input and (images.shape[-1] != self.input_size
                                      or images.shape[-2] != self.input_size):
             images = F.interpolate(images, size=(self.input_size, self.input_size),
                                    mode="bilinear", align_corners=False)
         feats = self._encode(images)
-        size = (out_size, out_size)
         if str(self.level) == "all":
-            maps = [F.adaptive_avg_pool2d(f.float(), size) for f in feats]
-        else:
-            idx  = int(self.level) % len(feats)
-            maps = [F.adaptive_avg_pool2d(feats[idx].float(), size)]
-        return torch.cat(maps, dim=1)                                  # (B, feature_dim, out_size, out_size)
+            return feats
+        return [feats[int(self.level) % len(feats)]]
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def pool_maps(self, maps: list[torch.Tensor], out_size: int) -> torch.Tensor:
+        """Pool encode_maps() output to out_size and concat → (B, feature_dim, out_size, out_size)."""
+        size = (out_size, out_size)
+        return torch.cat([F.adaptive_avg_pool2d(f.float(), size) for f in maps], dim=1)
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor, out_size: int) -> torch.Tensor:
+        return self.pool_maps(self.encode_maps(images), out_size)
 
 
 class DINOv3FeatureEncoder(nn.Module):
@@ -202,8 +216,14 @@ class DINOv3FeatureEncoder(nn.Module):
     def needs_pca_fit(self) -> bool:
         return self._reduce_kind == "pca" and not bool(self.reduce_fitted)
 
-    def _raw_features(self, images: torch.Tensor, out_size: int) -> torch.Tensor:
-        """Encode → pooled (optionally per-stage L2-normed) concat (B, raw_dim, S, S)."""
+    @torch.compiler.disable
+    @torch.no_grad()
+    def encode_maps(self, images: torch.Tensor) -> list[torch.Tensor]:
+        """Encode → selected pre-pool stage maps (independent of the output grid).
+
+        The ConvNeXt forward is the expensive, resolution-independent part; pooling
+        to a grid happens in pool_maps. Splitting them lets the multilevel chain
+        encode ONCE and pool the same maps at 32/64/128 instead of re-encoding."""
         if self.resize_to_input and (images.shape[-1] != self.input_size
                                      or images.shape[-2] != self.input_size):
             images = F.interpolate(images, size=(self.input_size, self.input_size),
@@ -213,15 +233,33 @@ class DINOv3FeatureEncoder(nn.Module):
             x = (x.float() - self._mean) / self._std
         # hidden_states = (input, stage0, stage1, stage2, stage3); drop the input.
         feats = self.model(x, output_hidden_states=True).hidden_states[1:]
-        sel = feats if str(self.level) == "all" else [feats[int(self.level) % 4]]
+        return list(feats) if str(self.level) == "all" else [feats[int(self.level) % 4]]
+
+    def _pool_raw(self, maps: list[torch.Tensor], out_size: int) -> torch.Tensor:
+        """Pool encode_maps() output to out_size (optional per-stage L2) → (B, raw_dim, S, S)."""
         size = (out_size, out_size)
-        maps = []
-        for f in sel:
+        parts = []
+        for f in maps:
             m = F.adaptive_avg_pool2d(f.float(), size)
             if self.stage_l2norm:
                 m = F.normalize(m, dim=1)
-            maps.append(m)
-        return torch.cat(maps, dim=1)
+            parts.append(m)
+        return torch.cat(parts, dim=1)
+
+    def _raw_features(self, images: torch.Tensor, out_size: int) -> torch.Tensor:
+        """Encode → pooled (optionally per-stage L2-normed) concat (B, raw_dim, S, S)."""
+        return self._pool_raw(self.encode_maps(images), out_size)
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def pool_maps(self, maps: list[torch.Tensor], out_size: int) -> torch.Tensor:
+        """Pool encode_maps() output to out_size and apply the channel reduction →
+        (B, feature_dim, out_size, out_size). Mirror of forward for the encode-once path."""
+        if self.needs_pca_fit:
+            raise RuntimeError(
+                "reduce='pca:…' but projection not fitted — call ensure_pca(image_iter) "
+                "(e.g. over the train loader) once before using the encoder.")
+        return self._reduce_channels(self._pool_raw(maps, out_size))
 
     def _reduce_channels(self, feat: torch.Tensor) -> torch.Tensor:
         """(B, raw_dim, S, S) → (B, feature_dim, S, S) via the configured reduction."""
@@ -240,11 +278,7 @@ class DINOv3FeatureEncoder(nn.Module):
     @torch.compiler.disable
     @torch.no_grad()
     def forward(self, images: torch.Tensor, out_size: int) -> torch.Tensor:
-        if self.needs_pca_fit:
-            raise RuntimeError(
-                "reduce='pca:…' but projection not fitted — call ensure_pca(image_iter) "
-                "(e.g. over the train loader) once before using the encoder.")
-        return self._reduce_channels(self._raw_features(images, out_size))
+        return self.pool_maps(self.encode_maps(images), out_size)
 
     # ── PCA fitting / caching ───────────────────────────────────────────────────
     def _pca_cache_path(self) -> str:

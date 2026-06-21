@@ -1,0 +1,25 @@
+controlSynth interaction grid — task_ambiguity (rows) × task_ambiguity_intensity (cols)
+  N=48 subjects
+
+mean Dice:
+ax2_value    0.0    0.5    1.0
+ax1_value                     
+0.0        0.921  0.921  0.921
+0.3        0.856  0.878  0.852
+0.6        0.842  0.793  0.802
+0.9        0.736  0.800  0.811
+
+fail rate (Dice<0.1):
+ax2_value  0.0  0.5  1.0
+ax1_value               
+0.0        0.0  0.0  0.0
+0.3        0.0  0.0  0.0
+0.6        0.0  0.0  0.0
+0.9        0.0  0.0  0.0
+
+baseline           (task_ambiguity=0, task_ambiguity_intensity=0): 0.921
+task_ambiguity alone (=0.9):  0.736  (Δ=-0.185)
+task_ambiguity_intensity alone (=1):  0.921  (Δ=+0.000)
+both high          (=0.9, =1): 0.811  (Δ=-0.109)
+
+INTERACTION (joint − sum of marginals) = +0.076  (negative => super-additive difficulty only when combined = real identification axis)

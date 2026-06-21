@@ -1,0 +1,68 @@
+controlSynth difficulty benchmark — UniverSeg baseline
+  baseline_preset=easy  overrides=None
+  image_size=128  context_size=3  num_tasks=64  subjects/task=24  N=10944 subjects
+  baseline build={'morphology': 'blob', 'thinness': 0.5, 'tortuosity': 0.4, 'branching_density': 0.5, 'region_size': 0.6, 'boundary_complexity': 0.2, 'scattered_count': 8, 'scattered_clustering': 0.0, 'task_ambiguity': 0.0}
+  baseline live ={'support_query_shift': 0.3, 'foreground_contrast': 0.1, 'texture_heterogeneity': 0.2, 'noise_level': 0.2, 'context_copy_fraction': 0.0, 'context_consistency': 1.0, 'task_ambiguity_intensity': 0.0}
+
+==============================================================================
+KNOB SENSITIVITY (ranked by Dice spread across swept values)
+==============================================================================
+knob                    kind     Δdice  easiest -> hardest
+context_copy_fraction   live     0.805  0.0=0.805  ->  1.0=0.000
+context_consistency     live     0.798  1.0=0.805  ->  0.0=0.008
+support_query_shift     live     0.465  0.0=0.817  ->  1.0=0.352
+morphology              build    0.302  blob=0.805  ->  tubular=0.503
+region_size             build    0.300  0.9=0.831  ->  0.05=0.530
+foreground_contrast     live     0.292  0.1=0.805  ->  1.0=0.513
+boundary_complexity     build    0.249  0.25=0.807  ->  1.0=0.559
+scattered_clustering    build    0.200  1.0=0.730  ->  0.33=0.530
+noise_level             live     0.160  0.25=0.800  ->  1.0=0.640
+branching_density       build    0.148  0.0=0.642  ->  1.0=0.494
+scattered_count         build    0.141  2=0.678  ->  32=0.537
+texture_heterogeneity   live     0.119  0.3=0.793  ->  1.0=0.675
+thinness                build    0.076  0.0=0.552  ->  1.0=0.476
+task_ambiguity          build    0.046  0.0=0.805  ->  0.8=0.759
+tortuosity              build    0.014  0.5=0.515  ->  0.0=0.502
+task_ambiguity_intensitylive     0.000  0.0=0.805  ->  0.0=0.805
+
+==============================================================================
+WHY: per-knob Spearman(Dice, driver) within each sweep
+==============================================================================
+knob                     rho(fg_frac) rho(ctx_dice)  note
+morphology                     -0.219         0.678  context-informativeness-mediated
+region_size                     0.440         0.483  foreground-size-mediated, context-informativeness-mediated
+boundary_complexity            -0.182         0.695  context-informativeness-mediated
+task_ambiguity                  0.251         0.353  
+thinness                        0.245         0.303  
+tortuosity                     -0.042         0.136  
+branching_density              -0.313         0.385  
+scattered_count                -0.118         0.484  context-informativeness-mediated
+scattered_clustering           -0.005         0.558  context-informativeness-mediated
+support_query_shift             0.203         0.739  context-informativeness-mediated
+foreground_contrast             0.247         0.047  
+texture_heterogeneity           0.235         0.339  
+noise_level                     0.228         0.305  
+context_copy_fraction           0.060        -0.735  inverse-ctx
+context_consistency             0.069         0.876  context-informativeness-mediated
+task_ambiguity_intensity        0.325         0.399  
+
+==============================================================================
+GLOBAL drivers (pooled across all sweeps; directional, confounded by OFAT)
+==============================================================================
+  rho(Dice, fg_frac                 ) = -0.109
+  rho(Dice, ctx_dice                ) = 0.520
+  rho(Dice, foreground_contrast     ) = 0.031
+  rho(Dice, noise_level             ) = 0.038
+  rho(Dice, task_ambiguity          ) = 0.145
+  rho(Dice, task_ambiguity_intensity) = 0.171
+  rho(Dice, region_size             ) = 0.077
+  rho(Dice, texture_heterogeneity   ) = 0.034
+  rho(Dice, support_query_shift     ) = -0.136
+  rho(Dice, boundary_complexity     ) = -0.012
+
+MORPHOLOGY mean Dice:
+  blob         dice=0.805  fail=0.01  fg=0.048  ctx=0.720
+  elongated    dice=0.737  fail=0.01  fg=0.048  ctx=0.664
+  annular      dice=0.598  fail=0.02  fg=0.048  ctx=0.511
+  scattered    dice=0.550  fail=0.00  fg=0.049  ctx=0.361
+  tubular      dice=0.503  fail=0.00  fg=0.100  ctx=0.333

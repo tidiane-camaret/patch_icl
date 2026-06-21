@@ -19,6 +19,7 @@ Usage:
         eval.stage1_checkpoint=results/2d/pfn_seg_universeg/<run>/best.pt
 """
 
+import datetime
 import random
 import sys
 import time
@@ -274,37 +275,54 @@ def _heatmap_ax(ax, arr: np.ndarray, title: str) -> None:
 
 
 def save_figure(
-    tgt_image:  np.ndarray,
-    tgt_gt:     np.ndarray,
-    tgt_gt_ds:  np.ndarray,
-    pred_ds:    np.ndarray,
-    ctx_images: list[np.ndarray],
-    ctx_gts:    list[np.ndarray],
-    ctx_gts_ds: list[np.ndarray],
-    out_path:   Path,
-    title:      str = "",
+    tgt_image:   np.ndarray,
+    tgt_gt:      np.ndarray,
+    pred_native: np.ndarray,
+    ctx_images:  list[np.ndarray],
+    ctx_gts:     list[np.ndarray],
+    out_path:    Path,
+    title:       str = "",
+    pred_lowres: np.ndarray | None = None,
+    gt_lowres:   np.ndarray | None = None,
 ) -> None:
-    """Row 0: target+GT | GT@output_size | pred.  Row 1: context images+GTs."""
-    K     = len(ctx_images)
-    ncols = max(3, 2 * K)
-    span  = ncols // 3
+    """Backend-agnostic qualitative panel.
 
-    fig, axes = plt.subplots(2, ncols, figsize=(3.2 * ncols, 6.5))
+    Row 0: target+GT overlay | target+pred overlay | (GT↓ | pred↓ when a low-res
+    grid is supplied). The two low-res heatmaps are omitted for backends without a
+    coarse grid (e.g. UniverSeg, whose only output is the native-res binary mask).
+    Row 1: the K context image+GT overlays.
+
+    `pred_native` is the native-resolution prediction (soft map for pfn_seg /
+    multilevel / feature_sim, binary mask for UniverSeg). `pred_lowres` / `gt_lowres`
+    are the coarse-grid prediction and avg-pooled GT at the model's token resolution.
+    """
+    # Row-0 panels as render closures so the low-res pair is purely optional.
+    row0 = [
+        lambda ax: _overlay_ax(ax, tgt_image, tgt_gt,      "Target + GT"),
+        lambda ax: _overlay_ax(ax, tgt_image, pred_native, "Target + Pred"),
+    ]
+    if pred_lowres is not None:
+        g = pred_lowres.shape[0]
+        row0.append(lambda ax: _heatmap_ax(ax, gt_lowres,   f"GT ↓{g}"))
+        row0.append(lambda ax: _heatmap_ax(ax, pred_lowres, f"Pred ↓{g}"))
+
+    K     = len(ctx_images)
+    ncols = max(len(row0), K, 1)
+
+    fig, axes = plt.subplots(2, ncols, figsize=(3.2 * ncols, 6.5), squeeze=False)
     fig.subplots_adjust(hspace=0.35, wspace=0.05)
 
-    _overlay_ax(axes[0, 0],        tgt_image, tgt_gt, "Target + GT")
-    _heatmap_ax(axes[0, span],     tgt_gt_ds,          f"GT ↓{tgt_gt_ds.shape[0]}")
-    _heatmap_ax(axes[0, 2 * span], pred_ds,            "Prediction")
-    for col in (list(range(1, span))
-                + list(range(span + 1, 2 * span))
-                + list(range(2 * span + 1, ncols))):
-        axes[0, col].axis("off")
+    for col in range(ncols):
+        if col < len(row0):
+            row0[col](axes[0, col])
+        else:
+            axes[0, col].axis("off")
 
-    for k in range(K):
-        _overlay_ax(axes[1, 2 * k],     ctx_images[k], ctx_gts[k], f"Ctx {k} + GT")
-        _heatmap_ax(axes[1, 2 * k + 1], ctx_gts_ds[k],             f"Ctx {k} GT ↓")
-    for col in range(2 * K, ncols):
-        axes[1, col].axis("off")
+    for col in range(ncols):
+        if col < K:
+            _overlay_ax(axes[1, col], ctx_images[col], ctx_gts[col], f"Ctx {col} + GT")
+        else:
+            axes[1, col].axis("off")
 
     fig.suptitle(title, fontsize=9)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,10 +353,25 @@ def main(cfg: DictConfig):
     # to native for scoring. encode_size must be divisible by the stage-1 resolution.
     pfn_ckpt = None
     model_size = None
+    train_data = None   # data config the checkpoint was trained on (None for old ckpts)
+    train_synth = None  # synth difficulty knobs when the checkpoint trained on synthetic
     if is_pfn_seg or is_multilevel:
         from omegaconf import open_dict
         pfn_ckpt = torch.load(cfg.eval.checkpoint, map_location="cpu", weights_only=False)
         model_size  = pfn_ckpt["image_size"]
+        # Training-time data provenance, embedded at save time. Absent for checkpoints
+        # saved before this was stored — log nothing rather than guess.
+        train_data  = pfn_ckpt.get("data")
+        train_synth = pfn_ckpt.get("synth")
+        if train_data is not None:
+            print(f"Checkpoint trained on: source={train_data.get('source')}, "
+                  f"dataset={train_data.get('dataset')}, "
+                  f"image_size={train_data.get('image_size')}, "
+                  f"context_size={train_data.get('context_size')}"
+                  + (f", synth={train_synth.get('build', train_synth)}"
+                     if train_synth is not None else ""))
+        else:
+            print("Checkpoint has no stored training-data params (older checkpoint).")
         encode_size = cfg.eval.get("encode_size", None) or model_size
         if encode_size != model_size:
             print(f"Strategy-A eval: model grids fixed at {model_size}px, but encoding "
@@ -390,11 +423,6 @@ def main(cfg: DictConfig):
         if cfg.tabpfn.balance_ratio is not None:
             print("WARNING: balance_ratio is set — batched TabPFN is disabled; inference will be slower.")
 
-        level_tag = str(cfg.feature.level).replace("-", "m")
-        run_name  = cfg.wandb.name or (
-            f"{cfg.model}_lvl{level_tag}_os{cfg.feature.output_size}"
-            f"_s{cfg.data.image_size}_k{cfg.data.context_size}"
-        )
         run_cfg = {
             "model":         cfg.model,
             "source":        cfg.data.get("source", "medsegbench"),
@@ -476,11 +504,6 @@ def main(cfg: DictConfig):
         del _imgs, _msks
         print(f"FLOPs (K={cfg.data.context_size}, {cfg.data.image_size}²): {flops/1e9:.2f} GFLOPs")
 
-        # Name encodes the model grid; append the encoder input size only when it
-        # differs (Strategy A), e.g. pfn_seg_2d_s128e256_k3.
-        size_tag = (f"s{model_size}" if cfg.data.image_size == model_size
-                    else f"s{model_size}e{cfg.data.image_size}")
-        run_name = cfg.wandb.name or f"{cfg.model}_{size_tag}_k{cfg.data.context_size}"
         run_cfg  = {
             "model":        cfg.model,
             "source":       cfg.data.get("source", "medsegbench"),
@@ -490,6 +513,8 @@ def main(cfg: DictConfig):
             "split":        cfg.data.split,
             "checkpoint":   str(cfg.eval.checkpoint),
             "arch":         dict(arch),
+            "train_data":   train_data,    # data the checkpoint was trained on
+            "train_synth":  train_synth,   # synth knobs (None unless trained on synthetic)
             "flops":        flops,
         }
 
@@ -584,10 +609,6 @@ def main(cfg: DictConfig):
         del _db
         print(f"FLOPs (K={K}, {Himg}²): {flops/1e9:.2f} GFLOPs")
 
-        # Name encodes the model grid; append the encoder input size only when it
-        # differs (Strategy A), e.g. patchset_pfn_s128e256_k3.
-        size_tag = f"s{model_size}" if Himg == model_size else f"s{model_size}e{Himg}"
-        run_name = cfg.wandb.name or f"{cfg.model}_{size_tag}_k{K}"
         run_cfg  = {
             "model":        cfg.model,
             "source":       cfg.data.get("source", "medsegbench"),
@@ -599,6 +620,8 @@ def main(cfg: DictConfig):
             "stage1_checkpoint": str(stage1_path),
             "arch":         dict(arch),
             "sample":       dict(pfn_ckpt["sample"]),
+            "train_data":   train_data,    # data the checkpoint was trained on
+            "train_synth":  train_synth,   # synth knobs (None unless trained on synthetic)
             "flops":        flops,
         }
 
@@ -617,7 +640,6 @@ def main(cfg: DictConfig):
         del _img, _ctx_in, _ctx_out
         print(f"FLOPs (S={cfg.data.context_size}, {cfg.data.image_size}²): {flops/1e9:.2f} GFLOPs")
 
-        run_name = cfg.wandb.name or f"{cfg.model}_s{cfg.data.image_size}_k{cfg.data.context_size}"
         run_cfg  = {
             "model":        cfg.model,
             "source":       cfg.data.get("source", "medsegbench"),
@@ -630,11 +652,15 @@ def main(cfg: DictConfig):
         }
 
     # ── wandb ─────────────────────────────────────────────────────────────────
-    run = wandb.init(project=cfg.wandb.project, name=run_name, config=run_cfg)
+    run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name, config=run_cfg)
     wandb.log({"flops_giga": flops / 1e9})
     sample_table = wandb.Table(columns=["dataset", "sample_idx", "label",
                                          "dice_ds", "dice_native", "dice_ds_soft"])
-    out_dir = Path(cfg.eval.out_dir)
+    # Output dir follows the wandb run name (auto-generated when cfg.wandb.name is
+    # null), so each run's figures/CSVs land in their own folder — mirrors pfn_seg.py.
+    run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or cfg.model
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    out_dir = Path(cfg.eval.out_dir) / f"{date_str}_{run_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── eval loop ─────────────────────────────────────────────────────────────
@@ -648,9 +674,19 @@ def main(cfg: DictConfig):
     tabpfn_times:    list[float] = []
     inference_times: list[float] = []
     saved_figures:   set[tuple[str, int]] = set()
+    # qualitative figures (all backends, opt-in via eval.save_figures + eval.max_figures)
+    save_figures = bool(cfg.eval.get("save_figures", False))
+    max_figures  = int(cfg.eval.get("max_figures", 50))
+    figures_to_wandb = bool(cfg.eval.get("figures_to_wandb", True))
     # per-patch error analysis (pfn_seg only, opt-in via eval.patch_csv)
     patch_csv = cfg.eval.get("patch_csv", None) if is_pfn_seg else None
     patch_rows: list[tuple] | None = [] if patch_csv else None
+    # per-element synth params (controlSynth only, opt-in via eval.synth_csv): one row
+    # per subject with its full difficulty knob vector + realized stats + Dice, so the
+    # difficulty of every parameter value can be analysed offline. Needs collate's
+    # `meta` passthrough (common.collate).
+    synth_csv = cfg.eval.get("synth_csv", None) if cfg.data.get("source") == "synthetic" else None
+    synth_rows: list[dict] | None = [] if synth_csv else None
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="eval"):
@@ -737,6 +773,7 @@ def main(cfg: DictConfig):
                                            device=DEVICE)
                 Hg = resolutions[-1]                                 # final-hop grid (model_size)
                 preds = outputs[-1]["refined_grid"].reshape(B, Hg, Hg)
+                preds_grid = preds.float().cpu()                     # coarse grid, for figures
                 if Hg != H:   # Strategy A: model grid < served/native size → upsample
                     preds = F.interpolate(preds.unsqueeze(1), size=(H, W),
                                           mode="bilinear", align_corners=False).squeeze(1)
@@ -757,6 +794,11 @@ def main(cfg: DictConfig):
                 label_value = int(batch["label_value"][b])
                 label       = labels[b, 0]
 
+                # Figure tensors set per branch: native-res pred (always) + an
+                # optional coarse grid (pred_lowres_b/gt_lowres_b, None when the
+                # backend has no low-res map). Consumed by the unified save block below.
+                pred_native_b = pred_lowres_b = gt_lowres_b = None
+
                 if is_feat_sim:
                     pred_ds  = preds_all[b]
                     d_ds     = hard_dice(pred_ds, downsample_mask(label, os_))
@@ -764,26 +806,11 @@ def main(cfg: DictConfig):
                     # shape: continuous low-res pred vs soft (avg-pooled, un-binarized) GT
                     d_ds_soft = soft_dice(pred_ds, downsample_mask(label, os_))
 
-                    fig_key = (ds_name, label_value)
-                    if fig_key not in saved_figures:
-                        saved_figures.add(fig_key)
-                        fig_path = out_dir / f"{ds_name}_l{label_value}.png"
-                        save_figure(
-                            tgt_image  = images[b, 0].cpu().numpy(),
-                            tgt_gt     = label.cpu().numpy(),
-                            tgt_gt_ds  = downsample_mask(label, os_, cfg.feature.mask_pool).cpu().numpy(),
-                            pred_ds    = pred_ds.cpu().numpy(),
-                            ctx_images = [context_in[b, k, 0].cpu().numpy() for k in range(K)],
-                            ctx_gts    = [context_out[b, k, 0].cpu().numpy() for k in range(K)],
-                            ctx_gts_ds = [
-                                downsample_mask(context_out[b, k, 0], os_, cfg.feature.mask_pool).cpu().numpy()
-                                for k in range(K)
-                            ],
-                            out_path = fig_path,
-                            title    = (f"{ds_name}  label={label_value}  sample={sample_idx}"
-                                        f"  dice_native={d_native:.3f}"),
-                        )
-                        wandb.log({f"figures/{ds_name}/label_{label_value}": wandb.Image(str(fig_path))})
+                    pred_lowres_b = pred_ds
+                    gt_lowres_b   = downsample_mask(label, os_, cfg.feature.mask_pool)
+                    pred_native_b = F.interpolate(
+                        pred_ds.unsqueeze(0).unsqueeze(0).float(),
+                        size=(H, W), mode="bilinear", align_corners=False).squeeze()
                 elif is_pfn_seg:
                     d_native = hard_dice(preds[b], label)
                     # Binarize the avg-pooled GT at >= 0.5 (majority vote) so the
@@ -791,6 +818,10 @@ def main(cfg: DictConfig):
                     d_ds     = hard_dice(preds_lowres[b], (downsample_mask(label, Hp) >= 0.5).float())
                     # shape: continuous low-res sigmoid map vs soft (un-binarized) GT
                     d_ds_soft = soft_dice(preds_lowres[b], downsample_mask(label, Hp))
+
+                    pred_native_b = preds[b]
+                    pred_lowres_b = preds_lowres[b]
+                    gt_lowres_b   = downsample_mask(label, Hp)
 
                     if patch_rows is not None:
                         # one row per low-res patch: pred, soft GT, signed error,
@@ -813,10 +844,17 @@ def main(cfg: DictConfig):
                     # other models. (Low-res variants not tracked — final dice only.)
                     d_ds = d_native = hard_dice(preds[b], label)
                     d_ds_soft = soft_dice(preds[b], label)
+
+                    pred_native_b = preds[b]
+                    if Hg != H:   # coarse grid distinct from native → show both
+                        pred_lowres_b = preds_grid[b]
+                        gt_lowres_b   = downsample_mask(label, Hg)
                 else:
                     d_ds = d_native = hard_dice(preds[b, 0], label)
                     # universeg has no low-res map; binary preds → equals hard dice
                     d_ds_soft = soft_dice(preds[b, 0], label)
+
+                    pred_native_b = preds[b, 0]   # native binary mask; no coarse grid
 
                 per_ds[ds_name].append(d_native)
                 per_label[f"{ds_name}/label_{label_value}"].append(d_native)
@@ -825,6 +863,44 @@ def main(cfg: DictConfig):
                 per_ds_ds_soft[ds_name].append(d_ds_soft)
                 per_label_ds_soft[f"{ds_name}/label_{label_value}"].append(d_ds_soft)
                 sample_table.add_data(ds_name, sample_idx, label_value, d_ds, d_native, d_ds_soft)
+
+                # ── qualitative figure (all backends, opt-in via eval.save_figures) ──
+                # One figure per (dataset, label_value), capped at eval.max_figures.
+                fig_key = (ds_name, label_value)
+                if (save_figures and pred_native_b is not None
+                        and fig_key not in saved_figures
+                        and len(saved_figures) < max_figures):
+                    saved_figures.add(fig_key)
+                    fig_path = out_dir / f"{ds_name}_l{label_value}.png"
+                    save_figure(
+                        tgt_image   = images[b, 0].cpu().numpy(),
+                        tgt_gt      = label.cpu().numpy(),
+                        pred_native = pred_native_b.cpu().numpy(),
+                        ctx_images  = [context_in[b, k, 0].cpu().numpy() for k in range(K)],
+                        ctx_gts     = [context_out[b, k, 0].cpu().numpy() for k in range(K)],
+                        out_path    = fig_path,
+                        title       = (f"{ds_name}  label={label_value}  sample={sample_idx}"
+                                       f"  dice_native={d_native:.3f}"),
+                        pred_lowres = None if pred_lowres_b is None else pred_lowres_b.cpu().numpy(),
+                        gt_lowres   = None if gt_lowres_b   is None else gt_lowres_b.cpu().numpy(),
+                    )
+                    if figures_to_wandb:
+                        wandb.log({f"figures/{ds_name}/label_{label_value}": wandb.Image(str(fig_path))})
+
+                if synth_rows is not None and "meta" in batch:
+                    m = batch["meta"][b]
+                    fg_frac = float((label > 0).float().mean())
+                    ctx_d = [hard_dice(label, context_out[b, k, 0]) for k in range(K)]
+                    row = {"dataset": ds_name, "sample_idx": sample_idx,
+                           "label_value": label_value, "dice_native": d_native, "dice_ds": d_ds,
+                           "morphology": m["morphology"], "task_id": int(m["task_id"]),
+                           "subject_index": int(m["subject_index"]), "fg_frac": fg_frac,
+                           "ctx_dice": float(np.nanmean(ctx_d)) if ctx_d else float("nan")}
+                    row.update({k: (float(v) if isinstance(v, (int, float)) else v)
+                                for k, v in m["difficulty"].items()})
+                    row["axis_identification"] = float(m["axis"]["identification"])
+                    row["axis_segmentation"]   = float(m["axis"]["segmentation"])
+                    synth_rows.append(row)
 
     # ── aggregate & log ───────────────────────────────────────────────────────
     if is_feat_sim:
@@ -863,6 +939,16 @@ def main(cfg: DictConfig):
                         "pred", "gt", "error", "gt_size", "ctx_dice"])
             w.writerows(patch_rows)
         print(f"Wrote {len(patch_rows)} patch records to {csv_path}")
+
+    if synth_rows:
+        import csv
+        csv_path = Path(synth_csv)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(synth_rows[0].keys()))
+            w.writeheader()
+            w.writerows(synth_rows)
+        print(f"Wrote {len(synth_rows)} synth-param records to {csv_path}")
 
     run.finish()
 

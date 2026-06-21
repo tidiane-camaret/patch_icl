@@ -1,6 +1,11 @@
+defaults:
+  - synth: default   # controlSynth config block -> cfg.synth (used when data.source=synthetic)
+  - _self_
+
 model: patchset_pfn
 
 data:
+  source: medsegbench  # medsegbench | biomedparse | synthetic (controlSynth generator)
   image_size: 128
   context_size: 3
   dataset: null

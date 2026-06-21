@@ -1,0 +1,19 @@
+BiomedParse mask shape/position/size stats  (split=train, res=256, 41 datasets, N=3944 masks, ~100/dataset)
+
+POSITION (normalized; 0.5,0.5 = image center)
+  centroid cx    mean=   0.493  p5=0.246  p25=0.417  p50=0.498  p75=0.567  p95=0.743
+  centroid cy    mean=   0.475  p5=0.243  p25=0.400  p50=0.477  p75=0.543  p95=0.712
+  center offset  mean=   0.168  p5=0.025  p25=0.076  p50=0.158  p75=0.242  p95=0.367
+    cx std=0.145  cy std=0.135  frac offset>0.2: 37.04%
+
+SIZE
+  area_frac      mean=  0.0652  p5=0.0009  p25=0.0062  p50=0.0192  p75=0.0894  p95=0.2691
+    area_frac log10 span p5..p95: 0.0009 .. 0.2691 (294x)
+
+SHAPE
+  eccentricity   mean=   0.751  p5=0.370  p25=0.635  p50=0.807  p75=0.906  p95=0.961
+  solidity       mean=   0.868  p5=0.572  p25=0.838  p50=0.912  p75=0.957  p95=0.980
+  extent         mean=   0.554  p5=0.114  p25=0.427  p50=0.593  p75=0.725  p95=0.814
+  n_cc           mean=    2.94  p5=1.00  p25=1.00  p50=1.00  p75=2.00  p95=7.00
+    frac multi-component (n_cc>1): 31.03%
+    frac touching frame border:   6.14%

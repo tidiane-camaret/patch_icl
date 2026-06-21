@@ -1,0 +1,85 @@
+# @package synth
+# Diverse + HARD synthetic training set for pfn_seg, derived from the controlSynth
+# difficulty study (docs/datasets/controlSynth_difficulty_findings.md).
+#
+# Design principles (training, not benchmarking):
+#  - DIVERSITY: many distinct base geometries (num_tasks), all 5 morphologies, and
+#    `per_task_sampled` so every task draws its own build difficulty -> one run spans a
+#    moderate->hard range (built-in curriculum) instead of a single operating point.
+#    Per-subject appearance/deformation is freshly drawn -> effectively infinite variety.
+#  - HARD but LEARNABLE: difficulty comes from the levers that teach in-context reasoning
+#    -- identification under ambiguity (shape+intensity look-alike distractors -> must use
+#    context), shape-reliance, and robustness to deformation/noise/rough boundaries. We do
+#    NOT push the degenerate knobs: region_size is floored so the target spans several
+#    cells of the 16x16 patch grid (sub-patch targets are unrepresentable, not "hard"),
+#    context_consistency stays high so the supervision signal survives, and
+#    context_copy_fraction=0 (no free easy exemplars).
+#
+# Usage:  python experiments/2d/pfn_seg.py data.source=synthetic synth=hard_diverse
+# Sanity: add train.epochs=3 synth.diversity.num_tasks=400 synth.sampling.epoch_length=2000
+#         and confirm val Dice climbs (>~0.3) before committing a full run.
+
+diversity:
+  num_tasks: 5000          # distinct base geometries (shape diversity). Init builds them all
+                           # in RAM once (~minutes incl. vessels); scale up for final runs.
+  num_labels: 20           # background regions -> richer backgrounds + more distractor pool
+  master_seed: 42
+  splits: [0.9, 0.05, 0.05]  # most tasks for training; held-out val/test shapes for eval
+
+build:                     # build-time difficulty, drawn PER TASK from `sampled`
+  mode: per_task_sampled
+  morphology: {blob: 1, elongated: 1, annular: 1, tubular: 1, scattered: 1}  # all 5, equal
+  # Fixed fallbacks (used only for factors absent from `sampled`).
+  thinness: 0.5
+  tortuosity: 0.5
+  branching_density: 0.5
+  region_size: 0.45
+  boundary_complexity: 0.5
+  scattered_count: 12
+  scattered_clustering: 0.5
+  task_ambiguity: 0.5
+  # Realism knobs (tuned to biomedparse mask stats; see docs/logs.md 2026-06-20).
+  # The original generator shattered shapes (n_cc median ~12) and kept them centered;
+  # these make masks mostly single-component, compact, and off-centre like real masks.
+  boundary_amp_scale: 0.5      # gentler boundary roughening (was effectively 1.0 -> islands)
+  boundary_sigma_frac: 0.4     # low-frequency roughening (blur ~ sqrt(area)*0.4)
+  boundary_keep_largest: true  # drop detached specks (blob/elongated/annular only)
+  position_jitter: 0.15        # off-centre placement: centroid ~ N(0.5, 0.15) -> real-like spread
+  # Per-task difficulty ranges (moderate -> hard). region_size widened+lowered to a
+  # MODERATE floor (0.12 ~ 0.5% area) so the size distribution matches real (median
+  # ~2% with a small-object tail) while staying resolvable at the res-16 stage-1 grid;
+  # ambiguity range keeps shape-distractors present so the model must learn identification.
+  sampled:
+    region_size: [0.12, 0.62]
+    boundary_complexity: [0.30, 1.00]
+    task_ambiguity: [0.30, 0.80]
+    branching_density: [0.30, 0.90]
+    scattered_count: [6, 24]
+    scattered_clustering: [0.00, 1.00]
+    thinness: [0.30, 0.90]
+    tortuosity: [0.20, 0.90]
+  n_bins: 5
+  bin_factor: task_ambiguity   # val metrics bin by ambiguity -> difficulty-response curve
+
+live:                      # global per-subject hardness (moderate-hard, learnable)
+  support_query_shift: 0.50      # context geometry misaligned with query -> deformation robustness
+  # Per-SUBJECT pose jitter -> within-(target+context)-set position/size spread, which a
+  # single deformed base lacks (real biomedparse sets: centroid_dist 0.16, area_logratio 1.2
+  # vs synth 0.11/0.55). Tuned to close most of that gap without collapsing within-set mask
+  # overlap below real (see scripts/context_mask_distance.py; docs/logs.md 2026-06-20).
+  support_query_translate: 0.05  # centroid shift std (fraction of image)
+  support_query_scale: 0.45      # log2 zoom std (~ x0.73..x1.37 per subject)
+  foreground_contrast: 0.50      # fg recognizable but not trivial; lets intensity-ambiguity bite
+  texture_heterogeneity: 0.35    # within-region intensity variation
+  noise_level: 0.40              # additive noise -> robustness (high = harder, monotone after fix)
+  context_copy_fraction: 0.0     # no pristine "easy" exemplars
+  context_consistency: 0.90      # mostly-clean context masks + a little label noise for robustness
+  task_ambiguity_intensity: 0.60 # 60% of shape-distractors also share the fg intensity ->
+                                 #   near-perfect look-alikes -> identification must use context
+
+sampling:
+  epoch_length: 20000      # train samples per epoch (fresh subjects from random train tasks)
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+
+noise_bank_size: 256

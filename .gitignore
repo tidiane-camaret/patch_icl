@@ -30,3 +30,4 @@ results/aug_benchmark/*.png
 docs/tabpfn/*.pdf
 results/2d/**/*.csv
 results/2d/**/*.png
+results/controlsynth/**/*.png

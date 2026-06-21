@@ -1,13 +1,18 @@
+defaults:
+  - synth: default   # controlSynth config block -> cfg.synth (used when data.source=synthetic)
+  - _self_
+
 model: pfn_seg_2d
 
 data:
+  source: medsegbench  # medsegbench | biomedparse | synthetic (controlSynth generator)
   image_size: 128
   context_size: 3
   dataset: null       # null = all datasets; or e.g. "abdomenus"
   max_train_samples: null  # null = full dataset; int = random subset per epoch
 
 arch:
-  image_encoder: patch  # image path: "patch" (raw pixels), "universeg", or "dinov3"/"dinov3-large" (frozen pretrained features)
+  image_encoder: universeg  # image path: "patch" (raw pixels), "universeg", or "dinov3"/"dinov3-large" (frozen pretrained features)
   feature_level: all    # encoder level: 0..3, -1 (bottleneck), or "all" (concat). UniverSeg all → 256ch; DINOv3 all → 1920ch
   encoder_resize_to_input: false  # if true, resize images to 128² before the (fully-conv) encoder; false = encode at native size
   encoder_imagenet_norm: true     # dinov3 only: ImageNet-normalize the (gray→RGB) input
@@ -45,8 +50,7 @@ eval:
   batch_size: 16
   workers: 8
   max_per_label: null #20
-  out_dir: results/2d/pfn_seg
-
+  out_dir: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d_train
 wandb:
   project: patch_icl_2d_exps_train
   name: null          # null = auto-generated

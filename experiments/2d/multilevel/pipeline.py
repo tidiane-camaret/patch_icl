@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import ListConfig
 
+from src.models.pfn_seg_2d import standardize_by_context
 from sampling import sample_patches, idx_to_ij, gather_grid
 
 
@@ -38,13 +39,35 @@ def coarse_predict(stage1, all_images, all_masks, K, grid_res):
     return p, p_lowres, think
 
 
+def _grid_from_feat(feat, B, T, grid_res, n_context):
+    """(B*T, Cf, R, R) pooled features → standardized (B, T, R², Cf), row-major cells."""
+    Cf = feat.shape[1]
+    feat = feat.flatten(2).transpose(1, 2).reshape(B, T, grid_res * grid_res, Cf)
+    return standardize_by_context(feat, n_context)
+
+
 @torch.no_grad()
-def encode_grid(encoder, images, grid_res):
-    """images (B, T, 1, H, W) → features (B, T, grid_res², Cf) in row-major cell order."""
+def encode_grid(encoder, images, grid_res, n_context):
+    """images (B, T, 1, H, W) → features (B, T, grid_res², Cf) in row-major cell order.
+
+    Full encode+pool in one call (fallback path for encoders without encode_maps;
+    run_chain prefers the encode-once path via pool_grid). Features are per-channel
+    standardized using the first `n_context` rows' statistics (standardize_by_context),
+    so the chain consumes them in the same normalized frame as ImagePFN's image path
+    (rather than raw encoder magnitudes, which for DINOv3 'all' differ ~10–100× across
+    stages)."""
     B, T, _, H, W = images.shape
     feat = encoder(images.reshape(B * T, 1, H, W), grid_res)  # (B*T, Cf, R2, R2)
-    Cf = feat.shape[1]
-    return feat.flatten(2).transpose(1, 2).reshape(B, T, grid_res * grid_res, Cf)
+    return _grid_from_feat(feat, B, T, grid_res, n_context)
+
+
+@torch.no_grad()
+def pool_grid(encoder, maps, B, T, grid_res, n_context):
+    """Pool pre-encoded stage maps (encoder.encode_maps output) to grid_res → standardized
+    (B, T, grid_res², Cf). The encode-once-pool-many path: the encoder ran once in
+    run_chain; here we only pool/concat (resolution-independent maps) per hop."""
+    feat = encoder.pool_maps(maps, grid_res)                 # (B*T, Cf, R2, R2)
+    return _grid_from_feat(feat, B, T, grid_res, n_context)
 
 
 def _grid_fractions(masks, grid_res):
@@ -147,6 +170,7 @@ def run_chain(batch, stage1, encoder, models, cfg, source, stochastic, device):
 
     all_images = torch.cat([context_in, image.unsqueeze(1)], dim=1)
     all_masks  = torch.cat([context_out, torch.zeros_like(image.unsqueeze(1))], dim=1)
+    T = all_images.shape[1]
 
     R0 = resolutions[0]
     # Frozen stage-1 + encoder: no grad (only the per-level PatchSetPFNs train).
@@ -156,13 +180,25 @@ def run_chain(batch, stage1, encoder, models, cfg, source, stochastic, device):
     prev_think = think
     prev_res = R0
 
+    # Encode the images ONCE (encoder stage maps are resolution-independent), then pool
+    # to each hop's grid. Avoids re-running the full encoder per hop — the maps differ
+    # between hops only in the final pooling size. Falls back to per-hop encode_grid for
+    # plain-callable encoders without encode_maps (e.g. test stubs).
+    H, W = all_images.shape[-2:]
+    encode_maps = getattr(encoder, "encode_maps", None)
+    img_maps = None
+    if encode_maps is not None:
+        with torch.no_grad():
+            img_maps = encode_maps(all_images.reshape(B * T, 1, H, W))
+
     outputs = []
     for L, grid in enumerate(resolutions[1:]):
         coarse_grid = F.interpolate(prev_dense.reshape(B, 1, prev_res, prev_res),
                                     size=(grid, grid), mode="bilinear",
                                     align_corners=False).reshape(B, grid * grid)
         with torch.no_grad():
-            feats = encode_grid(encoder, all_images, grid)
+            feats = (pool_grid(encoder, img_maps, B, T, grid, K) if img_maps is not None
+                     else encode_grid(encoder, all_images, grid, K))
         s = _level_cfg(cfg, L)
         hop = refine_level(models[L], batch, feats, coarse_grid, prev_think, grid, s,
                            source, stochastic, device)

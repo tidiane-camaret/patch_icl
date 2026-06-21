@@ -1,0 +1,270 @@
+Output -> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_232110
+Loading UniverSeg (size=128)...
+morphology            :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             morphology            :   0%|          | 0/5 [00:08<?, ?it/s]morphology            :  20%|██        | 1/5 [00:08<00:35,  8.83s/it]  morphology             = blob       n=144  mean Dice=0.805
+[controlSynth] building 64 base geometries (morphology=elongated, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     morphology            :  20%|██        | 1/5 [00:12<00:35,  8.83s/it]morphology            :  40%|████      | 2/5 [00:12<00:18,  6.01s/it]  morphology             = elongated  n=144  mean Dice=0.737
+[controlSynth] building 64 base geometries (morphology=annular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     morphology            :  40%|████      | 2/5 [00:16<00:18,  6.01s/it]morphology            :  60%|██████    | 3/5 [00:16<00:10,  5.05s/it]  morphology             = annular    n=144  mean Dice=0.598
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     morphology            :  60%|██████    | 3/5 [00:23<00:10,  5.05s/it]morphology            :  80%|████████  | 4/5 [00:23<00:05,  5.82s/it]  morphology             = tubular    n=144  mean Dice=0.503
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     morphology            :  80%|████████  | 4/5 [00:27<00:05,  5.82s/it]morphology            : 100%|██████████| 5/5 [00:27<00:00,  5.18s/it]morphology            : 100%|██████████| 5/5 [00:27<00:00,  5.57s/it]
+  morphology             = scattered  n=144  mean Dice=0.550
+region_size           :   0%|          | 0/6 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             region_size           :   0%|          | 0/6 [00:03<?, ?it/s]region_size           :  17%|█▋        | 1/6 [00:03<00:18,  3.70s/it]  region_size            = 0.05       n=144  mean Dice=0.530
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     region_size           :  17%|█▋        | 1/6 [00:07<00:18,  3.70s/it]region_size           :  33%|███▎      | 2/6 [00:07<00:14,  3.71s/it]  region_size            = 0.15       n=144  mean Dice=0.543
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     region_size           :  33%|███▎      | 2/6 [00:11<00:14,  3.71s/it]region_size           :  50%|█████     | 3/6 [00:11<00:11,  3.72s/it]  region_size            = 0.3        n=144  mean Dice=0.601
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     region_size           :  50%|█████     | 3/6 [00:14<00:11,  3.72s/it]region_size           :  67%|██████▋   | 4/6 [00:14<00:07,  3.75s/it]  region_size            = 0.5        n=144  mean Dice=0.746
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     region_size           :  67%|██████▋   | 4/6 [00:18<00:07,  3.75s/it]region_size           :  83%|████████▎ | 5/6 [00:18<00:03,  3.76s/it]  region_size            = 0.7        n=144  mean Dice=0.825
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     region_size           :  83%|████████▎ | 5/6 [00:22<00:03,  3.76s/it]region_size           : 100%|██████████| 6/6 [00:22<00:00,  3.76s/it]region_size           : 100%|██████████| 6/6 [00:22<00:00,  3.74s/it]
+  region_size            = 0.9        n=144  mean Dice=0.831
+boundary_complexity   :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             boundary_complexity   :   0%|          | 0/5 [00:03<?, ?it/s]boundary_complexity   :  20%|██        | 1/5 [00:03<00:13,  3.47s/it]  boundary_complexity    = 0.0        n=144  mean Dice=0.797
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     boundary_complexity   :  20%|██        | 1/5 [00:07<00:13,  3.47s/it]boundary_complexity   :  40%|████      | 2/5 [00:07<00:11,  3.68s/it]  boundary_complexity    = 0.25       n=144  mean Dice=0.807
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     boundary_complexity   :  40%|████      | 2/5 [00:11<00:11,  3.68s/it]boundary_complexity   :  60%|██████    | 3/5 [00:11<00:07,  3.71s/it]  boundary_complexity    = 0.5        n=144  mean Dice=0.715
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     boundary_complexity   :  60%|██████    | 3/5 [00:14<00:07,  3.71s/it]boundary_complexity   :  80%|████████  | 4/5 [00:14<00:03,  3.74s/it]  boundary_complexity    = 0.75       n=144  mean Dice=0.626
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     boundary_complexity   :  80%|████████  | 4/5 [00:18<00:03,  3.74s/it]boundary_complexity   : 100%|██████████| 5/5 [00:18<00:00,  3.75s/it]boundary_complexity   : 100%|██████████| 5/5 [00:18<00:00,  3.72s/it]
+  boundary_complexity    = 1.0        n=144  mean Dice=0.559
+task_ambiguity        :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity        :   0%|          | 0/5 [00:03<?, ?it/s]task_ambiguity        :  20%|██        | 1/5 [00:03<00:14,  3.70s/it]  task_ambiguity         = 0.0        n=144  mean Dice=0.805
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     task_ambiguity        :  20%|██        | 1/5 [00:07<00:14,  3.70s/it]task_ambiguity        :  40%|████      | 2/5 [00:07<00:11,  3.72s/it]  task_ambiguity         = 0.2        n=144  mean Dice=0.767
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     task_ambiguity        :  40%|████      | 2/5 [00:11<00:11,  3.72s/it]task_ambiguity        :  60%|██████    | 3/5 [00:11<00:07,  3.75s/it]  task_ambiguity         = 0.4        n=144  mean Dice=0.760
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     task_ambiguity        :  60%|██████    | 3/5 [00:15<00:07,  3.75s/it]task_ambiguity        :  80%|████████  | 4/5 [00:15<00:03,  3.83s/it]  task_ambiguity         = 0.6        n=144  mean Dice=0.760
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     task_ambiguity        :  80%|████████  | 4/5 [00:19<00:03,  3.83s/it]task_ambiguity        : 100%|██████████| 5/5 [00:19<00:00,  3.88s/it]task_ambiguity        : 100%|██████████| 5/5 [00:19<00:00,  3.83s/it]
+  task_ambiguity         = 0.8        n=144  mean Dice=0.759
+thinness              :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             thinness              :   0%|          | 0/5 [00:07<?, ?it/s]thinness              :  20%|██        | 1/5 [00:07<00:29,  7.31s/it]  thinness               = 0.0        n=144  mean Dice=0.552
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     thinness              :  20%|██        | 1/5 [00:13<00:29,  7.31s/it]thinness              :  40%|████      | 2/5 [00:13<00:20,  6.70s/it]  thinness               = 0.25       n=144  mean Dice=0.528
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     thinness              :  40%|████      | 2/5 [00:20<00:20,  6.70s/it]thinness              :  60%|██████    | 3/5 [00:20<00:13,  6.93s/it]  thinness               = 0.5        n=144  mean Dice=0.503
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     thinness              :  60%|██████    | 3/5 [00:26<00:13,  6.93s/it]thinness              :  80%|████████  | 4/5 [00:26<00:06,  6.42s/it]  thinness               = 0.75       n=144  mean Dice=0.480
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     thinness              :  80%|████████  | 4/5 [00:33<00:06,  6.42s/it]thinness              : 100%|██████████| 5/5 [00:33<00:00,  6.48s/it]thinness              : 100%|██████████| 5/5 [00:33<00:00,  6.60s/it]
+  thinness               = 1.0        n=144  mean Dice=0.476
+tortuosity            :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             tortuosity            :   0%|          | 0/5 [00:06<?, ?it/s]tortuosity            :  20%|██        | 1/5 [00:06<00:24,  6.04s/it]  tortuosity             = 0.0        n=144  mean Dice=0.502
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     tortuosity            :  20%|██        | 1/5 [00:11<00:24,  6.04s/it]tortuosity            :  40%|████      | 2/5 [00:11<00:17,  5.99s/it]  tortuosity             = 0.25       n=144  mean Dice=0.506
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     tortuosity            :  40%|████      | 2/5 [00:19<00:17,  5.99s/it]tortuosity            :  60%|██████    | 3/5 [00:19<00:12,  6.49s/it]  tortuosity             = 0.5        n=144  mean Dice=0.515
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     tortuosity            :  60%|██████    | 3/5 [00:26<00:12,  6.49s/it]tortuosity            :  80%|████████  | 4/5 [00:26<00:06,  6.68s/it]  tortuosity             = 0.75       n=144  mean Dice=0.502
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     tortuosity            :  80%|████████  | 4/5 [00:33<00:06,  6.68s/it]tortuosity            : 100%|██████████| 5/5 [00:33<00:00,  6.92s/it]tortuosity            : 100%|██████████| 5/5 [00:33<00:00,  6.68s/it]
+  tortuosity             = 1.0        n=144  mean Dice=0.508
+branching_density     :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             branching_density     :   0%|          | 0/5 [00:03<?, ?it/s]branching_density     :  20%|██        | 1/5 [00:03<00:15,  3.77s/it]  branching_density      = 0.0        n=144  mean Dice=0.642
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     branching_density     :  20%|██        | 1/5 [00:09<00:15,  3.77s/it]branching_density     :  40%|████      | 2/5 [00:09<00:13,  4.65s/it]  branching_density      = 0.25       n=144  mean Dice=0.568
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     branching_density     :  40%|████      | 2/5 [00:16<00:13,  4.65s/it]branching_density     :  60%|██████    | 3/5 [00:16<00:11,  5.74s/it]  branching_density      = 0.5        n=144  mean Dice=0.503
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     branching_density     :  60%|██████    | 3/5 [00:23<00:11,  5.74s/it]branching_density     :  80%|████████  | 4/5 [00:23<00:06,  6.49s/it]  branching_density      = 0.75       n=144  mean Dice=0.500
+[controlSynth] building 64 base geometries (morphology=tubular, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     branching_density     :  80%|████████  | 4/5 [00:31<00:06,  6.49s/it]branching_density     : 100%|██████████| 5/5 [00:31<00:00,  6.82s/it]branching_density     : 100%|██████████| 5/5 [00:31<00:00,  6.23s/it]
+  branching_density      = 1.0        n=144  mean Dice=0.494
+scattered_count       :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             scattered_count       :   0%|          | 0/5 [00:03<?, ?it/s]scattered_count       :  20%|██        | 1/5 [00:03<00:15,  3.78s/it]  scattered_count        = 2          n=144  mean Dice=0.678
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_count       :  20%|██        | 1/5 [00:07<00:15,  3.78s/it]scattered_count       :  40%|████      | 2/5 [00:07<00:11,  3.82s/it]  scattered_count        = 4          n=144  mean Dice=0.628
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_count       :  40%|████      | 2/5 [00:11<00:11,  3.82s/it]scattered_count       :  60%|██████    | 3/5 [00:11<00:07,  3.94s/it]  scattered_count        = 8          n=144  mean Dice=0.550
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_count       :  60%|██████    | 3/5 [00:16<00:07,  3.94s/it]scattered_count       :  80%|████████  | 4/5 [00:16<00:04,  4.10s/it]  scattered_count        = 16         n=144  mean Dice=0.546
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_count       :  80%|████████  | 4/5 [00:20<00:04,  4.10s/it]scattered_count       : 100%|██████████| 5/5 [00:20<00:00,  4.29s/it]scattered_count       : 100%|██████████| 5/5 [00:20<00:00,  4.14s/it]
+  scattered_count        = 32         n=144  mean Dice=0.537
+scattered_clustering  :   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             scattered_clustering  :   0%|          | 0/4 [00:03<?, ?it/s]scattered_clustering  :  25%|██▌       | 1/4 [00:03<00:11,  3.83s/it]  scattered_clustering   = 0.0        n=144  mean Dice=0.550
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_clustering  :  25%|██▌       | 1/4 [00:07<00:11,  3.83s/it]scattered_clustering  :  50%|█████     | 2/4 [00:07<00:07,  3.83s/it]  scattered_clustering   = 0.33       n=144  mean Dice=0.530
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_clustering  :  50%|█████     | 2/4 [00:11<00:07,  3.83s/it]scattered_clustering  :  75%|███████▌  | 3/4 [00:11<00:03,  3.73s/it]  scattered_clustering   = 0.66       n=144  mean Dice=0.567
+[controlSynth] building 64 base geometries (morphology=scattered, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                                     scattered_clustering  :  75%|███████▌  | 3/4 [00:15<00:03,  3.73s/it]scattered_clustering  : 100%|██████████| 4/4 [00:15<00:00,  3.75s/it]scattered_clustering  : 100%|██████████| 4/4 [00:15<00:00,  3.76s/it]
+  scattered_clustering   = 1.0        n=144  mean Dice=0.730
+support_query_shift   :   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             support_query_shift   :   0%|          | 0/4 [00:03<?, ?it/s]support_query_shift   :  25%|██▌       | 1/4 [00:03<00:10,  3.41s/it]  support_query_shift    = 0.0        n=144  mean Dice=0.817
+                                                                     support_query_shift   :  25%|██▌       | 1/4 [00:04<00:10,  3.41s/it]support_query_shift   :  50%|█████     | 2/4 [00:04<00:04,  2.20s/it]  support_query_shift    = 0.3        n=144  mean Dice=0.805
+                                                                     support_query_shift   :  50%|█████     | 2/4 [00:06<00:04,  2.20s/it]support_query_shift   :  75%|███████▌  | 3/4 [00:06<00:01,  1.82s/it]  support_query_shift    = 0.6        n=144  mean Dice=0.610
+                                                                     support_query_shift   :  75%|███████▌  | 3/4 [00:07<00:01,  1.82s/it]support_query_shift   : 100%|██████████| 4/4 [00:07<00:00,  1.66s/it]support_query_shift   : 100%|██████████| 4/4 [00:07<00:00,  1.89s/it]
+  support_query_shift    = 1.0        n=144  mean Dice=0.352
+foreground_contrast   :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             foreground_contrast   :   0%|          | 0/5 [00:03<?, ?it/s]foreground_contrast   :  20%|██        | 1/5 [00:03<00:15,  3.88s/it]  foreground_contrast    = 0.1        n=144  mean Dice=0.805
+                                                                     foreground_contrast   :  20%|██        | 1/5 [00:05<00:15,  3.88s/it]foreground_contrast   :  40%|████      | 2/5 [00:05<00:07,  2.41s/it]  foreground_contrast    = 0.3        n=144  mean Dice=0.750
+                                                                     foreground_contrast   :  40%|████      | 2/5 [00:06<00:07,  2.41s/it]foreground_contrast   :  60%|██████    | 3/5 [00:06<00:03,  1.94s/it]  foreground_contrast    = 0.5        n=144  mean Dice=0.678
+                                                                     foreground_contrast   :  60%|██████    | 3/5 [00:08<00:03,  1.94s/it]foreground_contrast   :  80%|████████  | 4/5 [00:08<00:01,  1.72s/it]  foreground_contrast    = 0.7        n=144  mean Dice=0.605
+                                                                     foreground_contrast   :  80%|████████  | 4/5 [00:09<00:01,  1.72s/it]foreground_contrast   : 100%|██████████| 5/5 [00:09<00:00,  1.57s/it]foreground_contrast   : 100%|██████████| 5/5 [00:09<00:00,  1.87s/it]
+  foreground_contrast    = 1.0        n=144  mean Dice=0.513
+texture_heterogeneity :   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             texture_heterogeneity :   0%|          | 0/4 [00:03<?, ?it/s]texture_heterogeneity :  25%|██▌       | 1/4 [00:03<00:11,  3.76s/it]  texture_heterogeneity  = 0.0        n=144  mean Dice=0.791
+                                                                     texture_heterogeneity :  25%|██▌       | 1/4 [00:05<00:11,  3.76s/it]texture_heterogeneity :  50%|█████     | 2/4 [00:05<00:04,  2.36s/it]  texture_heterogeneity  = 0.3        n=144  mean Dice=0.793
+                                                                     texture_heterogeneity :  50%|█████     | 2/4 [00:06<00:04,  2.36s/it]texture_heterogeneity :  75%|███████▌  | 3/4 [00:06<00:01,  1.92s/it]  texture_heterogeneity  = 0.6        n=144  mean Dice=0.728
+                                                                     texture_heterogeneity :  75%|███████▌  | 3/4 [00:07<00:01,  1.92s/it]texture_heterogeneity : 100%|██████████| 4/4 [00:07<00:00,  1.69s/it]texture_heterogeneity : 100%|██████████| 4/4 [00:07<00:00,  1.97s/it]
+  texture_heterogeneity  = 1.0        n=144  mean Dice=0.675
+noise_level           :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             noise_level           :   0%|          | 0/5 [00:03<?, ?it/s]noise_level           :  20%|██        | 1/5 [00:03<00:15,  3.80s/it]  noise_level            = 0.0        n=144  mean Dice=0.779
+                                                                     noise_level           :  20%|██        | 1/5 [00:05<00:15,  3.80s/it]noise_level           :  40%|████      | 2/5 [00:05<00:07,  2.39s/it]  noise_level            = 0.25       n=144  mean Dice=0.800
+                                                                     noise_level           :  40%|████      | 2/5 [00:06<00:07,  2.39s/it]noise_level           :  60%|██████    | 3/5 [00:06<00:03,  1.93s/it]  noise_level            = 0.5        n=144  mean Dice=0.742
+                                                                     noise_level           :  60%|██████    | 3/5 [00:07<00:03,  1.93s/it]noise_level           :  80%|████████  | 4/5 [00:07<00:01,  1.70s/it]  noise_level            = 0.75       n=144  mean Dice=0.684
+                                                                     noise_level           :  80%|████████  | 4/5 [00:09<00:01,  1.70s/it]noise_level           : 100%|██████████| 5/5 [00:09<00:00,  1.57s/it]noise_level           : 100%|██████████| 5/5 [00:09<00:00,  1.86s/it]
+  noise_level            = 1.0        n=144  mean Dice=0.640
+context_copy_fraction :   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             context_copy_fraction :   0%|          | 0/4 [00:03<?, ?it/s]context_copy_fraction :  25%|██▌       | 1/4 [00:03<00:11,  3.91s/it]  context_copy_fraction  = 0.0        n=144  mean Dice=0.805
+                                                                     context_copy_fraction :  25%|██▌       | 1/4 [00:05<00:11,  3.91s/it]context_copy_fraction :  50%|█████     | 2/4 [00:05<00:04,  2.35s/it]  context_copy_fraction  = 0.25       n=144  mean Dice=0.306
+                                                                     context_copy_fraction :  50%|█████     | 2/4 [00:06<00:04,  2.35s/it]context_copy_fraction :  75%|███████▌  | 3/4 [00:06<00:01,  1.92s/it]  context_copy_fraction  = 0.5        n=144  mean Dice=0.053
+                                                                     context_copy_fraction :  75%|███████▌  | 3/4 [00:07<00:01,  1.92s/it]context_copy_fraction : 100%|██████████| 4/4 [00:07<00:00,  1.69s/it]context_copy_fraction : 100%|██████████| 4/4 [00:07<00:00,  1.98s/it]
+  context_copy_fraction  = 1.0        n=144  mean Dice=0.000
+context_consistency   :   0%|          | 0/5 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             context_consistency   :   0%|          | 0/5 [00:03<?, ?it/s]context_consistency   :  20%|██        | 1/5 [00:03<00:15,  3.82s/it]  context_consistency    = 1.0        n=144  mean Dice=0.805
+                                                                     context_consistency   :  20%|██        | 1/5 [00:05<00:15,  3.82s/it]context_consistency   :  40%|████      | 2/5 [00:05<00:07,  2.36s/it]  context_consistency    = 0.75       n=144  mean Dice=0.628
+                                                                     context_consistency   :  40%|████      | 2/5 [00:06<00:07,  2.36s/it]context_consistency   :  60%|██████    | 3/5 [00:06<00:03,  1.92s/it]  context_consistency    = 0.5        n=144  mean Dice=0.429
+                                                                     context_consistency   :  60%|██████    | 3/5 [00:07<00:03,  1.92s/it]context_consistency   :  80%|████████  | 4/5 [00:07<00:01,  1.69s/it]  context_consistency    = 0.25       n=144  mean Dice=0.215
+                                                                     context_consistency   :  80%|████████  | 4/5 [00:09<00:01,  1.69s/it]context_consistency   : 100%|██████████| 5/5 [00:09<00:00,  1.58s/it]context_consistency   : 100%|██████████| 5/5 [00:09<00:00,  1.85s/it]
+  context_consistency    = 0.0        n=144  mean Dice=0.008
+task_ambiguity_intensity:   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                               task_ambiguity_intensity:   0%|          | 0/4 [00:03<?, ?it/s]task_ambiguity_intensity:  25%|██▌       | 1/4 [00:03<00:11,  3.85s/it]  task_ambiguity_intensity = 0.0        n=144  mean Dice=0.805
+                                                                       task_ambiguity_intensity:  25%|██▌       | 1/4 [00:05<00:11,  3.85s/it]task_ambiguity_intensity:  50%|█████     | 2/4 [00:05<00:04,  2.38s/it]  task_ambiguity_intensity = 0.3        n=144  mean Dice=0.805
+                                                                       task_ambiguity_intensity:  50%|█████     | 2/4 [00:06<00:04,  2.38s/it]task_ambiguity_intensity:  75%|███████▌  | 3/4 [00:06<00:01,  1.93s/it]  task_ambiguity_intensity = 0.6        n=144  mean Dice=0.805
+                                                                       task_ambiguity_intensity:  75%|███████▌  | 3/4 [00:07<00:01,  1.93s/it]task_ambiguity_intensity: 100%|██████████| 4/4 [00:07<00:00,  1.69s/it]task_ambiguity_intensity: 100%|██████████| 4/4 [00:07<00:00,  1.98s/it]
+  task_ambiguity_intensity = 1.0        n=144  mean Dice=0.805
+controlSynth difficulty benchmark — UniverSeg baseline
+  baseline_preset=easy  overrides=None
+  image_size=128  context_size=3  num_tasks=64  subjects/task=24  N=10944 subjects
+  baseline build={'morphology': 'blob', 'thinness': 0.5, 'tortuosity': 0.4, 'branching_density': 0.5, 'region_size': 0.6, 'boundary_complexity': 0.2, 'scattered_count': 8, 'scattered_clustering': 0.0, 'task_ambiguity': 0.0}
+  baseline live ={'support_query_shift': 0.3, 'foreground_contrast': 0.1, 'texture_heterogeneity': 0.2, 'noise_level': 0.2, 'context_copy_fraction': 0.0, 'context_consistency': 1.0, 'task_ambiguity_intensity': 0.0}
+
+==============================================================================
+KNOB SENSITIVITY (ranked by Dice spread across swept values)
+==============================================================================
+knob                    kind     Δdice  easiest -> hardest
+context_copy_fraction   live     0.805  0.0=0.805  ->  1.0=0.000
+context_consistency     live     0.798  1.0=0.805  ->  0.0=0.008
+support_query_shift     live     0.465  0.0=0.817  ->  1.0=0.352
+morphology              build    0.302  blob=0.805  ->  tubular=0.503
+region_size             build    0.300  0.9=0.831  ->  0.05=0.530
+foreground_contrast     live     0.292  0.1=0.805  ->  1.0=0.513
+boundary_complexity     build    0.249  0.25=0.807  ->  1.0=0.559
+scattered_clustering    build    0.200  1.0=0.730  ->  0.33=0.530
+noise_level             live     0.160  0.25=0.800  ->  1.0=0.640
+branching_density       build    0.148  0.0=0.642  ->  1.0=0.494
+scattered_count         build    0.141  2=0.678  ->  32=0.537
+texture_heterogeneity   live     0.119  0.3=0.793  ->  1.0=0.675
+thinness                build    0.076  0.0=0.552  ->  1.0=0.476
+task_ambiguity          build    0.046  0.0=0.805  ->  0.8=0.759
+tortuosity              build    0.014  0.5=0.515  ->  0.0=0.502
+task_ambiguity_intensitylive     0.000  0.0=0.805  ->  0.0=0.805
+
+==============================================================================
+WHY: per-knob Spearman(Dice, driver) within each sweep
+==============================================================================
+knob                     rho(fg_frac) rho(ctx_dice)  note
+morphology                     -0.219         0.678  context-informativeness-mediated
+region_size                     0.440         0.483  foreground-size-mediated, context-informativeness-mediated
+boundary_complexity            -0.182         0.695  context-informativeness-mediated
+task_ambiguity                  0.251         0.353  
+thinness                        0.245         0.303  
+tortuosity                     -0.042         0.136  
+branching_density              -0.313         0.385  
+scattered_count                -0.118         0.484  context-informativeness-mediated
+scattered_clustering           -0.005         0.558  context-informativeness-mediated
+support_query_shift             0.203         0.739  context-informativeness-mediated
+foreground_contrast             0.247         0.047  
+texture_heterogeneity           0.235         0.339  
+noise_level                     0.228         0.305  
+context_copy_fraction           0.060        -0.735  inverse-ctx
+context_consistency             0.069         0.876  context-informativeness-mediated
+task_ambiguity_intensity        0.325         0.399  
+
+==============================================================================
+GLOBAL drivers (pooled across all sweeps; directional, confounded by OFAT)
+==============================================================================
+  rho(Dice, fg_frac                 ) = -0.109
+  rho(Dice, ctx_dice                ) = 0.520
+  rho(Dice, foreground_contrast     ) = 0.031
+  rho(Dice, noise_level             ) = 0.038
+  rho(Dice, task_ambiguity          ) = 0.145
+  rho(Dice, task_ambiguity_intensity) = 0.171
+  rho(Dice, region_size             ) = 0.077
+  rho(Dice, texture_heterogeneity   ) = 0.034
+  rho(Dice, support_query_shift     ) = -0.136
+  rho(Dice, boundary_complexity     ) = -0.012
+
+MORPHOLOGY mean Dice:
+  blob         dice=0.805  fail=0.01  fg=0.048  ctx=0.720
+  elongated    dice=0.737  fail=0.01  fg=0.048  ctx=0.664
+  annular      dice=0.598  fail=0.02  fg=0.048  ctx=0.511
+  scattered    dice=0.550  fail=0.00  fg=0.049  ctx=0.361
+  tubular      dice=0.503  fail=0.00  fg=0.100  ctx=0.333
+
+
+Wrote: per_sample.csv (10944 rows), summary.csv, difficulty_curves.png, morphology_difficulty.png, report.txt
+-> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_232110

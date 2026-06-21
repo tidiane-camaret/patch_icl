@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, "/home/dpxuser/ic_segmentation")
@@ -26,7 +26,7 @@ def collate(batch):
     batch = [b for b in batch if b["context_in"].shape[0] > 0]
     if not batch:
         return None
-    return {
+    out = {
         "image":       torch.stack([b["image"]       for b in batch]),
         "label":       torch.stack([b["label"]       for b in batch]),
         "context_in":  torch.stack([b["context_in"]  for b in batch]),
@@ -35,6 +35,12 @@ def collate(batch):
         "sample_idx":  [b["sample_idx"]  for b in batch],
         "label_value": [b["label_value"] for b in batch],
     }
+    # Pass through per-element `meta` when the dataset provides it (controlSynth
+    # attaches per-subject synth params here). Kept as a Python list of dicts so
+    # downstream benchmarks can read every knob value for the batch element.
+    if "meta" in batch[0]:
+        out["meta"] = [b["meta"] for b in batch]
+    return out
 
 
 class TaggedDataset(torch.utils.data.Dataset):
@@ -54,47 +60,95 @@ class TaggedDataset(torch.utils.data.Dataset):
         return item
 
 
-def build_loader(cfg) -> DataLoader:
-    """Build a tagged, collated DataLoader from a Hydra eval config."""
-    datasets = [cfg.data.dataset] if cfg.data.dataset else None
+def build_dataset(cfg, split: str):
+    """Construct the raw (untagged) dataset for `split`, dispatching on cfg.data.source.
+
+    The single source of truth for "source -> dataset" wiring; all train/eval
+    scripts go through here. Source-specific deps (biomedparse, controlSynth) are
+    imported lazily so the common medsegbench path stays import-light and the
+    patch_icl `src` package wins over ic_segmentation's shadowing copy.
+    """
     source = cfg.data.get("source", "medsegbench")
+    datasets = [cfg.data.dataset] if cfg.data.get("dataset", None) else None
+    if source == "medsegbench":
+        return MedSegBenchDataset(
+            split=split, context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size, datasets=datasets,
+        )
     if source == "biomedparse":
         from src.datasets.biomedparse import BiomedParseDataset
-        ds = BiomedParseDataset(
-            split=cfg.data.split,          # biomedparse: only 'train' / 'test'
+        return BiomedParseDataset(           # biomedparse: only 'train' / 'test' splits
+            split=split, context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size, datasets=datasets,
+        )
+    if source == "synthetic":
+        from src.datasets.controlSynth import (
+            DifficultyBuildSpec, DifficultyLiveConfig, DiversityConfig, SynthICLDataset,
+        )
+        s = cfg.synth
+        return SynthICLDataset(
+            split=split,
             context_size=cfg.data.context_size,
             image_size=cfg.data.image_size,
-            datasets=datasets,
+            diversity=DiversityConfig(
+                num_tasks=s.diversity.num_tasks, num_labels=s.diversity.num_labels,
+                context_size=cfg.data.context_size, master_seed=s.diversity.master_seed,
+                splits=tuple(s.diversity.splits)),
+            build_spec=DifficultyBuildSpec(**dict(s.build)),
+            difficulty_live=DifficultyLiveConfig(**dict(s.live)),
+            epoch_length=s.sampling.epoch_length,
+            eval_seed_namespace=s.sampling.eval_seed_namespace,
+            eval_subjects_per_task=s.sampling.eval_subjects_per_task,
+            noise_bank_size=s.get("noise_bank_size", 256),
         )
-    elif source == "medsegbench":
-        ds = MedSegBenchDataset(
-            split=cfg.data.split,
-            context_size=cfg.data.context_size,
-            image_size=cfg.data.image_size,
-            datasets=datasets,
-        )
-    else:
-        raise ValueError(f"unknown data.source {source!r} (medsegbench | biomedparse)")
-    max_per_label = cfg.eval.get("max_per_label", None)
-    if max_per_label:
+    raise ValueError(
+        f"unknown data.source {source!r} (medsegbench | biomedparse | synthetic)")
+
+
+def make_loader(ds, cfg, split: str, shuffle: bool) -> DataLoader:
+    """Wrap a raw dataset in TaggedDataset + collate and build its DataLoader.
+
+    Shared train/eval policy:
+      - non-train splits (val/test) are subsampled to cfg.eval.max_per_label per
+        (dataset, label_value) cell when set; train is never subsampled.
+      - train uses cfg.train.batch_size/workers and an optional RandomSampler
+        (cfg.data.max_train_samples); eval/val use cfg.eval.batch_size/workers.
+    """
+    if split != "train" and cfg.eval.get("max_per_label", None):
+        max_per_label = cfg.eval.max_per_label
         groups: dict[tuple, list[int]] = {}
         for i, (ds_name, _, lv) in enumerate(ds.samples):
-            key = (ds_name, lv)
-            groups.setdefault(key, []).append(i)
+            groups.setdefault((ds_name, lv), []).append(i)
         keep: list[int] = []
         for indices in groups.values():
             keep.extend(random.sample(indices, min(max_per_label, len(indices))))
         ds.samples = [ds.samples[i] for i in sorted(keep)]
-        print(f"Subsampled to {len(ds.samples)} samples (max {max_per_label} per dataset/label)")
+        print(f"{split}: subsampled to {len(ds.samples)} samples "
+              f"(max {max_per_label} per dataset/label)")
+
+    is_train = split == "train"
+    bs = cfg.train.batch_size if is_train else cfg.eval.batch_size
+    nw = cfg.train.workers   if is_train else cfg.eval.workers
+    max_train = cfg.data.get("max_train_samples", None)
+    sampler = (RandomSampler(ds, replacement=False, num_samples=max_train)
+               if is_train and max_train is not None else None)
     return DataLoader(
         TaggedDataset(ds),
-        batch_size=cfg.eval.batch_size,
-        shuffle=False,
-        num_workers=cfg.eval.workers,
+        batch_size=bs,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
+        num_workers=nw,
         collate_fn=collate,
         pin_memory=DEVICE.type == "cuda",
-        persistent_workers=cfg.eval.workers > 0,
+        persistent_workers=nw > 0,
+        prefetch_factor=4 if nw > 0 else None,
     )
+
+
+def build_loader(cfg) -> DataLoader:
+    """Build a tagged, collated DataLoader from a Hydra eval config (cfg.data.split)."""
+    split = cfg.data.split
+    return make_loader(build_dataset(cfg, split), cfg, split, shuffle=False)
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ Usage:
 """
 
 import collections
+import datetime
 import math
 import os
 import random
@@ -39,8 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig
-from torch.utils.data import DataLoader, RandomSampler
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 _ROOT = str(Path(__file__).resolve().parents[2])
@@ -49,52 +50,21 @@ sys.path.insert(0, _ROOT)
 # ic_segmentation has its own src/__init__.py which would shadow our src/ if
 # imported first.  By importing here we cache the correct modules in sys.modules;
 # common.py's own "from src.datasets..." then finds the cached version and succeeds.
-from src.datasets.medsegbench import MedSegBenchDataset
+from src.datasets.medsegbench import MedSegBenchDataset  # noqa: F401  (caches patch_icl's src)
 from src.models.pfn_seg_2d import ImagePFN
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEVICE, TaggedDataset, collate, downsample_mask, hard_dice, soft_dice, log_summary
+from common import (
+    DEVICE, build_dataset, downsample_mask, hard_dice, log_summary, make_loader, soft_dice,
+)
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
 def build_split_loader(cfg, split: str, shuffle: bool) -> DataLoader:
-    datasets = [cfg.data.dataset] if cfg.data.dataset else None
-    ds = MedSegBenchDataset(
-        split=split,
-        context_size=cfg.data.context_size,
-        image_size=cfg.data.image_size,
-        datasets=datasets,
-    )
-    if split == "val" and cfg.eval.max_per_label:
-        groups: dict = {}
-        for i, (name, _, lv) in enumerate(ds.samples):
-            groups.setdefault((name, lv), []).append(i)
-        keep = []
-        for indices in groups.values():
-            keep.extend(random.sample(indices, min(cfg.eval.max_per_label, len(indices))))
-        ds.samples = [ds.samples[i] for i in sorted(keep)]
-        print(f"Val: subsampled to {len(ds.samples)} samples")
-    bs = cfg.train.batch_size if split == "train" else cfg.eval.batch_size
-    nw = cfg.train.workers   if split == "train" else cfg.eval.workers
-    max_train = cfg.data.get("max_train_samples", None)
-    sampler = (
-        RandomSampler(ds, replacement=False, num_samples=max_train)
-        if split == "train" and max_train is not None
-        else None
-    )
-    return DataLoader(
-        TaggedDataset(ds),
-        batch_size=bs,
-        shuffle=(shuffle and sampler is None),
-        sampler=sampler,
-        num_workers=nw,
-        collate_fn=collate,
-        pin_memory=DEVICE.type == "cuda",
-        persistent_workers=nw > 0,
-        prefetch_factor=4 if nw > 0 else None,
-    )
+    """Tagged, collated loader for `split`; source dispatch + policy live in common."""
+    return make_loader(build_dataset(cfg, split), cfg, split, shuffle)
 
 
 # ── Batch construction ────────────────────────────────────────────────────────
@@ -155,7 +125,9 @@ def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
 
 @torch.no_grad()
 def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
-    """LAWA-averaged eval on val split. Returns mean Dice."""
+    """LAWA-averaged eval on val split. Returns mean low-res soft (shape) Dice
+    (dice_ds_soft) — computed at the head's native patch resolution, so best-checkpoint
+    selection tracks the resolution the model is actually supervised at (no upsample)."""
     saved = lawa_average(lawa_queue, model, DEVICE)
     model.eval()
 
@@ -236,7 +208,7 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
                **{f"dice_ds/dataset/{k}": _dsmean(v) for k, v in per_ds_ds.items() if v},
                "dice_ds_soft/mean": mean_dice_ds_soft,
                **{f"dice_ds_soft/dataset/{k}": _dsmean(v) for k, v in per_ds_ds_soft.items() if v}})
-    return mean_dice
+    return mean_dice_ds_soft
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -357,27 +329,26 @@ def main(cfg: DictConfig):
     lawa_queue: collections.deque = collections.deque(maxlen=cfg.train.lawa_k)
 
     # ── W&B ───────────────────────────────────────────────────────────────────
-    _enc_tag = f"USeg{cfg.arch.feature_level}" if cfg.arch.get("image_encoder", "patch") == "universeg" else "patch"
-    run_name = cfg.wandb.name or (
-        f"pfn_seg_{_enc_tag}_R{cfg.arch.resolution}q{cfg.arch.input_patch_size}_e{cfg.arch.e}_l{cfg.arch.l}"
-        f"_k{cfg.data.context_size}_think{cfg.arch.thinking_rows}"
+    # name=None → wandb auto-generates (e.g. "deft-field-72"); log synth config so a
+    # difficulty sweep is comparable across runs by config.synth.*.
+    wandb.init(
+        project=cfg.wandb.project,
+        name=cfg.wandb.name,
+        config={
+            "arch": dict(cfg.arch),
+            "train": dict(cfg.train),
+            "data": dict(cfg.data),
+            "synth": dict(cfg.synth) if cfg.data.get("source") == "synthetic" else None,
+            "params": total_params,
+        },
+        mode="online" if cfg.wandb.enabled else "disabled",
     )
-    if cfg.wandb.enabled:
-        wandb.init(
-            project=cfg.wandb.project,
-            name=run_name,
-            config={
-                "arch": dict(cfg.arch),
-                "train": dict(cfg.train),
-                "data": dict(cfg.data),
-                "params": total_params,
-            },
-        )
-    else:
-        wandb.init(mode="disabled")
 
     # ── Checkpoint dir ────────────────────────────────────────────────────────
-    ckpt_dir = Path(cfg.eval.out_dir) / run_name
+    # Use the wandb-given run name; save under {date}_{run_name} (cf. multilevel/train.py).
+    run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or "pfn_seg"
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    ckpt_dir = Path(cfg.eval.out_dir) / f"{date_str}_{run_name}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -395,23 +366,31 @@ def main(cfg: DictConfig):
         lawa_queue.append({k: v.cpu().clone() for k, v in model.state_dict().items()})
 
         if epoch % cfg.train.eval_every == 0 or epoch == cfg.train.epochs:
+            # Best checkpoint selected on low-res soft (shape) Dice at the head's
+            # native resolution (dice_ds_soft), not the upsampled native-res Dice.
             dice = run_eval(model, val_loader, lawa_queue, cfg, epoch)
             if dice > best_dice:
                 best_dice = dice
                 # Save LAWA-averaged weights as best checkpoint.
                 # Embed arch + image_size so eval can rebuild the model from the
                 # checkpoint alone (state_dict keys may carry a _orig_mod. prefix
-                # when compiled — eval strips it on load).
+                # when compiled — eval strips it on load). Also embed the training
+                # data provenance (full data config + synth knobs when synthetic) so
+                # eval can report what the checkpoint was trained on — at eval time
+                # cfg.data reflects the *eval* dataset, not the training one.
                 saved = lawa_average(lawa_queue, model, DEVICE)
                 torch.save({
                     "model":        model.state_dict(),
                     "arch":         dict(cfg.arch),
                     "image_size":   cfg.data.image_size,
                     "context_size": cfg.data.context_size,
+                    "data":         OmegaConf.to_container(cfg.data, resolve=True),
+                    "synth":        (OmegaConf.to_container(cfg.synth, resolve=True)
+                                     if cfg.data.get("source") == "synthetic" else None),
                 }, ckpt_dir / "best.pt")
                 if saved:
                     model.load_state_dict(saved)
-                tqdm.write(f"  [best] dice={best_dice:.4f} → {ckpt_dir}/best.pt")
+                tqdm.write(f"  [best] dice_ds_soft={best_dice:.4f} → {ckpt_dir}/best.pt")
             epoch_pbar.set_postfix(loss=f"{loss:.4f}", lr=f"{current_lr:.1e}", best=f"{best_dice:.4f}")
 
     wandb.log({"best_dice": best_dice})

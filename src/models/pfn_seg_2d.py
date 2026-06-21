@@ -46,6 +46,26 @@ def patchify(x: torch.Tensor, P: int, out: int | None = None,
     return x.reshape(B, nh * nw, C * P * P)
 
 
+def standardize_by_context(feat: torch.Tensor, n_context: int,
+                           clamp: float = 10.0) -> torch.Tensor:
+    """Per-channel z-score of encoder features using context-row statistics.
+
+    `feat` is (B, T, N, C): rows 0..n_context-1 are the context (image, mask)
+    pairs and the remaining rows are the query. mu/sig are computed over the
+    context rows × cells, per channel, and applied to ALL rows — so the query is
+    standardized in the *context's* feature frame (it never sees its own stats).
+    This is the single normalization shared by ImagePFN's image path and the
+    multilevel pipeline, and matches the TabPFN feature_sim backend
+    (experiments/2d/eval.py: predict_tabpfn / batch_tabpfn). clamp<=0 disables the
+    final clamp.
+    """
+    ctx = feat[:, :n_context]
+    mu  = ctx.mean(dim=(1, 2), keepdim=True)            # (B,1,1,C)
+    sig = ctx.std( dim=(1, 2), keepdim=True) + 1e-8
+    feat = (feat - mu) / sig
+    return feat.clamp(-clamp, clamp) if clamp and clamp > 0 else feat
+
+
 # Flash / mem-efficient SDPA launch one CUDA grid-Y block per batch element, and
 # gridDim.y is hardware-capped at 65535. The sample-axis attention flattens to a
 # batch of B·2·resolution², which crosses the cap at resolution≥32 (B=32 → 65536),
@@ -256,17 +276,19 @@ class ImagePFN(nn.Module):
         if self.image_encoder is not None:
             # Pretrained features: encode each image → Hp×Hp feature grid → (B,T,N,C).
             # Patch order (row-major over the grid) matches pos_embed and the decoder
-            # reshape. Normalize per channel using context-image statistics.
+            # reshape. Per-channel context-stat standardization (shared with the
+            # multilevel pipeline via standardize_by_context).
             feat  = self.image_encoder(images.reshape(B * T, 1, H, W), Hp)  # (B*T, C, Hp, Hp)
             img_p = feat.flatten(2).transpose(1, 2).reshape(B, T, N, feat.shape[1])
-            mu  = img_p[:, :sep].mean(dim=(1, 2), keepdim=True)            # (B,1,1,C) per-channel
-            sig = img_p[:, :sep].std( dim=(1, 2), keepdim=True) + 1e-8
+            img_p = standardize_by_context(img_p, sep)
         else:
             # Raw pixels: native P×P patches each resized to Q×Q → (B,T,N,Q²).
+            # Scalar (not per-channel) normalization by context stats — the Q² columns
+            # are one grayscale patch, not independent feature channels.
             img_p = patchify(images.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
             mu  = img_p[:, :sep].mean(dim=(1, 2, 3), keepdim=True)         # (B,1,1,1) scalar
             sig = img_p[:, :sep].std( dim=(1, 2, 3), keepdim=True) + 1e-8
-        img_p = ((img_p - mu) / sig).clamp(-10, 10)
+            img_p = ((img_p - mu) / sig).clamp(-10, 10)
 
         # ── Mask cols (always raw P×P patches resized to Q×Q) ──────────────────
         mask_p = patchify(masks.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)

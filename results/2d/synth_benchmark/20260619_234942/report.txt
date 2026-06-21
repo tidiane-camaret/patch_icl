@@ -1,0 +1,33 @@
+controlSynth difficulty benchmark — UniverSeg baseline
+  baseline_preset=easy  overrides=None
+  image_size=128  context_size=3  num_tasks=64  subjects/task=24  N=1296 subjects
+  baseline build={'morphology': 'blob', 'thinness': 0.5, 'tortuosity': 0.4, 'branching_density': 0.5, 'region_size': 0.6, 'boundary_complexity': 0.2, 'scattered_count': 8, 'scattered_clustering': 0.0, 'task_ambiguity': 0.0}
+  baseline live ={'support_query_shift': 0.3, 'foreground_contrast': 0.1, 'texture_heterogeneity': 0.2, 'noise_level': 0.2, 'context_copy_fraction': 0.0, 'context_consistency': 1.0, 'task_ambiguity_intensity': 0.0}
+
+==============================================================================
+KNOB SENSITIVITY (ranked by Dice spread across swept values)
+==============================================================================
+knob                    kind     Δdice  easiest -> hardest
+noise_level             live     0.120  0.0=0.798  ->  1.0=0.678
+context_copy_fraction   live     0.011  1.0=0.801  ->  0.25=0.790
+
+==============================================================================
+WHY: per-knob Spearman(Dice, driver) within each sweep
+==============================================================================
+knob                     rho(fg_frac) rho(ctx_dice)  note
+noise_level                     0.232         0.337  
+context_copy_fraction           0.212         0.312  
+
+==============================================================================
+GLOBAL drivers (pooled across all sweeps; directional, confounded by OFAT)
+==============================================================================
+  rho(Dice, fg_frac                 ) = 0.212
+  rho(Dice, ctx_dice                ) = 0.356
+  rho(Dice, foreground_contrast     ) = nan
+  rho(Dice, noise_level             ) = -0.368
+  rho(Dice, task_ambiguity          ) = nan
+  rho(Dice, task_ambiguity_intensity) = nan
+  rho(Dice, region_size             ) = nan
+  rho(Dice, texture_heterogeneity   ) = nan
+  rho(Dice, support_query_shift     ) = nan
+  rho(Dice, boundary_complexity     ) = nan

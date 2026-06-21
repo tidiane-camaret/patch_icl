@@ -1,5 +1,211 @@
 # Change log
 
+## 2026-06-20 — Multilevel encoder: encode-once-pool-many (lossless ~2× speedup)
+
+- **Problem**: `pipeline.run_chain` re-ran the FULL frozen encoder once per hop
+  (`encode_grid(encoder, all_images, grid)` for each grid in resolutions[1:], e.g.
+  32/64/128 → 3 forwards). But the encoder's stage maps are resolution-independent —
+  `out_size` only feeds the final `adaptive_avg_pool2d`. So 2 of every 3 encoder passes
+  were redundant.
+- **Fix**: split both encoders into `encode_maps(images)` (resolution-independent stage
+  maps) + `pool_maps(maps, out_size)` (pool/concat → reduce). `forward` now = pool∘encode
+  (unchanged for single-resolution callers: ImagePFN, eval feature paths). `run_chain`
+  calls `encode_maps` ONCE, then `pool_grid` per hop. Fallback to per-hop `encode_grid`
+  for plain-callable encoders without `encode_maps` (e.g. test stubs).
+- **Bit-exact**: UniverSeg and DINOv3 (incl. stage_l2norm and reduce=random) match the
+  old per-hop output to max|Δ|=0 at every grid; unfitted-PCA guard preserved in pool_maps.
+- **Speedup**: UniverSeg, 64 imgs, hops [32,64,128]: 4792 → 2232 ms (~2.1×) on CPU.
+- **Tradeoff**: the 4 native-res stage maps are now held across the hop loop (stage0
+  dominates, ~Bᵀ·64·H·W). Worth it vs 3× encoder compute; note if GPU mem-bound.
+- Not the encoder context path (that's load-bearing, see prior analysis); this is the
+  redundant re-encode across resolutions.
+
+## 2026-06-20 — Unify encoder-feature normalization across pfn_seg / multilevel
+
+- **Problem**: encoder (UniverSeg/DINOv3) features were normalized inconsistently.
+  `ImagePFN` (pfn_seg stage-1) per-channel z-scored features by *context-row* stats
+  (matching the TabPFN feature_sim backend in eval.py), but the multilevel pipeline's
+  `encode_grid` fed *raw* encoder magnitudes straight into PatchSetPFN — no normalization.
+  Worst for DINOv3 `feature_level=all`, whose 4 concatenated stages differ ~10–100× in
+  magnitude (a known imbalance the `encoder_stage_l2norm` knob only partly addressed).
+- **Fix**: single shared helper `standardize_by_context(feat, n_context)` in
+  `src/models/pfn_seg_2d.py` — per-channel z-score using the first `n_context` rows'
+  stats, applied to all rows (query standardized in the context's frame), clamp ±10.
+  `ImagePFN`'s encoder path now calls it (raw-pixel path keeps its scalar normalization);
+  `pipeline.encode_grid` now calls it too (signature gains `n_context`; `run_chain` passes K).
+- **DINOv3 note**: per-channel z-score makes the cross-stage *magnitude* imbalance moot,
+  so `encoder_stage_l2norm` is now largely redundant (it only rebalances channel *counts*,
+  a representational weighting choice, not a scale bug). `encoder_imagenet_norm` is an
+  input-side normalization (gray→RGB, ImageNet mean/std) and is orthogonal — unchanged.
+- Verified: test_pipeline passes; helper gives ctx per-channel mean~0/std~1; both ImagePFN
+  paths run. No retraining done — existing checkpoints will see a shifted feature frame at
+  the multilevel chain, so chains should be re-trained/re-evaluated on the unified path.
+
+## 2026-06-19 — controlSynth: fix context_copy & noise_level; qualitative panels
+
+- **`context_copy_fraction` collapse FIXED** (`dataset.py`). At copy=1.0 UniverSeg gave
+  Dice exactly 0. Diagnostics (UniverSeg forward) showed it is NOT pixel-identity: even a
+  noised near-copy and mask-rolled variants collapsed, while real contexts scored 0.86.
+  Root cause: copying the target *frame* makes the **background** match the query as well
+  as the foreground, so the fg loses its distinctiveness for a context-matcher (the fg is
+  normally "the only region consistent across contexts"). Redefined the knob: a fraction
+  of contexts are now **pristine exemplars** — rendered with `shift_scale=0.1` (near-zero
+  deformation) but a **fresh background** (`_make_subject(..., shift_scale=)`; copy logic
+  moved out of `_apply_context_difficulty` → renamed `_apply_context_consistency`). Now
+  non-degenerate (copy=1.0 → Dice ~0.80); a mild ease knob (the easy baseline is already
+  context-saturated, so little headroom — eases more at harder operating points).
+- **`noise_level` now monotone-correct** (0.0 easiest 0.80 → 1.0 hardest 0.68). The earlier
+  baseline-dependent sign-flip resolved itself once the contrast redesign made the fg
+  properly salient (images less OOD-pathological), so added noise only ever hurts. No
+  separate noise code change needed.
+- **Qualitative panels** (`synth_benchmark.py --plot`): per knob, renders the target
+  (GT green / pred red contours) + K context images (fg mask overlay) at several knob
+  values, annotated with mean UniverSeg Dice → `results/2d/synth_benchmark/<ts>/panels/
+  <knob>.png`. Lets the difficulty curves be read against what the images look like.
+
+## 2026-06-19 — controlSynth difficulty study: findings + foreground_contrast redesign
+
+Four-round sensitivity study (UniverSeg baseline) consolidated in
+`docs/datasets/controlSynth_difficulty_findings.md`. Headline: context-quality
+(consistency/shift) and `region_size` are the real difficulty levers; the spec's
+identification axis (`task_ambiguity`) is **inert** for a context-matcher (confirmed via
+ambiguity×intensity and ambiguity×region_size grids — penalty ~−0.05 at every fg size);
+`foreground_contrast` was inverted and `context_copy_fraction` collapses UniverSeg to 0.
+
+**`foreground_contrast` redesign** (`src/datasets/controlSynth/appearance.py`,
+`config.py`, `task.py`, `dataset.py`):
+- Original bug: `gmm_fill` pushed *background* regions to the [0,1] extremes as contrast
+  rose (bg saturation 5%→52%), leaving the fg a bland mid-grey blob → higher contrast was
+  *harder* (Dice 0.60→0.23, inverted).
+- Fix (a): background means now stay in a fixed central band [0.25,0.75]; the foreground
+  is pushed `gap(contrast)` toward an extreme, so the **fg** owns the salient extremes.
+- Fix (b, deeper): the fg's side is now a **task-level constant**
+  (`task.make_base_geometry` records `meta["appearance_sign"]`, threaded through
+  `dataset._make_subject` → `gmm_fill(..., fg_sign=)`). Previously the per-subject random
+  extreme made high contrast push each subject's fg to an *independent* side, so the
+  context no longer matched the target (the true cause of the inversion).
+- `map_contrast_gap` range trimmed 0.55→0.40 (max gap 0.45) so extreme contrast stays
+  clear of the background band rather than saturating into its noise tail.
+- Result: correctly oriented axis — low contrast hardest (Dice 0.80, fg
+  intensity-invisible → found via shape/context), rising to a ~0.85 plateau.
+
+## 2026-06-19 — controlSynth difficulty benchmark (UniverSeg baseline)
+
+New `experiments/2d/synth_benchmark.py` — measures how each controlSynth knob affects
+task difficulty for the zero-training UniverSeg baseline, and surfaces *why* a value is
+easy/hard (not just that it is).
+
+- **Method = one-factor-at-a-time (OFAT)**: pin every knob at a moderate baseline
+  (`BUILD_DEFAULTS`/`LIVE_DEFAULTS` in the script), sweep ONE knob across a value grid,
+  so each knob's marginal effect on Dice is isolated. Morphology-specific knobs
+  (thinness/tortuosity/branching → tubular; scattered_count/clustering → scattered) are
+  swept with that morphology fixed; the rest use a clean `blob`. Live knobs reuse one
+  frozen geometry bank (only the per-subject path changes) → cheap.
+- **Per-subject record**: each evaluated subject logs its full param vector (all build +
+  live knobs), realized stats (`fg_frac`, mean target↔context Dice `ctx_dice`), axis
+  loadings, and Dice → `per_sample.csv` for arbitrary offline analysis.
+- **Outputs** (→ `results/2d/synth_benchmark/<ts>/`): `per_sample.csv`, `summary.csv`
+  (per knob×value: n, dice mean/median/std, fail_rate=Dice<0.1, fg_frac, ctx_dice),
+  `difficulty_curves.png` (Dice + fail-rate vs value per knob), `morphology_difficulty.png`,
+  and `report.txt` — knob sensitivity ranking (Dice spread, easiest→hardest value),
+  per-knob Spearman(Dice, fg_frac)/Spearman(Dice, ctx_dice) to attribute difficulty to
+  foreground-shrinkage vs. context-informativeness, and pooled global drivers.
+- CLI: `--num_tasks/--subjects/--image_size/--context_size/--batch_size/--workers`,
+  `--knobs <subset>`, `--quick` (smoke). Default 48 tasks × 24 subjects/task.
+- **Plumbing**: `common.collate` now passes through per-element `meta` when the dataset
+  provides it (controlSynth attaches its per-subject knob vector there); additive and
+  guarded, so non-synth loaders are unaffected. `eval.py` gains an opt-in
+  `eval.synth_csv` that dumps the same per-element synth-param rows from a normal eval
+  run (mirrors the existing `patch_csv` pattern).
+- Verified end-to-end with `--quick` (UniverSeg loads, sweeps run, all 5 artifacts
+  written, CSV carries the full knob vector per subject).
+
+## 2026-06-19 — Unify 2D dataset-source loading
+
+Deduplicated the dataset-loading logic that had drifted across the `experiments/2d`
+scripts (three near-identical loader builders with divergent source support: eval
+`common.build_loader` did all 3 sources, `pfn_seg` did medsegbench+synthetic,
+`multilevel/train` did medsegbench only).
+
+- **`common.py`**: two new shared functions are now the single source of truth.
+  - `build_dataset(cfg, split)` — dispatches on `cfg.data.source`
+    (`medsegbench | biomedparse | synthetic`); folds in the controlSynth config
+    wiring (previously duplicated in `common` *and* `pfn_seg._build_synth_dataset`).
+    biomedparse/controlSynth imported lazily so the medsegbench path stays light.
+  - `make_loader(ds, cfg, split, shuffle)` — shared subsample + `TaggedDataset`/
+    `collate` + sampler policy: non-train splits subsample to `eval.max_per_label`;
+    train uses `train.batch_size/workers` + optional `RandomSampler`
+    (`data.max_train_samples`); val/test use `eval.batch_size/workers`.
+  - `build_loader(cfg)` (eval) = `make_loader(build_dataset(cfg, cfg.data.split), …)`.
+- **`pfn_seg.py` / `multilevel/train.py`**: `build_split_loader` collapses to
+  `make_loader(build_dataset(cfg, split), cfg, split, shuffle)`. Removed the
+  copy-pasted source dispatch, synth wiring, subsample block, and DataLoader assembly.
+  Net effect: **every source is now available to every script** (multilevel/pfn_seg
+  can train on biomedparse or synthetic; eval already could).
+- **Configs**: the `synth:` block moved to a shared Hydra group
+  `configs/experiment/2d/synth/default.yaml` (`@package synth`), pulled into
+  `base`, `pfn_seg`, and `multilevel` via `defaults: [synth: default, _self_]`
+  (`feature_sim` inherits it through `base`). Added `data.source` to `multilevel.yaml`.
+  One place to edit synth defaults instead of three.
+- Verified: all 4 configs compose with `cfg.synth` present; the unified path builds
+  working train (bs=train) and val (bs=eval, difficulty-binned names) synthetic
+  loaders and yields correctly-shaped batches.
+
+## 2026-06-19 — controlSynth V1: difficulty-controlled synthetic in-context dataset
+
+New package `src/datasets/controlSynth/` — a minimal on-the-fly procedural generator
+for studying the impact of training on synthetic data (`experiments/2d/pfn_seg.py`).
+Implements the *minimal generator* slice of `docs/datasets/controlSynth.md`.
+
+- **Three orthogonal config axes** (`config.py`): `DiversityConfig` (num_tasks),
+  `DifficultyBuildSpec` (frozen geometry), `DifficultyLiveConfig` (per-subject), plus
+  documented monotone `[0,1]→param` mappings so a single difficulty knob can be swept
+  with the rest pinned.
+- **All five morphologies** (`shapes/`): blob/elongated/annular (`blob.py`), tubular via
+  space colonization → caliber taper → vectorized capsule rasterization (`vessel.py`),
+  scattered point process hardcore↔Poisson↔clustered (`scattered.py`); plus
+  morphology-independent `boundary.py`, `area.py`, and `distractors.py` (geometry side of
+  `task_ambiguity`).
+- **No LMDB.** Base geometry is precomputed in RAM at dataset init (`geometry.GeometryBank`,
+  the in-memory analog of the spec's store), deterministic in `master_seed`; only the cheap
+  live path (deform → GMM fill → noise from a precomputed Perlin bank) runs per item.
+  Vessels are therefore generated once per task, never per `__getitem__`.
+- **Determinism** (`dataset.SynthICLDataset`): train draws fresh entropy (infinite
+  subjects); val/test derive every subject seed from
+  `(eval_seed_namespace, task_id, sample_index)` → byte-identical eval set. Task ids are
+  split into disjoint train/val/test pools (held-out anatomies). Returns the MedSegBench
+  4-key dict + `meta`, and exposes `.samples`, so existing `TaggedDataset`/`collate` work
+  unchanged.
+- **Integration**: `data.source=synthetic` switch in `pfn_seg.py:build_split_loader` and
+  `common.py:build_loader`; a `synth:` config block in `configs/experiment/2d/pfn_seg.yaml`.
+- **Difficulty-stratified metrics**: val `.samples` names carry the swept difficulty tag
+  (`difficulty_tag()` from `build_spec.bin_factor`, e.g. `synth/blob/amb0.40`), so the
+  existing per-dataset grouping in `run_eval` logs `dice/dataset/synth/blob/amb0.40` (and
+  `dice_ds`/`dice_ds_soft` variants) with no eval-loop changes. `dice/mean` is unaffected.
+- **Run naming**: `pfn_seg.py` now lets W&B auto-generate the run name (single
+  `wandb.init(mode=…)` call) and saves checkpoints under `{date}_{wandb_run_name}` — the
+  same convention as `multilevel/train.py`. The full `synth` config is logged to W&B so a
+  difficulty sweep is comparable across runs by `config.synth.*`.
+- **Verification** (`scripts/controlsynth_smoke.py`): visual grids per morphology
+  (`results/controlsynth/*.png`), val determinism, and a DataLoader+ImagePFN forward all
+  pass. End-to-end sanity: easy config reaches val Dice 0.85 in 8 epochs; hard config
+  (small region + `task_ambiguity`) stays near 0 as expected.
+- **Task diversity in one run**: `build.morphology` accepts a `{type: weight}` mixture
+  (spans all five shape families); `mode=per_task_sampled` draws the factors listed in
+  `build.sampled` (`{factor: [lo, hi]}`) per task, so a single run spans a difficulty
+  range. The val grid then bins `bin_factor` into `n_bins` buckets → difficulty-response
+  curve from one run (keys like `dice/dataset/synth/tubular/amb0.30`). NB: inline-dict
+  yaml needs spaces (`{blob: 1, …}`); CLI overrides of `sampled` use `++` to replace the
+  empty default (`'++synth.build.sampled={task_ambiguity:[0.0,0.8]}'`).
+- **Deferred to later sub-projects** (per spec): LMDB store + precompute CLI,
+  `eval_harness.py` + oracle UNets, clDice/NSD/size-stratified metrics, `mixed.py`
+  (real+synth MixedDataLoader + curriculum). `resolve_difficulty` mode `binned` (a fixed
+  labeled eval grid) still raises `NotImplementedError`; `fixed` and `per_task_sampled`
+  are wired.
+- *Known V1 limitation*: vessel realized area is dominated by the min-caliber floor
+  (region_size weak for tubular), and thin vessels fragment under deformation — vessel
+  Dice is indicative only until clDice lands.
+
 ## 2026-06-18 — Cheap channel-dim reduction for DINOv3 features
 
 `DINOv3FeatureEncoder` gained an `encoder_reduce` knob (applied after pooling, so the
@@ -1271,3 +1477,135 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   - Error magnitude only ~⅓–½ predictable (observable R²=0.334, intrinsic R²=0.461):
     rankable, not precisely weightable. NB error≡pred−gt, so a model given both is
     circular (excluded) — drivers come from observable-only and intrinsic models.
+
+## controlSynth: fix gmm_fill IndexError on warped-out foreground (2026-06-20)
+- Crash: `synth=hard_diverse` raised `IndexError: index 41 out of bounds for axis 0
+  with size 27` in `appearance.gmm_fill` (`lut[fg_label]=fg_mean`). `fg_label=2*num_labels+1`
+  (=41 for hard_diverse's `num_labels=20`); the LUT was sized to `labels.max()+1` from
+  only the labels *present* in the deformed map.
+- Root cause: the elastic warp (`deform`, `support_query_shift=0.50`) can fold a thin/small
+  foreground (e.g. tubular, ~1.2% area) entirely out of frame, so `fg_label` exceeds the
+  warped map's max present label. Rare (~1/40000 subjects) but inevitable over a 20k-sample
+  epoch. Reproduced end-to-end on task 1044 (tubular), `warped.max()=26`.
+- Fix: size the LUT to every label `gmm_fill` *writes* (`fg_label` + `distractor_labels`),
+  not just those present. Slots for absent labels stay 0 and are never read (`img=lut[label_map]`).
+  A vanished-fg subject now renders as all-background with an empty mask — a valid degenerate
+  sample, no crash.
+
+## eval: log a checkpoint's training-data provenance (2026-06-20)
+- Problem: when evaluating a trained `pfn_seg_2d` / `patchset_pfn` checkpoint, the run had
+  no record of what the model was *trained on*. `cfg.data.*` (and thus `run_cfg.source`)
+  reflect the *eval* dataset, so a synth-trained vs medsegbench-trained checkpoint were
+  indistinguishable in W&B.
+- Fix (train side): `pfn_seg.py` and `multilevel/train.py` now embed the full training data
+  config in `best.pt` — `"data": OmegaConf.to_container(cfg.data, resolve=True)` plus
+  `"synth"` (the controlSynth knob block, or `None` when not `source=synthetic`).
+- Fix (eval side): `eval.py` reads `pfn_ckpt.get("data")` / `get("synth")` after loading the
+  checkpoint, prints a one-line `Checkpoint trained on: source=…, dataset=…, …` summary, and
+  logs them to the W&B run config as `train_data` / `train_synth` (both backends). Old
+  checkpoints lacking the keys log `None` and print an "older checkpoint" note — no guessing.
+
+## pfn_seg + multilevel: select best checkpoint on soft Dice at the model's output level (2026-06-20)
+- pfn_seg (`experiments/2d/pfn_seg.py`): `run_eval` now returns `dice_ds_soft/mean`
+  (low-res soft/shape Dice at the head's native patch grid Hp) instead of `dice/mean`
+  (the native-res hard Dice after upsampling preds to image size). All three metrics
+  are still logged; only checkpoint selection + the `[best]` message changed.
+- multilevel (`experiments/2d/multilevel/train.py`): added per-resolution soft Dice
+  `dice_soft_r{res}/mean` (continuous composite vs avg-pooled un-binarized GT, parallel
+  to the existing hard `dice_r{res}`), with `dice_soft/mean` = the last computed level.
+  Checkpoint selection switched from `dice/mean` (final hard, native) to `dice_soft/mean`.
+  Eval line now prints both hard and soft rows; best/summary keys renamed accordingly.
+- Rationale: select at the resolution the model is actually supervised at, on a
+  threshold-free shape score, rather than an upsampled hard-thresholded metric.
+
+## controlSynth realism: biomedparse mask shape/position/size stats (2026-06-20)
+- New `scripts/biomedparse_shape_stats.py`: samples masks balanced across all biomedparse
+  datasets (41 train dirs, ~100/ds, N≈3944) and measures position/size/shape. Writes
+  `results/controlsynth/biomedparse_shape_stats.{txt,json,png}`. Re-measured synth
+  hard_diverse with the same code (`mask_stats`) for a direct gap.
+- REAL biomedparse (median / p5..p95):
+  center offset 0.158 (p95 0.367; 37% off-center >0.2); area_frac 0.019 (0.0009..0.269,
+  ~294x span, heavy small tail); eccentricity 0.81; solidity 0.91; extent 0.59;
+  n_cc median 1 (69% single-component, only 31% multi); border-touch 6%.
+- SYNTH hard_diverse gap (the "centered + same size + ragged" issue):
+  * position too centered: offset p95 0.24 vs 0.37, only 9% off-center vs 37%; centroid
+    std ~0.09 vs ~0.14.
+  * size too narrow/large: area_frac 0.056 median, ~28x span (region_size floored at 0.30
+    → no small-object tail); real is 0.019 median, 294x span.
+  * BIGGEST gap = fragmentation: n_cc median 14, 87% multi-component, solidity 0.57,
+    extent 0.25 — real masks are mostly single compact regions (median 1 cc, solidity 0.91).
+  * border-touch 39% vs 6% — synth foregrounds run off-frame far too often (deformation).
+- Next (not yet done): translate targets into generator knobs — random fg placement
+  (centroid offset), log-distributed area with a small tail, reduce fragmentation
+  (boundary/deformation), keep fg in-frame.
+
+## controlSynth realism: generator + hard_diverse config (2026-06-20, implemented)
+- Added 4 backward-compatible DifficultyBuildSpec knobs (defaults = original behavior;
+  set only in hard_diverse.yaml so the difficulty-study presets are untouched):
+  boundary_amp_scale, boundary_sigma_frac, boundary_keep_largest (shapes/boundary.py),
+  position_jitter (new task.place_foreground). Knobs flow via geo_params (no signature change).
+  * boundary fix = the big one: roughening shattered shapes (n_cc median ~12); gentler
+    amplitude (0.5) + low-freq blur (sqrt(area)*0.4) + keep-largest (blob/elongated/annular
+    only) → mostly single compact regions.
+  * place_foreground translates the finished shape to centroid ~N(0.5, jitter), clamped to
+    keep its bbox in-frame.
+- hard_diverse.yaml: boundary_amp_scale=0.5, boundary_sigma_frac=0.4, boundary_keep_largest=true,
+  position_jitter=0.15, region_size range [0.30,0.70]→[0.12,0.62] (moderate floor).
+- Result (val masks, vs real biomedparse): n_cc med 12→2, solidity 0.57→0.83, area 0.050→0.028
+  (real 0.019), offset mean 0.14→0.18 / p95 0.27→0.31 (real 0.37). Sample plot regenerated
+  (results/controlsynth/hard_diverse_samples.png) — visibly compact + off-centre.
+- CAVEAT (not resolved): border-touch ~34% vs real 6%. Mostly the post-placement deformation
+  (shift=0.50, ~6px) pushing inset-2 shapes over the edge + sprawling tubular trees. Would
+  need a larger placement inset (vs deform magnitude) or in-frame deformation to fix.
+
+## controlSynth realism: within-(target+context)-set mask distance (2026-06-20)
+- New `scripts/context_mask_distance.py`: per in-context set (target label + K context
+  masks), averages pairwise overlay_dice, centroid_dist, area_logratio. Run on
+  biomedparse (1500 sets) and synth hard_diverse (800 sets), res=128, K=3.
+- REAL biomedparse: overlay_dice 0.25 macro (0.18 micro, median 0.10), centroid_dist 0.159,
+  area_logratio 1.20 (~2.3x within-set area swing). Many cells ~0 overlap (structure
+  relocates entirely across patients: LIDC/colon/polyp/disc).
+- SYNTH hard_diverse: overlay_dice 0.27 (median 0.24), centroid_dist 0.105, area_logratio 0.57.
+- Finding: synth context sets are too SELF-SIMILAR — real within-set spread comes from
+  independent patients; synth derives all K+1 subjects from ONE base geometry varied only
+  by per-subject elastic deform (support_query_shift). position_jitter is per-TASK (shared
+  by the set) so adds no within-set positional variability. To match real, add per-SUBJECT
+  position (centroid 0.105->~0.16) + scale (logratio 0.57->~1.2) jitter — but bounded, else
+  the fg stops being the consistent in-context cue. NOT implemented.
+
+## controlSynth realism: per-subject pose jitter (within-set spread) (2026-06-20, implemented)
+- Added 2 backward-compat DifficultyLiveConfig knobs (default 0 = original; declared in
+  default.yaml live, set in hard_diverse.yaml): support_query_translate (per-subject centroid
+  shift std, fraction of image), support_query_scale (per-subject log2 zoom std). Applied via
+  new deformation.jitter_pose (affine about fg centroid, clamped in-frame), after deform in
+  dataset._make_subject, scaled by shift_scale so pristine contexts stay near-aligned.
+- Rationale: support_query_shift only deforms ONE shared base -> synth (target+ctx) sets too
+  self-similar. position_jitter was per-TASK (no within-set spread).
+- Tuned to tr=0.05, sc=0.45 (closes ~80% of position gap, most of size gap without collapsing
+  within-set overlap below real; pushing tr>=0.06 overshoots centroid + drops overlap to ~0.14):
+    within-set overlay/centroid/area_logratio: 0.250/0.113/0.546 -> 0.168/0.146/1.042
+    (real biomedparse 0.254/0.159/1.202).
+  Single-mask shape stats unregressed (area med 0.022, n_cc med 1, solidity ~0.78, offset 0.18).
+- Sample plot regenerated: contexts now vary in position+size within each set.
+
+## 2D eval: qualitative figures for all backends (2026-06-21, implemented)
+- Generalized experiments/2d/eval.py:save_figure to be backend-agnostic. New signature takes
+  pred_native (H,W; soft for feat_sim/pfn_seg/multilevel, binary for universeg) plus an optional
+  coarse grid (pred_lowres/gt_lowres). Row 0 = Target+GT | Target+Pred | (GT↓ | Pred↓ only when a
+  low-res grid is supplied); Row 1 = K context overlays. Panels built dynamically, squeeze=False,
+  so K=1 and the no-low-res (universeg) case both render.
+- Prediction resolution per backend (figure source tensors): feat_sim pred_lowres=preds_all[b]
+  at output_size, native via bilinear upsample; pfn_seg pred_lowres=preds_lowres[b] at Hp, native
+  preds[b]; multilevel pred_lowres=refined_grid at Hg (captured as preds_grid before upsample,
+  only shown when Hg!=H), native preds[b]; universeg native binary preds[b,0], no low-res.
+- Replaced the feat_sim-only inline save with one unified block in the per-sample loop, gated by
+  new config knobs eval.save_figures (bool, default false) + eval.max_figures (cap, default 50).
+  Dedup stays one figure per (dataset, label_value). Previously only feat_sim emitted figures and
+  always-on; now all four backends can, opt-in.
+
+## 2D eval: wandb-named output folders (2026-06-21, implemented)
+- eval.py no longer builds descriptive run names per backend; wandb.init(name=cfg.wandb.name)
+  so a null name auto-generates (e.g. "deft-field-72"). out_dir now mirrors pfn_seg.py:
+  {eval.out_dir}/{date}_{run_name}, so each run's figures/CSVs land in their own folder instead
+  of all dumping into a shared results/2d/outputs. Added eval.figures_to_wandb (default true) to
+  toggle wandb upload independently of local PNG saving.

@@ -1,0 +1,80 @@
+Output -> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_233325
+Loading UniverSeg (size=128)...
+Grid: build:task_ambiguity=[0.0, 0.3, 0.6, 0.9] × build:region_size=[0.05, 0.15, 0.3, 0.6]  (baseline=easy)
+task_ambiguity:   0%|          | 0/4 [00:00<?, ?it/s][controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                     task_ambiguity:   0%|          | 0/4 [00:08<?, ?it/s]  task_ambiguity=0.0   region_size=0.05  n=144  dice=0.530
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                     task_ambiguity:   0%|          | 0/4 [00:12<?, ?it/s]  task_ambiguity=0.0   region_size=0.15  n=144  dice=0.543
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                     task_ambiguity:   0%|          | 0/4 [00:16<?, ?it/s]  task_ambiguity=0.0   region_size=0.3   n=144  dice=0.601
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                     task_ambiguity:   0%|          | 0/4 [00:20<?, ?it/s]task_ambiguity:  25%|██▌       | 1/4 [00:20<01:00, 20.23s/it]  task_ambiguity=0.0   region_size=0.6   n=144  dice=0.805
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:24<01:00, 20.23s/it]  task_ambiguity=0.3   region_size=0.05  n=144  dice=0.508
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:27<01:00, 20.23s/it]  task_ambiguity=0.3   region_size=0.15  n=144  dice=0.533
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:31<01:00, 20.23s/it]  task_ambiguity=0.3   region_size=0.3   n=144  dice=0.587
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  25%|██▌       | 1/4 [00:35<01:00, 20.23s/it]task_ambiguity:  50%|█████     | 2/4 [00:35<00:34, 17.43s/it]  task_ambiguity=0.3   region_size=0.6   n=144  dice=0.754
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:39<00:34, 17.43s/it]  task_ambiguity=0.6   region_size=0.05  n=144  dice=0.498
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:43<00:34, 17.43s/it]  task_ambiguity=0.6   region_size=0.15  n=144  dice=0.503
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:47<00:34, 17.43s/it]  task_ambiguity=0.6   region_size=0.3   n=144  dice=0.572
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  50%|█████     | 2/4 [00:51<00:34, 17.43s/it]task_ambiguity:  75%|███████▌  | 3/4 [00:51<00:16, 16.63s/it]  task_ambiguity=0.6   region_size=0.6   n=144  dice=0.760
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [00:55<00:16, 16.63s/it]  task_ambiguity=0.9   region_size=0.05  n=144  dice=0.471
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [00:59<00:16, 16.63s/it]  task_ambiguity=0.9   region_size=0.15  n=144  dice=0.490
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [01:03<00:16, 16.63s/it]  task_ambiguity=0.9   region_size=0.3   n=144  dice=0.574
+[controlSynth] building 64 base geometries (morphology=blob, size=128)...
+[controlSynth] done. task pools: {'train': 51, 'val': 6, 'test': 7}
+                                                             task_ambiguity:  75%|███████▌  | 3/4 [01:07<00:16, 16.63s/it]task_ambiguity: 100%|██████████| 4/4 [01:07<00:00, 16.49s/it]task_ambiguity: 100%|██████████| 4/4 [01:07<00:00, 16.91s/it]
+  task_ambiguity=0.9   region_size=0.6   n=144  dice=0.745
+controlSynth interaction grid — task_ambiguity (rows) × region_size (cols)
+  N=2304 subjects
+
+mean Dice:
+ax2_value   0.05   0.15   0.30   0.60
+ax1_value                            
+0.0        0.530  0.543  0.601  0.805
+0.3        0.508  0.533  0.587  0.754
+0.6        0.498  0.503  0.572  0.760
+0.9        0.471  0.490  0.574  0.745
+
+fail rate (Dice<0.1):
+ax2_value   0.05   0.15   0.30   0.60
+ax1_value                            
+0.0        0.181  0.167  0.132  0.007
+0.3        0.188  0.174  0.132  0.000
+0.6        0.215  0.222  0.139  0.000
+0.9        0.229  0.208  0.090  0.014
+
+baseline           (task_ambiguity=0, region_size=0.05): 0.530
+task_ambiguity alone (=0.9):  0.471  (Δ=-0.060)
+region_size alone (=0.6):  0.805  (Δ=+0.275)
+both high          (=0.9, =0.6): 0.745  (Δ=+0.214)
+
+INTERACTION (joint − sum of marginals) = -0.001  (negative => super-additive difficulty only when combined = real identification axis)
+
+Wrote: per_sample_grid.csv (2304 rows), grid_dice.csv, grid_heatmap.png, grid_report.txt
+-> /home/dpxuser/dev/patch_icl/results/2d/synth_benchmark/20260619_233325
