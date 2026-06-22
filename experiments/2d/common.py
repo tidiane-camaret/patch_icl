@@ -77,9 +77,22 @@ def build_dataset(cfg, split: str):
         )
     if source == "biomedparse":
         from src.datasets.biomedparse import BiomedParseDataset
-        return BiomedParseDataset(           # biomedparse: only 'train' / 'test' splits
-            split=split, context_size=cfg.data.context_size,
+        # biomedparse has only 'train' / 'test' — map the training script's 'val'
+        # eval split onto 'test' (its only held-out split).
+        bp_split = "test" if split == "val" else split
+        return BiomedParseDataset(
+            split=bp_split, context_size=cfg.data.context_size,
             image_size=cfg.data.image_size, datasets=datasets,
+        )
+    if source == "totalseg2d":
+        from src.datasets.totalseg2d import TotalSeg2DDataset
+        d = cfg.data
+        return TotalSeg2DDataset(
+            split=split, context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size,
+            stored_size=d.get("stored_size", 256),
+            hu_window=tuple(d.get("hu_window", (-1000.0, 1000.0))),
+            min_area=d.get("min_area", 16),
         )
     if source == "synthetic":
         from src.datasets.controlSynth import (
@@ -102,7 +115,7 @@ def build_dataset(cfg, split: str):
             noise_bank_size=s.get("noise_bank_size", 256),
         )
     raise ValueError(
-        f"unknown data.source {source!r} (medsegbench | biomedparse | synthetic)")
+        f"unknown data.source {source!r} (medsegbench | biomedparse | totalseg2d | synthetic)")
 
 
 def make_loader(ds, cfg, split: str, shuffle: bool) -> DataLoader:
@@ -122,7 +135,10 @@ def make_loader(ds, cfg, split: str, shuffle: bool) -> DataLoader:
         keep: list[int] = []
         for indices in groups.values():
             keep.extend(random.sample(indices, min(max_per_label, len(indices))))
-        ds.samples = [ds.samples[i] for i in sorted(keep)]
+        keep = sorted(keep)
+        # Keep the COW-safe SampleIndex when present (don't rebuild a list of tuples).
+        ds.samples = (ds.samples.subset(keep) if hasattr(ds.samples, "subset")
+                      else [ds.samples[i] for i in keep])
         print(f"{split}: subsampled to {len(ds.samples)} samples "
               f"(max {max_per_label} per dataset/label)")
 
@@ -174,6 +190,31 @@ def soft_dice(pred: torch.Tensor, gt: torch.Tensor) -> float:
     g = gt.float()
     den = p.sum() + g.sum()
     return float(2 * (p * g).sum() / den) if den > 1e-6 else float("nan")
+
+
+def batch_dice_sums(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
+    """Batched soft & hard Dice SUMS for cheap *training-accuracy* logging.
+
+    Same per-row semantics as soft_dice / hard_dice (a row whose pred+GT are both
+    empty is skipped), but vectorised and kept on-device: returns running SUMS and
+    valid-row COUNTS as 0-dim tensors so the caller accumulates over an epoch and
+    syncs (.item()) ONCE, avoiding a per-batch GPU→CPU stall. Computed from the
+    logits/target the forward already produced, so there is no extra model pass.
+
+    `prob` is a probability map (post-sigmoid), `target` the soft (avg-pooled) GT;
+    both (B, ...) and flattened per row. soft = 2·Σpg/(Σp+Σg); hard binarises both at
+    0.5 first. Returns (soft_sum, soft_cnt, hard_sum, hard_cnt).
+    """
+    p = prob.detach().flatten(1).float()
+    g = target.detach().flatten(1).float()
+    den_s = p.sum(1) + g.sum(1)
+    ok_s  = den_s > eps
+    soft  = torch.where(ok_s, 2 * (p * g).sum(1) / den_s.clamp_min(eps), torch.zeros_like(den_s))
+    pb, gb = (p >= 0.5).float(), (g >= 0.5).float()
+    den_h = pb.sum(1) + gb.sum(1)
+    ok_h  = den_h > eps
+    hard  = torch.where(ok_h, 2 * (pb * gb).sum(1) / den_h.clamp_min(eps), torch.zeros_like(den_h))
+    return soft.sum(), ok_s.sum(), hard.sum(), ok_h.sum()
 
 
 def downsample_mask(mask: torch.Tensor, output_size: int, mode: str = "avg") -> torch.Tensor:

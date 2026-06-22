@@ -127,7 +127,7 @@ PARAM_KEYS = [k for k in BUILD_DEFAULTS if k != "morphology"] + list(LIVE_DEFAUL
 def base_cfg(args):
     cfg_dir = str(_ROOT / "configs" / "experiment" / "2d")
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
-        cfg = compose(config_name="base", overrides=[
+        cfg = compose(config_name="eval_base", overrides=[
             "data.source=synthetic",
             f"data.image_size={args.image_size}",
             f"data.context_size={args.context_size}",

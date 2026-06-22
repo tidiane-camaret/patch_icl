@@ -1,0 +1,55 @@
+# Shared base for the 2D *training* configs (pfn_seg, multilevel).
+# Eval configs inherit from eval_base.yaml instead. Leaf training configs do:
+#   defaults: [train_base, _self_]   (their _self_ overrides these defaults)
+defaults:
+  - synth: default   # controlSynth config block -> cfg.synth (used when data.source=synthetic)
+  - _self_
+
+data:
+  source: medsegbench  # medsegbench | biomedparse | synthetic (controlSynth generator)
+  image_size: 128
+  context_size: 3
+  dataset: null            # null = all datasets; or e.g. "abdomenus"
+  max_train_samples: null  # null = full dataset; int = random subset per epoch
+
+arch:
+  feature_level: all   # encoder level: 0..3, -1 (bottleneck), or "all" (concat)
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 8
+  residual_decay: 0.95
+  compile: true        # torch.compile (slow first batch; graph-breaks at the frozen encoder)
+
+train:
+  epochs: 200
+  batch_size: 32
+  lr: 1.0e-3
+  grad_clip: 2.0
+  dice_weight: 1.0    # weight of soft-Dice term added to patch-level soft BCE
+  lawa_k: 10          # LAWA checkpoint buffer size
+  muon_lr_scale: 0.1  # Muon lr = muon_lr_scale * lr
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  adam_wd: 0.01
+  warmup_epochs: 5
+  eval_every: 1       # run val eval every N epochs
+  workers: 16
+  seed: 42
+  checkpoint: null    # path to warm-start weights (bare state_dict or {"model": ...})
+
+eval:
+  batch_size: 16
+  workers: 8
+  out_dir: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d_train
+
+wandb:
+  project: patch_icl_2d_exps_train
+  name: null          # null = auto-generated
+  enabled: true
+
+# Augmentation params live in the single shared file configs/augmentations/<preset>.yaml
+# (2D schema: enabled/geometric/intensity). Loaded into cfg.aug in main().
+# Override a field at the CLI with the +-prefix, e.g. +aug.enabled=false.
+aug_preset: 2d

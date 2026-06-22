@@ -13,13 +13,15 @@ data:
 
 eval:
   batch_size: 16
-  workers: 30
+  workers: 10
   seed: 0
   out_dir: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d_eval
-  max_per_label: 100 #20  # max samples per (dataset, label_value); null = all
+  max_per_label: null #100 #20  # max samples per (dataset, label_value); null = all
   checkpoint: null   # pfn_seg_2d / patchset_pfn: path to a trained best.pt (arch read from it)
   stage1_checkpoint: null  # patchset_pfn only: frozen stage-1 ImagePFN best.pt (fallback if not stored in checkpoint)
   encode_size: null  # pfn_seg_2d / patchset_pfn: feed images at this size, token grids stay at ckpt size (Strategy A); null = ckpt size
+  resolution: null   # pfn_seg_2d: override the checkpoint's token-grid resolution (patches/side); null = use ckpt's arch.resolution
+  input_patch_size: null  # pfn_seg_2d: override the per-patch embed size Q; null = use ckpt's arch.input_patch_size
   patch_csv: null    # pfn_seg_2d only: path to dump per-patch error analysis CSV; null = off
   synth_csv: null    # data.source=synthetic only: path to dump per-element synth-param CSV; null = off
   save_figures: true   # all backends: save qualitative PNGs (one per dataset/label) to out_dir

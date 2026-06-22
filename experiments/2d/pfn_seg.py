@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -55,7 +55,8 @@ from src.models.pfn_seg_2d import ImagePFN
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
-    DEVICE, build_dataset, downsample_mask, hard_dice, log_summary, make_loader, soft_dice,
+    DEVICE, batch_dice_sums, build_dataset, downsample_mask, hard_dice, log_summary,
+    make_loader, soft_dice,
 )
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
@@ -82,9 +83,19 @@ def make_model_inputs(batch: dict, device: torch.device):
 
 # ── Training epoch ────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
+def train_epoch(model, loader, optimizers, cfg, epoch: int) -> tuple[float, float, float]:
+    """Returns (mean_loss, train_dice_soft, train_dice). The two Dice metrics are the
+    low-res soft (shape) and hard Dice between the model's patch prediction and the
+    avg-pooled GT target — the exact tensors the forward already produced, accumulated
+    on-GPU and synced once at epoch end (no extra forward, no per-batch stall). They
+    mirror the val dice_ds_soft / dice_ds, so the train↔val gap is read at one glance."""
     model.train()
     total_loss, n = 0.0, 0
+    # On-GPU train-accuracy accumulators (distinct tensors — no aliasing).
+    soft_sum = torch.zeros((), device=DEVICE)
+    soft_cnt = torch.zeros((), device=DEVICE)
+    hard_sum = torch.zeros((), device=DEVICE)
+    hard_cnt = torch.zeros((), device=DEVICE)
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False, dynamic_ncols=True)
     for batch in pbar:
         if batch is None:
@@ -105,8 +116,9 @@ def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
             # grid → per-patch foreground fraction in [0, 1]. Supervise directly at
             # Hp (no upsample) so the objective matches the head's resolution.
             target = F.adaptive_avg_pool2d(gt.unsqueeze(1), (Hp, Hp)).squeeze(1)
+            prob = torch.sigmoid(logits.float())
             bce  = F.binary_cross_entropy_with_logits(logits, target)
-            dice = soft_dice_loss(torch.sigmoid(logits.float()), target)
+            dice = soft_dice_loss(prob, target)
             loss = bce + cfg.train.dice_weight * dice
 
         loss.backward()
@@ -116,9 +128,14 @@ def train_epoch(model, loader, optimizers, cfg, epoch: int) -> float:
 
         total_loss += loss.item()
         n += 1
+        # Train accuracy from already-computed prob/target (detached inside helper).
+        ss, sc, hs, hc = batch_dice_sums(prob, target)
+        soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
         pbar.set_postfix(loss=f"{total_loss / n:.4f}")
 
-    return total_loss / max(n, 1)
+    train_soft = float((soft_sum / soft_cnt.clamp_min(1)).item())
+    train_hard = float((hard_sum / hard_cnt.clamp_min(1)).item())
+    return total_loss / max(n, 1), train_soft, train_hard
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -138,6 +155,7 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
     sample_rows = []
     H = cfg.data.image_size
     running_dice, nd = 0.0, 0
+    total_loss, nl = 0.0, 0   # val loss, accumulated exactly as in train_epoch
 
     pbar = tqdm(loader, desc=f"eval  e{epoch}", leave=False, dynamic_ncols=True)
     for batch in pbar:
@@ -148,6 +166,14 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
         with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
                             enabled=DEVICE.type == "cuda"):
             logits = model(all_images, all_masks, sep=K)          # (B, Hp, Hp)
+            # Val loss: same soft patch-level objective the model is trained on.
+            gt_full = batch["label"].squeeze(1).float().to(DEVICE, non_blocking=True)
+            target  = F.adaptive_avg_pool2d(gt_full.unsqueeze(1),
+                                            (logits.shape[-1],) * 2).squeeze(1)
+            bce  = F.binary_cross_entropy_with_logits(logits, target)
+            dice = soft_dice_loss(torch.sigmoid(logits.float()), target)
+            total_loss += (bce + cfg.train.dice_weight * dice).item()
+            nl += 1
 
         Hp = logits.shape[-1]
         preds_lowres = torch.sigmoid(logits.float()).cpu()        # (B, Hp, Hp)
@@ -185,8 +211,9 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
     # Aggregate
     valid = [s for scores in per_ds.values() for s in scores if not np.isnan(s)]
     mean_dice = float(np.mean(valid)) if valid else float("nan")
+    val_loss  = total_loss / max(nl, 1)
 
-    tqdm.write(f"\n  [e{epoch}] mean Dice (val): {mean_dice:.4f}")
+    tqdm.write(f"\n  [e{epoch}] mean Dice (val): {mean_dice:.4f}  val loss: {val_loss:.4f}")
     for name in sorted(per_ds):
         sc = [s for s in per_ds[name] if not np.isnan(s)]
         tqdm.write(f"    {name:>25}  {float(np.mean(sc)) if sc else float('nan'):.4f}")
@@ -202,6 +229,7 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
     # dice_ds_soft (low-res soft/shape).
     _dsmean = lambda v: float(np.mean([s for s in v if not np.isnan(s)]))
     wandb.log({"epoch": epoch,
+               "val/loss": val_loss,
                "dice/mean": mean_dice,
                **{f"dice/dataset/{k}": _dsmean(v) for k, v in per_ds.items() if v},
                "dice_ds/mean": mean_dice_ds,
@@ -215,6 +243,13 @@ def run_eval(model, loader, lawa_queue, cfg, epoch: int) -> float:
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="pfn_seg", version_base=None)
 def main(cfg: DictConfig):
+    # Augmentation params come from the single shared file referenced by
+    # cfg.aug_preset (configs/augmentations/<preset>.yaml), not inlined here.
+    # CLI field overrides use the +-prefix, e.g. +aug.enabled=false, and win.
+    _aug = OmegaConf.load(Path(_ROOT) / "configs" / "augmentations" / f"{cfg.aug_preset}.yaml")
+    with open_dict(cfg):
+        cfg.aug = OmegaConf.merge(_aug, cfg.aug) if "aug" in cfg else _aug
+
     random.seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     torch.manual_seed(cfg.train.seed)
@@ -355,12 +390,15 @@ def main(cfg: DictConfig):
     best_dice = -1.0
     epoch_pbar = tqdm(range(1, cfg.train.epochs + 1), desc="epochs", dynamic_ncols=True)
     for epoch in epoch_pbar:
-        loss = train_epoch(model, train_loader, optimizers, cfg, epoch)
+        loss, train_soft, train_hard = train_epoch(model, train_loader, optimizers, cfg, epoch)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        wandb.log({"epoch": epoch, "train/loss": loss, "train/lr": current_lr})
-        epoch_pbar.set_postfix(loss=f"{loss:.4f}", lr=f"{current_lr:.1e}", best=f"{best_dice:.4f}")
+        # train/dice_soft and train/dice mirror the val dice_ds_soft / dice_ds metrics.
+        wandb.log({"epoch": epoch, "train/loss": loss, "train/lr": current_lr,
+                   "train/dice_soft": train_soft, "train/dice": train_hard})
+        epoch_pbar.set_postfix(loss=f"{loss:.4f}", lr=f"{current_lr:.1e}",
+                               tr_dice=f"{train_soft:.4f}", best=f"{best_dice:.4f}")
 
         # Push checkpoint to LAWA buffer every epoch
         lawa_queue.append({k: v.cpu().clone() for k, v in model.state_dict().items()})

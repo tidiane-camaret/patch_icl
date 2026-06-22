@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 _ROOT = str(Path(__file__).resolve().parents[3])
@@ -56,7 +56,8 @@ from src.models.patchset_pfn import PatchSetPFN
 from src.models.pretrained_encoders import build_image_encoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # experiments/2d
-from common import DEVICE, build_dataset, downsample_mask, hard_dice, make_loader, soft_dice
+from common import (DEVICE, batch_dice_sums, build_dataset, downsample_mask, hard_dice,
+                    make_loader, soft_dice)
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))       # multilevel
@@ -98,8 +99,19 @@ def patch_loss(logits, batch, cfg):
 
 
 def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
+    """Returns (mean_loss, train_soft, train_hard); the two dicts are keyed by hop grid
+    and hold the soft (shape) / hard Dice between each hop's prediction and its query GT
+    — the tensors run_chain already produced, accumulated on-GPU and synced once at epoch
+    end (no extra forward). NB: measured on the *sampled query patches* (what the hop is
+    trained on), not the full grid, so it reads slightly higher than the val dice_soft_r*."""
     model.train()
     total, n = 0.0, 0
+    hops = list(cfg.sample.resolutions)[1:]
+    nh = len(hops)
+    soft_sum = [torch.zeros((), device=DEVICE) for _ in range(nh)]
+    soft_cnt = [torch.zeros((), device=DEVICE) for _ in range(nh)]
+    hard_sum = [torch.zeros((), device=DEVICE) for _ in range(nh)]
+    hard_cnt = [torch.zeros((), device=DEVICE) for _ in range(nh)]
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False, dynamic_ncols=True)
     for batch in pbar:
         if batch is None:
@@ -128,8 +140,15 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
         for opt in optimizers:
             opt.step()
         total += loss.item(); n += 1
+        # Per-hop train accuracy on the sampled query patches (no extra forward).
+        with torch.no_grad():
+            for L, o in enumerate(outputs):
+                ss, sc, hs, hc = batch_dice_sums(torch.sigmoid(o["logits"].float()), o["qry_gt"])
+                soft_sum[L] += ss; soft_cnt[L] += sc; hard_sum[L] += hs; hard_cnt[L] += hc
         pbar.set_postfix(loss=f"{total/n:.4f}")
-    return total / max(n, 1)
+    train_soft = {hops[L]: float((soft_sum[L] / soft_cnt[L].clamp_min(1)).item()) for L in range(nh)}
+    train_hard = {hops[L]: float((hard_sum[L] / hard_cnt[L].clamp_min(1)).item()) for L in range(nh)}
+    return total / max(n, 1), train_soft, train_hard
 
 
 @torch.no_grad()
@@ -142,6 +161,7 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     per_ds = {r: defaultdict(list) for r in resolutions}             # hard dice
     per_ds_soft = {r: defaultdict(list) for r in resolutions}        # soft (shape) dice
     acc = {L: {k: [] for k in ("derr", "dd", "sdd")} for L in range(len(hops))}
+    total_loss, nl = 0.0, 0   # val loss, accumulated exactly as in train_epoch
 
     for batch in loader:
         if batch is None: continue
@@ -150,6 +170,11 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
                                            cfg.sample.eval,
                                            stochastic=not cfg.sample.eval_deterministic,
                                            device=DEVICE)
+            # Val loss: same per-hop weighted objective the chain is trained on.
+            weights = list(cfg.train.loss_weights)
+            total_loss += sum(w * patch_loss(o["logits"], {"qry_gt": o["qry_gt"]}, cfg)
+                              for w, o in zip(weights, outputs)).item()
+            nl += 1
         B = coarse_lr.shape[0]
         for b in range(B):
             ds_name   = batch["dataset"][b]
@@ -185,7 +210,7 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
         return float(np.mean(v)) if v else float("nan")
     flat = lambda d: [x for sc in d.values() for x in sc if not np.isnan(x)]
 
-    metrics = {"epoch": epoch}
+    metrics = {"epoch": epoch, "val/loss": total_loss / max(nl, 1)}
     for r in resolutions:
         metrics[f"dice_r{r}/mean"] = (float(np.mean(flat(per_ds[r])))
                                       if flat(per_ds[r]) else float("nan"))
@@ -203,7 +228,7 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
         for k, v in per_ds_soft[r].items():
             metrics[f"dice_soft/dataset_r{r}/{k}"] = nanmean(v)
 
-    tqdm.write(f"  [e{epoch}] hard " + "  ".join(
+    tqdm.write(f"  [e{epoch}] val loss={metrics['val/loss']:.4f}  hard " + "  ".join(
         f"r{r}={metrics[f'dice_r{r}/mean']:.4f}" for r in resolutions)
         + "  | soft " + "  ".join(
         f"r{r}={metrics[f'dice_soft_r{r}/mean']:.4f}" for r in resolutions))
@@ -216,6 +241,12 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
 @hydra.main(config_path="../../../configs/experiment/2d", config_name="multilevel", version_base=None)
 def main(cfg: DictConfig):
     import random
+    # Augmentation params come from the single shared file referenced by
+    # cfg.aug_preset (configs/augmentations/<preset>.yaml), not inlined here.
+    # CLI field overrides use the +-prefix, e.g. +aug.enabled=false, and win.
+    _aug = OmegaConf.load(Path(_ROOT) / "configs" / "augmentations" / f"{cfg.aug_preset}.yaml")
+    with open_dict(cfg):
+        cfg.aug = OmegaConf.merge(_aug, cfg.aug) if "aug" in cfg else _aug
     random.seed(cfg.train.seed); np.random.seed(cfg.train.seed); torch.manual_seed(cfg.train.seed)
     if DEVICE.type == "cuda":
         torch.set_float32_matmul_precision("high"); torch.backends.cudnn.benchmark = True
@@ -313,9 +344,15 @@ def main(cfg: DictConfig):
 
     best = -1e9
     for epoch in tqdm(range(1, cfg.train.epochs + 1), desc="epochs", dynamic_ncols=True):
-        loss = train_epoch(model, train_loader, stage1, encoder, optimizers, cfg, epoch)
+        loss, train_soft, train_hard = train_epoch(model, train_loader, stage1, encoder,
+                                                    optimizers, cfg, epoch)
         scheduler.step()
-        wandb.log({"epoch": epoch, "train/loss": loss, "train/lr": scheduler.get_last_lr()[0]})
+        # Per-hop train accuracy mirrors the val dice_soft_r{grid} / dice_r{grid} naming.
+        train_log = {"epoch": epoch, "train/loss": loss, "train/lr": scheduler.get_last_lr()[0]}
+        for g in train_soft:
+            train_log[f"train/dice_soft_r{g}/mean"] = train_soft[g]
+            train_log[f"train/dice_r{g}/mean"] = train_hard[g]
+        wandb.log(train_log)
         lawa_queue.append({k: v.cpu().clone() for k, v in model.state_dict().items()})
         if epoch % cfg.train.eval_every == 0 or epoch == cfg.train.epochs:
             # Best on soft Dice at the last computed level (dice_soft/mean), not the

@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.datasets.cow_index import SampleIndex, build_candidate_index, sample_context
+
 DATA_ROOT = "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/medsegbench"
 
 
@@ -84,10 +86,14 @@ class MedSegBenchDataset(Dataset):
         image_size: int = 128,
         data_root: str = DATA_ROOT,
         datasets: Optional[List[str]] = None,
+        deterministic: Optional[bool] = None,
     ):
         self.split = split
         self.context_size = context_size
         self.image_size = image_size
+        # Non-train splits get reproducible context (seeded from idx) so eval Dice
+        # isn't perturbed by context-sampling variance across runs/epochs.
+        self.deterministic = (split != "train") if deterministic is None else deterministic
 
         # Discover npz files for the requested size
         if datasets is not None:
@@ -104,11 +110,12 @@ class MedSegBenchDataset(Dataset):
         self.images: Dict[str, np.ndarray] = {}
         self.labels: Dict[str, np.ndarray] = {}
 
-        # Flat index: list of (dataset_name, sample_idx, label_value)
-        self.samples: List[Tuple[str, int, int]] = []
-
-        # label_value → list of (dataset_name, sample_idx) for context lookup
-        self.label_index: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+        # COW-safe flat index, built from parallel int lists below (see cow_index).
+        # ds_id indexes self._ds_names; one row per (image, present label_value).
+        self._ds_names: List[str] = []
+        _ds_ids: List[int] = []
+        _img_idxs: List[int] = []
+        _label_values: List[int] = []
 
         print(f"Loading MedSegBench (size={image_size}, split={split})...")
         for path in npz_files:
@@ -129,15 +136,20 @@ class MedSegBenchDataset(Dataset):
             self.images[name] = images
             self.labels[name] = labels
 
+            ds_id = len(self._ds_names)
+            self._ds_names.append(name)
             for i in range(len(images)):
                 for lv in np.unique(labels[i]):
                     if lv != 0:
-                        lv = int(lv)
-                        self.samples.append((name, i, lv))
-                        self.label_index[lv].append((name, i))
+                        _ds_ids.append(ds_id)
+                        _img_idxs.append(i)
+                        _label_values.append(int(lv))
 
             print(f"  [ok] {name}: {len(images)} samples, labels {np.unique(labels).tolist()}")
 
+        # COW-safe index + per-(ds, label) candidate arrays for context lookup.
+        self.samples = SampleIndex(_ds_ids, _img_idxs, _label_values, self._ds_names)
+        self._cand = build_candidate_index(_ds_ids, _img_idxs, _label_values)
         print(f"Total: {len(self.samples)} samples from {len(self.images)} datasets")
 
     def __len__(self) -> int:
@@ -151,30 +163,26 @@ class MedSegBenchDataset(Dataset):
             context_in [K, 1, H, W]
             context_out[K, 1, H, W]
         """
-        ds, sample_idx, label_value = self.samples[idx]
+        si = self.samples
+        ds = si.ds_names[int(si.ds_ids[idx])]
+        sample_idx  = int(si.img_idxs[idx])
+        label_value = int(si.label_values[idx])
         image = self.images[ds][sample_idx]
         mask = self.labels[ds][sample_idx]
 
-        # Sample K context pairs (same dataset, same label, different index)
-        candidates = [
-            (d, i) for d, i in self.label_index.get(label_value, [])
-            if d == ds and i != sample_idx
-        ]
-        if not candidates:
-            context_samples = []
-        elif len(candidates) >= self.context_size:
-            context_samples = random.sample(candidates, self.context_size)
-        else:
-            # Fewer unique candidates than K — sample with replacement
-            context_samples = random.choices(candidates, k=self.context_size)
+        # Sample K context indices (same dataset, same label, different index).
+        rng = random.Random(idx) if self.deterministic else None
+        cand = self._cand.get((int(si.ds_ids[idx]), label_value))
+        ctx = sample_context(cand, sample_idx, self.context_size, rng) if cand is not None \
+            else np.empty(0, dtype=np.int32)
 
         context_in = torch.stack([
-            _to_tensor(self.images[d][i]) for d, i in context_samples
-        ]) if context_samples else torch.zeros(0, 1, self.image_size, self.image_size)
+            _to_tensor(self.images[ds][int(i)]) for i in ctx
+        ]) if len(ctx) else torch.zeros(0, 1, self.image_size, self.image_size)
 
         context_out = torch.stack([
-            _binary_mask_tensor(self.labels[d][i], label_value) for d, i in context_samples
-        ]) if context_samples else torch.zeros(0, 1, self.image_size, self.image_size)
+            _binary_mask_tensor(self.labels[ds][int(i)], label_value) for i in ctx
+        ]) if len(ctx) else torch.zeros(0, 1, self.image_size, self.image_size)
 
         return {
             "image": _to_tensor(image),

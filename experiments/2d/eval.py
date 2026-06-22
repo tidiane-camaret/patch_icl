@@ -332,7 +332,7 @@ def save_figure(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-@hydra.main(config_path="../../configs/experiment/2d", config_name="base", version_base=None)
+@hydra.main(config_path="../../configs/experiment/2d", config_name="eval_base", version_base=None)
 def main(cfg: DictConfig):
     random.seed(cfg.eval.seed)
     torch.manual_seed(cfg.eval.seed)
@@ -453,13 +453,24 @@ def main(cfg: DictConfig):
         _pfn_mod = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_pfn_mod)
         ImagePFN = _pfn_mod.ImagePFN
-        arch = pfn_ckpt["arch"]
+        arch = dict(pfn_ckpt["arch"])
         img_size = pfn_ckpt["image_size"]
         # New checkpoints store `resolution` (+ `input_patch_size`); old ones store
         # `patch_size`. Derive the new params from the old field for back-compat.
-        resolution = arch.get("resolution", img_size // arch["patch_size"]
-                              if "patch_size" in arch else None)
-        input_patch_size = arch.get("input_patch_size", img_size // resolution)
+        ckpt_resolution = arch.get("resolution", img_size // arch["patch_size"]
+                                   if "patch_size" in arch else None)
+        # Eval-time override: force a token-grid resolution / patch-embed size that
+        # differs from what the checkpoint's arch recorded (e.g. the stored metadata
+        # is wrong/missing). pos_embed is shaped (1,1,resolution²,e), so an override
+        # the weights weren't trained for fails loudly at load_state_dict below.
+        resolution = cfg.eval.get("resolution", None) or ckpt_resolution
+        input_patch_size = (cfg.eval.get("input_patch_size", None)
+                            or arch.get("input_patch_size", img_size // resolution))
+        if resolution != ckpt_resolution:
+            print(f"Eval-time override: resolution {ckpt_resolution} -> {resolution} "
+                  f"(input_patch_size={input_patch_size}).")
+        # Reflect the resolution actually used in the logged run config (run_cfg below).
+        arch["resolution"], arch["input_patch_size"] = resolution, input_patch_size
         # Rebuild the frozen image encoder if the checkpoint used one (injected,
         # mirroring training). Encoder weights are also in the state_dict, so the
         # subsequent strict load just overwrites these fresh (identical) weights.
@@ -850,9 +861,12 @@ def main(cfg: DictConfig):
                         pred_lowres_b = preds_grid[b]
                         gt_lowres_b   = downsample_mask(label, Hg)
                 else:
-                    d_ds = d_native = hard_dice(preds[b, 0], label)
-                    # universeg has no low-res map; binary preds → equals hard dice
-                    d_ds_soft = soft_dice(preds[b, 0], label)
+                    d_native = hard_dice(preds[b, 0], label)
+                    # UniverSeg's only output is a native-res binary mask — there is no
+                    # low-res/soft coarse grid to score. Emit NaN (not a copy of d_native)
+                    # so dice_ds / dice_ds_soft don't falsely imply a shape score; the
+                    # NaN-filtered aggregation in log_summary drops them.
+                    d_ds = d_ds_soft = float("nan")
 
                     pred_native_b = preds[b, 0]   # native binary mask; no coarse grid
 

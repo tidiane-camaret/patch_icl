@@ -1,5 +1,27 @@
 # Change log
 
+## 2026-06-22 — Deterministic eval context for the real-image 2D datasets
+
+- medsegbench / biomedparse / totalseg2d picked their K context pairs via
+  `cow_index.sample_context`, which used the global `random` module. That is
+  worker-safe (PyTorch reseeds stdlib `random` per worker, unlike numpy), but it
+  also meant eval context drifted run-to-run and epoch-to-epoch — context-sampling
+  variance leaking into eval Dice.
+- `sample_context(cand, exclude, k, rng=None)` now takes an optional
+  `random.Random`. Each dataset gained `deterministic` (default `split != "train"`,
+  mirroring controlSynth) and passes `random.Random(idx)` on non-train splits, so a
+  given eval target always draws the same context. Train keeps `rng=None` → global
+  module → fresh, worker-distinct draws each epoch. controlSynth already had its own
+  deterministic eval path (SeedSequence), so it was unchanged.
+
+## 2026-06-22 — Fix UnboundLocalError in pfn_seg.run_eval
+
+- `run_eval` accumulated val loss into `total_loss`/`nl` but referenced an
+  undefined `val_loss` in the `tqdm.write` print (line 215), crashing the first
+  eval. `val_loss = total_loss / max(nl, 1)` was only computed later (before the
+  wandb.log). Moved that computation up before the print and removed the
+  now-duplicate line.
+
 ## 2026-06-20 — Multilevel encoder: encode-once-pool-many (lossless ~2× speedup)
 
 - **Problem**: `pipeline.run_chain` re-ran the FULL frozen encoder once per hop
@@ -1609,3 +1631,149 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   {eval.out_dir}/{date}_{run_name}, so each run's figures/CSVs land in their own folder instead
   of all dumping into a shared results/2d/outputs. Added eval.figures_to_wandb (default true) to
   toggle wandb upload independently of local PNG saving.
+
+## TotalSegmentator 2D cross-section manifest (2026-06-21, implemented)
+- New scripts/build_totalseg_2d_manifest.py: picks ONE axial cross-section per subject that
+  is densest in the most common classes, emits one (subject,class) task row per class present.
+  Output: results/totalseg2d/manifest_128.csv (17621 rows, 1228 subjects, 110/121 classes;
+  splits from meta.csv: 1082 train / 57 val / 89 test; ~14 tasks/subject).
+- Axial axis = AXIS 2 of label_{S}x{S}x{S}.npy (verified, non-obvious): a true cross-section
+  cuts <=2 vertebrae, only axis 2 satisfies this (axes 0/1 span 7-18 vertebrae = coronal/sagittal).
+  Axis-2 slices are also organ-richest.
+- Selection score = soft area-ramp: sum over classes (area>=noise_floor) of
+  global_weight[class] * min(1, area/area_cap). global_weight = occurrences/max from
+  label_stats.csv. Ramp rewards substantial presence (not grazing many organs by a few px) and
+  is robust (top slices form one tight cluster; a hard min_area threshold flips between distant
+  abdominal/pelvic slices near ties, and a tiny floor selects fragment-heavy edge slices).
+  Defaults noise_floor=10, area_cap=100. Task emission decoupled: emit classes with
+  area>=task_min_area (default 25), so slivers don't become degenerate targets nor sway selection.
+- Selected slices land on the thoraco-abdominal belt (lungs, heart, aorta, autochthon, liver,
+  spleen, kidneys, pancreas, stomach, IVC) — matching the global most-common classes.
+- NOTE for the dataset step: ct_{S}x{S}x{S}.npy is float16 and pre-normalized (~z-scored, range
+  ~[-1.7, 3.3]), NOT [0,1] — a TotalSeg2D dataset must min-max/clip-rescale per slice to match the
+  MedSegBench [0,1] convention before serving to the 2D in-context pipeline.
+
+## TotalSegmentator 2D slice export to npz (2026-06-21, implemented)
+- New scripts/totalseg2d/to_npz.py: exports ONE axial cross-section per subject to a single
+  npz for the 2D experiments. Two deliberate specs vs convert_to_npy.py:
+  1. FIXED mm/pixel (default 2.0mm, size 256 -> 512mm FOV), centered on the label. Fixes the
+     cross-subject scale drift from longest-axis->cube normalization (s0919 vs s1158 was ~4.5x
+     frame-area mismatch in the 128^3 cubes; now ~1.4x, i.e. genuine anatomy only).
+  2. RAW int16 HU, no normalization (same bytes as float16, exact). Clip/z-score/windowing is
+     deferred to the dataloader for flexibility. Disk/time cost of deferring measured ~0:
+     int16 raw == float16 size; ~0.5ms/slice to normalize at load.
+- Reads native label.npy (already canonical, axis2=axial) + ct.nii.gz (for raw HU only) +
+  spacings.json. Slice selection = soft area-ramp over global class freq (build_totalseg_2d_manifest),
+  but areas in PHYSICAL units (voxel count x in-plane mm^2 -> output px at mm_per_px) so argmax is
+  FOV-consistent and self-contained (supersedes the cube-based manifest's z for storage).
+- Per-slice render: in-plane ndi.zoom to mm_per_px (Gaussian AA on image downsample, nearest for
+  label) then center on label centroid into a size x size grid; image pad = AIR_HU (-1024).
+- npz schema per split: {split}_images int16 (N,size,size), {split}_label uint8, {split}_subjects,
+  {split}_z, {split}_spacing; scalars mm_per_px/size/air_hu + class_names. savez_compressed.
+- Smoke: 12 test subjects in 11s, 0 errors; verified raw HU range, scale fix, centering visually.
+
+## TotalSeg2D in-context dataloader (2026-06-21, implemented)
+- New src/datasets/totalseg2d.py: TotalSeg2DDataset mirrors MedSegBenchDataset's interface
+  (returns {image,label,context_in,context_out}; exposes .samples/.label_index) so it plugs into
+  the 2D pipeline via common.build_dataset with data.source="totalseg2d".
+- Reads totalseg2d_{stored_size}.npz (to_npz output). Differences vs medsegbench:
+  * Images are raw int16 HU -> normalized HERE: clip to data.hu_window (default [-1000,1000]) then
+    min-max to [0,1] (clipping also tames extreme out-of-FOV HU outliers, e.g. -8653 seen in data).
+  * Loads the 256px export (512mm FOV) and resizes to data.image_size (bilinear img / nearest label),
+    decoupling model res from FOV. The 128px export is a tighter 256mm FOV (clips bodies) — avoided.
+  * data.min_area (default 16 px @ image_size): a (subject,class) pair is a sample only above this,
+    so tiny slivers aren't degenerate targets.
+  * Single "dataset" name; label_value = TotalSeg class index 1..117.
+- Wired into experiments/2d/common.py build_dataset (new totalseg2d branch + error-msg update).
+- Verified with configs/augmentations/medsegbench.yaml via pfn_train.augment: geometric (flip/rotate)
+  hits context pairs only, intensity (brightness/contrast/gamma/noise) hits all, query mask untouched,
+  outputs stay in [0,1]. Plot: results/totalseg2d/dataloader_aug_samples.png (orig vs aug).
+
+## 2D aug: single shared config + strong preset (2026-06-22)
+- De-duplicated the 2D aug config. The identical `aug:` block was inlined in both
+  configs/experiment/2d/pfn_seg.yaml and multilevel.yaml; replaced each with `aug_preset: 2d`
+  and a code-load (`OmegaConf.load(configs/augmentations/<preset>.yaml)` merged into cfg.aug in
+  main(), mirroring the 3D experiments/multilevel/train.py pattern). New canonical file:
+  configs/augmentations/2d.yaml (2D schema: enabled/geometric/intensity; the old medsegbench.yaml
+  is now an unused orphan). CLI field override uses the +-prefix, e.g. +aug.enabled=false.
+- Extended pfn_train.augment() with literature-backed, backward-compatible ops (off unless the
+  preset sets the keys; base 2d.yaml takes the identical legacy path — affine theta reduces to the
+  old rotate-only matrix):
+  * task.invert: episode-wide intensity inversion (UniverSeg "task augmentation"). Intensity-only,
+    shared across all K+1, so the query image can be touched without desyncing its GT.
+  * geometric.scale/translate: folded into the existing rotate affine (one grid_sample); context only.
+  * geometric.elastic: smooth displacement field (low-res random -> bilinear upsample = smoothing);
+    context pairs, image bilinear / mask nearest.
+  * intensity.bias_field: smooth multiplicative inhomogeneity exp(field*strength) (SynthICL); all images.
+  * query_perturb: extra independent noise on the query slot only (Iris "imperfect reference").
+  * geometric.crop: random-resized crop — sample an in-bounds sub-window (relative size
+    s∈[min_scale,1], shift bounded by 1-s so it never leaves the image → no border padding)
+    and resize to full H×W. Context only; lets each context show a different region.
+    In 2d_strong: p=0.5, min_scale=0.75. Verified a solid context stays unpadded post-crop.
+  Geometric stays context-only by design: the training target is read from the un-augmented batch,
+  so moving the query would break query/GT alignment. class dropout (Iris) is dataset-level, N/A here.
+- New preset configs/augmentations/2d_strong.yaml enables all of the above (use aug_preset=2d_strong).
+- Verified: both presets through augment() preserve shape, keep masks binary, leave the query mask slot
+  zero, and clamp images to [0,1]. A/B vs 2d.yaml still TODO (gains may be aug strength, not transform).
+
+## COW-safe dataset indexes (2026-06-22, implemented)
+- Cause of DataLoader worker RAM creep / periodic stalls: forked workers share memory
+  copy-on-write; COW copies a page only on WRITE, and the only writes during iteration are
+  CPython refcount bumps on PyObject headers. The big image/label numpy buffers are read-only
+  (safe), but the per-sample `list[(ds,idx,lv)]` and the `dict[..]->list[tuple]` context-lookup
+  structures get refcount-churned every __getitem__ -> pages fork per worker -> RSS climbs over
+  the run (persistent_workers never resets).
+- Fix: src/datasets/cow_index.py — SampleIndex stores the (ds_id,img_idx,label) triples as 3
+  contiguous int32 arrays + a small ds_names list, but still behaves like list[(ds,idx,lv)]
+  (len/index/iter/subset) so common.TaggedDataset/collate/eval are unchanged. build_candidate_index
+  groups image idxs by (ds_id,label) into read-only int32 arrays (replaces label_index/group_index).
+  sample_context picks K context idxs from a candidate array via the `random` module (positions, not
+  objects). Workers now read only numpy buffers -> no per-element refcount COW.
+- Applied to src/datasets/{medsegbench,totalseg2d,biomedparse}.py (__init__ build + __getitem__
+  lookup; biomedparse diversity tags + self-test updated). common.make_loader eval-subsampling uses
+  SampleIndex.subset (no list rebuild).
+- Verified: SampleIndex unit (tuple iface + subset), biomedparse self-test, totalseg2d/medsegbench
+  item correctness, and 2 epochs through 3 persistent workers via TaggedDataset+collate.
+- NB: still the bigger lever for the user's 48-worker/64GB case is fewer workers (~8-12) — an
+  all-in-RAM dataset with cheap __getitem__ is GPU-bound; this fix removes the per-worker creep that
+  made the stalls recur every few epochs.
+
+## 2026-06-22 — Log val loss in 2D training scripts
+- experiments/2d/pfn_seg.py and experiments/2d/multilevel/train.py now compute and log
+  `val/loss` in their `run_eval`, accumulated with the same objective each uses for train
+  loss (pfn_seg: BCE + dice_weight*soft_dice on the avg-pooled patch target; multilevel:
+  the per-hop `loss_weights`-weighted `patch_loss` sum over chain outputs). Logged to wandb
+  alongside the dice metrics and added to the per-epoch eval summary line.
+
+## 2026-06-22 — Shared train_base.yaml for 2D training configs
+- New configs/experiment/2d/train_base.yaml holds params common to pfn_seg.yaml and
+  2d/multilevel.yaml (full data block; arch-core e/h/l/a/feature_level/thinking_rows/
+  residual_decay/compile; full train block; eval.batch_size/workers/out_dir; wandb;
+  aug_preset). Mirrors the eval-side base.yaml pattern (defaults: [synth: default, _self_]).
+- pfn_seg.yaml / 2d/multilevel.yaml now do `defaults: [train_base, _self_]` and keep only
+  model-specific + differing keys (encoders/resolution for pfn_seg; sample block, mask_prior/
+  stage1 thinking/loss_weights/stage1_checkpoint for multilevel; per-config max_per_label).
+- eval.out_dir set to .../2d_train for BOTH training scripts (multilevel previously .../2d).
+- Verified composition with `--cfg job`: resolved configs match prior values (out_dir aside).
+  Eval-only base.yaml and its consumers (feature_sim.yaml etc.) are untouched.
+- Renamed configs/experiment/2d/base.yaml → eval_base.yaml for symmetry with train_base.yaml.
+  Updated refs: feature_sim.yaml (defaults), eval.py + synth_benchmark.py (config_name).
+  Verified eval.py / feature_sim.py compose unchanged via `--cfg job`.
+- eval.py universeg backend: dice_ds / dice_ds_soft now logged as NaN instead of a copy of
+  the native dice. UniverSeg emits only a native-res binary mask (no low-res/soft coarse grid),
+  so for binary pred+GT both low-res metrics were mathematically equal to dice — misleadingly
+  implying a shape score. log_summary's NaN-filtered aggregation drops them. Other backends
+  (pfn_seg/feature_sim/patchset_pfn) score a genuine coarse grid and are unchanged.
+
+## 2026-06-22 — Train-accuracy metrics in 2D training (near-zero cost)
+- New common.batch_dice_sums(prob, target): vectorised, on-device soft + hard Dice SUMS +
+  valid-row COUNTS, same per-row semantics as soft_dice/hard_dice (hard binarises both at
+  0.5; empty pred+GT rows skipped). Verified numerically equal to the per-sample helpers
+  (eval-style GT binarization). Lets train accuracy accumulate on GPU and sync once/epoch.
+- pfn_seg.py train_epoch now returns (loss, train_dice_soft, train_dice) computed from the
+  logits/target the forward already produced (reuses the sigmoid feeding the dice loss) —
+  no extra forward, no per-batch GPU→CPU stall. Logged as train/dice_soft and train/dice,
+  mirroring val dice_ds_soft / dice_ds so the train↔val gap is directly readable.
+- multilevel/train.py train_epoch returns per-hop dicts; logs train/dice_soft_r{grid}/mean
+  and train/dice_r{grid}/mean (mirrors val dice_soft_r* naming). Measured on each hop's
+  sampled query patches (what it trains on), so reads slightly above the full-grid val metric.

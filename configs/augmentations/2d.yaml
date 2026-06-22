@@ -1,0 +1,30 @@
+# 2D in-context aug preset — consumed via cfg.aug by the 2D augment() in
+# experiments/2d/pfn_train.py. Top-level schema (enabled/geometric/intensity),
+# NOT the 3D `augmentations:`-wrapped schema used by multiverseg*/nnunet/synth_equiv.
+# Inherit with a Hydra group, e.g. in pfn_seg.yaml / multilevel.yaml:
+#   defaults:
+#     - augmentations@aug: 2d
+enabled: true
+
+# Applied jointly to (image, mask) — context pairs only; query GT is not transformed
+geometric:
+  hflip_p: 0.5
+  vflip_p: 0.5
+  rotate:
+    p: 0.5
+    max_angle_deg: 20.0
+
+# Applied independently to every image (context + query); masks unchanged
+intensity:
+  brightness:
+    p: 0.5
+    max_delta: 0.15
+  contrast:
+    p: 0.5
+    range: [0.8, 1.2]
+  gamma:
+    p: 0.3
+    range: [0.75, 1.33]
+  noise:
+    p: 0.3
+    std: 0.04

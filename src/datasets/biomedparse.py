@@ -50,6 +50,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from src.datasets.cow_index import SampleIndex, build_candidate_index, sample_context
+
 DATA_ROOT = "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/biomedparse"
 
 _SPLIT_DIRS = {"train": ("train", "train_mask"), "test": ("test", "test_mask")}
@@ -169,6 +171,7 @@ class BiomedParseDataset(Dataset):
         data_root: str = DATA_ROOT,
         datasets: Optional[List[str]] = None,
         cache_size: Optional[int] = None,
+        deterministic: Optional[bool] = None,
     ):
         if split not in _SPLIT_DIRS:
             raise ValueError(f"split must be one of {list(_SPLIT_DIRS)}, got {split!r}")
@@ -178,19 +181,24 @@ class BiomedParseDataset(Dataset):
         self.split = split
         self.context_size = context_size
         self.image_size = image_size
+        # Non-train splits get reproducible context (seeded from idx) so eval Dice
+        # isn't perturbed by context-sampling variance across runs/epochs.
+        self.deterministic = (split != "train") if deterministic is None else deterministic
         self.data_root = data_root
         img_dir_name, mask_dir_name = _SPLIT_DIRS[split]
         sources = _discover_sources(data_root, img_dir_name, mask_dir_name, datasets)
 
-        # samples: (dataset, image_idx, target_int) — MedSegBench-compatible 3-tuple.
-        self.samples: List[Tuple[str, int, int]] = []
+        # COW-safe sample index, built from parallel int lists below (see cow_index).
+        self._ds_names: List[str] = []
+        _ds_ids: List[int] = []
+        _img_idxs: List[int] = []
+        _tgt_ints: List[int] = []
         # Side tables for lazy loading + context lookup.
         self.image_paths: Dict[str, List[str]] = {}                      # ds -> [path]
         self.mask_path: Dict[Tuple[str, int, int], str] = {}            # (ds, img_idx, tgt) -> path
         self.target_to_int: Dict[str, Dict[str, int]] = {}             # ds -> {target_str: int}
         self.int_to_target: Dict[str, Dict[int, str]] = {}            # ds -> {int: target_str}
         self.meta: Dict[Tuple[str, int], Tuple[str, str]] = {}        # (ds, img_idx) -> (modality, site)
-        self.group_index: Dict[Tuple[str, int], List[int]] = defaultdict(list)  # (ds, tgt) -> [img_idx]
 
         # Cache the small *resized* tensors (not the 1024x1024 source): context
         # images are reused heavily across samples, so a hit skips the PNG decode
@@ -203,11 +211,13 @@ class BiomedParseDataset(Dataset):
 
         print(f"Loading BiomedParseData (size={image_size}, split={split})...")
         for ds, img_dir, mask_dir in sources:
+            ds_id = len(self._ds_names)
+            self._ds_names.append(ds)
             image_idx_of: Dict[str, int] = {}   # image_stem -> image_idx (per dataset)
             paths: List[str] = []
             t2i = self.target_to_int.setdefault(ds, {})
             i2t = self.int_to_target.setdefault(ds, {})
-            n_before = len(self.samples)
+            n_before = len(_ds_ids)
 
             for mask_path in sorted(glob.glob(os.path.join(mask_dir, "*.png"))):
                 if os.path.basename(mask_path) == _ABSENT_MASK:
@@ -232,27 +242,34 @@ class BiomedParseDataset(Dataset):
                 tgt_int = t2i[target]
 
                 self.mask_path[(ds, img_idx, tgt_int)] = mask_path
-                self.group_index[(ds, tgt_int)].append(img_idx)
-                self.samples.append((ds, img_idx, tgt_int))
+                _ds_ids.append(ds_id)
+                _img_idxs.append(img_idx)
+                _tgt_ints.append(tgt_int)
 
             self.image_paths[ds] = paths
             print(f"  [ok] {ds}: {len(paths)} images, {len(t2i)} targets, "
-                  f"{len(self.samples) - n_before} samples")
+                  f"{len(_ds_ids) - n_before} samples")
 
+        # COW-safe index + per-(ds, target) candidate arrays (replaces group_index).
+        self.samples = SampleIndex(_ds_ids, _img_idxs, _tgt_ints, self._ds_names)
+        self._cand = build_candidate_index(_ds_ids, _img_idxs, _tgt_ints)
         print(f"Total: {len(self.samples)} samples from {len(self.image_paths)} datasets")
 
     # ── diversity tags (for macro-averaging eval) ──────────────────────────────
 
     def dataset_of(self, idx: int) -> str:
-        return self.samples[idx][0]
+        si = self.samples
+        return si.ds_names[int(si.ds_ids[idx])]
 
     def modality_of(self, idx: int) -> str:
-        ds, img_idx, _ = self.samples[idx]
-        return self.meta[(ds, img_idx)][0]
+        si = self.samples
+        ds = si.ds_names[int(si.ds_ids[idx])]
+        return self.meta[(ds, int(si.img_idxs[idx]))][0]
 
     def target_of(self, idx: int) -> str:
-        ds, _, tgt = self.samples[idx]
-        return self.int_to_target[ds][tgt]
+        si = self.samples
+        ds = si.ds_names[int(si.ds_ids[idx])]
+        return self.int_to_target[ds][int(si.label_values[idx])]
 
     def cell_of(self, idx: int) -> Tuple[str, str, str]:
         """
@@ -275,20 +292,21 @@ class BiomedParseDataset(Dataset):
         return self._mask_cache(self.mask_path[(ds, img_idx, tgt)])
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        ds, img_idx, tgt = self.samples[idx]
+        si = self.samples
+        did = int(si.ds_ids[idx])
+        ds = si.ds_names[did]
+        img_idx = int(si.img_idxs[idx])
+        tgt = int(si.label_values[idx])
 
         # Context: other images sharing the same (dataset, target).
-        candidates = [i for i in self.group_index[(ds, tgt)] if i != img_idx]
-        if not candidates:
-            ctx_idxs: List[int] = []
-        elif len(candidates) >= self.context_size:
-            ctx_idxs = random.sample(candidates, self.context_size)
-        else:
-            ctx_idxs = random.choices(candidates, k=self.context_size)
+        rng = random.Random(idx) if self.deterministic else None
+        cand = self._cand.get((did, tgt))
+        ctx_idxs = sample_context(cand, img_idx, self.context_size, rng) if cand is not None \
+            else np.empty(0, dtype=np.int32)
 
-        if ctx_idxs:
-            context_in = torch.stack([self._img(ds, i) for i in ctx_idxs])
-            context_out = torch.stack([self._mask(ds, i, tgt) for i in ctx_idxs])
+        if len(ctx_idxs):
+            context_in = torch.stack([self._img(ds, int(i)) for i in ctx_idxs])
+            context_out = torch.stack([self._mask(ds, int(i), tgt) for i in ctx_idxs])
         else:
             z = torch.zeros(0, 1, self.image_size, self.image_size)
             context_in = context_out = z
@@ -365,9 +383,10 @@ def _self_test() -> None:
         # Context shares the same (dataset, target) cell as the target.
         cell = ds.cell_of(0)
         assert isinstance(cell, tuple) and len(cell) == 3
-        ds0, img0, tgt0 = ds.samples[0]
-        cand = [i for i in ds.group_index[(ds0, tgt0)] if i != img0]
-        assert all(i in ds.group_index[(ds0, tgt0)] for i in cand)
+        si = ds.samples
+        did0, img0, tgt0 = int(si.ds_ids[0]), int(si.img_idxs[0]), int(si.label_values[0])
+        cand = ds._cand[(did0, tgt0)]                      # COW-safe candidate array
+        assert (cand == img0).any()                        # target's own image is in its cell
 
         # Grid coverage: distinct (dataset, modality, target) cells present.
         cells = {ds.cell_of(i) for i in range(len(ds))}
