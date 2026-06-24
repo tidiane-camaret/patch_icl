@@ -220,7 +220,8 @@ class ImagePFN(nn.Module):
             is unchanged (raw P×P patches resized to Q×Q). The encoder is injected (not
             imported here) so this module stays dependency-light.
         feature_dim: channel count of the encoder's pooled features; required when
-            image_encoder is provided (sets the image_embed input dim).
+            image_encoder is provided or use_external_features is True (sets the
+            image_embed input dim).
     """
     def __init__(
         self,
@@ -235,6 +236,7 @@ class ImagePFN(nn.Module):
         residual_decay: float = 0.95,
         image_encoder: nn.Module | None = None,
         feature_dim: int | None = None,
+        use_external_features: bool = False,
     ):
         super().__init__()
         assert image_size % resolution == 0, "image_size must be divisible by resolution"
@@ -246,9 +248,15 @@ class ImagePFN(nn.Module):
         self.N = N
 
         self.image_encoder = image_encoder
+        self.use_external_features = use_external_features
         if image_encoder is not None:
             assert feature_dim is not None, "feature_dim required with image_encoder"
             self.image_embed = nn.Linear(feature_dim, e)   # embed pretrained features
+        elif use_external_features:
+            # Features are computed outside (e.g. the zoom pipeline crop-pools encoder maps)
+            # and passed to forward(image_feats=...); no internal encoder submodule.
+            assert feature_dim is not None, "feature_dim required with use_external_features"
+            self.image_embed = nn.Linear(feature_dim, e)
         else:
             self.image_embed = nn.Linear(Q * Q, e)         # embed raw pixel patches
         self.mask_embed  = nn.Linear(Q * Q, e)             # mask path always raw patches
@@ -263,17 +271,23 @@ class ImagePFN(nn.Module):
 
     def forward(
         self,
-        images: torch.Tensor,  # (B, K+1, 1, H, W) — last row is query
-        masks:  torch.Tensor,  # (B, K+1, 1, H, W) — query mask is replaced below
+        images: torch.Tensor | None,  # (B, K+1, 1, H, W) — last row is query; may be None if image_feats given
+        masks:  torch.Tensor,  # (B, K+1, 1, H, W) — query mask is replaced below (unless seed_query_mask)
         sep:    int,           # K = number of context images
         return_thinking: bool = False,
+        image_feats: torch.Tensor | None = None,   # (B,T,N,Cf) precomputed → skip encoding
+        seed_query_mask: bool = False,             # keep query mask as passed (no context-mean)
     ):                         # (B, H//P, W//P) logits, or (logits, thinking) if return_thinking
-        B, T, _, H, W = images.shape
+        ref = images if images is not None else masks
+        B, T, _, H, W = ref.shape
         P, N, Q = self.patch_size, self.N, self.input_patch_size
         Hp = H // P
 
         # ── Image cols ─────────────────────────────────────────────────────────
-        if self.image_encoder is not None:
+        if image_feats is not None:
+            # Precomputed features (e.g. zoom pipeline crop-pooled encoder maps).
+            img_p = standardize_by_context(image_feats, sep)
+        elif self.image_encoder is not None:
             # Pretrained features: encode each image → Hp×Hp feature grid → (B,T,N,C).
             # Patch order (row-major over the grid) matches pos_embed and the decoder
             # reshape. Per-channel context-stat standardization (shared with the
@@ -293,12 +307,15 @@ class ImagePFN(nn.Module):
         # ── Mask cols (always raw P×P patches resized to Q×Q) ──────────────────
         mask_p = patchify(masks.reshape(B * T, 1, H, W), P, out=Q).reshape(B, T, N, Q * Q)
 
-        # TargetEncoder trick: replace query mask patches with mean of context masks
-        ctx_mask_mean = mask_p[:, :sep].mean(dim=1, keepdim=True)           # (B, 1, N, Q²)
-        mask_p = torch.cat(
-            [mask_p[:, :sep], ctx_mask_mean.expand(B, T - sep, N, Q * Q)],
-            dim=1,
-        )                                                                     # (B, T, N, Q²)
+        # TargetEncoder trick: replace query mask patches with mean of context masks —
+        # unless seed_query_mask, in which case the caller already put a real prior
+        # (e.g. the cropped coarse prediction) in the query rows.
+        if not seed_query_mask:
+            ctx_mask_mean = mask_p[:, :sep].mean(dim=1, keepdim=True)        # (B, 1, N, Q²)
+            mask_p = torch.cat(
+                [mask_p[:, :sep], ctx_mask_mean.expand(B, T - sep, N, Q * Q)],
+                dim=1,
+            )                                                                 # (B, T, N, Q²)
 
         # Separate col groups; cat along col dim → (B, T, 2N, e)
         x_img  = self.image_embed(img_p)  + self.pos_embed   # (B, T, N, e)

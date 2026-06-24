@@ -62,6 +62,7 @@ from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))       # multilevel
 from pipeline import run_chain
+from zoom_pipeline import run_zoom_chain
 
 
 def build_split_loader(cfg, split, shuffle):
@@ -91,6 +92,64 @@ def load_stage1(cfg):
     return model
 
 
+def _check_zoom_encoder(encoder):
+    """Raise loudly if the encoder applies channel reduction or per-stage L2 norm.
+
+    crop_pool_maps concatenates raw encode_maps() stage maps without running the
+    encoder's _reduce_channels or stage_l2norm — for UniverSeg (reduce=none, no L2)
+    these are both no-ops so the channel count equals feature_dim and results are
+    correct.  For DINOv3 with encoder_reduce != 'none' or encoder_stage_l2norm=True
+    the emitted features would have the wrong channel count / be unreduced, silently
+    invalidating the warm-start and the experiment.  v1 zoom is scoped to UniverSeg;
+    DINOv3 reduce/PCA zoom is out of scope until crop_pool_maps is extended."""
+    reduce_kind = getattr(encoder, "_reduce_kind", "none")
+    stage_l2 = getattr(encoder, "stage_l2norm", False)
+    if reduce_kind != "none":
+        raise NotImplementedError(
+            f"crop_pool_maps does not apply the encoder's channel reduction "
+            f"(_reduce_kind={reduce_kind!r}); the zoom path currently supports only "
+            f"plain-concat features (e.g. UniverSeg feature_level=all, reduce=none). "
+            f"DINOv3 reduce/PCA zoom is out of scope for v1.")
+    if stage_l2:
+        raise NotImplementedError(
+            "crop_pool_maps does not apply the encoder's per-stage L2 norm "
+            "(stage_l2norm=True); the zoom path currently supports only "
+            "plain-concat features (e.g. UniverSeg feature_level=all, reduce=none). "
+            "DINOv3 stage_l2norm zoom is out of scope for v1.")
+
+
+def build_zoom_models(cfg, stage1, encoder, feature_dim):
+    """ModuleList of ImagePFN hops (one per crop_sizes), warm-started from frozen stage-1.
+
+    External-features mode: the encoder lives once in the chain; hops consume crop-pooled
+    features. Warm-start loads stage-1's weights minus image_encoder.* (strict=False).
+    Raises NotImplementedError for encoder configs not supported by crop_pool_maps."""
+    _check_zoom_encoder(encoder)
+    ckpt = torch.load(cfg.train.stage1_checkpoint, map_location="cpu", weights_only=False)
+    arch, img = ckpt["arch"], ckpt["image_size"]
+    resolution = int(round(stage1.N ** 0.5))
+    n_hops = len(cfg.sample.crop_sizes)
+    models = nn.ModuleList([
+        ImagePFN(resolution=resolution, image_size=img,
+                 input_patch_size=arch.get("input_patch_size", img // resolution),
+                 use_external_features=True, feature_dim=feature_dim,
+                 e=arch["e"], h=arch["h"], l=arch["l"], a=arch["a"],
+                 thinking_rows=arch["thinking_rows"],
+                 residual_decay=arch["residual_decay"]).to(DEVICE)
+        for _ in range(n_hops)])
+    s1 = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()
+          if not k.removeprefix("_orig_mod.").startswith("image_encoder.")}
+    for m in models:
+        m.load_state_dict(s1, strict=False)
+    assert stage1.image_embed.in_features == feature_dim, (
+        f"chain encoder feature_dim {feature_dim} != stage-1 image_embed "
+        f"{stage1.image_embed.in_features}; encoder must match the stage-1 checkpoint")
+    print(f"Zoom ImagePFN chain: {n_hops} hops (crop_sizes={list(cfg.sample.crop_sizes)}), "
+          f"warm-started from stage-1; "
+          f"{sum(p.numel() for p in models.parameters() if p.requires_grad):,} params")
+    return models
+
+
 def patch_loss(logits, batch, cfg):
     target = batch["qry_gt"]
     bce  = F.binary_cross_entropy_with_logits(logits, target)
@@ -98,7 +157,7 @@ def patch_loss(logits, batch, cfg):
     return bce + cfg.train.dice_weight * dice
 
 
-def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
+def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch, chain_fn, hop_labels):
     """Returns (mean_loss, train_soft, train_hard); the two dicts are keyed by hop grid
     and hold the soft (shape) / hard Dice between each hop's prediction and its query GT
     — the tensors run_chain already produced, accumulated on-GPU and synced once at epoch
@@ -106,7 +165,7 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
     trained on), not the full grid, so it reads slightly higher than the val dice_soft_r*."""
     model.train()
     total, n = 0.0, 0
-    hops = list(cfg.sample.resolutions)[1:]
+    hops = list(hop_labels)
     nh = len(hops)
     soft_sum = [torch.zeros((), device=DEVICE) for _ in range(nh)]
     soft_cnt = [torch.zeros((), device=DEVICE) for _ in range(nh)]
@@ -130,8 +189,8 @@ def train_epoch(model, loader, stage1, encoder, optimizers, cfg, epoch):
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
-            outputs, _ = run_chain(batch, stage1, encoder, model, cfg, cfg.sample.train,
-                                   stochastic=True, device=DEVICE)
+            outputs, _ = chain_fn(batch, stage1, encoder, model, cfg, cfg.sample.train,
+                                  stochastic=True, device=DEVICE)
             weights = list(cfg.train.loss_weights)
             loss = sum(w * patch_loss(o["logits"], {"qry_gt": o["qry_gt"]}, cfg)
                        for w, o in zip(weights, outputs))
@@ -238,6 +297,77 @@ def run_eval(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
     return metrics["dice_soft/mean"]
 
 
+@torch.no_grad()
+def run_eval_zoom(model, loader, stage1, encoder, lawa_queue, cfg, epoch):
+    """Eval for the zoom chain: composite is at native H, so metrics are full-res Dice
+    after each hop, plus the in-bbox refine delta. Returns dice_soft/mean (ckpt metric)."""
+    saved = lawa_average(lawa_queue, model, DEVICE)
+    for m in model: m.eval()
+    crop_sizes = list(cfg.sample.crop_sizes)
+    nh = len(crop_sizes)
+    per_ds      = defaultdict(list)                 # final hard dice
+    per_ds_soft = defaultdict(list)                 # final soft dice
+    after = [defaultdict(list) for _ in range(nh)]  # hard dice after each hop
+    delta = [[] for _ in range(nh)]                 # in-bbox hard-dice gain vs prior
+    total_loss, nl = 0.0, 0
+
+    for batch in loader:
+        if batch is None: continue
+        with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
+            outputs, coarse_lr = run_zoom_chain(batch, stage1, encoder, model, cfg,
+                                                cfg.sample.eval,
+                                                stochastic=not cfg.sample.eval_deterministic,
+                                                device=DEVICE)
+            weights = list(cfg.train.loss_weights)
+            total_loss += sum(w * patch_loss(o["logits"], {"qry_gt": o["qry_gt"]}, cfg)
+                              for w, o in zip(weights, outputs)).item()
+            nl += 1
+        B = coarse_lr.shape[0]
+        H = cfg.data.image_size
+        # Stage-1 baseline composite at native H (for the in-bbox delta of hop 0).
+        prev_full = F.interpolate(coarse_lr.unsqueeze(1), size=(H, H),
+                                  mode="bilinear", align_corners=False)
+        for L, o in enumerate(outputs):
+            full = o["refined_full"]
+            for b in range(B):
+                ds = batch["dataset"][b]
+                gt = batch["label"][b, 0]
+                after[L][ds].append(hard_dice(full[b, 0].cpu(), gt))
+                r0, c0 = int(o["origin"][b, 0]), int(o["origin"][b, 1]); s = o["crop_size"]
+                box = (slice(r0, r0 + s), slice(c0, c0 + s))
+                gtb = (gt[box] >= 0.5).float()
+                delta[L].append(hard_dice(full[b, 0, box[0], box[1]].cpu(), gtb)
+                                - hard_dice(prev_full[b, 0, box[0], box[1]].cpu(), gtb))
+            prev_full = full
+        for b in range(B):
+            ds = batch["dataset"][b]; gt = batch["label"][b, 0]
+            per_ds[ds].append(hard_dice(outputs[-1]["refined_full"][b, 0].cpu(), gt))
+            per_ds_soft[ds].append(soft_dice(outputs[-1]["refined_full"][b, 0].cpu(), gt))
+    if saved is not None:
+        model.load_state_dict(saved)
+
+    def nanmean(xs):
+        v = [x for x in xs if not np.isnan(x)]
+        return float(np.mean(v)) if v else float("nan")
+    flat = lambda d: [x for sc in d.values() for x in sc if not np.isnan(x)]
+
+    metrics = {"epoch": epoch, "val/loss": total_loss / max(nl, 1)}
+    metrics["dice/mean"]      = float(np.mean(flat(per_ds)))      if flat(per_ds)      else float("nan")
+    metrics["dice_soft/mean"] = float(np.mean(flat(per_ds_soft))) if flat(per_ds_soft) else float("nan")
+    for L in range(nh):
+        metrics[f"dice_after_hop{L}/mean"]  = float(np.mean(flat(after[L]))) if flat(after[L]) else float("nan")
+        metrics[f"refine/hop{L}/dice_delta"] = nanmean(delta[L])
+    for k, v in per_ds.items():
+        metrics[f"dice/dataset/{k}"] = nanmean(v)
+    tqdm.write(f"  [e{epoch}] val loss={metrics['val/loss']:.4f}  "
+               f"dice={metrics['dice/mean']:.4f}  soft={metrics['dice_soft/mean']:.4f}  "
+               + "  ".join(f"d{cs}={metrics[f'refine/hop{L}/dice_delta']:+.4f}"
+                           for L, cs in enumerate(crop_sizes)))
+    wandb.log(metrics)
+    for m in model: m.train()
+    return metrics["dice_soft/mean"]
+
+
 @hydra.main(config_path="../../../configs/experiment/2d", config_name="multilevel", version_base=None)
 def main(cfg: DictConfig):
     import random
@@ -276,27 +406,36 @@ def main(cfg: DictConfig):
         encoder.ensure_pca(_img_iter(), fit_out_size=list(cfg.sample.resolutions)[1])
 
     # Stage-1 thinking memory: dim e1 read from the frozen stage-1's thinking tokens.
-    if cfg.arch.use_stage1_thinking:
+    if cfg.arch.get("use_stage1_thinking", False):
         stage1_dim = stage1.thinking.tokens.shape[-1]
         print(f"Stage-1 thinking memory enabled (e1={stage1_dim}, n_think={stage1.thinking.n})")
     else:
         stage1_dim = None
 
-    resolutions = list(cfg.sample.resolutions)
-    assert resolutions[0] == int(round(stage1.N ** 0.5)), \
-        f"resolutions[0]={resolutions[0]} must equal stage-1 res {int(round(stage1.N ** 0.5))}"
-    # Chained thinking: hop L>0 receives the previous PatchSetPFN's thinking (dim e).
-    model = nn.ModuleList([
-        PatchSetPFN(feature_dim=feature_dim, e=cfg.arch.e, h=cfg.arch.h, l=cfg.arch.l,
-                    a=cfg.arch.a, thinking_rows=cfg.arch.thinking_rows,
-                    residual_decay=cfg.arch.residual_decay, fourier_bands=cfg.arch.fourier_bands,
-                    mask_prior=cfg.arch.mask_prior,
-                    mask_patch_size=cfg.data.image_size // grid,
-                    stage1_dim=(stage1_dim if L == 0 else cfg.arch.e),
-                    query_self_attn=cfg.arch.query_self_attn).to(DEVICE)
-        for L, grid in enumerate(resolutions[1:])])
-    print(f"PatchSetPFN chain: {len(model)} hops, "
-          f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} params")
+    is_zoom = cfg.arch.get("refine_arch", "patchset") == "imagepfn_zoom"
+    chain_fn = run_zoom_chain if is_zoom else run_chain
+    eval_fn  = run_eval_zoom if is_zoom else run_eval
+    hop_labels = (list(cfg.sample.crop_sizes) if is_zoom
+                  else list(cfg.sample.resolutions)[1:])
+
+    if is_zoom:
+        model = build_zoom_models(cfg, stage1, encoder, feature_dim)
+    else:
+        resolutions = list(cfg.sample.resolutions)
+        assert resolutions[0] == int(round(stage1.N ** 0.5)), \
+            f"resolutions[0]={resolutions[0]} must equal stage-1 res {int(round(stage1.N ** 0.5))}"
+        # Chained thinking: hop L>0 receives the previous PatchSetPFN's thinking (dim e).
+        model = nn.ModuleList([
+            PatchSetPFN(feature_dim=feature_dim, e=cfg.arch.e, h=cfg.arch.h, l=cfg.arch.l,
+                        a=cfg.arch.a, thinking_rows=cfg.arch.thinking_rows,
+                        residual_decay=cfg.arch.residual_decay, fourier_bands=cfg.arch.fourier_bands,
+                        mask_prior=cfg.arch.mask_prior,
+                        mask_patch_size=cfg.data.image_size // grid,
+                        stage1_dim=(stage1_dim if L == 0 else cfg.arch.e),
+                        query_self_attn=cfg.arch.query_self_attn).to(DEVICE)
+            for L, grid in enumerate(resolutions[1:])])
+        print(f"PatchSetPFN chain: {len(model)} hops, "
+              f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} params")
 
     if cfg.train.get("checkpoint", None):
         raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
@@ -345,7 +484,7 @@ def main(cfg: DictConfig):
     best = -1e9
     for epoch in tqdm(range(1, cfg.train.epochs + 1), desc="epochs", dynamic_ncols=True):
         loss, train_soft, train_hard = train_epoch(model, train_loader, stage1, encoder,
-                                                    optimizers, cfg, epoch)
+                                                    optimizers, cfg, epoch, chain_fn, hop_labels)
         scheduler.step()
         # Per-hop train accuracy mirrors the val dice_soft_r{grid} / dice_r{grid} naming.
         train_log = {"epoch": epoch, "train/loss": loss, "train/lr": scheduler.get_last_lr()[0]}
@@ -357,7 +496,7 @@ def main(cfg: DictConfig):
         if epoch % cfg.train.eval_every == 0 or epoch == cfg.train.epochs:
             # Best on soft Dice at the last computed level (dice_soft/mean), not the
             # hard native-resolution dice/mean.
-            dice_soft = run_eval(model, val_loader, stage1, encoder, lawa_queue, cfg, epoch)
+            dice_soft = eval_fn(model, val_loader, stage1, encoder, lawa_queue, cfg, epoch)
             if dice_soft > best:
                 best = dice_soft
                 saved = lawa_average(lawa_queue, model, DEVICE)

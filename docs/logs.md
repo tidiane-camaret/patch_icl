@@ -1,5 +1,51 @@
 # Change log
 
+## 2026-06-24 — eval.py: imagepfn_zoom backend
+- experiments/2d/eval.py now evaluates zoom-chain checkpoints (model=imagepfn_zoom),
+  mirroring the patchset_pfn (is_multilevel) backend: reads arch+sample+stage1 path from
+  the best.pt, loads the frozen stage-1 ImagePFN + UniverSeg encoder, rebuilds the
+  warm-started external-features ImagePFN hops (new helper build_zoom_chain — same shapes
+  as train.py:build_zoom_models, no warm-start since trained weights are loaded), and
+  drives them with run_zoom_chain. Prediction = final hop's refined_full (already native
+  H, no upsample); scored with the same hard/soft Dice. Figure low-res panel uses the
+  stage-1 coarse seed (R0×R0). Added "imagepfn_zoom" to the top-of-file src-precedence
+  argv gate. Run: python experiments/2d/eval.py model=imagepfn_zoom eval.checkpoint=<best.pt>
+
+## 2026-06-22 — Zoom-refinement variant (shared ImagePFN arch)
+- New stage-2 refinement path selectable via arch.refine_arch=imagepfn_zoom (default
+  patchset, unchanged). Instead of PatchSetPFN on scattered patches, a warm-started
+  ImagePFN refines a contiguous square crop ("zoom"), so the refiner is the SAME arch as
+  stage-1 — isolating refinement from the change of model class.
+- experiments/2d/multilevel/bbox.py: max_sum_window / gt_window (s×s square of largest
+  predicted mass / densest GT), crop_resize (batched grid_sample crop+resample),
+  composite_window (write crop back). Unit-tested in test_bbox.py.
+- src/models/pfn_seg_2d.py ImagePFN: backward-compatible use_external_features (consume
+  precomputed features, no internal encoder) + forward(image_feats=, seed_query_mask=).
+  Defaults reproduce prior behavior; test_imagepfn_modes.py + test_pipeline.py green.
+- experiments/2d/multilevel/zoom_pipeline.py run_zoom_chain: frozen stage-1 coarse pred →
+  encode maps ONCE → per hop crop-pool maps to the bbox (same encode-once features the
+  PatchSetPFN chain uses), seed the query with the cropped coarse pred, composite the
+  upsampled R0 output back at native H. test_zoom_pipeline.py.
+- train.py: refine_arch switch (build_zoom_models warm-start, chain_fn dispatch in
+  train_epoch, run_eval_zoom with native-H dice + in-bbox refine delta). Config
+  configs/experiment/2d/multilevel_zoom.yaml (single 64px hop). Verified 1-epoch smoke run.
+- bbox.max_sum_window / gt_window: empty maps (densest s×s window holds <0.5 mass — e.g. an
+  all-background prediction or empty GT) CENTER the crop instead of collapsing to corner
+  (0,0). Per-sample within a batch. Covered by test_bbox.py (empty + mixed-batch cases).
+
+## 2026-06-22 — eval.py: allow eval-time override of pfn_seg token-grid resolution
+
+- The pfn_seg_2d eval branch rebuilt ImagePFN using `resolution`/`input_patch_size`
+  read *only* from the checkpoint's stored `arch`, so passing `arch.resolution=...`
+  on the eval CLI was silently ignored.
+- Added `eval.resolution` / `eval.input_patch_size` (default null → use ckpt) to
+  eval_base.yaml; eval.py now prefers them over the checkpoint's arch and reflects
+  the value actually used in the logged run_cfg. ImagePFN's learnable
+  `pos_embed` is shaped (1,1,resolution²,e), so overriding to a resolution the
+  weights weren't trained at fails loudly at load_state_dict (verified) — no silent
+  wrong-weight eval. (patchset_pfn resolution comes from cfg.sample.resolutions, a
+  separate mechanism — unchanged.)
+
 ## 2026-06-22 — Deterministic eval context for the real-image 2D datasets
 
 - medsegbench / biomedparse / totalseg2d picked their K context pairs via

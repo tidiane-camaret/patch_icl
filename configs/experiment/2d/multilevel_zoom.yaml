@@ -1,0 +1,23 @@
+# Stage-2 zoom refinement: same ImagePFN arch as stage-1, fed a square crop (no PatchSetPFN).
+# Selected via arch.refine_arch=imagepfn_zoom. Common params inherited from train_base.yaml.
+defaults:
+  - train_base
+  - _self_
+
+model: imagepfn_zoom
+
+sample:
+  crop_sizes: [64]           # one per hop, pixels in the 128 frame (start: single 64px hop)
+  eval_deterministic: true
+  train: prev_pred           # source arg passed to run_zoom_chain (unused in body, kept for API compat)
+  eval: prev_pred
+
+arch:
+  refine_arch: imagepfn_zoom
+
+train:
+  loss_weights: [1.0]        # len == len(crop_sizes)
+  stage1_checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d_train/2026-06-22_legendary-pond-52/best.pt
+
+eval:
+  max_per_label: null

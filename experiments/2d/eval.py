@@ -8,6 +8,10 @@ Dispatches on cfg.model:
   patchset_pfn          → multilevel coarse→fine chain (frozen stage-1 ImagePFN +
                           frozen UniverSeg encoder + trained PatchSetPFN hops); the
                           final hop's native-resolution composite is the prediction.
+  imagepfn_zoom         → multilevel zoom chain (frozen stage-1 ImagePFN + frozen
+                          UniverSeg encoder + trained warm-started ImagePFN hops fed a
+                          square crop); the final hop's native-resolution composite is
+                          the prediction.
 
 Usage:
     python experiments/2d/eval.py                                     # universeg
@@ -17,6 +21,7 @@ Usage:
     python experiments/2d/eval.py model=pfn_seg_2d eval.checkpoint=results/2d/pfn_seg/<run>/best.pt
     python experiments/2d/eval.py model=patchset_pfn eval.checkpoint=results/2d/<run>/best.pt \
         eval.stage1_checkpoint=results/2d/pfn_seg_universeg/<run>/best.pt
+    python experiments/2d/eval.py model=imagepfn_zoom eval.checkpoint=results/2d/<run>/best.pt
 """
 
 import datetime
@@ -41,7 +46,7 @@ from tqdm import tqdm
 # shadowing copy (common.py puts the latter on sys.path). Cache patch_icl's src
 # package before common imports from it — mirrors pfn_seg.py. Skipped for the
 # universeg backends, which rely on ic_segmentation's src.models.universeg_baseline.
-if any(("pfn_seg" in _a) or ("patchset_pfn" in _a) for _a in sys.argv):
+if any(("pfn_seg" in _a) or ("patchset_pfn" in _a) or ("imagepfn_zoom" in _a) for _a in sys.argv):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     import src.datasets.medsegbench  # noqa: F401  (caches patch_icl's src)
 
@@ -259,6 +264,30 @@ def load_stage1(path: str):
     return model
 
 
+def build_zoom_chain(stage1_ckpt_path: str, feature_dim: int, n_hops: int, stage1):
+    """Rebuild the zoom ImagePFN ModuleList (external-features hops) to match training.
+
+    Mirrors experiments/2d/multilevel/train.py:build_zoom_models, minus the warm-start —
+    the trained stage-2 weights are loaded by the caller, so the modules only need the
+    right shapes. The transformer arch (e/h/l/a/…) and the native image_size/patch size
+    come from the *stage-1* checkpoint, exactly as build_zoom_models reads them.
+    """
+    import torch.nn as nn
+    from src.models.pfn_seg_2d import ImagePFN
+    ckpt = torch.load(stage1_ckpt_path, map_location="cpu", weights_only=False)
+    arch, img = ckpt["arch"], ckpt["image_size"]
+    resolution = int(round(stage1.N ** 0.5))
+    models = nn.ModuleList([
+        ImagePFN(resolution=resolution, image_size=img,
+                 input_patch_size=arch.get("input_patch_size", img // resolution),
+                 use_external_features=True, feature_dim=feature_dim,
+                 e=arch["e"], h=arch["h"], l=arch["l"], a=arch["a"],
+                 thinking_rows=arch["thinking_rows"],
+                 residual_decay=arch["residual_decay"]).to(DEVICE)
+        for _ in range(n_hops)])
+    return models
+
+
 # ── Visualisation (feature_sim backend) ──────────────────────────────────────
 
 def _overlay_ax(ax, image: np.ndarray, mask: np.ndarray, title: str) -> None:
@@ -343,6 +372,7 @@ def main(cfg: DictConfig):
     is_feat_sim   = cfg.model == "universeg_featuresim"
     is_pfn_seg    = cfg.model == "pfn_seg_2d"
     is_multilevel = cfg.model == "patchset_pfn"
+    is_zoom       = cfg.model == "imagepfn_zoom"
 
     # pfn_seg / patchset_pfn: arch + image_size live in the checkpoint. The model is
     # built at the checkpoint's `model_size` (token grids are baked in); the loader
@@ -355,7 +385,7 @@ def main(cfg: DictConfig):
     model_size = None
     train_data = None   # data config the checkpoint was trained on (None for old ckpts)
     train_synth = None  # synth difficulty knobs when the checkpoint trained on synthetic
-    if is_pfn_seg or is_multilevel:
+    if is_pfn_seg or is_multilevel or is_zoom:
         from omegaconf import open_dict
         pfn_ckpt = torch.load(cfg.eval.checkpoint, map_location="cpu", weights_only=False)
         model_size  = pfn_ckpt["image_size"]
@@ -379,7 +409,7 @@ def main(cfg: DictConfig):
                   f"upsampled to {encode_size} for scoring).")
         with open_dict(cfg):
             cfg.data.image_size = encode_size
-            if is_multilevel and "context_size" in pfn_ckpt:
+            if (is_multilevel or is_zoom) and "context_size" in pfn_ckpt:
                 cfg.data.context_size = pfn_ckpt["context_size"]
 
     loader = build_loader(cfg)
@@ -636,6 +666,89 @@ def main(cfg: DictConfig):
             "flops":        flops,
         }
 
+    elif is_zoom:
+        # Multilevel zoom chain: frozen stage-1 ImagePFN + frozen UniverSeg encoder +
+        # trained warm-started ImagePFN hops fed a square crop. arch + sample come from
+        # the checkpoint; the prediction is the final hop's native-resolution composite
+        # (refined_full), == training's dice/mean. Mirrors the is_multilevel branch but
+        # builds ImagePFN hops (build_zoom_chain) and drives them with run_zoom_chain.
+        from omegaconf import OmegaConf
+        from src.models.pretrained_encoders import build_image_encoder
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "multilevel"))
+        from zoom_pipeline import run_zoom_chain
+
+        arch = pfn_ckpt["arch"]
+        with open_dict(cfg):
+            cfg.arch   = OmegaConf.create(dict(arch))
+            cfg.sample = OmegaConf.create(dict(pfn_ckpt["sample"]))
+
+        # Frozen stage-1: path stored in the checkpoint (new runs) else from config.
+        stage1_path = pfn_ckpt.get("stage1_checkpoint") or cfg.eval.get("stage1_checkpoint", None)
+        if not stage1_path:
+            raise ValueError(
+                "imagepfn_zoom eval needs the frozen stage-1 ImagePFN checkpoint, but the "
+                "best.pt does not record one. Pass eval.stage1_checkpoint=<path/to/stage1/best.pt>.")
+        stage1 = load_stage1(stage1_path)
+        # Chain encoder matches training (UniverSeg unless arch.image_encoder set). The
+        # zoom path's crop_pool_maps supports only plain-concat features (no reduce / L2),
+        # i.e. UniverSeg feature_level=all — see train.py:_check_zoom_encoder.
+        encoder, feature_dim = build_image_encoder(
+            {"image_encoder": cfg.arch.get("image_encoder", "universeg"),
+             "feature_level": cfg.arch.feature_level,
+             "encoder_resize_to_input": cfg.arch.get("encoder_resize_to_input", False),
+             "encoder_imagenet_norm": cfg.arch.get("encoder_imagenet_norm", True),
+             "encoder_reduce": cfg.arch.get("encoder_reduce", "none"),
+             "encoder_stage_l2norm": cfg.arch.get("encoder_stage_l2norm", False)}, DEVICE)
+
+        crop_sizes = list(cfg.sample.crop_sizes)
+        model = build_zoom_chain(stage1_path, feature_dim, len(crop_sizes), stage1)
+        # `replace` (not `removeprefix`): a compiled ModuleList buries _orig_mod. mid-key.
+        sd = {k.replace("_orig_mod.", ""): v for k, v in pfn_ckpt["model"].items()}
+        model.load_state_dict(sd)
+        for m in model:
+            m.eval()
+        print(f"Loaded zoom ImagePFN chain: {len(model)} hops, crop_sizes={crop_sizes}")
+
+        # Strategy A: rescale the frozen stage-1's effective patch size so its coarse seed
+        # survives a larger input (Hp = H//P stays == stage-1 resolution). Only the conv
+        # encoder then sees encode_size; the hops re-patchify their crops at native H.
+        stage1_res = int(round(stage1.N ** 0.5))
+        if cfg.data.image_size != model_size:
+            assert cfg.data.image_size % stage1_res == 0, \
+                f"encode_size={cfg.data.image_size} must be divisible by stage-1 res {stage1_res}"
+            stage1.patch_size = cfg.data.image_size // stage1_res
+
+        # FLOPs: full zoom chain (stage-1 + encoder + all hops) on a dummy batch.
+        K = cfg.data.context_size
+        Himg = cfg.data.image_size
+        _db = {"image":       torch.zeros(1, 1, Himg, Himg, device=DEVICE),
+               "context_in":  torch.zeros(1, K, 1, Himg, Himg, device=DEVICE),
+               "context_out": torch.zeros(1, K, 1, Himg, Himg, device=DEVICE),
+               "label":       torch.zeros(1, 1, Himg, Himg, device=DEVICE)}
+        with FlopCounterMode(display=False) as _fc:
+            with torch.no_grad():
+                run_zoom_chain(_db, stage1, encoder, model, cfg, cfg.sample.eval,
+                               stochastic=False, device=DEVICE)
+        flops = _fc.get_total_flops()
+        del _db
+        print(f"FLOPs (K={K}, {Himg}²): {flops/1e9:.2f} GFLOPs")
+
+        run_cfg  = {
+            "model":        cfg.model,
+            "source":       cfg.data.get("source", "medsegbench"),
+            "encoder_input_size": Himg,         # served pixels (== model_size unless Strategy A)
+            "model_size":         model_size,   # native H the composite was built at
+            "context_size": K,
+            "split":        cfg.data.split,
+            "checkpoint":   str(cfg.eval.checkpoint),
+            "stage1_checkpoint": str(stage1_path),
+            "arch":         dict(arch),
+            "sample":       dict(pfn_ckpt["sample"]),
+            "train_data":   train_data,    # data the checkpoint was trained on
+            "train_synth":  train_synth,   # synth knobs (None unless trained on synthetic)
+            "flops":        flops,
+        }
+
     else:
         from src.models.universeg_baseline import UniverSegBaseline
         print(f"Loading UniverSeg (size={cfg.data.image_size})...")
@@ -791,6 +904,19 @@ def main(cfg: DictConfig):
                 preds = preds.float().cpu()
                 inference_times.append((time.perf_counter() - t0) / B)
 
+            elif is_zoom:
+                # Zoom chain; final hop's refined_full composite is already native-res.
+                t0 = time.perf_counter()
+                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
+                                    enabled=DEVICE.type == "cuda"):
+                    outputs, coarse_lr = run_zoom_chain(batch, stage1, encoder, model, cfg,
+                                                        cfg.sample.eval,
+                                                        stochastic=not cfg.sample.eval_deterministic,
+                                                        device=DEVICE)
+                preds = outputs[-1]["refined_full"][:, 0].float().cpu()   # (B, H, W) native
+                coarse_grid = coarse_lr.float().cpu()                     # (B, R0, R0) stage-1 seed
+                inference_times.append((time.perf_counter() - t0) / B)
+
             else:
                 t0 = time.perf_counter()
                 with torch.autocast(device_type=DEVICE.type, enabled=DEVICE.type == "cuda"):
@@ -860,6 +986,16 @@ def main(cfg: DictConfig):
                     if Hg != H:   # coarse grid distinct from native → show both
                         pred_lowres_b = preds_grid[b]
                         gt_lowres_b   = downsample_mask(label, Hg)
+                elif is_zoom:
+                    # refined_full composite is already native-res; final dice only.
+                    d_ds = d_native = hard_dice(preds[b], label)
+                    d_ds_soft = soft_dice(preds[b], label)
+
+                    pred_native_b = preds[b]
+                    # Stage-1 coarse seed (R0×R0) as the figure's low-res panel.
+                    R0 = coarse_grid.shape[-1]
+                    pred_lowres_b = coarse_grid[b]
+                    gt_lowres_b   = downsample_mask(label, R0)
                 else:
                     d_native = hard_dice(preds[b, 0], label)
                     # UniverSeg's only output is a native-res binary mask — there is no
