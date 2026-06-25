@@ -161,6 +161,13 @@ class BiomedParseDataset(Dataset):
         datasets: list of dataset folder names to load; None loads all under root
         cache_size: per-process LRU capacity for resized tensors. None (default)
             picks a size-aware budget (~64 MB/worker) so 512px runs don't OOM.
+            Only used on the PNG-decode fallback path.
+        npy_root: root of the pre-resized uint8 store written by
+            scripts/datasets/biomedparse/to_npz.py. None -> `<data_root>/_npy`.
+        use_npy: if True (default), datasets with a matching store are read from
+            memmap'd uint8 .npy (~760x faster than decoding the 1024px PNGs); any
+            dataset without a (shape-matching) store transparently falls back to
+            PNG decode. Set False to force decoding everywhere.
     """
 
     def __init__(
@@ -172,6 +179,8 @@ class BiomedParseDataset(Dataset):
         datasets: Optional[List[str]] = None,
         cache_size: Optional[int] = None,
         deterministic: Optional[bool] = None,
+        npy_root: Optional[str] = None,
+        use_npy: bool = True,
     ):
         if split not in _SPLIT_DIRS:
             raise ValueError(f"split must be one of {list(_SPLIT_DIRS)}, got {split!r}")
@@ -185,6 +194,12 @@ class BiomedParseDataset(Dataset):
         # isn't perturbed by context-sampling variance across runs/epochs.
         self.deterministic = (split != "train") if deterministic is None else deterministic
         self.data_root = data_root
+        self.use_npy = use_npy
+        self.npy_root = npy_root or os.path.join(data_root, "_npy")
+        # Pre-resized uint8 store: ds -> (images_mm, masks_mm); rows align with this
+        # dataset's own discovery order (image row == img_idx, mask row below).
+        self._npy: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._mask_row: Dict[Tuple[str, int, int], int] = {}  # (ds, img_idx, tgt) -> store row
         img_dir_name, mask_dir_name = _SPLIT_DIRS[split]
         sources = _discover_sources(data_root, img_dir_name, mask_dir_name, datasets)
 
@@ -241,19 +256,54 @@ class BiomedParseDataset(Dataset):
                     i2t[tgt_int] = target
                 tgt_int = t2i[target]
 
+                # Mask store row = #masks kept so far for this ds (matches to_npz's
+                # append order); recorded alongside the path like mask_path itself.
+                self._mask_row[(ds, img_idx, tgt_int)] = len(_ds_ids) - n_before
                 self.mask_path[(ds, img_idx, tgt_int)] = mask_path
                 _ds_ids.append(ds_id)
                 _img_idxs.append(img_idx)
                 _tgt_ints.append(tgt_int)
 
             self.image_paths[ds] = paths
+            n_masks = len(_ds_ids) - n_before
             print(f"  [ok] {ds}: {len(paths)} images, {len(t2i)} targets, "
-                  f"{len(_ds_ids) - n_before} samples")
+                  f"{n_masks} samples")
+            self._maybe_load_store(ds, len(paths), n_masks)
 
         # COW-safe index + per-(ds, target) candidate arrays (replaces group_index).
         self.samples = SampleIndex(_ds_ids, _img_idxs, _tgt_ints, self._ds_names)
         self._cand = build_candidate_index(_ds_ids, _img_idxs, _tgt_ints)
-        print(f"Total: {len(self.samples)} samples from {len(self.image_paths)} datasets")
+        n_store = len(self._npy)
+        print(f"Total: {len(self.samples)} samples from {len(self.image_paths)} datasets "
+              f"(npy fast-path: {n_store}, PNG decode: {len(self.image_paths) - n_store})")
+
+    def _maybe_load_store(self, ds: str, n_imgs: int, n_masks: int) -> None:
+        """Memmap the pre-resized store for `ds` if present and shape-consistent.
+
+        Shape equality is the alignment guarantee: to_npz.py uses the identical
+        sorted-glob discovery, so matching counts means row i == image_idx i and
+        mask row j == this dataset's j-th kept mask. Any mismatch (stale/missing
+        store, different size) silently leaves `ds` on the PNG-decode path.
+        """
+        if not self.use_npy:
+            return
+        S = self.image_size
+        d = os.path.join(self.npy_root, self.split, ds)
+        img_f = os.path.join(d, f"images_{S}.npy")
+        msk_f = os.path.join(d, f"masks_{S}.npy")
+        if not (os.path.exists(img_f) and os.path.exists(msk_f)):
+            return
+        try:
+            images = np.load(img_f, mmap_mode="r")
+            masks = np.load(msk_f, mmap_mode="r")
+        except Exception as e:  # noqa: BLE001 — corrupt store must not kill loading
+            print(f"  [npy] {ds}: load failed ({e}); using PNG decode")
+            return
+        if images.shape != (n_imgs, S, S) or masks.shape != (n_masks, S, S):
+            print(f"  [npy] {ds}: store {images.shape}/{masks.shape} != expected "
+                  f"({n_imgs},{S},{S})/({n_masks},{S},{S}); using PNG decode")
+            return
+        self._npy[ds] = (images, masks)
 
     # ── diversity tags (for macro-averaging eval) ──────────────────────────────
 
@@ -286,9 +336,19 @@ class BiomedParseDataset(Dataset):
         return len(self.samples)
 
     def _img(self, ds: str, img_idx: int) -> torch.Tensor:
+        store = self._npy.get(ds)
+        if store is not None:
+            # asarray(..., float32) copies out of the read-only memmap (page-cache
+            # shared across workers) into an owned, writable buffer for torch.
+            arr = np.asarray(store[0][img_idx], dtype=np.float32) / 255.0
+            return torch.from_numpy(arr).unsqueeze(0)
         return self._img_cache(self.image_paths[ds][img_idx])
 
     def _mask(self, ds: str, img_idx: int, tgt: int) -> torch.Tensor:
+        store = self._npy.get(ds)
+        if store is not None:
+            arr = store[1][self._mask_row[(ds, img_idx, tgt)]].astype(np.float32)
+            return torch.from_numpy(arr).unsqueeze(0)
         return self._mask_cache(self.mask_path[(ds, img_idx, tgt)])
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

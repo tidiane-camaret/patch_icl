@@ -1,5 +1,33 @@
 # Change log
 
+## 2026-06-24 — BiomedParse dataloading: benchmark + pre-resize pipeline
+- Benchmarked src/datasets/biomedparse.py loading. Bottleneck is purely PNG decode:
+  every image/mask is a 1024x1024 RGBA PNG; decode->128 grayscale = ~33 ms/img, all CPU
+  (zlib inflate + RGBA->L; resize ~2 ms, NFS negligible — cold≈warm, header-open 0.36 ms).
+  Each __getitem__ does up to 2*(K+1)=8 decodes. Real shuffled DataLoader throughput:
+  2.7 / 22 / 33 / 104 img/s at num_workers 0 / 8 / 16 / 32 — fully decode-bound, scales
+  linearly with cores. Corpus = 1.23M PNGs (MSD 605k, amos22 240k dominate).
+- Fix: decode once, store pre-resized uint8. memmap'd .npy reload = 0.043 ms/img (~760x).
+  At 128px the whole corpus is ~20 GB (fits the 995 GB RAM / OS page cache); one-time
+  convert ≈ 20 min on 32 cores.
+- New scripts/datasets/biomedparse/to_npz.py: parallel PNG->uint8, per-dataset memmap-able
+  images_{S}.npy / masks_{S}.npy stacks + index_{S}.npz (paths rel to data_root). NOT a
+  monolithic .npz like totalseg2d's — NpzFile can't be memmapped, so 32 persistent workers
+  would each hold a full RAM copy; standalone .npy lets them share one OS-cached copy
+  (COW-safe). Row order + resize semantics reproduce the dataset exactly (image L/BILINEAR/
+  /255; mask L/NEAREST/>0); verified bit-exact (max diff 0.0) and row==image_idx aligned.
+- BiomedParseDataset memmap fast-path (done): new use_npy/npy_root args; per dataset,
+  _maybe_load_store() memmaps images_{S}.npy/masks_{S}.npy from <data_root>/_npy and uses
+  them iff shapes match the discovered (n_imgs, n_masks) — else that dataset silently
+  decodes PNGs (per-dataset fallback). Rows align by construction (same sorted-glob order):
+  image row == img_idx, mask row == per-ds kept-mask counter (self._mask_row, populated
+  beside self.mask_path, so no new COW-heavy dict). Verified bit-exact vs decode (max diff
+  0.0 over images/labels/context). Throughput on ACDC+BreastUS+amos22 @128/K=3: 142 -> 0.20
+  ms/item single-process (~700x); DataLoader now FASTEST at num_workers=0 (2822 img/s) and
+  SLOWER with workers (1545 @16) — load is no longer the bottleneck, so worker IPC dominates
+  (revisit worker count once heavy augmentation is in the pipeline). Store built at 128px
+  for both splits (~5 GB, 41 dataset sources each).
+
 ## 2026-06-24 — eval.py: imagepfn_zoom backend
 - experiments/2d/eval.py now evaluates zoom-chain checkpoints (model=imagepfn_zoom),
   mirroring the patchset_pfn (is_multilevel) backend: reads arch+sample+stage1 path from
