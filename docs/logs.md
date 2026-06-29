@@ -1,5 +1,19 @@
 # Change log
 
+## 2026-06-29 — omniSynth: in-context Omniglot grid dataset wired into 2D pipeline
+- New dataset `src/datasets/omniSynth/`: in-context 2D segmentation from Omniglot characters
+  arranged on a grid. A task = one target character class; each scene is a 4x4 grid where
+  k cells contain the target (mask = ink pixels of the target characters within those cells)
+  and the remaining cells hold distractor characters from other classes.
+- Wired as `data.source=omnisynth` in `experiments/2d/common.py:build_dataset`.
+- Hydra config: `configs/experiment/2d/synth/omniglot.yaml` (under `@package synth`).
+  Key knobs: `target_mode` (identical | aug | class — controls what "same target" means),
+  `k_min`/`k_max` (number of target cells per scene), train=background alphabets,
+  val/test=evaluation alphabets (split by `val_test_split`).
+- `paths.omniglot` added to `configs/config.yaml` and both cluster configs
+  (`configs/cluster/nfs.yaml`, `configs/cluster/meta.yaml`).
+- Integration test: `src/datasets/omniSynth/test_integration.py` (run directly, no pytest).
+
 ## 2026-06-28 — OOD generalization study of imagepfn_zoom (hard_diverse checkpoint)
 - Probed how the `2026-06-22_kind-durian-59` imagepfn_zoom checkpoint (trained on
   `synth=hard_diverse`) generalizes outside its training distribution, on the held-out

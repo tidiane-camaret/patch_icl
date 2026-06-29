@@ -1,0 +1,33 @@
+# Fine-tune UniverSeg on a 2D in-context dataset (default: omniSynth). Shared
+# params (data/train/eval/wandb) come from train_base.yaml. Launch with
+# `synth=omniglot` to select the omniSynth generator block (train_base defaults to
+# the controlSynth `synth: default` block otherwise):
+#   python experiments/2d/universeg_train.py synth=omniglot synth.scene.target_mode=mix
+defaults:
+  - train_base
+  - _self_
+
+model: universeg
+
+data:
+  source: omnisynth
+  image_size: 128       # UniverSeg native res; grid=4 -> 32px cells
+  context_size: 3
+
+train:
+  epochs: 20
+  batch_size: 32
+  lr: 1.0e-4
+  adam_wd: 0.01
+  grad_clip: 1.0
+  dice_weight: 1.0
+  warmup_epochs: 1
+  eval_every: 1
+  workers: 8
+  seed: 42
+  pretrained: true      # fine-tune from pretrained UniverSeg (false = train from scratch)
+
+eval:
+  batch_size: 32
+  workers: 8
+  max_per_label: 20     # cap val per (alphabet,label) during training for speed

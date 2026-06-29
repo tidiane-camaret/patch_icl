@@ -8,6 +8,7 @@ defaults:
 paths:
   checkpoints:  ${paths.results}/checkpoints
   totalsegmri:  ???   # set in cluster config
+  omniglot: /home/dpxuser/repos/omniglot/python   # dir holding images_background.zip / images_evaluation.zip
 
 data:
   dataset: totalseg   # totalseg | totalsegmri

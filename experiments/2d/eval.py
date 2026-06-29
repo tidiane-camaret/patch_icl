@@ -751,8 +751,18 @@ def main(cfg: DictConfig):
 
     else:
         from src.models.universeg_baseline import UniverSegBaseline
-        print(f"Loading UniverSeg (size={cfg.data.image_size})...")
-        model = UniverSegBaseline(pretrained=True, input_size=cfg.data.image_size).to(DEVICE).eval()
+        # eval.checkpoint (optional): load a fine-tuned UniverSeg saved by
+        # universeg_train.py ({"model": state_dict}). Absent -> pretrained baseline.
+        ckpt_path = cfg.eval.get("checkpoint", None)
+        print(f"Loading UniverSeg (size={cfg.data.image_size})"
+              + (f", checkpoint={ckpt_path}" if ckpt_path else " (pretrained)") + "...")
+        model = UniverSegBaseline(pretrained=True, input_size=cfg.data.image_size).to(DEVICE)
+        if ckpt_path:
+            _ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            _state = _ck["model"] if isinstance(_ck, dict) and "model" in _ck else _ck
+            _state = {k.removeprefix("_orig_mod."): v for k, v in _state.items()}
+            model.load_state_dict(_state)
+        model = model.eval()
 
         _img = torch.zeros(1, 1, cfg.data.image_size, cfg.data.image_size, device=DEVICE)
         _ctx_in  = torch.zeros(1, cfg.data.context_size, 1, cfg.data.image_size, cfg.data.image_size, device=DEVICE)
@@ -772,6 +782,7 @@ def main(cfg: DictConfig):
             "model_size":         cfg.data.image_size,
             "context_size": cfg.data.context_size,
             "split":        cfg.data.split,
+            "checkpoint":   str(ckpt_path) if ckpt_path else None,
             "flops":        flops,
         }
 
@@ -919,7 +930,10 @@ def main(cfg: DictConfig):
 
             else:
                 t0 = time.perf_counter()
-                with torch.autocast(device_type=DEVICE.type, enabled=DEVICE.type == "cuda"):
+                # bf16 (not default fp16): fine-tuned UniverSeg weights overflow under
+                # fp16 autocast and collapse to ~0 Dice; bf16 matches fp32 exactly here.
+                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
+                                    enabled=DEVICE.type == "cuda"):
                     out = model(images, context_in=context_in,
                                 context_out=context_out.to(DEVICE, non_blocking=True), mode="val")
                 preds = (out["final_logit"] > 0).float().cpu()   # (B, 1, H, W)

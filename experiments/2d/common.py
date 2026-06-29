@@ -114,8 +114,29 @@ def build_dataset(cfg, split: str):
             eval_subjects_per_task=s.sampling.eval_subjects_per_task,
             noise_bank_size=s.get("noise_bank_size", 256),
         )
+    if source == "omnisynth":
+        from src.datasets.omniSynth import (
+            OmniDiversityConfig, OmniSamplingConfig, OmniSceneConfig, OmniSynthICLDataset,
+        )
+        s = cfg.synth
+        # omniglot_root comes from cfg.paths.omniglot when the config tree includes a
+        # `paths` block (train configs do); the standalone eval_base.yaml has none, so
+        # fall back to OmniDiversityConfig's default path.
+        paths = cfg.get("paths", None)
+        div_kwargs = dict(s.diversity)
+        if paths is not None and paths.get("omniglot", None):
+            div_kwargs["omniglot_root"] = paths.omniglot
+        return OmniSynthICLDataset(
+            split=split,
+            context_size=cfg.data.context_size,
+            image_size=cfg.data.image_size,
+            diversity=OmniDiversityConfig(**div_kwargs),
+            scene=OmniSceneConfig(**dict(s.scene)),
+            sampling=OmniSamplingConfig(**dict(s.sampling)),
+        )
     raise ValueError(
-        f"unknown data.source {source!r} (medsegbench | biomedparse | totalseg2d | synthetic)")
+        f"unknown data.source {source!r} "
+        "(medsegbench | biomedparse | totalseg2d | synthetic | omnisynth)")
 
 
 def make_loader(ds, cfg, split: str, shuffle: bool) -> DataLoader:

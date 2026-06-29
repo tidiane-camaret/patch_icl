@@ -1,0 +1,24 @@
+# omniSynth generator (only used when data.source=omnisynth). In-context Omniglot:
+# a 4x4 grid of characters; k cells hold the target class (mask = ink pixels of
+# the target characters within those cells), the rest are distractors.
+# See docs/superpowers/specs/2026-06-29-omnisynth-design.md.
+# Reuses the `synth` package slot, so set data.source=omnisynth to select it.
+# @package synth
+diversity:
+  master_seed: 42
+  train_zip: images_background.zip   # 30 background alphabets -> train
+  eval_zip: images_evaluation.zip    # 20 evaluation alphabets -> val/test
+  val_test_split: 0.5                # fraction of eval classes -> val (rest -> test)
+scene:
+  grid: 4                # grid x grid cells fill the canvas (image_size must divide by grid)
+  k_min: 1               # target cells ~ U[k_min, k_max]
+  k_max: 6
+  cell_margin: 0.1       # fractional padding inside each cell (currently UNUSED; hardcoded at 0.1 in V1)
+  target_mode: class     # identical | aug | class  (what "same target" means)
+  aug_rotate: 15.0       # deg; aug-mode per-placement jitter
+  aug_scale: 0.1         # +/- log2 scale
+  aug_translate: 0.1     # fraction of cell
+sampling:
+  epoch_length: 10000
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0

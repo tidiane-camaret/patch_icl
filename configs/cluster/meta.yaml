@@ -5,6 +5,7 @@ paths:
   totalseg:    /work/dlclarge2/ndirt-SegFM3D/data/totalseg
   totalsegmri: /work/dlclarge2/ndirt-SegFM3D/data/totalsegmri
   nnunet:      /work/dlclarge2/ndirt-SegFM3D/results/nnunet
+  omniglot:    /home/dpxuser/repos/omniglot/python   # no cluster-specific copy; reuse dev path
 
 train:
   batch_size: 4
