@@ -1,5 +1,24 @@
 # Change log
 
+## 2026-06-28 — OOD generalization study of imagepfn_zoom (hard_diverse checkpoint)
+- Probed how the `2026-06-22_kind-durian-59` imagepfn_zoom checkpoint (trained on
+  `synth=hard_diverse`) generalizes outside its training distribution, on the held-out
+  val shape pool. In-dist anchor Dice = 0.648.
+- New eval configs: `configs/experiment/2d/synth/{ood_appearance,ood_conditions}.yaml`.
+  Appearance-only OOD (noise/contrast/texture pushed OOD, context correspondence kept
+  in-dist so ctx_dice unchanged) → Dice 0.648→0.261: a CLEAN −0.39 generalization gap.
+  Combined OOD → 0.071 but ctx_dice collapsed 0.164→0.045, so partly an artifact (no
+  usable context), not pure generalization.
+- Per-axis sweep (`results/controlsynth/sweep/run_sweep.sh`, 50 runs, num_tasks=2000):
+  each knob varied around its single training point. Used realized ctx_dice to split
+  info-preserving axes (drop = model brittleness) from ctx_dice-falling axes (drop partly
+  inherent). Findings: genuine weaknesses are appearance knobs only —
+  foreground_contrast (−0.30) ≫ noise (−0.19) ≈ texture (−0.14); support_query_scale is
+  robust to 2.5× trained; region_size extrapolates UPWARD better than in-range; ambiguity
+  axes handled gracefully. No catastrophic overfit (easy-side extrapolation flat-or-better).
+- Recommendation: randomize live appearance knobs during training (currently pinned to
+  single scalars in hard_diverse). Full writeup + figures: `results/controlsynth/sweep/SUMMARY.md`.
+
 ## 2026-06-24 — BiomedParse dataloading: benchmark + pre-resize pipeline
 - Benchmarked src/datasets/biomedparse.py loading. Bottleneck is purely PNG decode:
   every image/mask is a 1024x1024 RGBA PNG; decode->128 grayscale = ~33 ms/img, all CPU

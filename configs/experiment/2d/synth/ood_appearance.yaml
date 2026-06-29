@@ -1,0 +1,72 @@
+# @package synth
+# DISENTANGLING OOD probe: APPEARANCE-only shift, context information PRESERVED.
+#
+# The combined ood_conditions set also degraded context↔query correspondence
+# (support_query_shift/scale/translate, context_consistency), which collapses the
+# realized ctx_dice and makes the task near-impossible regardless of generalization.
+# This config instead keeps EVERYTHING in-distribution (geometry AND context
+# correspondence — shift/scale/translate/consistency/ambiguity all at hard_diverse
+# training values) and pushes ONLY the per-subject appearance knobs out of range:
+#
+#   noise_level           0.40 -> 0.85
+#   foreground_contrast   0.50 -> 0.15
+#   texture_heterogeneity 0.35 -> 0.75
+#
+# Because context correspondence is unchanged, the usable information content is the
+# same as in-distribution; a Dice drop here is a clean measure of the model failing to
+# generalize to an unseen *appearance* regime (vs. the task simply carrying less signal).
+#
+# Usage: python experiments/2d/eval.py model=imagepfn_zoom eval.checkpoint=<best.pt> \
+#          data.source=synthetic synth=ood_appearance \
+#          eval.synth_csv=results/controlsynth/ood_appearance.csv
+
+diversity:
+  num_tasks: 5000
+  num_labels: 20
+  master_seed: 42
+  splits: [0.9, 0.05, 0.05]
+
+build:                         # geometry: IN-distribution (identical to hard_diverse)
+  mode: per_task_sampled
+  morphology: {blob: 1, elongated: 1, annular: 1, tubular: 1, scattered: 1}
+  thinness: 0.5
+  tortuosity: 0.5
+  branching_density: 0.5
+  region_size: 0.45
+  boundary_complexity: 0.5
+  scattered_count: 12
+  scattered_clustering: 0.5
+  task_ambiguity: 0.5
+  boundary_amp_scale: 0.5
+  boundary_sigma_frac: 0.4
+  boundary_keep_largest: true
+  position_jitter: 0.15
+  sampled:                     # all IN-dist (identical to hard_diverse)
+    region_size: [0.12, 0.62]
+    boundary_complexity: [0.30, 1.00]
+    task_ambiguity: [0.30, 0.80]
+    branching_density: [0.30, 0.90]
+    scattered_count: [6, 24]
+    scattered_clustering: [0.00, 1.00]
+    thinness: [0.30, 0.90]
+    tortuosity: [0.20, 0.90]
+  n_bins: 5
+  bin_factor: task_ambiguity
+
+live:                          # context correspondence IN-dist; appearance OOD
+  support_query_shift: 0.50        # IN-dist
+  support_query_translate: 0.05    # IN-dist
+  support_query_scale: 0.45        # IN-dist
+  foreground_contrast: 0.15        # OOD (train 0.50): fainter foreground
+  texture_heterogeneity: 0.75      # OOD (train 0.35)
+  noise_level: 0.85                # OOD (train 0.40)
+  context_copy_fraction: 0.0
+  context_consistency: 0.90        # IN-dist
+  task_ambiguity_intensity: 0.60   # IN-dist
+
+sampling:
+  epoch_length: 20000
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+
+noise_bank_size: 256

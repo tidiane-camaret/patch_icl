@@ -31,3 +31,7 @@ docs/tabpfn/*.pdf
 results/2d/**/*.csv
 results/2d/**/*.png
 results/controlsynth/**/*.png
+results/controlsynth/hard_diverse.csv
+results/controlsynth/sweep/*.csv
+results/controlsynth/sweep/*.log
+

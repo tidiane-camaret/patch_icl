@@ -1,0 +1,80 @@
+# @package synth
+# OUT-OF-DISTRIBUTION eval set for the imagepfn_zoom model trained on synth=hard_diverse.
+#
+# Generalization probe: the SHAPE distribution is held IN-distribution (build.sampled
+# ranges, morphology mix, region_size and all geometry knobs are identical to
+# hard_diverse), so the model sees the same *kinds* of shapes it trained on. What is
+# pushed OUT of the training envelope is the imaging/appearance, context-reliability,
+# deformation, and identification-ambiguity regime. A Dice drop vs the in-distribution
+# hard_diverse eval is therefore attributable to OOD *conditions*, not to degenerate
+# geometry (region_size is deliberately NOT shrunk below its 0.12 sub-patch floor, which
+# the difficulty study flags as a floor artifact rather than genuine difficulty).
+#
+# Eval protocol (diversity / splits / sampling / context_size) is identical to
+# hard_diverse so the only thing that changes is the difficulty distribution.
+#
+#   knob                       train (hard_diverse)   -> OOD
+#   task_ambiguity (build)     [0.30, 0.80]           -> [0.85, 1.00]
+#   task_ambiguity_intensity   0.60                   -> 0.95
+#   support_query_shift        0.50                   -> 0.90
+#   support_query_scale        0.45                   -> 0.90
+#   support_query_translate    0.05                   -> 0.20
+#   foreground_contrast        0.50                   -> 0.15
+#   texture_heterogeneity      0.35                   -> 0.75
+#   noise_level                0.40                   -> 0.85
+#   context_consistency        0.90                   -> 0.55
+#
+# Usage: python experiments/2d/eval.py model=imagepfn_zoom eval.checkpoint=<best.pt> \
+#          data.source=synthetic synth=ood_conditions \
+#          eval.synth_csv=results/controlsynth/ood_conditions.csv
+
+diversity:
+  num_tasks: 5000
+  num_labels: 20
+  master_seed: 42
+  splits: [0.9, 0.05, 0.05]   # same held-out val/test shape pools as hard_diverse
+
+build:                         # geometry: IN-distribution (identical to hard_diverse)
+  mode: per_task_sampled
+  morphology: {blob: 1, elongated: 1, annular: 1, tubular: 1, scattered: 1}
+  thinness: 0.5
+  tortuosity: 0.5
+  branching_density: 0.5
+  region_size: 0.45
+  boundary_complexity: 0.5
+  scattered_count: 12
+  scattered_clustering: 0.5
+  task_ambiguity: 0.9          # fallback (the OOD value sits in `sampled` below)
+  boundary_amp_scale: 0.5
+  boundary_sigma_frac: 0.4
+  boundary_keep_largest: true
+  position_jitter: 0.15
+  sampled:
+    region_size: [0.12, 0.62]          # IN-dist
+    boundary_complexity: [0.30, 1.00]  # IN-dist
+    branching_density: [0.30, 0.90]    # IN-dist
+    scattered_count: [6, 24]           # IN-dist
+    scattered_clustering: [0.00, 1.00] # IN-dist
+    thinness: [0.30, 0.90]             # IN-dist
+    tortuosity: [0.20, 0.90]           # IN-dist
+    task_ambiguity: [0.85, 1.00]       # OOD: more / closer shape-distractors than trained
+  n_bins: 5
+  bin_factor: task_ambiguity
+
+live:                          # conditions: OUT-of-distribution (harder than trained)
+  support_query_shift: 0.90        # context geometry far more misaligned with query
+  support_query_translate: 0.20    # larger within-set centroid spread
+  support_query_scale: 0.90        # larger within-set scale spread
+  foreground_contrast: 0.15        # fainter foreground than ever trained
+  texture_heterogeneity: 0.75      # much stronger within-region intensity variation
+  noise_level: 0.85                # heavy additive noise
+  context_copy_fraction: 0.0
+  context_consistency: 0.55        # much noisier context masks than trained (0.90)
+  task_ambiguity_intensity: 0.95   # near-all distractors also share fg intensity
+
+sampling:
+  epoch_length: 20000
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+
+noise_bank_size: 256
