@@ -46,11 +46,8 @@ from tqdm import tqdm
 
 _ROOT = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, _ROOT)
-# Import patch_icl modules BEFORE common.py inserts ic_segmentation into sys.path.
-# ic_segmentation has its own src/__init__.py which would shadow our src/ if
-# imported first.  By importing here we cache the correct modules in sys.modules;
-# common.py's own "from src.datasets..." then finds the cached version and succeeds.
-from src.datasets.medsegbench import MedSegBenchDataset  # noqa: F401  (caches patch_icl's src)
+# Put patch_icl's repo root on sys.path before importing common / src modules.
+from src.datasets.medsegbench import MedSegBenchDataset  # noqa: F401
 from src.models.pfn_seg_2d import ImagePFN
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

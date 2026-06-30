@@ -1,0 +1,52 @@
+# Train PatchSetCNN — a simple low-resolution in-context segmentation model — on a
+# 2D dataset (default: omniSynth). Shared params come from train_base.yaml; the
+# transformer hyperparams (arch.e/h/l/a/thinking_rows/residual_decay) are inherited
+# and extended here with the encoder/bottleneck knobs.
+#
+# Prediction is at arch.resolution (R×R); the trainer pools the GT mask to R×R for
+# the loss. enc_dims must have log2(image_size/resolution)+1 entries (one stem + one
+# per stride-2 stage), e.g. 128→16 needs 4. The encoder concatenates every stage's
+# feature map (pooled to R×R), so the per-patch feature dim = sum(enc_dims).
+#
+#   python experiments/2d/train.py --config-name patchset_cnn_train synth=omniglot
+#   python experiments/2d/train.py --config-name patchset_cnn_train synth=omniglot \
+#       synth.scene.target_mode=mix arch.resolution=16
+defaults:
+  - train_base
+  - _self_
+
+model: patchset_cnn
+
+data:
+  source: omnisynth
+  image_size: 128       # grid=4 -> 32px cells
+  context_size: 3
+
+arch:
+  resolution: 16              # bottleneck/prediction grid (R×R)
+  enc_dims: [64, 64, 64, 64]  # UniverSeg per-stage widths; stem + 3 stride-2 stages
+                              # (len = log2(128/16)+1 = 4). Encoder concats all → 256 ch
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 1
+  residual_decay: 0.95
+  query_self_attn: true      # let query patches attend to each other (within-target)
+
+train:
+  epochs: 50
+  batch_size: 64
+  lr: 3.0e-4
+  adam_wd: 0.01
+  grad_clip: 1.0
+  dice_weight: 1.0
+  warmup_epochs: 1
+  eval_every: 1
+  workers: 16
+  seed: 42
+
+eval:
+  batch_size: 64
+  workers: 16
+  max_per_label: 100000     # cap val per (alphabet,label) during training for speed

@@ -8,7 +8,7 @@ diversity:
   master_seed: 42
   train_zip: images_background.zip   # 30 background alphabets -> train
   eval_zip: images_evaluation.zip    # 20 evaluation alphabets -> val/test
-  val_test_split: 1                # fraction of eval classes -> val (rest -> test)
+  val_test_split: 0.5                # fraction of eval classes -> val (rest -> test)
 scene:
   grid: 4                # grid x grid cells fill the canvas (image_size must divide by grid)
   k_min: 1               # target cells ~ U[k_min, k_max]
@@ -20,5 +20,5 @@ scene:
   aug_translate: 0.2     # fraction of cell
 sampling:
   epoch_length: 10000
-  eval_subjects_per_task: 50
+  eval_subjects_per_task: 4
   eval_seed_namespace: 0

@@ -42,13 +42,10 @@ import wandb
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-# For the pfn_seg backend, patch_icl's `src` package must win over ic_segmentation's
-# shadowing copy (common.py puts the latter on sys.path). Cache patch_icl's src
-# package before common imports from it — mirrors pfn_seg.py. Skipped for the
-# universeg backends, which rely on ic_segmentation's src.models.universeg_baseline.
-if any(("pfn_seg" in _a) or ("patchset_pfn" in _a) or ("imagepfn_zoom" in _a) for _a in sys.argv):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    import src.datasets.medsegbench  # noqa: F401  (caches patch_icl's src)
+# patch_icl's src package on sys.path for every backend (pfn_seg, universeg, ...).
+# universeg_baseline is now vendored in patch_icl, so there is no ic_segmentation
+# shadowing to work around.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_loader, hard_dice, soft_dice, downsample_mask, log_summary
@@ -473,16 +470,7 @@ def main(cfg: DictConfig):
         }
 
     elif is_pfn_seg:
-        # pfn_seg_2d lives in patch_icl's src, but common.py puts ic_segmentation
-        # (which has its own shadowing src/) ahead on sys.path, so a plain
-        # `import src.models.pfn_seg_2d` resolves to the wrong package. The module
-        # only depends on torch, so load it directly by file path.
-        import importlib.util
-        _pfn_path = Path(__file__).resolve().parents[2] / "src" / "models" / "pfn_seg_2d.py"
-        _spec = importlib.util.spec_from_file_location("pfn_seg_2d", _pfn_path)
-        _pfn_mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_pfn_mod)
-        ImagePFN = _pfn_mod.ImagePFN
+        from src.models.pfn_seg_2d import ImagePFN
         arch = dict(pfn_ckpt["arch"])
         img_size = pfn_ckpt["image_size"]
         # New checkpoints store `resolution` (+ `input_patch_size`); old ones store
@@ -752,7 +740,7 @@ def main(cfg: DictConfig):
     else:
         from src.models.universeg_baseline import UniverSegBaseline
         # eval.checkpoint (optional): load a fine-tuned UniverSeg saved by
-        # universeg_train.py ({"model": state_dict}). Absent -> pretrained baseline.
+        # train.py ({"model": state_dict}). Absent -> pretrained baseline.
         ckpt_path = cfg.eval.get("checkpoint", None)
         print(f"Loading UniverSeg (size={cfg.data.image_size})"
               + (f", checkpoint={ckpt_path}" if ckpt_path else " (pretrained)") + "...")

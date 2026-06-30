@@ -34,7 +34,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "experiments" / "2d"))
 
-# patch_icl src must be cached before common.py inserts ic_segmentation's shadowing src.
+# Ensure patch_icl's src is importable before importing common.
 from src.datasets.medsegbench import MedSegBenchDataset  # noqa: F401
 from common import build_dataset  # noqa: E402
 

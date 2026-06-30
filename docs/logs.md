@@ -1,5 +1,25 @@
 # Change log
 
+## 2026-06-30 — BiomedParseDataset init: skip the ~1.8h NFS glob/stat via the store index
+- Symptom: `eval.py data.source=biomedparse` "dataloading takes forever" — init never
+  reached the eval loop. Cause was entirely in `BiomedParseDataset.__init__`, not decode:
+  it rebuilt the sample index by globbing the raw PNG tree (`_discover_sources` at depths
+  1–4 = 67s) and calling `os.path.exists` on the sibling image of every one of ~179k masks.
+  Measured ~37ms/stat over this NFS mount → ~6600s (~1.8h) of pure stat() before iteration.
+- The pre-resized store already ships a per-dataset `index_{S}.npz` (written by
+  `scripts/datasets/biomedparse/to_npz.py`) recording image/mask paths relative to
+  data_root in the exact discovery order. The fast pixel-path read those stores but the
+  index was still rebuilt from scratch every run.
+- Fix (`src/datasets/biomedparse.py`): when `use_npy`, discover datasets from the store
+  tree (`_discover_stores`: ~41 dirs under `_npy/<split>`) and rebuild each sample index
+  from its `index_{S}.npz` (`_index_from_npz`) — zero PNG globs, zero per-mask stats. The
+  raw PNG-tree scan (`_discover_sources` + per-mask `os.path.exists`) is kept as the
+  fallback when `use_npy=False` or no store exists for the requested size.
+- Result: test-split init 179,284 samples / 41 datasets in **35.6s** (was >900s, timed out),
+  all on the npy fast-path. Sample count + ordering match the PNG path (to_npz uses the
+  identical `_collect` discovery, so `index_{S}.npz` rows align with the image/mask stacks).
+  Self-test (PNG fallback) still passes; item shapes/ranges/binary masks spot-checked.
+
 ## 2026-06-29 — omniSynth: in-context Omniglot grid dataset wired into 2D pipeline
 - New dataset `src/datasets/omniSynth/`: in-context 2D segmentation from Omniglot characters
   arranged on a grid. A task = one target character class; each scene is a 4x4 grid where
@@ -1884,3 +1904,61 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
 - multilevel/train.py train_epoch returns per-hop dicts; logs train/dice_soft_r{grid}/mean
   and train/dice_r{grid}/mean (mirrors val dice_soft_r* naming). Measured on each hop's
   sampled query patches (what it trains on), so reads slightly above the full-grid val metric.
+- universeg_train.py: train Dice was never logged (train_epoch only returned loss; the
+  soft-dice term was folded into the loss, and log_summary ran only on val output). Added
+  per-batch hard_dice accumulation over train predictions; train_epoch now returns
+  (loss, train_dice), logged as train/dice and shown in the per-epoch console line + tqdm
+  postfix. Monitoring only (under no_grad), independent of synth=omniglot / pretrained flags.
+- New model src/models/patchset_cnn.py (PatchSetCNN): trainable single-stream conv
+  encoder downsamples each image to an R×R grid (default 16), then ImagePFN's dual-axis
+  TransformerEncoderStack reasons in-context over [img | mask-occupancy] columns. Mask
+  token = scalar avg-pool occupancy (Linear(1→e)); query mask = context-mean prior. Head
+  is a per-patch Linear → R×R logits (no decoder/upsampling); loss vs avg-pooled GT.
+- Fused experiments/2d/{universeg_train.py + patchset_cnn trainer} → experiments/2d/train.py.
+  One model-agnostic loop: both models called as model(img, context_in, context_out, mode)
+  -> {"final_logit"}; GT is avg-pooled to the logit's spatial size (no-op for UniverSeg
+  H×W, R×R downsample for PatchSetCNN). Model selected by cfg.model (universeg | patchset_cnn).
+  New config configs/experiment/2d/patchset_cnn_train.yaml; universeg_train.yaml kept.
+  Removed universeg_train.py.
+- Removed ic_segmentation dependency entirely. universeg_baseline lived only in
+  ic_segmentation/src/models and was reached via common.py putting ic_segmentation on
+  sys.path, whose src/__init__.py shadowed patch_icl's src. Vendored universeg_baseline.py
+  into src/models/, dropped the ic_segmentation sys.path insert in common.py, and removed
+  the shadowing workarounds (eval.py importlib-by-path load of pfn_seg_2d → plain import;
+  stale "cache before ic_segmentation" comments in pfn_seg.py/multilevel/train.py/
+  plot_synth_samples.py). `src` is now unambiguously patch_icl.
+- Low-res Dice metric: hard Dice at R×R is degenerate for thin omniglot strokes (avg-pooled
+  GT binarized at 0.5 is ~empty → NaN). train.py now logs BOTH soft Dice (threshold-free,
+  prob vs occupancy) and hard Dice (pred≥0.5, GT>0) for train and val, and selects the best
+  checkpoint on soft (dice_soft/mean). Mirrors multilevel/train.py's dice_soft/dice pair.
+- PatchSetCNN encoder reworked to UniverSeg per-stage widths + multi-scale concat:
+  enc_dims default [64,64,64,64] (UniverSeg v1 encoder_blocks). ConvEncoder now keeps
+  the stem + every stage feature map, avg-pools each to R×R, and concatenates along
+  channels (out_ch = sum(enc_dims) = 256) instead of returning only the last stage.
+  img_embed = Linear(sum(enc_dims) → e) adapts automatically; per-patch tokens now carry
+  low- through high-level features. ~4.44M params at e=256.
+- train.py metric consistency: `dice` (hard) is now computed at the ORIGINAL resolution
+  — preds upscaled (bilinear) to H×W, thresholded ≥0.5, vs the full-res GT (>0). This is a
+  no-op for native-res UniverSeg, so the headline `dice` is directly comparable across
+  models/resolutions. The soft metric (prob vs pooled occupancy at the model's logit res)
+  is renamed dice_soft → `dice_ds_soft` (downsampled). wandb: train/dice_ds_soft, train/dice,
+  dice_ds_soft/*, dice/*; best-checkpoint still on dice_ds_soft/mean. NB: a 16×16 PatchSetCNN
+  upscaled to 128 cannot recover sub-patch thin strokes, so its native `dice` is capped — it
+  reads the achievable native accuracy, while dice_ds_soft reflects the training objective.
+- PatchSetCNN switched from image-grid to SET-of-patches attention (PatchSetPFN layout).
+  Motivation: the image-grid layout's cross-image (sample-axis) attention is position-
+  locked — query patch (i,j) attends only to context patch (i,j) — which is wasteful when
+  objects aren't spatially aligned across images (omniSynth chars in random cells). New
+  layout: rows = thinking + support patches (K·N) + query patches (N); cols = [img|mask].
+  Sample-axis attention is now full-set content matching (query patches attend to all
+  support patches); the patch (i,j) is injected as a Fourier positional FEATURE
+  (FourierPositionalEncoding reused from patchset_pfn) instead of being enforced by
+  structure. Replaced the learned pos_embed; per-channel feature standardization now uses
+  support-patch stats. Query mask token = support-mean occupancy prior.
+  Supporting fix: pfn_seg_2d TransformerEncoderLayer feature-axis now uses batched_sdpa
+  (was plain SDPA) so the b*rows grid stays under the CUDA gridDim.y cap (65535) when rows
+  = all patches (e.g. B=64, R=16 → 65600 rows). No-op for existing small-batch ImagePFN use.
+- PatchSetCNN: added query_self_attn flag (arch.query_self_attn, default false), mirroring
+  PatchSetPFN. When true, query patches attend to each other (within-target spatial
+  reasoning) in addition to the support set, via an (r×r) bool attn_mask passed to the
+  sample-axis. Queries carry the prior (not GT) so query↔query attention leaks no labels.

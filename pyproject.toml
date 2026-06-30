@@ -5,10 +5,6 @@ description = "patch-based icl on images"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    # PyTorch — install separately with the cu124 index (see README)
-    # uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-    "torch>=2.5.1",
-    "torchvision>=0.20.0",
     # Scientific stack
     "numpy>=1.26",
     "scipy>=1.13",
@@ -26,13 +22,54 @@ dependencies = [
     "pillow>=10.0",
     "tqdm>=4.66",
     "psutil>=6.0",
-    # nnUNet (ResEncEncoder + dynamic_network_architectures)
+    # nnUNet (ResEncEncoder + dynamic_network_architectures) — pulls torch transitively
     "nnunetv2>=2.5",
     "pytorch-lightning>=2.6.4",
     "tabulate>=0.10.0",
     "monai>=1.5.2",
 ]
 
+# Pick exactly one of these at sync time:
+#   uv sync --extra cu124   # older Ampere/Hopper boxes
+#   uv sync --extra cu128   # Blackwell (sm_120, e.g. RTX PRO 6000)
+#   uv sync --extra cpu     # laptop / CI
+[project.optional-dependencies]
+cu124 = ["torch>=2.5.1", "torchvision>=0.20.0"]
+cu128 = ["torch>=2.5.1", "torchvision>=0.20.0"]
+cpu   = ["torch>=2.5.1", "torchvision>=0.20.0"]
+
 [tool.uv]
-# Pull torch/torchvision from the CUDA 12.4 wheel index.
-extra-index-url = ["https://download.pytorch.org/whl/cu124"]
+conflicts = [
+    [
+        { extra = "cu124" },
+        { extra = "cu128" },
+        { extra = "cpu" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cpu",   extra = "cpu"   },
+]
+torchvision = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cpu",   extra = "cpu"   },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

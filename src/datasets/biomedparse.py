@@ -106,6 +106,47 @@ def _discover_sources(
     return sorted(sources)
 
 
+def _discover_stores(
+    npy_root: str, split: str, size: int, datasets: Optional[List[str]],
+) -> List[Tuple[str, str]]:
+    """Find every (ds_key, index_npz) pre-resized store under <npy_root>/<split>.
+
+    A store dir holds images_{S}.npy + masks_{S}.npy + index_{S}.npz, all written
+    together by scripts/datasets/biomedparse/to_npz.py. ds_key is the dir's path
+    relative to <npy_root>/<split>, which equals _discover_sources' collapsed key.
+    `datasets`, if given, filters by the top-level segment of ds_key.
+
+    This lets the use_npy path enumerate datasets from the ~41-dir store tree instead
+    of globbing the raw PNG tree at depths 1-4 and stat-ing every one of ~180k masks
+    (the latter is ~1.8h over NFS at ~37ms/stat).
+    """
+    base = os.path.join(npy_root, split)
+    if not os.path.isdir(base):
+        return []
+    out: List[Tuple[str, str]] = []
+    for dirpath, _dirs, files in os.walk(base):
+        if f"index_{size}.npz" in files and f"images_{size}.npy" in files:
+            ds_key = os.path.relpath(dirpath, base)
+            if datasets is not None and ds_key.split(os.sep)[0] not in datasets:
+                continue
+            out.append((ds_key, os.path.join(dirpath, f"index_{size}.npz")))
+    return sorted(out)
+
+
+def _index_from_npz(idx_npz: str, data_root: str) -> Tuple[List[str], List[str]]:
+    """Load (image_paths, mask_paths) as absolute paths from a store's index_{S}.npz.
+
+    to_npz.py stores both arrays relative to data_root in the dataset's exact
+    discovery order (sorted mask-glob, absent/orphan masks already dropped), so
+    joining with data_root reproduces the paths __init__ would have globbed — with
+    zero filesystem stats.
+    """
+    z = np.load(idx_npz, allow_pickle=False)
+    image_paths = [os.path.join(data_root, str(p)) for p in z["image_paths"]]
+    mask_paths = [os.path.join(data_root, str(p)) for p in z["mask_paths"]]
+    return image_paths, mask_paths
+
+
 def _parse_mask_stem(mask_stem: str) -> Tuple[str, str, str, str]:
     """
     Split a mask filename stem into (image_stem, modality, site, target).
@@ -201,7 +242,17 @@ class BiomedParseDataset(Dataset):
         self._npy: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._mask_row: Dict[Tuple[str, int, int], int] = {}  # (ds, img_idx, tgt) -> store row
         img_dir_name, mask_dir_name = _SPLIT_DIRS[split]
-        sources = _discover_sources(data_root, img_dir_name, mask_dir_name, datasets)
+        # Fast discovery: when reading the pre-resized store, enumerate datasets from
+        # the store tree and rebuild each sample index from its index_{S}.npz — no PNG
+        # glob, no per-mask stat. Falls back to the raw PNG-tree scan when use_npy is
+        # off or no store exists for this size. sources is a 4-tuple per dataset:
+        # (ds_key, img_dir, mask_dir, idx_npz); idx_npz is None on the PNG path.
+        stores = _discover_stores(self.npy_root, split, image_size, datasets) if use_npy else []
+        if stores:
+            sources = [(ds, None, None, idx_npz) for ds, idx_npz in stores]
+        else:
+            sources = [(ds, img_dir, mask_dir, None) for ds, img_dir, mask_dir in
+                       _discover_sources(data_root, img_dir_name, mask_dir_name, datasets)]
 
         # COW-safe sample index, built from parallel int lists below (see cow_index).
         self._ds_names: List[str] = []
@@ -225,7 +276,7 @@ class BiomedParseDataset(Dataset):
             lambda path: _read_mask_tensor(path, sz))
 
         print(f"Loading BiomedParseData (size={image_size}, split={split})...")
-        for ds, img_dir, mask_dir in sources:
+        for ds, img_dir, mask_dir, idx_npz in sources:
             ds_id = len(self._ds_names)
             self._ds_names.append(ds)
             image_idx_of: Dict[str, int] = {}   # image_stem -> image_idx (per dataset)
@@ -234,15 +285,32 @@ class BiomedParseDataset(Dataset):
             i2t = self.int_to_target.setdefault(ds, {})
             n_before = len(_ds_ids)
 
-            for mask_path in sorted(glob.glob(os.path.join(mask_dir, "*.png"))):
+            # Mask paths to index + how to resolve each mask's image. From the npz
+            # store (pre-filtered, no stat) when present, else by globbing + stat. The
+            # in-loop first-seen image order reproduces the store's image-row order, so
+            # img_idx stays aligned with images_{S}.npy either way.
+            if idx_npz is not None:
+                image_abs, mask_items = _index_from_npz(idx_npz, data_root)
+                stem_to_img = {os.path.splitext(os.path.basename(p))[0]: p
+                               for p in image_abs}
+            else:
+                mask_items = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+                stem_to_img = None
+
+            for mask_path in mask_items:
                 if os.path.basename(mask_path) == _ABSENT_MASK:
-                    continue  # "target not present" sentinel
+                    continue  # "target not present" sentinel (npz already excludes)
                 stem = os.path.splitext(os.path.basename(mask_path))[0]
                 image_stem, modality, site, target = _parse_mask_stem(stem)
 
-                img_path = os.path.join(img_dir, image_stem + ".png")
-                if not os.path.exists(img_path):
-                    continue  # mask with no matching image — skip
+                if stem_to_img is None:
+                    img_path = os.path.join(img_dir, image_stem + ".png")
+                    if not os.path.exists(img_path):
+                        continue  # mask with no matching image — skip
+                else:
+                    img_path = stem_to_img.get(image_stem)
+                    if img_path is None:
+                        continue  # mask's image not in store index (shouldn't happen)
 
                 if image_stem not in image_idx_of:
                     image_idx_of[image_stem] = len(paths)

@@ -49,7 +49,7 @@ from tqdm import tqdm
 
 _ROOT = str(Path(__file__).resolve().parents[3])
 sys.path.insert(0, _ROOT)
-# Cache patch_icl's src before common.py inserts ic_segmentation's shadowing src.
+# Put patch_icl's repo root on sys.path before importing common / src modules.
 from src.datasets.medsegbench import MedSegBenchDataset   # noqa: F401
 from src.models.pfn_seg_2d import ImagePFN
 from src.models.patchset_pfn import PatchSetPFN

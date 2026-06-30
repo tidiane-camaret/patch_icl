@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, "/home/dpxuser/ic_segmentation")
 sys.path.insert(0, "/home/dpxuser/repos/UniverSeg")
 
 from src.datasets.medsegbench import MedSegBenchDataset
@@ -65,8 +64,7 @@ def build_dataset(cfg, split: str):
 
     The single source of truth for "source -> dataset" wiring; all train/eval
     scripts go through here. Source-specific deps (biomedparse, controlSynth) are
-    imported lazily so the common medsegbench path stays import-light and the
-    patch_icl `src` package wins over ic_segmentation's shadowing copy.
+    imported lazily so the common medsegbench path stays import-light.
     """
     source = cfg.data.get("source", "medsegbench")
     datasets = [cfg.data.dataset] if cfg.data.get("dataset", None) else None

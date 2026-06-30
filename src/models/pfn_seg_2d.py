@@ -143,11 +143,13 @@ class TransformerEncoderLayer(nn.Module):
         a, d = self.a, self.d
 
         # ── Feature-axis: spatial attention within each image ──────────────────
+        # batched_sdpa (not plain SDPA) so the b*r grid stays under the gridDim.y cap
+        # when r is large (e.g. set-of-patches layouts where rows = all patches).
         x = src.reshape(b * r, c, e)
         res = x
         x = self.norm1(x)
         qkv = self.qkv_col(x).reshape(b * r, c, 3, a, d).permute(2, 0, 3, 1, 4)
-        x = F.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2])
+        x = batched_sdpa(qkv[0], qkv[1], qkv[2])
         x = x.transpose(1, 2).reshape(b * r, c, e)
         src = (res + x).reshape(b, r, c, e)
 

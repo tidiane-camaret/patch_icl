@@ -30,4 +30,4 @@ train:
 eval:
   batch_size: 64
   workers: 16
-  max_per_label: 100000     # cap val per (alphabet,label) during training for speed
+  max_per_label: 20     # cap val per (alphabet,label) during training for speed
