@@ -211,6 +211,22 @@ def soft_dice(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return float(2 * (p * g).sum() / den) if den > 1e-6 else float("nan")
 
 
+def cosine_sim(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> float:
+    """Scale-invariant similarity of two soft maps: Σ(p·g) / (‖p‖·‖g‖).
+
+    Unlike soft_dice, the magnitude cancels (the denominator is quadratic in the
+    values, matching the numerator), so it reaches 1.0 whenever pred and GT agree in
+    shape/location regardless of the absolute occupancy — a meaningful 0→1 progress
+    signal at low prediction resolutions, where avg-pooling a sparse mask yields tiny
+    (≪0.5) soft targets that pin soft_dice near its mean-occupancy ceiling. Returns
+    NaN when the GT map is empty.
+    """
+    p = pred.float().flatten()
+    g = gt.float().flatten()
+    den = p.norm() * g.norm()
+    return float((p * g).sum() / den) if den > eps else float("nan")
+
+
 def batch_dice_sums(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
     """Batched soft & hard Dice SUMS for cheap *training-accuracy* logging.
 

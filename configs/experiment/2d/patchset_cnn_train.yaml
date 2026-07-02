@@ -28,11 +28,14 @@ arch:
                               # (len = log2(128/16)+1 = 4). Encoder concats all → 256 ch
   e: 256
   h: 512
-  l: 6
+  l: 1
   a: 4
   thinking_rows: 1
   residual_decay: 0.95
   query_self_attn: true      # let query patches attend to each other (within-target)
+  context_id_embed: true     # learned per-context-image tag so attention can group/tell
+                             # apart source images (incl. identical instCopy duplicates)
+  max_context: 16            # size of the context-id embedding table (context_size ≤ this)
 
 train:
   epochs: 50

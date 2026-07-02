@@ -29,8 +29,6 @@ Design choices (see docs/logs.md):
     the full-set cross-patch matching (query patches attend to support patches only).
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,22 +40,22 @@ from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
 class ConvEncoder(nn.Module):
     """Single-stream conv encoder with multi-scale feature concatenation.
 
-    (B, in_ch, H, W) → (B, sum(dims), R, R). One feature map is produced per stage
-    (stem at full res, then one per stride-2 stage); every map is avg-pooled to the
-    bottleneck resolution R and concatenated along channels, so each output patch
-    token carries low- through high-level features (cf. UniverSeg's per-stage 64-wide
-    encoder blocks). `dims` are the per-stage channel widths. Each stage is a strided
-    conv + a same-resolution conv (GroupNorm + LeakyReLU); one stream, no cross-conv.
+    (B, in_ch, H, W) → (B, sum(dims), R, R). The encoder DEPTH is set purely by
+    `len(dims)` — a full-res stem + (len(dims)-1) stride-2 stages — so the deepest
+    map lands at H / 2**(len(dims)-1), the encoder's *natural* resolution. The token
+    grid R is decoupled from that: every scale is resampled to R×R (area-pool to
+    downsample, bilinear to upsample) and concatenated along channels, so each output
+    patch token carries low- through high-level features (cf. UniverSeg's per-stage
+    64-wide encoder blocks) regardless of how R compares to the encoder depth. `dims`
+    are the per-stage channel widths. Each stage is a strided conv + a same-resolution
+    conv (GroupNorm + LeakyReLU); one stream, no cross-conv.
     """
-    def __init__(self, in_ch: int, dims: tuple[int, ...], image_size: int,
-                 resolution: int, groups: int = 8):
+    def __init__(self, in_ch: int, dims: tuple[int, ...], resolution: int,
+                 groups: int = 8):
         super().__init__()
+        assert len(dims) >= 1, "dims needs at least a stem width"
         self.resolution = resolution
-        n_down = int(round(math.log2(image_size / resolution)))
-        assert 2 ** n_down * resolution == image_size, \
-            f"image_size {image_size} must be resolution {resolution} × a power of 2"
-        assert len(dims) == n_down + 1, \
-            f"need len(dims)={n_down + 1} for {image_size}→{resolution}, got {len(dims)}"
+        n_down = len(dims) - 1                          # depth from architecture, not R
 
         def cbr(ci, co, stride):
             return nn.Sequential(
@@ -74,13 +72,23 @@ class ConvEncoder(nn.Module):
         ])
         self.out_ch = sum(dims)                        # concatenated multi-scale width
 
+    @staticmethod
+    def _resample(f: torch.Tensor, R: int) -> torch.Tensor:
+        """Resize an (B,C,h,w) feature map to R×R: area-pool when shrinking, bilinear
+        when growing — so R can be smaller OR larger than the feature's native size."""
+        if f.shape[-1] == R:
+            return f
+        if f.shape[-1] > R:
+            return F.interpolate(f, size=(R, R), mode="area")
+        return F.interpolate(f, size=(R, R), mode="bilinear", align_corners=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         R = self.resolution
         feats = [self.stem(x)]                         # full-res stem features
         for stage in self.stages:
             feats.append(stage(feats[-1]))             # successively downsampled stages
-        # Pool every scale to R×R (last stage is already R) and concat along channels.
-        feats = [f if f.shape[-1] == R else F.adaptive_avg_pool2d(f, (R, R)) for f in feats]
+        # Resample every scale to the token grid R×R and concat along channels.
+        feats = [self._resample(f, R) for f in feats]
         return torch.cat(feats, dim=1)                 # (B, sum(dims), R, R)
 
 
@@ -98,16 +106,35 @@ class PatchSetCNN(nn.Module):
         residual_decay: float = 0.95,
         fourier_bands: int = 8,
         query_self_attn: bool = False,
+        context_id_embed: bool = False,
+        max_context: int = 16,
     ):
         super().__init__()
         self.image_size = image_size
         self.resolution = resolution
         self.N = resolution ** 2
         self.query_self_attn = query_self_attn
-        self.encoder = ConvEncoder(1, tuple(enc_dims), image_size, resolution)
+        self.context_id_embed = context_id_embed
+        self.max_context = max_context
+        self.encoder = ConvEncoder(1, tuple(enc_dims), resolution)
         self.img_embed = nn.Linear(self.encoder.out_ch, e)
         self.mask_embed = nn.Linear(1, e)              # scalar occupancy → e
         self.pos = FourierPositionalEncoding(e, fourier_bands)   # (i,j) → e, added to both cols
+        # Optional per-context-image identity: a learned tag added to all patches of a
+        # given context image (shared across its N patches, both cols), so the otherwise
+        # permutation-invariant patch set can be grouped by source image. The query image
+        # gets its own learned tag. Without this, two context images with identical content
+        # (e.g. instCopy duplicates) yield byte-identical tokens and are indistinguishable.
+        if context_id_embed:
+            self.ctx_id = nn.Embedding(max_context, e)     # support image slot → e
+            self.qry_id = nn.Parameter(torch.zeros(e))     # the target image's tag
+            # Small-norm init (σ≈0.1) puts this learnable identity embedding in the
+            # rich/feature-learning regime — the Adam sweet spot from Ito et al. (2025),
+            # "Learning interpretable positional encodings depends on initialization".
+            # nn.Embedding's default (σ=1) is the lazy/memorization regime; σ≲0.05 also
+            # hurts under Adam (adaptive LR jumps back to the kernel regime).
+            nn.init.normal_(self.ctx_id.weight, std=0.1)
+            nn.init.normal_(self.qry_id, std=0.1)
         self.thinking = ThinkingRows(thinking_rows, e)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
         self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, 1))
@@ -162,6 +189,19 @@ class PatchSetCNN(nn.Module):
         # ── set-of-patches transformer: rows = [support | query], cols = [img|mask]
         sup_tok = self._tokens(sup_feat, sup_occ, sup_ij)                 # (B,S,2,e)
         qry_tok = self._tokens(qry_feat, qry_occ, qry_ij)                 # (B,Q,2,e)
+
+        # Per-image identity: same tag for all N patches of a context image (image-major
+        # order in sup_*), added to both cols; the target image gets its own tag. Lets the
+        # attention group patches by source image (and tell apart identical context copies).
+        if self.context_id_embed:
+            assert K <= self.max_context, \
+                f"context_size {K} exceeds max_context {self.max_context}"
+            e_dim = sup_tok.shape[-1]
+            ctx_emb = self.ctx_id(torch.arange(K, device=sup_tok.device))  # (K,e)
+            ctx_emb = ctx_emb.repeat_interleave(N, dim=0)                  # (S,e) image-major
+            sup_tok = sup_tok + ctx_emb.view(1, K * N, 1, e_dim)
+            qry_tok = qry_tok + self.qry_id.view(1, 1, 1, e_dim)
+
         x = torch.cat([sup_tok, qry_tok], dim=1)                          # (B,S+Q,2,e)
 
         x, sep_t = self.thinking(x, K * N)

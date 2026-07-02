@@ -123,6 +123,18 @@ class OmniSynthICLDataset(Dataset):
         t_img, t_seg, t_k = scene(rngs[0])
         ctx = [scene(rngs[1 + i]) for i in range(self.context_size)]
 
+        is_copy = False
+        copy_slot = -1
+        if not self.deterministic and self.context_size > 0 and self.scene.p_copy > 0.0:
+            crng = np.random.default_rng()       # isolated: never perturbs subject/item seeds
+            if crng.random() < self.scene.p_copy:
+                n = max(1, min(int(self.scene.n_copy), self.context_size))
+                slots = crng.permutation(self.context_size)[:n].tolist()
+                for j in slots:
+                    ctx[j] = (t_img.copy(), t_seg.copy(), t_k)   # exact copy of the query scene
+                is_copy = True
+                copy_slot = min(slots)
+
         return {
             "image":       _to_img_tensor(t_img),
             "label":       _to_img_tensor(t_seg),
@@ -134,5 +146,7 @@ class OmniSynthICLDataset(Dataset):
                 "subject_index": int(sample_index),
                 "target_mode": mode,
                 "k_target": int(t_k),
+                "is_copy": bool(is_copy),
+                "copy_slot": int(copy_slot),
             },
         }

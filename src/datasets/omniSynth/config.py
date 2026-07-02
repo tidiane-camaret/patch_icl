@@ -23,6 +23,9 @@ class OmniSceneConfig:
     aug_rotate: float = 15.0      # deg; aug-mode per-placement jitter
     aug_scale: float = 0.1        # +/- log2 scale
     aug_translate: float = 0.1    # fraction of cell
+    p_copy: float = 0.9           # train-only per-item prob of injecting copy slot(s)
+    n_copy: int = 1               # number of context slots to copy when an item is a
+                                  # copy-task (clamped to context_size); each is an exact copy of the query scene
 
 
 @dataclass

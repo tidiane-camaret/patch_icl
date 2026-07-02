@@ -18,6 +18,8 @@ scene:
   aug_rotate: 20.0       # deg; aug-mode per-placement jitter
   aug_scale: 0.2         # +/- log2 scale
   aug_translate: 0.2     # fraction of cell
+  p_copy: 0.9            # instCopy (train only): per-item prob of injecting copy slot(s); 0 disables
+  n_copy: 3              # number of context slots overwritten with an EXACT copy of the query scene (clamped to K)
 sampling:
   epoch_length: 10000
   eval_subjects_per_task: 50

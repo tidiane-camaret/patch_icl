@@ -14,6 +14,49 @@ def _ds(split, **scene_kw):
     )
 
 
+def _iou(a, b):
+    a = a > 0.5; b = b > 0.5
+    inter = (a & b).sum().item(); union = (a | b).sum().item()
+    return inter / union if union else 1.0
+
+
+def test_copy_injects_one_aligned_slot():
+    # p_copy=1, n_copy=1 (train): exactly one context slot is a near-copy of the
+    # query (high mask-IoU), and it is the strongest match; meta flags it.
+    ds = _ds("train", p_copy=1.0, n_copy=1)
+    item = ds[0]
+    assert item["meta"]["is_copy"] is True
+    slot = item["meta"]["copy_slot"]
+    assert 0 <= slot < K
+    ious = [_iou(item["context_out"][j, 0], item["label"][0]) for j in range(K)]
+    assert ious[slot] > 0.5, f"copy slot IoU too low: {ious}"
+    assert ious[slot] == max(ious), f"copy slot not the strongest match: {ious}"
+
+
+def test_copy_multi_slot():
+    # p_copy=1, n_copy=2: two distinct slots are near-copies of the query.
+    ds = _ds("train", p_copy=1.0, n_copy=2)
+    item = ds[0]
+    assert item["meta"]["is_copy"] is True
+    ious = [_iou(item["context_out"][j, 0], item["label"][0]) for j in range(K)]
+    n_high = sum(v > 0.5 for v in ious)
+    assert n_high >= 2, f"expected >=2 copy slots, ious={ious}"
+
+
+def test_eval_never_copies():
+    # deterministic split must ignore p_copy entirely.
+    ds = _ds("val", p_copy=1.0, n_copy=2)
+    for i in range(min(4, len(ds))):
+        assert ds[i]["meta"]["is_copy"] is False
+
+
+def test_copy_disabled_when_pcopy_zero():
+    ds = _ds("train", p_copy=0.0)
+    item = ds[0]
+    assert item["meta"]["is_copy"] is False
+    assert item["meta"]["copy_slot"] == -1
+
+
 def test_item_shapes_and_keys():
     ds = _ds("train")
     item = ds[0]
@@ -100,6 +143,10 @@ def test_mix_mode_samples_all_three():
 
 
 if __name__ == "__main__":
+    test_copy_injects_one_aligned_slot()
+    test_copy_multi_slot()
+    test_eval_never_copies()
+    test_copy_disabled_when_pcopy_zero()
     test_item_shapes_and_keys()
     test_label_matches_target_cells_only()
     test_image_size_divisible_guard()

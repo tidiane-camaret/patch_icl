@@ -39,7 +39,8 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEVICE, build_dataset, hard_dice, log_summary, make_loader, soft_dice
+from common import (DEVICE, build_dataset, cosine_sim, hard_dice, log_summary,
+                    make_loader, soft_dice)
 from pfn_train import soft_dice_loss
 
 
@@ -62,6 +63,20 @@ def _soft_sum(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
     ok = den > eps
     s = torch.where(ok, 2 * (p * g).sum(1) / den.clamp_min(eps), torch.zeros_like(den))
     return s.sum(), ok.sum()
+
+
+def _cos_sum(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
+    """Scale-invariant cosine similarity SUM + valid-row count (prob & target same res).
+
+    Σ(p·g)/(‖p‖·‖g‖) per row: magnitude cancels, so it stays a real 0→1 signal at low
+    resolution where soft Dice collapses toward the mean occupancy. Rows with an empty
+    GT map are skipped (matches _soft_sum's valid-row convention)."""
+    p = prob.detach().flatten(1).float()
+    g = target.detach().flatten(1).float()
+    den = p.norm(dim=1) * g.norm(dim=1)
+    ok = den > eps
+    c = torch.where(ok, (p * g).sum(1) / den.clamp_min(eps), torch.zeros_like(den))
+    return c.sum(), ok.sum()
 
 
 def _hard_sum(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6):
@@ -92,9 +107,13 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             enc_dims=tuple(a.enc_dims), e=a.e, h=a.h, l=a.l, a=a.a,
             thinking_rows=a.thinking_rows, residual_decay=a.residual_decay,
             query_self_attn=a.get("query_self_attn", False),
+            context_id_embed=a.get("context_id_embed", False),
+            max_context=a.get("max_context", 16),
         )
         return model, name, {"resolution": a.resolution, "enc_dims": list(a.enc_dims),
-                             "query_self_attn": a.get("query_self_attn", False)}
+                             "query_self_attn": a.get("query_self_attn", False),
+                             "context_id_embed": a.get("context_id_embed", False),
+                             "max_context": a.get("max_context", 16)}
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 
@@ -108,10 +127,11 @@ def _target_like(lbl: torch.Tensor, logit: torch.Tensor) -> torch.Tensor:
     return F.adaptive_avg_pool2d(lbl, logit.shape[-2:])
 
 
-def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float]:
+def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float]:
     model.train()
     total, n = 0.0, 0
     soft_sum = soft_cnt = hard_sum = hard_cnt = 0.0   # on-device running sums (synced once)
+    cos_sum = cos_cnt = 0.0
     pbar = tqdm(loader, desc=f"train e{epoch}")
     for batch in pbar:
         if batch is None:
@@ -142,16 +162,20 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
             prob = torch.sigmoid(logit)
             ss, sc = _soft_sum(prob, target)
             hs, hc = _hard_sum(_upsample_to(prob, lbl.shape[-2:]), lbl)
+            cs, cc = _cos_sum(prob, target)
             soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
+            cos_sum += cs; cos_cnt += cc
 
         total += loss.item()
         n += 1
         pbar.set_postfix(loss=f"{total / n:.4f}",
+                         cos=f"{float(cos_sum) / max(float(cos_cnt), 1):.4f}",
                          dice=f"{float(soft_sum) / max(float(soft_cnt), 1):.4f}",
                          lr=f"{scheduler.get_last_lr()[0]:.1e}")
     return (total / max(n, 1),
             float(soft_sum) / max(float(soft_cnt), 1),
-            float(hard_sum) / max(float(hard_cnt), 1))
+            float(hard_sum) / max(float(hard_cnt), 1),
+            float(cos_sum) / max(float(cos_cnt), 1))
 
 
 @torch.no_grad()
@@ -168,6 +192,8 @@ def validate(model, loader):
     soft_label: dict[str, list[float]] = defaultdict(list)
     hard_ds: dict[str, list[float]] = defaultdict(list)
     hard_label: dict[str, list[float]] = defaultdict(list)
+    cos_ds: dict[str, list[float]] = defaultdict(list)
+    cos_label: dict[str, list[float]] = defaultdict(list)
     for batch in tqdm(loader, desc="val", leave=False):
         if batch is None:
             continue
@@ -185,9 +211,11 @@ def validate(model, loader):
             key = f"{batch['dataset'][b]}/label_{int(batch['label_value'][b])}"
             s = soft_dice(prob[b, 0], target[b, 0])      # dice_ds_soft: downsampled soft
             h = hard_dice(prob_nat[b, 0], lbl[b, 0])     # dice: native-resolution hard
+            c = cosine_sim(prob[b, 0], target[b, 0])     # cossim: scale-invariant, downsampled
             soft_ds[batch["dataset"][b]].append(s); soft_label[key].append(s)
             hard_ds[batch["dataset"][b]].append(h); hard_label[key].append(h)
-    return (soft_ds, soft_label), (hard_ds, hard_label)
+            cos_ds[batch["dataset"][b]].append(c); cos_label[key].append(c)
+    return (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label)
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -252,22 +280,27 @@ def main(cfg: DictConfig):
     best_dice = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss, train_soft, train_hard = train_epoch(model, train_loader, optimizer,
-                                                    scheduler, cfg, epoch)
+        loss, train_soft, train_hard, train_cos = train_epoch(model, train_loader, optimizer,
+                                                              scheduler, cfg, epoch)
         log = {"epoch": epoch, "train/loss": loss,
+               "train/cossim": train_cos,
                "train/dice_ds_soft": train_soft, "train/dice": train_hard,
                "train/lr": scheduler.get_last_lr()[0],
                "time/epoch_s": time.perf_counter() - t0}
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            (soft_ds, soft_label), (hard_ds, hard_label) = validate(model, val_loader)
-            summary = log_summary(soft_ds, soft_label, prefix="dice_ds_soft", metric_label="ds soft")
+            (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label) = validate(model, val_loader)
+            summary = log_summary(cos_ds, cos_label, prefix="cossim", metric_label="cos sim")
+            summary.update(log_summary(soft_ds, soft_label, prefix="dice_ds_soft", metric_label="ds soft"))
             summary.update(log_summary(hard_ds, hard_label, prefix="dice", metric_label="native"))
-            mean_dice = summary.get("dice_ds_soft/mean", float("nan"))   # checkpoint on ds soft
+            # Checkpoint on cosine similarity: scale-invariant, so it stays a real 0→1
+            # signal at low resolution where dice_ds_soft is pinned near its tiny ceiling.
+            mean_dice = summary.get("cossim/mean", float("nan"))
             log.update(summary)
-            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}  train ds_soft={train_soft:.4f}"
-                       f"  val ds_soft={mean_dice:.4f} dice={summary.get('dice/mean', float('nan')):.4f}"
-                       f"  (best ds_soft={max(best_dice, mean_dice):.4f})")
+            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}  train cos={train_cos:.4f}"
+                       f"  val cos={mean_dice:.4f} ds_soft={summary.get('dice_ds_soft/mean', float('nan')):.4f}"
+                       f" dice={summary.get('dice/mean', float('nan')):.4f}"
+                       f"  (best cos={max(best_dice, mean_dice):.4f})")
             if mean_dice > best_dice:
                 best_dice = mean_dice
                 torch.save({
@@ -280,10 +313,10 @@ def main(cfg: DictConfig):
                     "synth": OmegaConf.to_container(cfg.synth, resolve=True) if cfg.get("synth", None) else None,
                     **ckpt_meta,
                 }, ckpt_path)
-                log["val/best_dice"] = best_dice
+                log["val/best_cossim"] = best_dice
         wandb.log(log)
 
-    print(f"Done. Best val Dice={best_dice:.4f}. Checkpoint: {ckpt_path}")
+    print(f"Done. Best val cossim={best_dice:.4f}. Checkpoint: {ckpt_path}")
     run.finish()
 
 
