@@ -40,7 +40,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (DEVICE, build_dataset, cosine_sim, hard_dice, log_summary,
-                    make_loader, soft_dice)
+                    make_loader, soft_dice, topk_overlap)
 from pfn_train import soft_dice_loss
 
 
@@ -77,6 +77,26 @@ def _cos_sum(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
     ok = den > eps
     c = torch.where(ok, (p * g).sum(1) / den.clamp_min(eps), torch.zeros_like(den))
     return c.sum(), ok.sum()
+
+
+def _topk_sum(prob: torch.Tensor, target: torch.Tensor, k: int, eps: float = 1e-6):
+    """Top-k patch-overlap SUM + valid-row count (prob & target at the same res).
+
+    Batched form of common.topk_overlap: per row, recall of the GT-positive patches
+    within the pred top-k — |gt_pos ∩ topk(pred)| / |gt_pos| (|gt_pos| capped to k). k is
+    clamped to the patch count; rows with an empty GT map are skipped."""
+    p = prob.detach().flatten(1).float()
+    g = target.detach().flatten(1).float()
+    k = min(k, p.shape[1])
+    n_pos = (g > eps).sum(1)                             # (B,) GT-positive patches per row
+    ok = n_pos > 0
+    m = n_pos.clamp(max=k)                               # (B,) GT set size, capped to k
+    pi = p.topk(k, dim=1).indices                        # (B,k) pred top-k indices
+    hit_pred = torch.zeros_like(g, dtype=torch.bool).scatter_(1, pi, True)
+    gv, gi = g.topk(k, dim=1)                            # (B,k) highest GT values + indices
+    inter = (hit_pred.gather(1, gi) & (gv > eps)).sum(1).float()   # positives recalled in pred top-k
+    o = torch.where(ok, inter / m.clamp(min=1).float(), torch.zeros_like(inter))
+    return o.sum(), ok.sum()
 
 
 def _hard_sum(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6):
@@ -127,11 +147,12 @@ def _target_like(lbl: torch.Tensor, logit: torch.Tensor) -> torch.Tensor:
     return F.adaptive_avg_pool2d(lbl, logit.shape[-2:])
 
 
-def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float]:
+def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float, float]:
     model.train()
     total, n = 0.0, 0
     soft_sum = soft_cnt = hard_sum = hard_cnt = 0.0   # on-device running sums (synced once)
-    cos_sum = cos_cnt = 0.0
+    cos_sum = cos_cnt = topk_sum = topk_cnt = 0.0
+    topk_k = int(cfg.train.get("topk_k", 16))
     pbar = tqdm(loader, desc=f"train e{epoch}")
     for batch in pbar:
         if batch is None:
@@ -158,34 +179,43 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
 
         # Monitoring (not the loss): downsampled soft Dice (prob vs occupancy at logit
         # res) + native-resolution hard Dice (preds upscaled to original res vs GT).
+        # cossim only adds signal below native res; at native res it is redundant with Dice.
         with torch.no_grad():
             prob = torch.sigmoid(logit)
             ss, sc = _soft_sum(prob, target)
             hs, hc = _hard_sum(_upsample_to(prob, lbl.shape[-2:]), lbl)
-            cs, cc = _cos_sum(prob, target)
             soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
-            cos_sum += cs; cos_cnt += cc
+            if logit.shape[-2:] != lbl.shape[-2:]:   # low res: cossim + top-k patch overlap
+                cs, cc = _cos_sum(prob, target)
+                ts, tc = _topk_sum(prob, target, topk_k)
+                cos_sum += cs; cos_cnt += cc; topk_sum += ts; topk_cnt += tc
 
         total += loss.item()
         n += 1
-        pbar.set_postfix(loss=f"{total / n:.4f}",
-                         cos=f"{float(cos_sum) / max(float(cos_cnt), 1):.4f}",
-                         dice=f"{float(soft_sum) / max(float(soft_cnt), 1):.4f}",
-                         lr=f"{scheduler.get_last_lr()[0]:.1e}")
+        post = {"loss": f"{total / n:.4f}",
+                "dice": f"{float(soft_sum) / max(float(soft_cnt), 1):.4f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.1e}"}
+        if cos_cnt:
+            post["cos"] = f"{float(cos_sum) / float(cos_cnt):.4f}"
+            post[f"top{topk_k}"] = f"{float(topk_sum) / float(topk_cnt):.4f}"
+        pbar.set_postfix(**post)
     return (total / max(n, 1),
             float(soft_sum) / max(float(soft_cnt), 1),
             float(hard_sum) / max(float(hard_cnt), 1),
-            float(cos_sum) / max(float(cos_cnt), 1))
+            float(cos_sum) / float(cos_cnt) if cos_cnt else float("nan"),
+            float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"))
 
 
 @torch.no_grad()
-def validate(model, loader):
-    """Returns (soft_ds, soft_label), (hard_ds, hard_label) Dice score dicts.
+def validate(model, loader, topk_k: int = 16):
+    """Returns (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label),
+    (topk_ds, topk_label) score dicts.
 
     dice_ds_soft = threshold-free Dice of the prob map vs the pooled occupancy GT, at
     the model's (downsampled) logit res. dice = hard Dice (pred≥0.5 vs GT>0) at the
     ORIGINAL resolution — preds upscaled to H×W vs the full-res GT, so it is directly
     comparable across models/resolutions (a no-op upscale for native-res UniverSeg).
+    cossim + top-k patch overlap are low-res-only (empty at native res).
     """
     model.eval()
     soft_ds: dict[str, list[float]] = defaultdict(list)
@@ -194,6 +224,8 @@ def validate(model, loader):
     hard_label: dict[str, list[float]] = defaultdict(list)
     cos_ds: dict[str, list[float]] = defaultdict(list)
     cos_label: dict[str, list[float]] = defaultdict(list)
+    topk_ds: dict[str, list[float]] = defaultdict(list)
+    topk_label: dict[str, list[float]] = defaultdict(list)
     for batch in tqdm(loader, desc="val", leave=False):
         if batch is None:
             continue
@@ -207,15 +239,20 @@ def validate(model, loader):
         target = _target_like(lbl, logit)               # GT pooled to logit res (soft)
         prob = torch.sigmoid(logit)
         prob_nat = _upsample_to(prob, lbl.shape[-2:])    # preds upscaled to original res (hard)
+        native = logit.shape[-2:] == lbl.shape[-2:]      # native res → cossim redundant, skip
         for b in range(len(batch["dataset"])):
             key = f"{batch['dataset'][b]}/label_{int(batch['label_value'][b])}"
             s = soft_dice(prob[b, 0], target[b, 0])      # dice_ds_soft: downsampled soft
             h = hard_dice(prob_nat[b, 0], lbl[b, 0])     # dice: native-resolution hard
-            c = cosine_sim(prob[b, 0], target[b, 0])     # cossim: scale-invariant, downsampled
             soft_ds[batch["dataset"][b]].append(s); soft_label[key].append(s)
             hard_ds[batch["dataset"][b]].append(h); hard_label[key].append(h)
-            cos_ds[batch["dataset"][b]].append(c); cos_label[key].append(c)
-    return (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label)
+            if not native:
+                c = cosine_sim(prob[b, 0], target[b, 0]) # cossim: scale-invariant, downsampled
+                t = topk_overlap(prob[b, 0], target[b, 0], topk_k)  # top-k patch overlap
+                cos_ds[batch["dataset"][b]].append(c); cos_label[key].append(c)
+                topk_ds[batch["dataset"][b]].append(t); topk_label[key].append(t)
+    return ((soft_ds, soft_label), (hard_ds, hard_label),
+            (cos_ds, cos_label), (topk_ds, topk_label))
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -252,22 +289,14 @@ def main(cfg: DictConfig):
 
     # ── wandb / output dir ──────────────────────────────────────────────────────
     wandb_enabled = bool(cfg.wandb.get("enabled", True))
-    scene = cfg.synth.get("scene", None) if cfg.get("synth", None) else None
-    target_mode = scene.get("target_mode", "na") if scene else "na"
     # name=None → wandb auto-generates the run name; the checkpoint dir uses it (cf. pfn_seg.py).
     run_name = cfg.wandb.name
-    wandb_config = {
-        "model": model_name, "source": cfg.data.source,
-        "image_size": cfg.data.image_size, "context_size": cfg.data.context_size,
-        "epochs": cfg.train.epochs, "batch_size": cfg.train.batch_size, "lr": cfg.train.lr,
-        **ckpt_meta,
-    }
-    if scene is not None:
-        wandb_config.update({"grid": scene.get("grid", None), "target_mode": target_mode,
-                             "epoch_length": cfg.synth.sampling.epoch_length})
+    # Log the whole resolved Hydra config (nested: train.*, data.*, synth.*, arch.*, ...)
+    # as the single source of truth — no hand-maintained subset to drift out of sync.
     run = wandb.init(
         project=cfg.wandb.project, name=run_name,
-        mode="online" if wandb_enabled else "disabled", config=wandb_config,
+        mode="online" if wandb_enabled else "disabled",
+        config=OmegaConf.to_container(cfg, resolve=True),
     )
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
     date_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -278,29 +307,43 @@ def main(cfg: DictConfig):
 
     # ── train loop ──────────────────────────────────────────────────────────────
     best_dice = -1.0
+    metric = "cossim"  # checkpoint-selection metric (→ "dice" when preds are at native res)
+    topk_k = int(cfg.train.get("topk_k", 16))
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss, train_soft, train_hard, train_cos = train_epoch(model, train_loader, optimizer,
-                                                              scheduler, cfg, epoch)
+        loss, train_soft, train_hard, train_cos, train_topk = train_epoch(
+            model, train_loader, optimizer, scheduler, cfg, epoch)
         log = {"epoch": epoch, "train/loss": loss,
-               "train/cossim": train_cos,
                "train/dice_ds_soft": train_soft, "train/dice": train_hard,
                "train/lr": scheduler.get_last_lr()[0],
                "time/epoch_s": time.perf_counter() - t0}
+        if not math.isnan(train_cos):
+            log["train/cossim"] = train_cos
+        if not math.isnan(train_topk):
+            log[f"train/top{topk_k}"] = train_topk
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label) = validate(model, val_loader)
-            summary = log_summary(cos_ds, cos_label, prefix="cossim", metric_label="cos sim")
+            ((soft_ds, soft_label), (hard_ds, hard_label),
+             (cos_ds, cos_label), (topk_ds, topk_label)) = validate(model, val_loader, topk_k)
+            # At native prediction res cossim is redundant with Dice and validate() returns
+            # empty cos dicts → checkpoint on native hard Dice; otherwise on cossim, which is
+            # scale-invariant and stays a real 0→1 signal where dice_ds_soft is pinned near
+            # its tiny ceiling.
+            metric = "cossim" if cos_ds else "dice"
+            summary = {}
+            if cos_ds:
+                summary.update(log_summary(cos_ds, cos_label, prefix="cossim", metric_label="cos sim"))
+                summary.update(log_summary(topk_ds, topk_label, prefix=f"top{topk_k}",
+                                           metric_label=f"top{topk_k}"))
             summary.update(log_summary(soft_ds, soft_label, prefix="dice_ds_soft", metric_label="ds soft"))
             summary.update(log_summary(hard_ds, hard_label, prefix="dice", metric_label="native"))
-            # Checkpoint on cosine similarity: scale-invariant, so it stays a real 0→1
-            # signal at low resolution where dice_ds_soft is pinned near its tiny ceiling.
-            mean_dice = summary.get("cossim/mean", float("nan"))
+            mean_dice = summary.get(f"{metric}/mean", float("nan"))
             log.update(summary)
-            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}  train cos={train_cos:.4f}"
-                       f"  val cos={mean_dice:.4f} ds_soft={summary.get('dice_ds_soft/mean', float('nan')):.4f}"
+            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}"
+                       f"  val {metric}={mean_dice:.4f} top{topk_k}={summary.get(f'top{topk_k}/mean', float('nan')):.4f}"
+                       f" ds_soft={summary.get('dice_ds_soft/mean', float('nan')):.4f}"
                        f" dice={summary.get('dice/mean', float('nan')):.4f}"
-                       f"  (best cos={max(best_dice, mean_dice):.4f})")
+                       f"  (best {metric}={max(best_dice, mean_dice):.4f})")
             if mean_dice > best_dice:
                 best_dice = mean_dice
                 torch.save({
@@ -313,10 +356,10 @@ def main(cfg: DictConfig):
                     "synth": OmegaConf.to_container(cfg.synth, resolve=True) if cfg.get("synth", None) else None,
                     **ckpt_meta,
                 }, ckpt_path)
-                log["val/best_cossim"] = best_dice
+                log[f"val/best_{metric}"] = best_dice
         wandb.log(log)
 
-    print(f"Done. Best val cossim={best_dice:.4f}. Checkpoint: {ckpt_path}")
+    print(f"Done. Best val {metric}={best_dice:.4f}. Checkpoint: {ckpt_path}")
     run.finish()
 
 

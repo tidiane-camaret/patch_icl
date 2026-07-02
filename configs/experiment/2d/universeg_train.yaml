@@ -25,7 +25,7 @@ train:
   eval_every: 1
   workers: 16
   seed: 42
-  pretrained: true      # fine-tune from pretrained UniverSeg (false = train from scratch)
+  pretrained: false      # fine-tune from pretrained UniverSeg (false = train from scratch)
 
 eval:
   batch_size: 64

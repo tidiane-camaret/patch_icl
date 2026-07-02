@@ -227,6 +227,28 @@ def cosine_sim(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> float
     return float((p * g).sum() / den) if den > eps else float("nan")
 
 
+def topk_overlap(pred: torch.Tensor, gt: torch.Tensor, k: int, eps: float = 1e-6) -> float:
+    """Recall of the GT-positive patches within the k highest-valued predicted patches.
+
+    GT maps are sparse (usually < k positive patches), so dividing by k would penalise a
+    model that already found every true patch. Instead the denominator is the number of
+    GT-positive patches (patches with GT > 0), capped to k: score = |gt_pos ∩ topk(pred)|
+    / |gt_pos|. It reaches 1.0 exactly when ALL true patches are among the model's top-k.
+    Purely rank-based on the pred side (threshold/scale-free). Meant for low-res patch
+    maps — at native res a "patch" is a pixel. Returns NaN when the GT map is empty.
+    """
+    p = pred.float().flatten()
+    g = gt.float().flatten()
+    n_pos = int((g > eps).sum())
+    if n_pos == 0:
+        return float("nan")
+    k = min(k, p.numel())
+    m = min(n_pos, k)                         # GT-positive count, capped to k
+    gi = torch.topk(g, m).indices            # the m highest GT patches (= all positives when n_pos ≤ k)
+    pi = torch.topk(p, k).indices
+    return float(torch.isin(gi, pi).sum()) / m
+
+
 def batch_dice_sums(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
     """Batched soft & hard Dice SUMS for cheap *training-accuracy* logging.
 
