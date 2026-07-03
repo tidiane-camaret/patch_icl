@@ -122,18 +122,20 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
         from src.models.patchset_cnn import PatchSetCNN
         a = cfg.arch
         print(f"Building PatchSetCNN (size={cfg.data.image_size}, resolution={a.resolution})...")
-        model = PatchSetCNN(
-            image_size=cfg.data.image_size, resolution=a.resolution,
-            enc_dims=tuple(a.enc_dims), e=a.e, h=a.h, l=a.l, a=a.a,
-            thinking_rows=a.thinking_rows, residual_decay=a.residual_decay,
-            query_self_attn=a.get("query_self_attn", False),
-            context_id_embed=a.get("context_id_embed", False),
-            max_context=a.get("max_context", 16),
-        )
-        return model, name, {"resolution": a.resolution, "enc_dims": list(a.enc_dims),
-                             "query_self_attn": a.get("query_self_attn", False),
-                             "context_id_embed": a.get("context_id_embed", False),
-                             "max_context": a.get("max_context", 16)}
+        # Full constructor kwargs (minus image_size, stored at ckpt top level). Built once
+        # and reused as the checkpoint's `arch` so eval can rebuild via PatchSetCNN(
+        # image_size=ckpt["image_size"], **ckpt["arch"]) with zero drift.
+        arch = {
+            "resolution": a.resolution, "enc_dims": list(a.enc_dims),
+            "e": a.e, "h": a.h, "l": a.l, "a": a.a,
+            "thinking_rows": a.thinking_rows, "residual_decay": a.residual_decay,
+            "fourier_bands": a.get("fourier_bands", 8),
+            "query_self_attn": a.get("query_self_attn", False),
+            "context_id_embed": a.get("context_id_embed", False),
+            "max_context": a.get("max_context", 16),
+        }
+        model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
+        return model, name, {"arch": arch}
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 

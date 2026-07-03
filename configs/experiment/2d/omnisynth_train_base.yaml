@@ -1,0 +1,28 @@
+# Shared base for the omniSynth *training* configs (universeg_train, patchset_cnn_train).
+# Sits between train_base.yaml (generic 2D-training defaults) and the per-model leaves,
+# holding every key those two leaves had in common. Leaves keep only what is genuinely
+# model-specific: `model`, their `arch` block, `train.lr`, and universeg's `pretrained`.
+#
+# NB: does NOT touch train_base.yaml, so the medsegbench/ImagePFN configs
+# (pfn_seg, multilevel, multilevel_zoom) are unaffected.
+defaults:
+  - train_base
+  - override synth: omniglot   # omniSynth generator by default (source=omnisynth needs cfg.synth.scene.*);
+                               # drop this line to fall back to train_base's controlSynth `synth: default`.
+  - _self_
+
+data:
+  source: omnisynth     # image_size=128 / context_size=3 already match train_base
+
+train:
+  epochs: 50
+  batch_size: 64
+  grad_clip: 1.0
+  warmup_epochs: 1
+  # lr is model-specific -> set in each leaf. adam_wd/dice_weight/eval_every/workers/seed
+  # already match train_base.
+
+eval:
+  batch_size: 64
+  workers: 16
+  max_per_label: 100000   # cap val per (alphabet,label) during training for speed

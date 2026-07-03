@@ -1971,3 +1971,30 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   PatchSetPFN. When true, query patches attend to each other (within-target spatial
   reasoning) in addition to the support set, via an (r×r) bool attn_mask passed to the
   sample-axis. Queries carry the prior (not GT) so query↔query attention leaks no labels.
+
+## 2026-07-03 — omnisynth_train_base.yaml between train_base and the omniSynth leaves
+- universeg_train.yaml and patchset_cnn_train.yaml duplicated every non-model key
+  (data.source=omnisynth, the 50-epoch/batch-64 schedule, eval batch/workers/max_per_label).
+  Factored the shared keys into a new intermediate config
+  configs/experiment/2d/omnisynth_train_base.yaml (defaults: [train_base, override
+  synth: omniglot, _self_]). Leaves now carry only model-specific keys: `model`, their
+  `arch` block (patchset only; universeg ignores arch), `train.lr`, universeg `pretrained`.
+- train_base.yaml deliberately left untouched so the medsegbench/ImagePFN configs
+  (pfn_seg, multilevel, multilevel_zoom) keep inheriting source=medsegbench + the long
+  200-epoch schedule + the transformer arch block.
+- Side effect: the intermediate defaults `synth: omniglot`, so `synth.scene.*` overrides
+  (e.g. synth.scene.p_copy / synth.scene.grid) now work without passing synth=omniglot.
+  Verified both leaves resolve to their pre-refactor values via `train.py --cfg job`.
+
+## 2026-07-03 — Store full PatchSetCNN arch in the checkpoint
+- train.py:build_model previously saved only a partial patchset_cnn ckpt_meta
+  (resolution/enc_dims/query_self_attn/context_id_embed/max_context), omitting the
+  transformer knobs (e/h/l/a/thinking_rows/residual_decay/fourier_bands) — so a best.pt
+  could not be rebuilt without also supplying the training config.
+- Now build_model constructs a single `arch` dict (all PatchSetCNN kwargs except
+  image_size), uses it to instantiate the model, AND returns it as ckpt_meta -> the
+  checkpoint stores it under `arch` (nested, mirroring pfn_seg_2d). A focused eval script
+  can rebuild via PatchSetCNN(image_size=ckpt["image_size"], **ckpt["arch"]). Verified the
+  round-trip yields an identical state_dict (keys+shapes). image_size stays at the ckpt
+  top level (unchanged). Nothing else consumes patchset_cnn checkpoints, so the shape
+  change (flat keys -> nested `arch`) is safe.
