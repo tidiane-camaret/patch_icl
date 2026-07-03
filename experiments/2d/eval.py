@@ -32,9 +32,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import hydra
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -49,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_loader, hard_dice, soft_dice, downsample_mask, log_summary
+from evaluate import save_figure  # _overlay_ax/_heatmap_ax used only inside save_figure
 
 
 # ── UniverSeg encoder (feature_sim backend) ───────────────────────────────────
@@ -284,76 +282,6 @@ def build_zoom_chain(stage1_ckpt_path: str, feature_dim: int, n_hops: int, stage
         for _ in range(n_hops)])
     return models
 
-
-# ── Visualisation (feature_sim backend) ──────────────────────────────────────
-
-def _overlay_ax(ax, image: np.ndarray, mask: np.ndarray, title: str) -> None:
-    ax.imshow(image, cmap="gray", vmin=0, vmax=1)
-    ax.imshow(mask,  cmap="Reds", alpha=0.45, vmin=0, vmax=1)
-    ax.set_title(title, fontsize=8)
-    ax.axis("off")
-
-
-def _heatmap_ax(ax, arr: np.ndarray, title: str) -> None:
-    ax.imshow(arr, cmap="hot", vmin=0, vmax=1, interpolation="nearest")
-    ax.set_title(title, fontsize=8)
-    ax.axis("off")
-
-
-def save_figure(
-    tgt_image:   np.ndarray,
-    tgt_gt:      np.ndarray,
-    pred_native: np.ndarray,
-    ctx_images:  list[np.ndarray],
-    ctx_gts:     list[np.ndarray],
-    out_path:    Path,
-    title:       str = "",
-    pred_lowres: np.ndarray | None = None,
-    gt_lowres:   np.ndarray | None = None,
-) -> None:
-    """Backend-agnostic qualitative panel.
-
-    Row 0: target+GT overlay | target+pred overlay | (GT↓ | pred↓ when a low-res
-    grid is supplied). The two low-res heatmaps are omitted for backends without a
-    coarse grid (e.g. UniverSeg, whose only output is the native-res binary mask).
-    Row 1: the K context image+GT overlays.
-
-    `pred_native` is the native-resolution prediction (soft map for pfn_seg /
-    multilevel / feature_sim, binary mask for UniverSeg). `pred_lowres` / `gt_lowres`
-    are the coarse-grid prediction and avg-pooled GT at the model's token resolution.
-    """
-    # Row-0 panels as render closures so the low-res pair is purely optional.
-    row0 = [
-        lambda ax: _overlay_ax(ax, tgt_image, tgt_gt,      "Target + GT"),
-        lambda ax: _overlay_ax(ax, tgt_image, pred_native, "Target + Pred"),
-    ]
-    if pred_lowres is not None:
-        g = pred_lowres.shape[0]
-        row0.append(lambda ax: _heatmap_ax(ax, gt_lowres,   f"GT ↓{g}"))
-        row0.append(lambda ax: _heatmap_ax(ax, pred_lowres, f"Pred ↓{g}"))
-
-    K     = len(ctx_images)
-    ncols = max(len(row0), K, 1)
-
-    fig, axes = plt.subplots(2, ncols, figsize=(3.2 * ncols, 6.5), squeeze=False)
-    fig.subplots_adjust(hspace=0.35, wspace=0.05)
-
-    for col in range(ncols):
-        if col < len(row0):
-            row0[col](axes[0, col])
-        else:
-            axes[0, col].axis("off")
-
-    for col in range(ncols):
-        if col < K:
-            _overlay_ax(axes[1, col], ctx_images[col], ctx_gts[col], f"Ctx {col} + GT")
-        else:
-            axes[1, col].axis("off")
-
-    fig.suptitle(title, fontsize=9)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

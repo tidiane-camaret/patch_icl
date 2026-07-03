@@ -27,7 +27,6 @@ import math
 import random
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import hydra
@@ -39,20 +38,14 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (DEVICE, build_dataset, cosine_sim, hard_dice, log_summary,
-                    make_loader, soft_dice, topk_overlap)
+from common import DEVICE, build_dataset, make_loader
+from evaluate import validate, _target_like, _upsample_to
 from pfn_train import soft_dice_loss
 
 
 def _autocast():
     return torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
                           enabled=DEVICE.type == "cuda")
-
-
-def _upsample_to(x: torch.Tensor, size) -> torch.Tensor:
-    """Bilinear-resize (B,1,h,w) → (B,1,*size); no-op when already at `size`."""
-    return (x if x.shape[-2:] == tuple(size)
-            else F.interpolate(x, size=tuple(size), mode="bilinear", align_corners=False))
 
 
 def _soft_sum(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
@@ -139,16 +132,6 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 
-def _target_like(lbl: torch.Tensor, logit: torch.Tensor) -> torch.Tensor:
-    """Avg-pool the (B,1,H,W) GT to the logit's spatial size (no-op when equal).
-
-    UniverSeg's logit is H×W → identity; PatchSetCNN's is R×R → soft occupancy GT.
-    """
-    if lbl.shape[-2:] == logit.shape[-2:]:
-        return lbl
-    return F.adaptive_avg_pool2d(lbl, logit.shape[-2:])
-
-
 def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float, float]:
     model.train()
     total, n = 0.0, 0
@@ -206,88 +189,6 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
             float(hard_sum) / max(float(hard_cnt), 1),
             float(cos_sum) / float(cos_cnt) if cos_cnt else float("nan"),
             float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"))
-
-
-def _fmt_transforms(transforms) -> str:
-    """One compact 'r..,s..,dx..,dy..' string per target placement (aug mode);
-    empty when the mode applies no per-placement jitter (identical/class)."""
-    if not transforms:
-        return ""
-    parts = []
-    for p in transforms:
-        if p is None:
-            parts.append("-")
-        else:
-            parts.append(f"r{p['rotate']:+.0f},s{p['scale']:.2f},"
-                         f"dx{p['dx']:+.2f},dy{p['dy']:+.2f}")
-    return " | ".join(parts)
-
-
-# Per-sample qualitative val log: target/context cell (row, col) positions, the
-# resolved target_mode, the per-placement aug transforms and the sample's Dice.
-SAMPLE_COLS = ["epoch", "dataset", "character", "target_mode", "target_pos",
-               "context_pos", "transforms", "dice"]
-
-
-@torch.no_grad()
-def validate(model, loader, topk_k: int = 16, epoch: int = 0):
-    """Returns (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label),
-    (topk_ds, topk_label) score dicts, plus a per-sample wandb.Table (SAMPLE_COLS).
-
-    dice_ds_soft = threshold-free Dice of the prob map vs the pooled occupancy GT, at
-    the model's (downsampled) logit res. dice = hard Dice (pred≥0.5 vs GT>0) at the
-    ORIGINAL resolution — preds upscaled to H×W vs the full-res GT, so it is directly
-    comparable across models/resolutions (a no-op upscale for native-res UniverSeg).
-    cossim + top-k patch overlap are low-res-only (empty at native res).
-    """
-    model.eval()
-    soft_ds: dict[str, list[float]] = defaultdict(list)
-    soft_label: dict[str, list[float]] = defaultdict(list)
-    hard_ds: dict[str, list[float]] = defaultdict(list)
-    hard_label: dict[str, list[float]] = defaultdict(list)
-    cos_ds: dict[str, list[float]] = defaultdict(list)
-    cos_label: dict[str, list[float]] = defaultdict(list)
-    topk_ds: dict[str, list[float]] = defaultdict(list)
-    topk_label: dict[str, list[float]] = defaultdict(list)
-    table = wandb.Table(columns=SAMPLE_COLS)
-    for batch in tqdm(loader, desc="val", leave=False):
-        if batch is None:
-            continue
-        img = batch["image"].to(DEVICE, non_blocking=True)
-        lbl = batch["label"].to(DEVICE, non_blocking=True).float()
-        cin = batch["context_in"].to(DEVICE, non_blocking=True)
-        cout = batch["context_out"].to(DEVICE, non_blocking=True)
-        with _autocast():
-            out = model(img, context_in=cin, context_out=cout, mode="val")
-        logit = out["final_logit"].float()
-        target = _target_like(lbl, logit)               # GT pooled to logit res (soft)
-        prob = torch.sigmoid(logit)
-        prob_nat = _upsample_to(prob, lbl.shape[-2:])    # preds upscaled to original res (hard)
-        native = logit.shape[-2:] == lbl.shape[-2:]      # native res → cossim redundant, skip
-        metas = batch.get("meta")
-        for b in range(len(batch["dataset"])):
-            key = f"{batch['dataset'][b]}/label_{int(batch['label_value'][b])}"
-            s = soft_dice(prob[b, 0], target[b, 0])      # dice_ds_soft: downsampled soft
-            h = hard_dice(prob_nat[b, 0], lbl[b, 0])     # dice: native-resolution hard
-            soft_ds[batch["dataset"][b]].append(s); soft_label[key].append(s)
-            hard_ds[batch["dataset"][b]].append(h); hard_label[key].append(h)
-            if not native:
-                c = cosine_sim(prob[b, 0], target[b, 0]) # cossim: scale-invariant, downsampled
-                t = topk_overlap(prob[b, 0], target[b, 0], topk_k)  # top-k patch overlap
-                cos_ds[batch["dataset"][b]].append(c); cos_label[key].append(c)
-                topk_ds[batch["dataset"][b]].append(t); topk_label[key].append(t)
-            if metas is not None:                        # qualitative per-sample row
-                m = metas[b]
-                table.add_data(
-                    epoch, batch["dataset"][b],
-                    f"{m['alphabet']}/{m['class_id']}", m.get("target_mode", ""),
-                    str(m.get("target_cells", [])),      # target (row, col) positions
-                    str(m.get("context_cells", [])),     # per-context (row, col) positions
-                    _fmt_transforms(m.get("target_transforms")),
-                    h,                                   # native-res hard Dice
-                )
-    return ((soft_ds, soft_label), (hard_ds, hard_label),
-            (cos_ds, cos_label), (topk_ds, topk_label), table)
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -358,21 +259,10 @@ def main(cfg: DictConfig):
             log[f"train/top{topk_k}"] = train_topk
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            ((soft_ds, soft_label), (hard_ds, hard_label),
-             (cos_ds, cos_label), (topk_ds, topk_label),
-             sample_table) = validate(model, val_loader, topk_k, epoch)
-            # At native prediction res cossim is redundant with Dice and validate() returns
-            # empty cos dicts → checkpoint on native hard Dice; otherwise on cossim, which is
-            # scale-invariant and stays a real 0→1 signal where dice_ds_soft is pinned near
-            # its tiny ceiling.
-            metric = "cossim" if cos_ds else "dice"
-            summary = {}
-            if cos_ds:
-                summary.update(log_summary(cos_ds, cos_label, prefix="cossim", metric_label="cos sim"))
-                summary.update(log_summary(topk_ds, topk_label, prefix=f"top{topk_k}",
-                                           metric_label=f"top{topk_k}"))
-            summary.update(log_summary(soft_ds, soft_label, prefix="dice_ds_soft", metric_label="ds soft"))
-            summary.update(log_summary(hard_ds, hard_label, prefix="dice", metric_label="native"))
+            summary, sample_table, _ = validate(
+                model, val_loader, topk_k=topk_k, epoch=epoch,
+                compute_flops=(epoch == 0))
+            metric = "cossim" if "cossim/mean" in summary else "dice"
             mean_dice = summary.get(f"{metric}/mean", float("nan"))
             log.update(summary)
             log["val/samples"] = sample_table

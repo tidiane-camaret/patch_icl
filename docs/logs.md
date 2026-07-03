@@ -1998,3 +1998,30 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   round-trip yields an identical state_dict (keys+shapes). image_size stays at the ckpt
   top level (unchanged). Nothing else consumes patchset_cnn checkpoints, so the shape
   change (flat keys -> nested `arch`) is safe.
+
+## 2026-07-03 — Shared validate() + focused eval_incontext.py (universeg / patchset_cnn)
+- Extracted the per-epoch eval loop into experiments/2d/evaluate.py as a single shared
+  validate() used by BOTH train.py and the new eval script (metrics coherent by construction).
+  It computes native `dice` plus, for low-res models, `dice_ds`/`dice_ds_soft`/`cossim`/`top{k}`,
+  fills an adaptive per-sample table (source-aware `_sample_detail`), and gates figures /
+  patch_csv / synth_csv / a one-shot FLOPs count behind opt-in args.
+- train.py now imports validate/_target_like/_upsample_to from evaluate.py (dropped its own
+  copies + _fmt_transforms/SAMPLE_COLS and 6 now-dead imports). Behavior unchanged: low-res
+  models checkpoint on cossim, native on dice (verified by 1-epoch smoke runs).
+- eval.py DRY: its save_figure/_overlay_ax/_heatmap_ax now live in evaluate.py (eval.py imports
+  save_figure). Its 5-backend dispatch is otherwise untouched.
+- New experiments/2d/eval_incontext.py: thin Hydra wrapper (reuses eval_base.yaml) that loads a
+  train.py checkpoint, dispatches on model_name, rebuilds universeg or patchset_cnn (via
+  **ckpt["arch"]), and runs the shared validate() with figures/CSVs/FLOPs on. Fails loudly on
+  pre-arch patchset_cnn checkpoints. Injects the checkpoint's stored `synth` block into cfg.synth
+  so eval reproduces the model's exact training distribution (eval_base defaults to the
+  controlSynth synth schema; omniSynth models need the omniglot schema — without this the eval
+  silently ran on default scene config and scored a misleading ~0.07 vs the correct ~0.86).
+
+## 2026-07-03 — eval_incontext.py: CLI omniSynth overrides (OOD eval)
+- Added configs/experiment/2d/eval_incontext.yaml (defaults: [eval_base, override synth: omniglot,
+  _self_]) and pointed the wrapper's @hydra.main at it. Defaulting the synth group to omniglot lets
+  `synth.scene.*` compose (eval_base's controlSynth default has no `scene` -> "not in struct").
+- Wrapper now uses the checkpoint's stored synth as the BASE, then merges CLI `synth.*` overrides on
+  top (read from HydraConfig.get().overrides.task) so they win. Unspecified keys still reproduce the
+  training distribution. Enables OOD eval, e.g. `synth.scene.grid=2 synth.scene.target_mode=class`.

@@ -1,0 +1,14 @@
+# Config for experiments/2d/eval_incontext.py — the focused eval wrapper for the
+# universeg / patchset_cnn in-context models. Same as eval_base.yaml but defaults the
+# `synth` GROUP to omniglot so eval-time omniSynth scene overrides compose cleanly, e.g.
+#   python experiments/2d/eval_incontext.py eval.checkpoint=<best.pt> \
+#       data.source=omnisynth data.split=val synth.scene.grid=2 synth.scene.target_mode=class
+#
+# The wrapper injects the checkpoint's stored `synth` block as the base (reproducing the
+# training distribution); any CLI `synth.*` override then wins on top of it. With the
+# controlSynth default (eval_base's `synth: default`) `synth.scene.*` would fail to
+# compose ("Key 'scene' is not in struct"), which is why we default to omniglot here.
+defaults:
+  - eval_base
+  - override synth: omniglot
+  - _self_
