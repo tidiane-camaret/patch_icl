@@ -206,10 +206,31 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
             float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"))
 
 
+def _fmt_transforms(transforms) -> str:
+    """One compact 'r..,s..,dx..,dy..' string per target placement (aug mode);
+    empty when the mode applies no per-placement jitter (identical/class)."""
+    if not transforms:
+        return ""
+    parts = []
+    for p in transforms:
+        if p is None:
+            parts.append("-")
+        else:
+            parts.append(f"r{p['rotate']:+.0f},s{p['scale']:.2f},"
+                         f"dx{p['dx']:+.2f},dy{p['dy']:+.2f}")
+    return " | ".join(parts)
+
+
+# Per-sample qualitative val log: target/context cell (row, col) positions, the
+# resolved target_mode, the per-placement aug transforms and the sample's Dice.
+SAMPLE_COLS = ["epoch", "dataset", "character", "target_mode", "target_pos",
+               "context_pos", "transforms", "dice"]
+
+
 @torch.no_grad()
-def validate(model, loader, topk_k: int = 16):
+def validate(model, loader, topk_k: int = 16, epoch: int = 0):
     """Returns (soft_ds, soft_label), (hard_ds, hard_label), (cos_ds, cos_label),
-    (topk_ds, topk_label) score dicts.
+    (topk_ds, topk_label) score dicts, plus a per-sample wandb.Table (SAMPLE_COLS).
 
     dice_ds_soft = threshold-free Dice of the prob map vs the pooled occupancy GT, at
     the model's (downsampled) logit res. dice = hard Dice (pred≥0.5 vs GT>0) at the
@@ -226,6 +247,7 @@ def validate(model, loader, topk_k: int = 16):
     cos_label: dict[str, list[float]] = defaultdict(list)
     topk_ds: dict[str, list[float]] = defaultdict(list)
     topk_label: dict[str, list[float]] = defaultdict(list)
+    table = wandb.Table(columns=SAMPLE_COLS)
     for batch in tqdm(loader, desc="val", leave=False):
         if batch is None:
             continue
@@ -240,6 +262,7 @@ def validate(model, loader, topk_k: int = 16):
         prob = torch.sigmoid(logit)
         prob_nat = _upsample_to(prob, lbl.shape[-2:])    # preds upscaled to original res (hard)
         native = logit.shape[-2:] == lbl.shape[-2:]      # native res → cossim redundant, skip
+        metas = batch.get("meta")
         for b in range(len(batch["dataset"])):
             key = f"{batch['dataset'][b]}/label_{int(batch['label_value'][b])}"
             s = soft_dice(prob[b, 0], target[b, 0])      # dice_ds_soft: downsampled soft
@@ -251,8 +274,18 @@ def validate(model, loader, topk_k: int = 16):
                 t = topk_overlap(prob[b, 0], target[b, 0], topk_k)  # top-k patch overlap
                 cos_ds[batch["dataset"][b]].append(c); cos_label[key].append(c)
                 topk_ds[batch["dataset"][b]].append(t); topk_label[key].append(t)
+            if metas is not None:                        # qualitative per-sample row
+                m = metas[b]
+                table.add_data(
+                    epoch, batch["dataset"][b],
+                    f"{m['alphabet']}/{m['class_id']}", m.get("target_mode", ""),
+                    str(m.get("target_cells", [])),      # target (row, col) positions
+                    str(m.get("context_cells", [])),     # per-context (row, col) positions
+                    _fmt_transforms(m.get("target_transforms")),
+                    h,                                   # native-res hard Dice
+                )
     return ((soft_ds, soft_label), (hard_ds, hard_label),
-            (cos_ds, cos_label), (topk_ds, topk_label))
+            (cos_ds, cos_label), (topk_ds, topk_label), table)
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -324,7 +357,8 @@ def main(cfg: DictConfig):
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
             ((soft_ds, soft_label), (hard_ds, hard_label),
-             (cos_ds, cos_label), (topk_ds, topk_label)) = validate(model, val_loader, topk_k)
+             (cos_ds, cos_label), (topk_ds, topk_label),
+             sample_table) = validate(model, val_loader, topk_k, epoch)
             # At native prediction res cossim is redundant with Dice and validate() returns
             # empty cos dicts → checkpoint on native hard Dice; otherwise on cossim, which is
             # scale-invariant and stays a real 0→1 signal where dice_ds_soft is pinned near
@@ -339,6 +373,7 @@ def main(cfg: DictConfig):
             summary.update(log_summary(hard_ds, hard_label, prefix="dice", metric_label="native"))
             mean_dice = summary.get(f"{metric}/mean", float("nan"))
             log.update(summary)
+            log["val/samples"] = sample_table
             tqdm.write(f"  [e{epoch}] train loss={loss:.4f}"
                        f"  val {metric}={mean_dice:.4f} top{topk_k}={summary.get(f'top{topk_k}/mean', float('nan')):.4f}"
                        f" ds_soft={summary.get('dice_ds_soft/mean', float('nan')):.4f}"

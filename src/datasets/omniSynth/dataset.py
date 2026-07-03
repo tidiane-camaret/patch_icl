@@ -120,7 +120,7 @@ class OmniSynthICLDataset(Dataset):
             return render_scene(rng, self.scene, self.scene.grid, self.cell_size,
                                 target_sampler, distractor_sampler)
 
-        t_img, t_seg, t_k = scene(rngs[0])
+        t_img, t_seg, t_k, t_info = scene(rngs[0])
         ctx = [scene(rngs[1 + i]) for i in range(self.context_size)]
 
         is_copy = False
@@ -131,9 +131,15 @@ class OmniSynthICLDataset(Dataset):
                 n = max(1, min(int(self.scene.n_copy), self.context_size))
                 slots = crng.permutation(self.context_size)[:n].tolist()
                 for j in slots:
-                    ctx[j] = (t_img.copy(), t_seg.copy(), t_k)   # exact copy of the query scene
+                    ctx[j] = (t_img.copy(), t_seg.copy(), t_k, t_info)  # exact copy of the query scene
                 is_copy = True
                 copy_slot = min(slots)
+
+        # Cell provenance for logging: report each target cell as its (row, col) grid
+        # position rather than the flat row-major index (grid = scene.grid).
+        grid = self.scene.grid
+        def _pos(cells):
+            return [tuple(int(v) for v in divmod(int(cell), grid)) for cell in cells]
 
         return {
             "image":       _to_img_tensor(t_img),
@@ -148,5 +154,8 @@ class OmniSynthICLDataset(Dataset):
                 "k_target": int(t_k),
                 "is_copy": bool(is_copy),
                 "copy_slot": int(copy_slot),
+                "target_cells": _pos(t_info["target_cells"]),          # [(row, col), ...]
+                "target_transforms": t_info["target_transforms"],       # list[dict|None]
+                "context_cells": [_pos(c[3]["target_cells"]) for c in ctx],
             },
         }

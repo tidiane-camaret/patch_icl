@@ -15,7 +15,7 @@ def test_shapes_and_k_range():
     scene = OmniSceneConfig(k_min=2, k_max=5)
     rng = np.random.default_rng(0)
     for _ in range(50):
-        img, mask, k = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
+        img, mask, k, _ = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
         assert img.shape == (GRID * CELL, GRID * CELL) and img.dtype == np.float32
         assert mask.shape == img.shape
         assert 2 <= k <= 5
@@ -25,7 +25,7 @@ def test_mask_marks_exactly_k_cells():
     # target sampler fills its cell with 1s; mask must equal the painted target cells.
     scene = OmniSceneConfig(k_min=3, k_max=3)
     rng = np.random.default_rng(1)
-    img, mask, k = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
+    img, mask, k, _ = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
     assert k == 3
     # exactly 3 of the 16 cells are fully masked, the rest empty
     cells_masked = 0
@@ -42,7 +42,7 @@ def test_mask_is_target_cells_not_distractors():
     # distractor sampler also paints 1s into the image, but must NOT be in the mask.
     scene = OmniSceneConfig(k_min=4, k_max=4)
     rng = np.random.default_rng(2)
-    img, mask, k = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(1))
+    img, mask, k, _ = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(1))
     assert img.sum() == GRID * GRID * CELL * CELL        # every cell painted
     assert mask.sum() == 4 * CELL * CELL                 # only 4 target cells masked
 
@@ -50,7 +50,7 @@ def test_mask_is_target_cells_not_distractors():
 def test_k_clamped_to_valid_range():
     scene = OmniSceneConfig(k_min=99, k_max=99)          # absurd -> clamp to n_cells
     rng = np.random.default_rng(3)
-    _, _, k = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
+    _, _, k, _ = render_scene(rng, scene, GRID, CELL, _const_sampler(1), _const_sampler(0))
     assert k == GRID * GRID
 
 
@@ -58,7 +58,7 @@ def test_affine_jitter_preserves_shape_and_binary():
     scene = OmniSceneConfig()
     base = np.zeros((CELL, CELL), dtype=np.uint8)
     base[4:12, 4:12] = 1
-    out = affine_jitter(base, scene, np.random.default_rng(4))
+    out, _ = affine_jitter(base, scene, np.random.default_rng(4))
     assert out.shape == (CELL, CELL) and out.dtype == np.uint8
     assert set(np.unique(out)).issubset({0, 1})
 

@@ -5,8 +5,12 @@ configs/experiment/2d/synth/omniglot.yaml) so the preview matches what training
 sees. Copies are train-only, so --split defaults to train to make p_copy/n_copy
 visible; each row is annotated with is_copy / copy_slot.
 
+Any trailing `key=value` args are OmegaConf dotlist overrides on the loaded config
+(scene/diversity/sampling blocks), applied after --config is loaded.
+
 Run: .venv311/bin/python experiments/2d/synth/preview_omnisynth.py
      .venv311/bin/python experiments/2d/synth/preview_omnisynth.py --split val --mode class
+     .venv311/bin/python experiments/2d/synth/preview_omnisynth.py --split val scene.grid=2 scene.k_max=3
 """
 import argparse
 import sys; sys.path.insert(0, ".")
@@ -32,9 +36,17 @@ def main():
     ap.add_argument("--image_size", type=int, default=128)
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--out", default="results/omnisynth_preview.png")
-    args = ap.parse_args()
+    args, overrides = ap.parse_known_args()
 
     cfg = OmegaConf.load(args.config)
+    # Any leftover `key=value` args are OmegaConf dotlist overrides on the loaded
+    # config, e.g. `scene.grid=2 scene.k_max=3 sampling.epoch_length=10`.
+    if overrides:
+        bad = [o for o in overrides if "=" not in o]
+        if bad:
+            ap.error(f"unrecognized arguments: {' '.join(bad)} "
+                     "(config overrides must be dotlist key=value, e.g. scene.grid=2)")
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     scene_kw = dict(cfg.scene)
     if args.mode is not None:
         scene_kw["target_mode"] = args.mode
