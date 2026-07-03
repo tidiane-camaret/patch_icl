@@ -53,7 +53,7 @@ class OmniSynthICLDataset(Dataset):
             for class_id in self.pool:
                 alph = self.bank.alphabet(class_id)
                 for s in range(self.sampling.eval_subjects_per_task):
-                    self.samples.append((f"omniglot/{alph}", len(self._eval_index), 1))
+                    self.samples.append((f"omniglot/{alph}", len(self._eval_index), int(class_id)))
                     self._eval_index.append((class_id, s))
         else:
             self._eval_index = None
@@ -120,7 +120,7 @@ class OmniSynthICLDataset(Dataset):
             return render_scene(rng, self.scene, self.scene.grid, self.cell_size,
                                 target_sampler, distractor_sampler)
 
-        t_img, t_seg, t_k = scene(rngs[0])
+        t_img, t_seg, t_k, t_info = scene(rngs[0])
         ctx = [scene(rngs[1 + i]) for i in range(self.context_size)]
 
         return {
@@ -134,5 +134,8 @@ class OmniSynthICLDataset(Dataset):
                 "subject_index": int(sample_index),
                 "target_mode": mode,
                 "k_target": int(t_k),
+                "target_cells": list(t_info["target_cells"]),
+                "target_transforms": t_info["target_transforms"],   # list[dict|None]
+                "context_cells": [list(c[3]["target_cells"]) for c in ctx],
             },
         }

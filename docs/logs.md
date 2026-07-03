@@ -1884,3 +1884,22 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
 - multilevel/train.py train_epoch returns per-hop dicts; logs train/dice_soft_r{grid}/mean
   and train/dice_r{grid}/mean (mirrors val dice_soft_r* naming). Measured on each hop's
   sampled query patches (what it trains on), so reads slightly above the full-grid val metric.
+
+- omniSynth eval per-label breakdown: OmniSynthICLDataset hardcoded label_value=1 for
+  all samples, so universeg_train validate() only ever logged `omniglot/{alph}/label_1`.
+  Eval (deterministic) branch now reports `int(class_id)` as label_value, giving a
+  per-character split. Train branch stays 1 (class_id drawn at __getitem__ time, train
+  is not evaluated).
+
+- universeg_train train_epoch now returns (loss, train_dice_soft, train_dice) and logs
+  train/dice_soft + train/dice, mirroring pfn_seg. Soft+hard Dice are accumulated on-GPU
+  via batch_dice_sums from the prob/lbl the forward already produced (no extra pass,
+  single sync at epoch end); per-epoch console line also prints train Dice.
+
+- omniSynth per-item provenance: render_scene now returns (image, mask, k, info) with
+  info={k, target_cells, target_transforms}; affine_jitter returns (bitmap, params)
+  capturing rotate/scale/dx/dy. Dataset stashes target_cells, target_transforms, and
+  context_cells (per-context target positions) in meta. universeg_train validate() builds
+  a wandb.Table "val/samples" [epoch, dataset, character, target_mode, target_pos,
+  context_pos, transforms, dice] per val item (guarded on meta presence). Updated
+  test_render.py for the new arity; tests pass.

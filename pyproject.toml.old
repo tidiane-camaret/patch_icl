@@ -1,0 +1,38 @@
+[project]
+name = "patch-icl"
+version = "0.1.0"
+description = "patch-based icl on images"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # PyTorch — install separately with the cu124 index (see README)
+    # uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    "torch>=2.5.1",
+    "torchvision>=0.20.0",
+    # Scientific stack
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "scikit-image>=0.24",
+    # Config / experiment
+    "omegaconf>=2.3",
+    "hydra-core>=1.3",
+    "wandb>=0.19",
+    # Medical imaging / data
+    "nibabel>=5.2",
+    "huggingface_hub>=0.23",
+    # Visualisation / utilities
+    "matplotlib>=3.9",
+    "pillow>=10.0",
+    "tqdm>=4.66",
+    "psutil>=6.0",
+    # nnUNet (ResEncEncoder + dynamic_network_architectures)
+    "nnunetv2>=2.5",
+    "pytorch-lightning>=2.6.4",
+    "tabulate>=0.10.0",
+    "monai>=1.5.2",
+]
+
+[tool.uv]
+# Pull torch/torchvision from the CUDA 12.4 wheel index.
+extra-index-url = ["https://download.pytorch.org/whl/cu124"]

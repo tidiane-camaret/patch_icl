@@ -32,7 +32,9 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEVICE, build_dataset, hard_dice, log_summary, make_loader
+from common import (
+    DEVICE, batch_dice_sums, build_dataset, hard_dice, log_summary, make_loader,
+)
 from pfn_train import soft_dice_loss
 
 
@@ -41,9 +43,19 @@ def _autocast():
                           enabled=DEVICE.type == "cuda")
 
 
-def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> float:
+def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float]:
+    """Returns (mean_loss, train_dice_soft, train_dice). The two Dice metrics are the
+    soft and hard Dice between the model's native-res prediction and the binary GT —
+    the exact tensors the forward already produced, accumulated on-GPU and synced once
+    at epoch end (no extra forward, no per-batch stall). They mirror the val dice, so
+    the train↔val gap is read at one glance."""
     model.train()
     total, n = 0.0, 0
+    # On-GPU train-accuracy accumulators (distinct tensors — no aliasing).
+    soft_sum = torch.zeros((), device=DEVICE)
+    soft_cnt = torch.zeros((), device=DEVICE)
+    hard_sum = torch.zeros((), device=DEVICE)
+    hard_cnt = torch.zeros((), device=DEVICE)
     pbar = tqdm(loader, desc=f"train e{epoch}")
     for batch in pbar:
         if batch is None:
@@ -57,8 +69,9 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> float:
         with _autocast():
             out = model(img, context_in=cin, context_out=cout, mode="train")
             logit = out["final_logit"].float()                    # (B,1,H,W)
+        prob = torch.sigmoid(logit)
         bce = F.binary_cross_entropy_with_logits(logit, lbl)
-        dice = soft_dice_loss(torch.sigmoid(logit), lbl)
+        dice = soft_dice_loss(prob, lbl)
         loss = bce + cfg.train.dice_weight * dice
 
         loss.backward()
@@ -69,15 +82,41 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> float:
 
         total += loss.item()
         n += 1
+        # Train accuracy from already-computed prob/lbl (detached inside helper).
+        ss, sc, hs, hc = batch_dice_sums(prob, lbl)
+        soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
         pbar.set_postfix(loss=f"{total / n:.4f}", lr=f"{scheduler.get_last_lr()[0]:.1e}")
-    return total / max(n, 1)
+
+    train_soft = float((soft_sum / soft_cnt.clamp_min(1)).item())
+    train_hard = float((hard_sum / hard_cnt.clamp_min(1)).item())
+    return total / max(n, 1), train_soft, train_hard
+
+
+def _fmt_transforms(transforms) -> str:
+    """One compact 'r..,s..,dx..,dy..' string per target placement (aug mode);
+    empty when the mode applies no per-placement jitter (identical/class)."""
+    if not transforms:
+        return ""
+    parts = []
+    for p in transforms:
+        if p is None:
+            parts.append("-")
+        else:
+            parts.append(f"r{p['rotate']:+.0f},s{p['scale']:.2f},"
+                         f"dx{p['dx']:+.2f},dy{p['dy']:+.2f}")
+    return " | ".join(parts)
+
+
+SAMPLE_COLS = ["epoch", "dataset", "character", "target_mode", "target_pos",
+               "context_pos", "transforms", "dice"]
 
 
 @torch.no_grad()
-def validate(model, loader):
+def validate(model, loader, epoch=0):
     model.eval()
     per_ds: dict[str, list[float]] = defaultdict(list)
     per_label: dict[str, list[float]] = defaultdict(list)
+    table = wandb.Table(columns=SAMPLE_COLS)
     for batch in tqdm(loader, desc="val", leave=False):
         if batch is None:
             continue
@@ -85,6 +124,7 @@ def validate(model, loader):
         cin = batch["context_in"].to(DEVICE, non_blocking=True)
         cout = batch["context_out"].to(DEVICE, non_blocking=True)
         labels = batch["label"]
+        metas = batch.get("meta")
         with _autocast():
             out = model(img, context_in=cin, context_out=cout, mode="val")
         preds = (out["final_logit"] > 0).float().cpu()
@@ -92,7 +132,17 @@ def validate(model, loader):
             d = hard_dice(preds[b, 0], labels[b, 0])
             per_ds[batch["dataset"][b]].append(d)
             per_label[f"{batch['dataset'][b]}/label_{int(batch['label_value'][b])}"].append(d)
-    return per_ds, per_label
+            if metas is not None:
+                m = metas[b]
+                table.add_data(
+                    epoch, batch["dataset"][b],
+                    f"{m['alphabet']}/{m['class_id']}", m.get("target_mode", ""),
+                    str(m.get("target_cells", [])),
+                    str(m.get("context_cells", [])),
+                    _fmt_transforms(m.get("target_transforms")),
+                    d,
+                )
+    return per_ds, per_label, table
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -156,18 +206,21 @@ def main(cfg: DictConfig):
     best_dice = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss = train_epoch(model, train_loader, optimizer, scheduler, cfg, epoch)
+        loss, train_soft, train_hard = train_epoch(
+            model, train_loader, optimizer, scheduler, cfg, epoch)
         log = {"epoch": epoch, "train/loss": loss,
+               "train/dice_soft": train_soft, "train/dice": train_hard,
                "train/lr": scheduler.get_last_lr()[0],
                "time/epoch_s": time.perf_counter() - t0}
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            per_ds, per_label = validate(model, val_loader)
+            per_ds, per_label, sample_table = validate(model, val_loader, epoch)
             summary = log_summary(per_ds, per_label)
             mean_dice = summary.get("dice/mean", float("nan"))
             log.update(summary)
-            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}  val Dice={mean_dice:.4f}"
-                       f"  (best={max(best_dice, mean_dice):.4f})")
+            log["val/samples"] = sample_table
+            tqdm.write(f"  [e{epoch}] train loss={loss:.4f}  train Dice={train_hard:.4f}"
+                       f"  val Dice={mean_dice:.4f}  (best={max(best_dice, mean_dice):.4f})")
             if mean_dice > best_dice:
                 best_dice = mean_dice
                 torch.save({
