@@ -33,3 +33,4 @@ arch:
 
 train:
   lr: 3.0e-4
+  topk_k: 32

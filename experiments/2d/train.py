@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_dataset, make_loader
-from evaluate import validate, _target_like, _upsample_to
+from evaluate import validate, _target_like, _upsample_to, _as_res_list
 from pfn_train import soft_dice_loss
 
 
@@ -132,12 +132,16 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 
-def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float, float]:
+def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float, float, dict, int | None]:
     model.train()
     total, n = 0.0, 0
     soft_sum = soft_cnt = hard_sum = hard_cnt = 0.0   # on-device running sums (synced once)
     cos_sum = cos_cnt = topk_sum = topk_cnt = 0.0
     topk_k = int(cfg.train.get("topk_k", 16))
+    res_list = _as_res_list(cfg.eval.get("ds_metric_res", None))   # fixed-res pooled Dice
+    dsr_sums = {R: {"ss": 0.0, "sc": 0.0, "hs": 0.0, "hc": 0.0} for R in res_list}
+    low_res = None                              # non-native model's coarse logit side length
+    lr_hard_sum = lr_hard_cnt = 0.0            # hard Dice at that native low res (patchset_cnn)
     pbar = tqdm(loader, desc=f"train e{epoch}")
     for batch in pbar:
         if batch is None:
@@ -167,13 +171,24 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
         # cossim only adds signal below native res; at native res it is redundant with Dice.
         with torch.no_grad():
             prob = torch.sigmoid(logit)
+            prob_nat = _upsample_to(prob, lbl.shape[-2:])
             ss, sc = _soft_sum(prob, target)
-            hs, hc = _hard_sum(_upsample_to(prob, lbl.shape[-2:]), lbl)
+            hs, hc = _hard_sum(prob_nat, lbl)
             soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
-            if logit.shape[-2:] != lbl.shape[-2:]:   # low res: cossim + top-k patch overlap
+            if logit.shape[-2:] != lbl.shape[-2:]:   # low res: cossim + top-k + hard@nativeres
+                low_res = logit.shape[-1]
                 cs, cc = _cos_sum(prob, target)
                 ts, tc = _topk_sum(prob, target, topk_k)
                 cos_sum += cs; cos_cnt += cc; topk_sum += ts; topk_cnt += tc
+                hlr, clr = _hard_sum(prob, (target >= 0.5).float())   # hard Dice at the coarse grid
+                lr_hard_sum += hlr; lr_hard_cnt += clr
+            for R in res_list:   # fixed-res pooled Dice (GT + pred avg-pooled to RxR)
+                p_r = F.adaptive_avg_pool2d(prob_nat, (R, R))
+                g_r = F.adaptive_avg_pool2d(lbl, (R, R))
+                ss_r, sc_r = _soft_sum(p_r, g_r)
+                hs_r, hc_r = _hard_sum(p_r, (g_r >= 0.5).float())
+                d = dsr_sums[R]
+                d["ss"] += ss_r; d["sc"] += sc_r; d["hs"] += hs_r; d["hc"] += hc_r
 
         total += loss.item()
         n += 1
@@ -184,11 +199,20 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
             post["cos"] = f"{float(cos_sum) / float(cos_cnt):.4f}"
             post[f"top{topk_k}"] = f"{float(topk_sum) / float(topk_cnt):.4f}"
         pbar.set_postfix(**post)
+    dsr_out = {}
+    for R in res_list:                          # universeg: user-requested fixed resolutions
+        d = dsr_sums[R]
+        dsr_out[f"dice_ds@{R}"] = float(d["hs"]) / max(float(d["hc"]), 1)
+        dsr_out[f"dice_ds_soft@{R}"] = float(d["ss"]) / max(float(d["sc"]), 1)
+    if low_res is not None:                     # patchset_cnn: tag its native coarse grid too
+        dsr_out[f"dice_ds@{low_res}"] = float(lr_hard_sum) / max(float(lr_hard_cnt), 1)
+        dsr_out[f"dice_ds_soft@{low_res}"] = float(soft_sum) / max(float(soft_cnt), 1)
     return (total / max(n, 1),
             float(soft_sum) / max(float(soft_cnt), 1),
             float(hard_sum) / max(float(hard_cnt), 1),
             float(cos_sum) / float(cos_cnt) if cos_cnt else float("nan"),
-            float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"))
+            float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"),
+            dsr_out, low_res)
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -205,6 +229,28 @@ def main(cfg: DictConfig):
     val_loader = make_loader(build_dataset(cfg, "val"), cfg, "val", shuffle=False)
 
     model, model_name, ckpt_meta = build_model(cfg)
+
+    # Optional warm-start for retraining. Accepts a bare state_dict (old format) or the
+    # new {"model": ...} checkpoint; strips the _orig_mod. prefix left by torch.compile.
+    # Tolerant load: keep only tensors whose name AND shape match the current model, so a
+    # checkpoint from a slightly different config still warm-starts (cf. pfn_seg.py).
+    if cfg.train.get("checkpoint", None):
+        raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
+        sd = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
+        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        model_sd = model.state_dict()
+        compatible = {k: v for k, v in sd.items()
+                      if k in model_sd and v.shape == model_sd[k].shape}
+        skipped = [k for k in sd if k not in compatible]
+        fresh = [k for k in model_sd if k not in compatible]
+        model.load_state_dict(compatible, strict=False)
+        print(f"Warm-start from {cfg.train.checkpoint}: "
+              f"loaded {len(compatible)}/{len(model_sd)} tensors")
+        if skipped:
+            print(f"  skipped (shape mismatch / not in model): {skipped}")
+        if fresh:
+            print(f"  kept freshly initialized (not in checkpoint): {fresh}")
+
     model = model.to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params/1e6:.2f}M")
@@ -247,28 +293,34 @@ def main(cfg: DictConfig):
     topk_k = int(cfg.train.get("topk_k", 16))
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss, train_soft, train_hard, train_cos, train_topk = train_epoch(
+        loss, train_soft, train_hard, train_cos, train_topk, train_dsr, train_lowres = train_epoch(
             model, train_loader, optimizer, scheduler, cfg, epoch)
-        log = {"epoch": epoch, "train/loss": loss,
-               "train/dice_ds_soft": train_soft, "train/dice": train_hard,
+        log = {"epoch": epoch, "train/dice": train_hard, "train/loss": loss,
                "train/lr": scheduler.get_last_lr()[0],
                "time/epoch_s": time.perf_counter() - t0}
+        if train_lowres is None:   # native model (universeg): dice_ds_soft is the full-res soft
+            log["train/dice_ds_soft"] = train_soft
         if not math.isnan(train_cos):
             log["train/cossim"] = train_cos
         if not math.isnan(train_topk):
             log[f"train/top{topk_k}"] = train_topk
+        log.update({f"train/{k}": v for k, v in train_dsr.items()})   # dice_ds@R / dice_ds_soft@R
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
             summary, sample_table, _ = validate(
                 model, val_loader, topk_k=topk_k, epoch=epoch,
-                compute_flops=(epoch == 0))
+                compute_flops=(epoch == 0),
+                ds_metric_res=cfg.eval.get("ds_metric_res", None))
             metric = "cossim" if "cossim/mean" in summary else "dice"
             mean_dice = summary.get(f"{metric}/mean", float("nan"))
             log.update(summary)
             log["val/samples"] = sample_table
+            ds_soft_key = next((k for k in summary
+                                if k.startswith("dice_ds_soft") and k.endswith("/mean")), None)
+            ds_soft = summary.get(ds_soft_key, float("nan")) if ds_soft_key else float("nan")
             tqdm.write(f"  [e{epoch}] train loss={loss:.4f}"
                        f"  val {metric}={mean_dice:.4f} top{topk_k}={summary.get(f'top{topk_k}/mean', float('nan')):.4f}"
-                       f" ds_soft={summary.get('dice_ds_soft/mean', float('nan')):.4f}"
+                       f" ds_soft={ds_soft:.4f}"
                        f" dice={summary.get('dice/mean', float('nan')):.4f}"
                        f"  (best {metric}={max(best_dice, mean_dice):.4f})")
             if mean_dice > best_dice:

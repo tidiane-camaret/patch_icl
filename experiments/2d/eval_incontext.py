@@ -100,11 +100,15 @@ def main(cfg: DictConfig):
         model, loader, topk_k=int(cfg.eval.get("topk_k", 16)), epoch=0,
         figures=figures, patch_csv=cfg.eval.get("patch_csv"),
         synth_csv=(cfg.eval.get("synth_csv") if cfg.data.get("source") == "synthetic" else None),
-        compute_flops=True)
+        compute_flops=True, ds_metric_res=cfg.eval.get("ds_metric_res", None))
     summary["samples"] = table
     wandb.log(summary)
+    ds_key = next((k for k in summary
+                   if k.startswith("dice_ds") and not k.startswith("dice_ds_soft")
+                   and k.endswith("/mean")), None)
+    ds_str = f"{summary.get(ds_key):.4f} ({ds_key})" if ds_key else "n/a"
     print(f"dice/mean={summary.get('dice/mean'):.4f}  "
-          f"dice_ds/mean={summary.get('dice_ds/mean', float('nan')):.4f}  "
+          f"dice_ds/mean={ds_str}  "
           f"flops={summary.get('flops_giga', float('nan')):.2f}G  out={out_dir}")
     run.finish()
 

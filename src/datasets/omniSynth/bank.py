@@ -25,16 +25,19 @@ _BANK_CACHE: dict = {}
 _ENTRY = re.compile(r"^[^/]+/([^/]+)/(character\d+)/([^/]+\.png)$")
 
 
-def get_or_build_bank(diversity: OmniDiversityConfig, cell_size: int) -> "OmniglotBank":
-    key = (repr(diversity), int(cell_size))
+def get_or_build_bank(diversity: OmniDiversityConfig, cell_size: int,
+                      cell_margin: float = 0.1) -> "OmniglotBank":
+    key = (repr(diversity), int(cell_size), float(cell_margin))
     if key not in _BANK_CACHE:
-        _BANK_CACHE[key] = OmniglotBank(diversity, cell_size)
+        _BANK_CACHE[key] = OmniglotBank(diversity, cell_size, cell_margin)
     return _BANK_CACHE[key]
 
 
 class OmniglotBank:
-    def __init__(self, diversity: OmniDiversityConfig, cell_size: int):
+    def __init__(self, diversity: OmniDiversityConfig, cell_size: int,
+                 cell_margin: float = 0.1):
         self.cell_size = int(cell_size)
+        self.cell_margin = float(cell_margin)
         self._renditions: dict[int, list[np.ndarray]] = {}
         self._alphabet: dict[int, str] = {}
         self._pools: dict[str, list[int]] = {"train": [], "val": [], "test": []}
@@ -84,18 +87,25 @@ class OmniglotBank:
         return next_id
 
     def _to_bitmap(self, png_bytes: bytes) -> np.ndarray:
-        """PNG bytes -> [cell,cell] uint8 in {0,1}, inverted, margin-padded, centered."""
+        """PNG bytes -> [tile,tile] uint8 in {0,1}, inverted, centered in its tile.
+
+        The glyph is resized to an `inner`-sized box where `inner = (1 - 2*margin)*cell`:
+        margin>0 shrinks the glyph inside a cell-sized tile (the tile stays `cell` so a
+        margin>=0 tile drops into one grid cell exactly); margin<0 makes `inner > cell`, so
+        the tile is `inner` and the glyph deliberately overflows its cell (render pastes it
+        onto the canvas with union blending, giving larger, mutually overlapping characters)."""
         img = Image.open(io.BytesIO(png_bytes)).convert("L")
         arr = np.asarray(img)
         fg = (arr < 128)                       # ink (black) -> foreground
         cell = self.cell_size
-        inner = max(1, int(round(cell * (1.0 - 2.0 * 0.1))))  # V1 hardcoded margin (0.1); OmniSceneConfig.cell_margin not threaded through yet
+        inner = max(1, int(round(cell * (1.0 - 2.0 * self.cell_margin))))
         resized = np.asarray(
             Image.fromarray((fg * 255).astype(np.uint8)).resize((inner, inner), Image.BILINEAR)
         )
         bm_inner = (resized >= 128).astype(np.uint8)
-        out = np.zeros((cell, cell), dtype=np.uint8)
-        off = (cell - inner) // 2
+        tile = max(cell, inner)                # >= cell keeps margin>=0 exactly cell-sized
+        out = np.zeros((tile, tile), dtype=np.uint8)
+        off = (tile - inner) // 2
         out[off:off + inner, off:off + inner] = bm_inner
         return out
 

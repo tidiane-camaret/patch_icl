@@ -13,7 +13,9 @@ scene:
   grid: 4                # grid x grid cells fill the canvas (image_size must divide by grid)
   k_min: 1               # target cells ~ U[k_min, k_max]
   k_max: 1
-  cell_margin: 0.1       # fractional padding inside each cell (currently UNUSED; hardcoded at 0.1 in V1)
+  cell_margin: -0.15     # glyph size = (1-2*margin)*cell. <0 -> glyphs larger than their cell,
+                         # overflowing into neighbours (union-blended) for more ink / training
+                         # signal with small tolerable overlap. 0.1=old inset, 0=fill cell.
   target_mode: aug     # identical | aug | class  (what "same target" means)
   aug_rotate: 20.0       # deg; aug-mode per-placement jitter
   aug_scale: 0.2         # +/- log2 scale

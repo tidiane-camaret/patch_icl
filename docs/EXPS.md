@@ -1,17 +1,24 @@
 
-# 6_patchset_cnn_2_lvls
-## Q : on omnisynth, is second level of patchset_cnn able to produce masks at full resolution ? 
-- Q1 : level 0 accuracy (resolution 16, omnisynth : 2x2 grid, 1 ctx)
+# 7_patchset_cnn_2_lvls
+## Q : on omnisynth, behavior of 2nd lvl 32-> 128 ? 
+omnisynth : 4x4 grid, 1 ctx
+- Q1 : level 0 : resolution 32, get log gt/pred bbox overlap
+- Q2 : level 1 (resolution 128, omnisynth : 4x4 grid, 1 ctx)
 ## R : 
 
-# 5_patchset_cnn_2_instcopy_effect 
+# 6_patchset_cnn_finer_res_effect
+## Q : when sampling at higher res, the input has more details but more patches -> more long-range attention spatially-wise
+- Q1 : dice at resolutions 16,32,64 compared to universeg 
+## R : 
+
+# 5_patchset_cnn_instcopy_effect 
 ## Q : do tgt repetition helps generalization ? 
 experiments/2d/train.py --config-name patchset_cnn_train synth=omniglot data.context_size=1 synth.scene.grid=2 arch.resolution=16
 synth.scene.p_copy=0.9 : damymmfw  
 synth.scene.p_copy=0 : 
 ## R : 
 
-# 4_weaknesses_universeg (03_07_26)
+# 4_weaknesses (03_07_26)
 ## Q : when trained and eval on omnisynth, where does universeg fails ?
 ## R : 
 

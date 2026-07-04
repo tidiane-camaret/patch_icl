@@ -105,6 +105,20 @@ def _fmt_transforms(transforms) -> str:
     return " | ".join(parts)
 
 
+def _fmt_positions(positions) -> str:
+    """Compact real (x, y) glyph positions, e.g. '(0.51,0.48)(0.12,0.90)'; empty when none."""
+    return "".join(f"({x:.3f},{y:.3f})" for x, y in (positions or []))
+
+
+def _as_res_list(ds_metric_res) -> list[int]:
+    """Normalise the ds_metric_res config (None | int | list/ListConfig) to [int, ...]."""
+    if ds_metric_res is None:
+        return []
+    if isinstance(ds_metric_res, int):
+        return [ds_metric_res]
+    return [int(r) for r in ds_metric_res]
+
+
 SAMPLE_COLS = ["epoch", "dataset", "sample_idx", "label",
                "dice", "dice_ds", "dice_ds_soft", "detail"]
 
@@ -112,16 +126,26 @@ SAMPLE_COLS = ["epoch", "dataset", "sample_idx", "label",
 def _sample_detail(meta: dict | None) -> str:
     """One compact string describing a sample, adapting to the data source.
 
-    omniSynth meta -> "alphabet/class mode=<m> cells=<...> tf=<...>";
-    controlSynth meta -> "<morphology> task=<id>"; anything else (e.g. medsegbench,
-    or missing meta) -> "". Keeps the wandb sample table's columns fixed across sources.
+    omniSynth meta -> "alphabet/class mode=<m> cells=<...> ctx=<...> pos=<...> cpos=<...>
+    sub=<i> tf=<...>"; controlSynth meta -> "<morphology> task=<id>"; anything else (e.g.
+    medsegbench, or missing meta) -> "". Keeps the sample table's columns fixed across sources.
+
+    ctx (context_cells) + sub (subject_index) make an omniSynth-only run self-contained.
+    pos/cpos are the real post-aug (x, y) target/context positions in [0, 1] (ink centroid),
+    the continuous counterpart of the discrete cells for target<->context distance analysis.
+    tf stays last because it is the only free-form field (spaces + " | " between placements).
     """
     if not meta:
         return ""
     if "alphabet" in meta:  # omniSynth
+        cpos = " ".join(_fmt_positions(p) for p in meta.get("context_positions", []))
         return (f"{meta.get('alphabet')}/{meta.get('class_id')} "
                 f"mode={meta.get('target_mode', '')} "
                 f"cells={meta.get('target_cells', [])} "
+                f"ctx={meta.get('context_cells', [])} "
+                f"pos={_fmt_positions(meta.get('target_positions'))} "
+                f"cpos={cpos} "
+                f"sub={meta.get('subject_index', -1)} "
                 f"tf={_fmt_transforms(meta.get('target_transforms'))}")
     if "morphology" in meta:  # controlSynth
         return f"{meta.get('morphology')} task={int(meta.get('task_id', -1))}"
@@ -143,7 +167,7 @@ def _upsample_to(x: torch.Tensor, size) -> torch.Tensor:
 
 @torch.no_grad()
 def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
-             patch_csv=None, synth_csv=None, compute_flops=False):
+             patch_csv=None, synth_csv=None, compute_flops=False, ds_metric_res=None):
     from torch.utils.flop_counter import FlopCounterMode
     model.eval()
     hard_ds, hard_lab = defaultdict(list), defaultdict(list)   # native hard dice
@@ -151,6 +175,12 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
     soft_ds, soft_lab = defaultdict(list), defaultdict(list)   # low-res soft dice_ds_soft
     cos_ds,  cos_lab  = defaultdict(list), defaultdict(list)   # populated only when not native
     topk_ds, topk_lab = defaultdict(list), defaultdict(list)
+    # Optional fixed-resolution hard/soft Dice on avg-pooled GT vs avg-pooled pred. Lets a
+    # native-res model (UniverSeg) report a coarse-grid score comparable to patchset_cnn.
+    res_list = _as_res_list(ds_metric_res)
+    dsr = {R: {"hd": defaultdict(list), "hl": defaultdict(list),
+               "sd": defaultdict(list), "sl": defaultdict(list)} for R in res_list}
+    low_res = None   # a non-native model's coarse logit side length (e.g. 16 for patchset_cnn)
     table = wandb.Table(columns=SAMPLE_COLS)
     inf_times, flops, saved = [], None, set()
     warned_patch = False
@@ -186,6 +216,11 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
         prob     = torch.sigmoid(logit)                  # (B,1,hp,wp)
         prob_nat = _upsample_to(prob, lbl.shape[-2:])   # (B,1,H,W)
         native   = logit.shape[-2:] == lbl.shape[-2:]
+        if not native and low_res is None:
+            low_res = logit.shape[-1]
+        # avg-pool the full-res pred + GT to each requested resolution (batched, once)
+        pooled = {R: (F.adaptive_avg_pool2d(prob_nat, (R, R)),
+                      F.adaptive_avg_pool2d(lbl, (R, R))) for R in res_list}
         if native and patch_rows is not None and not warned_patch:
             print("warning: patch_csv is set but this model is native-resolution "
                   "(no low-res grid) — no patch rows will be written.")
@@ -211,6 +246,14 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 dh = s = float("nan")                    # native: no coarse grid
             dsh_ds[ds].append(dh); dsh_lab[key].append(dh)
             soft_ds[ds].append(s); soft_lab[key].append(s)
+
+            for R in res_list:                            # fixed-res pooled Dice
+                p_r, g_r = pooled[R]
+                sr = soft_dice(p_r[b, 0], g_r[b, 0])
+                hr = hard_dice(p_r[b, 0], (g_r[b, 0] >= 0.5).float())
+                d = dsr[R]
+                d["sd"][ds].append(sr); d["sl"][key].append(sr)
+                d["hd"][ds].append(hr); d["hl"][key].append(hr)
 
             detail = _sample_detail(metas[b]) if metas is not None else ""
             table.add_data(epoch, ds, si, lv, h, dh, s, detail)
@@ -265,15 +308,22 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
     summary = {}
     summary.update(log_summary(hard_ds, hard_lab, prefix="dice",
                                metric_label="native", extra=extra))
-    summary.update(log_summary(dsh_ds, dsh_lab, prefix="dice_ds",
-                               metric_label="downsampled"))
-    summary.update(log_summary(soft_ds, soft_lab, prefix="dice_ds_soft",
-                               metric_label="low-res soft"))
+    if low_res is not None:   # non-native model: tag its coarse-grid Dice with the resolution
+        summary.update(log_summary(dsh_ds, dsh_lab, prefix=f"dice_ds@{low_res}",
+                                   metric_label=f"hard@{low_res}"))
+        summary.update(log_summary(soft_ds, soft_lab, prefix=f"dice_ds_soft@{low_res}",
+                                   metric_label=f"soft@{low_res}"))
     if cos_ds:   # populated only when some batch was non-native
         summary.update(log_summary(cos_ds, cos_lab, prefix="cossim",
                                    metric_label="cos sim"))
         summary.update(log_summary(topk_ds, topk_lab, prefix=f"top{topk_k}",
                                    metric_label=f"top{topk_k}"))
+    for R in res_list:                                    # fixed-res pooled Dice
+        d = dsr[R]
+        summary.update(log_summary(d["hd"], d["hl"], prefix=f"dice_ds@{R}",
+                                   metric_label=f"hard@{R}"))
+        summary.update(log_summary(d["sd"], d["sl"], prefix=f"dice_ds_soft@{R}",
+                                   metric_label=f"soft@{R}"))
 
     if patch_rows:
         p = Path(patch_csv); p.parent.mkdir(parents=True, exist_ok=True)

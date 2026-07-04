@@ -54,6 +54,24 @@ def test_k_clamped_to_valid_range():
     assert k == GRID * GRID
 
 
+def test_oversized_tiles_overflow_and_union():
+    # A tile larger than the cell (margin<0 case) must overflow its cell and union-blend
+    # into neighbours instead of being clipped or overwriting them.
+    scene = OmniSceneConfig(k_min=1, k_max=1)
+    big = 24                                             # > CELL (16) -> overflows the cell
+    rng = np.random.default_rng(7)
+    tgt = lambda rng: np.ones((big, big), dtype=np.uint8)
+    img, mask, k, info = render_scene(rng, scene, GRID, CELL, tgt, _const_sampler(0))
+    assert img.shape == (GRID * CELL, GRID * CELL)
+    # the single target's ink spills beyond one cell: more than CELL*CELL painted pixels
+    assert mask.sum() > CELL * CELL
+    # union never exceeds 1 even where the oversized glyph overlaps neighbours
+    assert img.max() == 1.0 and mask.max() == 1.0
+    # centroid is reported in [0,1]
+    (x, y), = info["target_positions"]
+    assert 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+
+
 def test_affine_jitter_preserves_shape_and_binary():
     scene = OmniSceneConfig()
     base = np.zeros((CELL, CELL), dtype=np.uint8)
@@ -68,5 +86,6 @@ if __name__ == "__main__":
     test_mask_marks_exactly_k_cells()
     test_mask_is_target_cells_not_distractors()
     test_k_clamped_to_valid_range()
+    test_oversized_tiles_overflow_and_union()
     test_affine_jitter_preserves_shape_and_binary()
     print("ALL RENDER TESTS PASSED")

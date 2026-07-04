@@ -2025,3 +2025,125 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
 - Wrapper now uses the checkpoint's stored synth as the BASE, then merges CLI `synth.*` overrides on
   top (read from HydraConfig.get().overrides.task) so they win. Unspecified keys still reproduce the
   training distribution. Enables OOD eval, e.g. `synth.scene.grid=2 synth.scene.target_mode=class`.
+
+## 4_weaknesses.py — universeg vs patchset_cnn weakness analysis (omnisynth)
+- Added marimo analysis cells (runs uixvcpny=universeg, kq1cent3=patchset_cnn). The two eval
+  tables have different schemas: universeg has explicit cols; patchset packs everything into a
+  `detail` string ("char mode= cells= tf="). Cells parse `detail`, unify into one long df, decode
+  `transforms` -> rot/scale/dx/dy features, and build a paired merge on
+  (dataset, character, target_pos, transforms).
+- Findings: universeg mean/median Dice 0.76/0.91 (bimodal: 52% >0.9, 10% <0.1); patchset_cnn
+  0.46/0.50, unimodal peak ~0.5, 0% samples >0.9. Universeg wins 82.6% of paired samples.
+- Both models: Dice *increases* with |rotation| — the (0,5]deg bin is the hardest
+  (uni 0.57, pat 0.41), rising to ~0.88/0.50 by 15-20deg. target_pos has ~no effect.
+  Spearman(dice,|rot|): uni +0.35, pat +0.22; scale/translation weak.
+- NB: marimo/wandb/seaborn live in `.venv` (py3.12), not `.venv311`. Verification figs:
+  results/experiments/4w_fig{1_dist,2_rot,3_paired}.png.
+
+## 4_weaknesses.py — driver analysis (what drives Dice for each model)
+- Enriched the paired frame (`mg`): borrowed universeg's `context_pos` onto patchset (same
+  seeded samples) to get target-context grid distance for both; parsed transforms; added
+  per-character object size = mean ink fraction of the Omniglot glyph (via
+  src/datasets/omniSynth/bank.py over val+test pools, keyed by class_id in "alphabet/class_id").
+- Quantified with eta^2 (variance-explained). The two models are driven by DIFFERENT things:
+    driver              universeg  patchset_cnn
+    object size (ink)      0.008     0.094
+    character id           0.050     0.242
+    dataset/alphabet       0.015     0.107
+    target |rotation|      0.174     0.073
+    scale deviation        0.009     0.015
+    translation            0.033     0.010
+    tgt-ctx distance       0.001     0.001
+- universeg: accuracy driven by AUGMENTATION (rotation); robust to object identity/size.
+  patchset_cnn: driven by OBJECT IDENTITY/SIZE (character 0.24, size 0.09, dataset 0.11);
+  fails on small/thin glyphs (ink-quintile Dice 0.37->0.51 vs universeg 0.72->0.81).
+- target-context grid distance is negligible for both (eta^2 0.001; ~flat curve).
+- Rotation paradox (more |rot| -> higher Dice) is NOT a size confound:
+  spearman(|rot|, ink_frac)=0.004; independent. Since target rotation is independent of the
+  context, this looks like a target-mask rendering/Dice-geometry effect (thin axis-aligned
+  strokes at |rot|~0), not a target-context similarity effect. Open question.
+- Cross-model per-character difficulty correlates only rho=0.35 (dataset-level 0.46): partly
+  shared difficulty, but the models fail on different objects. patchset uniformly below diagonal.
+- Figures: results/experiments/4w_fig{4_drivers,5_size_dist,6_charscatter}.png.
+
+## omniSynth eval logging: self-contained context + real (x,y) positions
+- evaluate.py `_sample_detail`: the newer source-agnostic `detail` schema was dropping
+  `context_cells`. Added `ctx=` (context cells) and `sub=` (subject_index) so an
+  omniSynth-only run is self-contained (context position + per-sample join key). Kept the
+  free-form `tf=` last for easy parsing.
+- New: real post-aug glyph positions (not just grid cell indices).
+  - render.py `render_scene` now returns `info["target_positions"]`: per target cell, the
+    ink centre-of-mass in full-canvas coords normalised to [0,1] (x right, y down), via
+    `_centroid_xy` (falls back to cell centre if a placement has no ink). Captures cell +
+    shift + rotate/scale + glyph asymmetry — the continuous counterpart of target_cells.
+  - dataset.py meta gains `target_positions` + `context_positions` (aligned with the cells).
+  - `_sample_detail` logs them as `pos=(x,y)...` / `cpos=...` (via `_fmt_positions`).
+- Motivation: grid-cell tgt-ctx distance was too coarse (eta^2~0.001 in 4_weaknesses.py);
+  continuous positions enable a real distance driver. Existing runs unaffected (re-run needed).
+- Verified: render + dataset tests pass; deterministic val sample renders correct centroids
+  (cell (0,1) center x0.75,y0.25 -> centroid 0.726,0.247 under dx-0.07 shift).
+
+## Fixed-resolution downsampled Dice for native-res models (UniverSeg)
+- New config knob `eval.ds_metric_res` (in universeg_train.yaml, default `[16]`, list-capable,
+  null/[] disables). UniverSeg predicts at native full-res so dice_ds/dice_ds_soft are NaN;
+  this also logs hard + soft Dice with GT and pred both avg-pooled to RxR (hard thresholded at
+  >=0.5), matching patchset_cnn's low-res grid recipe.
+- evaluate.py: `validate(..., ds_metric_res=None)` + `_as_res_list` helper. Per batch, pools
+  prob_nat & lbl to each R (batched), accumulates per-(dataset,label), emits summary keys
+  `dice_ds@{R}/*` and `dice_ds_soft@{R}/*` via log_summary. Sample table (SAMPLE_COLS) unchanged.
+- train.py: `train_epoch` reads `cfg.eval.ds_metric_res`, accumulates on-device running sums per
+  R (reuses _soft_sum/_hard_sum on pooled maps), returns them as a 6th dict element; main logs
+  `train/dice_ds@{R}` + `train/dice_ds_soft@{R}`. Checkpoint selection metric unchanged (native dice).
+- Cost (measured, B=64, 128->16 on GPU): +0.30 ms/batch = 0.12% of a train step, 0.28% of eval;
+  ~0.05s/epoch train, ~0.15s/full val. Negligible.
+- Verified: 1-epoch smoke run (grid=2, ds_metric_res=[16,32]) logs all four metric families
+  clean; other validate/train_epoch callers unaffected (default None / distinct local funcs).
+
+## omniSynth: larger, overlapping glyphs via cell_margin (wired + allows <0)
+- Problem: chars filled only 80% of their cell (hardcoded 0.1 margin in bank._to_bitmap) and
+  cells tiled the canvas non-overlapping -> glyphs looked far apart, little ink/training signal.
+- cell_margin is now threaded through (was dead config): glyph size = (1-2*margin)*cell.
+  margin>0 insets inside the cell (old look); 0 fills it; <0 makes the glyph LARGER than its
+  cell and overflow into neighbours.
+- bank.py: _to_bitmap renders the glyph at inner=(1-2*margin)*cell into a tile=max(cell,inner)
+  (so margin>=0 stays exactly cell-sized -> byte-identical + tests pass). get_or_build_bank /
+  OmniglotBank take cell_margin (in the cache key). dataset.py passes scene.cell_margin.
+- render.py: cells no longer written as disjoint slices. Each glyph is pasted centred on its
+  cell centre via _paste (np.maximum union, clipped to canvas) so oversized glyphs overlap
+  instead of overwrite; order-independent. Target mask = union of target tiles; positions =
+  centroid of the pasted (clipped) target ink. New _paste/_paste_centroid; dropped _centroid_xy.
+- config omniglot.yaml: cell_margin -0.15 (glyph 1.3x cell, small overlap). Tunable; visual
+  sweep saved to results/experiments/omnisynth_margins.png (ink fraction 0.046 -> ~0.14 at -0.15).
+- Backward compat: OmniSceneConfig default stays 0.1 -> all existing tests unchanged. Added
+  test_oversized_tiles_overflow_and_union. 22 omniSynth tests pass; 1-epoch train smoke clean.
+
+## Consistent dice_ds@{R} naming for patchset_cnn (match universeg)
+- Patchset's coarse-grid metrics were logged unqualified (dice_ds, dice_ds_soft) while universeg
+  used the resolution suffix (dice_ds@32). Now both carry @{R}.
+- evaluate.py validate: capture `low_res` = non-native model's logit side length; log its coarse
+  Dice as `dice_ds@{low_res}` / `dice_ds_soft@{low_res}` (skip entirely for native universeg, which
+  previously emitted all-NaN dice_ds/*). Resolution is auto-detected, no config needed for patchset.
+- train.py train_epoch: detect non-native low_res, accumulate hard Dice at that grid, and return
+  `dice_ds@{low_res}` + `dice_ds_soft@{low_res}` in the metrics dict; returns low_res. main skips the
+  generic `train/dice_ds_soft` for non-native models (universeg keeps it = full-res soft). tqdm.write
+  and eval_incontext.py print now look up the dice_ds(_soft) key dynamically (any @R).
+- eval_incontext.py: also passes ds_metric_res through so standalone eval honors the knob.
+- Per-sample SAMPLE_COLS table keeps generic `dice_ds`/`dice_ds_soft` columns (fixed schema); only
+  the scalar summary/train metric names got the @R suffix. Legacy eval.py untouched (separate script).
+- Verified: patchset smoke logs hard@16/soft@16; universeg smoke logs hard@32/soft@32 (ds_metric_res
+  =[32]); checkpoint selection unchanged (cossim / native dice).
+
+## omniSynth: fix border-cell glyph cropping from cell_margin<0
+- Bug: with cell_margin<0, oversized glyph tiles in the 12/16 border cells overflowed the canvas
+  and _paste clipped them -> 13% of glyphs cropped >1% at margin=-0.15 (up to 42%), 25% at -0.25.
+  Interior overlap was fine; only canvas-edge glyphs were cut.
+- Fix (render.py _clamp_center): nudge each glyph's paste centre inward so its square tile stays
+  fully on-canvas (border glyphs shift <=~5px inward for -0.15). No-op for cell-sized tiles
+  (margin>=0). Applied to targets and distractors; positions computed from the clamped paste.
+- Verified: crop rate 13%/25% -> 0% at -0.15/-0.25; 22 omniSynth tests pass; glyphs now whole
+  (results/experiments/omnisynth_crop_fixed.png vs omnisynth_crop.png).
+
+- train.py (2d): added optional warm-start via `train.checkpoint` (already `null` in
+  train_base.yaml). Tolerant load — keeps only name+shape-matching tensors, strips
+  `_orig_mod.` prefix, accepts bare state_dict or `{"model": ...}` (mirrors pfn_seg.py).
+  Enables retraining, e.g. `... train.checkpoint=.../best.pt`.

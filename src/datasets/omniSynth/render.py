@@ -20,6 +20,10 @@ def render_scene(rng, scene, grid, cell_size, target_sampler, distractor_sampler
       - "target_cells": sorted list of target cell indices (row-major)
       - "target_transforms": list aligned with target_cells; each entry is the
         affine-jitter params dict (aug mode) or None (identical/class mode).
+      - "target_positions": list aligned with target_cells of the real (x, y) glyph
+        location = ink centre-of-mass in full-canvas coords, normalised to [0, 1]
+        (x rightward, y downward). This reflects the actual post-aug position (cell +
+        shift + rotation/scale + glyph asymmetry), unlike the discrete cell index.
     target_sampler may return a bare bitmap or a (bitmap, params) tuple; the latter
     surfaces the per-placement transform. Distractor params are not recorded."""
     n_cells = grid * grid
@@ -31,22 +35,68 @@ def render_scene(rng, scene, grid, cell_size, target_sampler, distractor_sampler
     H = W = grid * cell_size
     image = np.zeros((H, W), dtype=np.float32)
     mask = np.zeros((H, W), dtype=np.float32)
-    sorted_targets, transforms = [], []
+    sorted_targets, transforms, positions = [], [], []
     for cell in range(n_cells):
         r, c = divmod(cell, grid)
-        y0, x0 = r * cell_size, c * cell_size
+        # paste each glyph centred on its cell centre. Tiles are cell-sized for margin>=0
+        # (dropping into one cell exactly) but larger for margin<0 (overflow + overlap).
+        cy, cx = r * cell_size + cell_size // 2, c * cell_size + cell_size // 2
         if cell in target_cells:
             res = target_sampler(rng)
             bm, params = res if isinstance(res, tuple) else (res, None)
-            image[y0:y0 + cell_size, x0:x0 + cell_size] = bm
-            mask[y0:y0 + cell_size, x0:x0 + cell_size] = bm
+            pcy, pcx = _clamp_center(cy, cx, bm.shape[0], H, W)  # keep oversized glyphs whole
+            _paste(image, bm, pcy, pcx)
+            pasted = _paste(mask, bm, pcy, pcx)
             sorted_targets.append(cell)
             transforms.append(params)
+            positions.append(_paste_centroid(pasted, pcy, pcx, H, W))
         else:
             bm = distractor_sampler(rng)
-            image[y0:y0 + cell_size, x0:x0 + cell_size] = bm
-    info = {"k": k, "target_cells": sorted_targets, "target_transforms": transforms}
+            pcy, pcx = _clamp_center(cy, cx, bm.shape[0], H, W)
+            _paste(image, bm, pcy, pcx)
+    info = {"k": k, "target_cells": sorted_targets, "target_transforms": transforms,
+            "target_positions": positions}
     return image, mask, k, info
+
+
+def _clamp_center(cy, cx, th, H, W):
+    """Nudge a glyph's paste centre inward so its square `th`-sized tile stays fully on the
+    HxW canvas — keeps oversized (margin<0) border glyphs whole instead of clipping them at
+    the edge. A no-op for cell-sized tiles (margin>=0), which already fit their cell."""
+    lo = th // 2
+    cy = min(max(cy, lo), H - (th - lo))
+    cx = min(max(cx, lo), W - (th - lo))
+    return cy, cx
+
+
+def _paste(canvas, tile, cy, cx):
+    """Union-paste (np.maximum) a square `tile` centred at (cy, cx), clipped to `canvas`.
+
+    Overlaps merge instead of overwrite, so order is irrelevant and no glyph erases another.
+    Returns (dy0, dx0, sub) of the in-bounds slice actually written (for centroid), or None
+    when the tile lands fully off-canvas."""
+    th, tw = tile.shape
+    oy, ox = cy - th // 2, cx - tw // 2
+    dy0, dx0 = max(0, oy), max(0, ox)
+    dy1, dx1 = min(canvas.shape[0], oy + th), min(canvas.shape[1], ox + tw)
+    if dy0 >= dy1 or dx0 >= dx1:
+        return None
+    sub = tile[dy0 - oy:dy1 - oy, dx0 - ox:dx1 - ox]
+    region = canvas[dy0:dy1, dx0:dx1]
+    np.maximum(region, sub, out=region)
+    return dy0, dx0, sub
+
+
+def _paste_centroid(pasted, cy, cx, H, W):
+    """Real (x, y) position of a pasted glyph = ink centre-of-mass in full-canvas coords,
+    normalised to [0, 1] (x rightward, y downward). Falls back to the cell centre when the
+    glyph has no ink or landed off-canvas."""
+    if pasted is not None:
+        dy0, dx0, sub = pasted
+        ys, xs = np.nonzero(sub)
+        if ys.size:
+            return ((dx0 + float(xs.mean())) / W, (dy0 + float(ys.mean())) / H)
+    return (cx / W, cy / H)
 
 
 def _zoom_to_size(img, scale, size):

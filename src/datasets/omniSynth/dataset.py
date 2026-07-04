@@ -42,7 +42,8 @@ class OmniSynthICLDataset(Dataset):
             raise ValueError(f"image_size {image_size} not divisible by grid {grid}")
         self.cell_size = image_size // grid
 
-        self.bank = get_or_build_bank(self.diversity, self.cell_size)
+        self.bank = get_or_build_bank(self.diversity, self.cell_size,
+                                      self.scene.cell_margin)
         self.pool = self.bank.task_ids(split)
         if not self.pool:
             raise ValueError(f"empty class pool for split {split!r}")
@@ -157,5 +158,8 @@ class OmniSynthICLDataset(Dataset):
                 "target_cells": _pos(t_info["target_cells"]),          # [(row, col), ...]
                 "target_transforms": t_info["target_transforms"],       # list[dict|None]
                 "context_cells": [_pos(c[3]["target_cells"]) for c in ctx],
+                # real post-aug (x, y) positions in [0, 1], aligned with the cells above
+                "target_positions": t_info["target_positions"],         # [(x, y), ...]
+                "context_positions": [c[3]["target_positions"] for c in ctx],
             },
         }

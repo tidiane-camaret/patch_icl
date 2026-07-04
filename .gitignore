@@ -35,3 +35,6 @@ results/controlsynth/hard_diverse.csv
 results/controlsynth/sweep/*.csv
 results/controlsynth/sweep/*.log
 
+results/experiments/artifacts/
+artifacts/
+results/experiments/__marimo__/

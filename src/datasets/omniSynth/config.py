@@ -18,7 +18,9 @@ class OmniSceneConfig:
     grid: int = 2                 # grid x grid cells fill the canvas
     k_min: int = 1                # target cells ~ U[k_min, k_max] (clamped to [1, grid*grid])
     k_max: int = 2
-    cell_margin: float = 0.1      # fractional padding inside each cell
+    cell_margin: float = 0.1      # glyph size = (1 - 2*margin)*cell. >0: padding inside the
+                                  # cell; 0: fills the cell; <0: glyph exceeds the cell and
+                                  # overflows into neighbours (rendered with union blending).
     target_mode: str = "class"    # identical | aug | class
     aug_rotate: float = 15.0      # deg; aug-mode per-placement jitter
     aug_scale: float = 0.1        # +/- log2 scale
