@@ -109,11 +109,18 @@ def _(PROJECT_NAME, api, runs):
 
 @app.cell
 def _(dp, du, np, pd, re):
-    # Parse `detail` for both runs (same schema):
-    # "Angelic/964 mode=aug cells=[[0, 1]] tf=r+7,s0.95,dx-0.13,dy+0.01"
+    # Parse `detail` for both runs (same schema, see evaluate._sample_detail):
+    # "Angelic/964 mode=aug cells=[[0, 1]] ctx=[[2, 3]] pos=(0.51,0.48) "
+    # "cpos=(0.12,0.90) sub=5 tf=r+7,s0.95,dx-0.13,dy+0.01"
+    # target_pos = discrete target cell(s); context_pos = discrete context cell(s).
+    # pos/cpos (continuous ink centroids) and sub are captured but unused here.
+    # cpos may contain spaces (one group per context placement) and tf may be
+    # empty (identical/class mode), so both are matched non-greedily up to ` sub=`.
     _pat = re.compile(
         r"^(?P<character>\S+) mode=(?P<target_mode>\S+) "
-        r"cells=(?P<target_pos>\[\[.*?\]\]) tf=(?P<transforms>.+)$"
+        r"cells=(?P<target_pos>\[\[.*?\]\]) ctx=(?P<context_pos>\[\[.*?\]\]) "
+        r"pos=(?P<pos>.*?) cpos=(?P<cpos>.*?) "
+        r"sub=(?P<subject_index>-?\d+) tf=(?P<transforms>.*)$"
     )
     du2 = pd.concat([du, du["detail"].str.extract(_pat)], axis=1)
     dp2 = pd.concat([dp, dp["detail"].str.extract(_pat)], axis=1)
@@ -141,7 +148,7 @@ def _(dp, du, np, pd, re):
     long["trans"] = np.hypot(long["dx"], long["dy"])
 
     # Paired frame — universeg keeps context_pos for grid-distance analysis
-    _u = du2[["dataset", "character", "target_pos", 
+    _u = du2[["dataset", "character", "target_pos", "context_pos",
               "transforms", "dice"]].rename(columns={"dice": "dice_uni"})
     _p = dp2[["dataset", "character", "target_pos",
               "transforms", "dice"]].rename(columns={"dice": "dice_pat"})
@@ -169,12 +176,6 @@ def _(dp, du, np, pd, re):
     print(f"long: {len(long)} rows | paired: {len(mg)} rows "
           f"| ink NaN: {mg.ink_frac.isna().sum()}")
     return long, mg
-
-
-@app.cell
-def _(mg):
-    mg.head()
-    return
 
 
 @app.cell

@@ -1,3 +1,4 @@
+# @package _global_
 augmentations:
   enabled: true
 

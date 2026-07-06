@@ -11,6 +11,7 @@ paths:
   omniglot: /home/dpxuser/repos/omniglot/python   # dir holding images_background.zip / images_evaluation.zip
 
 data:
+  source: totalseg    # totalseg | totalsegmri  (3D build_dataset dispatch, experiments/3d/common.py)
   dataset: totalseg   # totalseg | totalsegmri
   # Use split names from label_stats.csv ("train" / "val"), or an explicit list.
   train_classes: train

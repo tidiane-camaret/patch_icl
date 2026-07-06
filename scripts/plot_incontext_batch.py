@@ -1,6 +1,12 @@
 """
 Visualise in-context samples from TotalSegInContextDataset.
 
+Builds the *training* dataset exactly as scripts/train.py does — same Hydra
+`data.*` config (train split, augmentations, synth path, class balancing,
+crop, image size, context size) — so the figure shows precisely what the
+model is trained on.  Change anything via the same Hydra overrides train.py
+accepts (they are forwarded verbatim).
+
 Each row is one sample; columns are: target | ctx-1 | ctx-2 | … | ctx-K.
 Each cell shows the axial slice with the most mask coverage, with a
 semi-transparent colour overlay of the segmentation mask.
@@ -8,12 +14,12 @@ semi-transparent colour overlay of the segmentation mask.
 Usage
 -----
   python scripts/plot_incontext_batch.py
-  python scripts/plot_incontext_batch.py --n_samples 6 --context_size 3
-  python scripts/plot_incontext_batch.py --aug           # with augmentations
-  python scripts/plot_incontext_batch.py --synth         # include synth items
+  python scripts/plot_incontext_batch.py --n_samples 6
   python scripts/plot_incontext_batch.py --out results/my_batch.png
-  # Hydra overrides are forwarded (e.g. cluster=meta):
+  # Hydra overrides are forwarded, just like train.py:
   python scripts/plot_incontext_batch.py cluster=meta
+  python scripts/plot_incontext_batch.py data.p_synth=1.0    # synth-only view
+  python scripts/plot_incontext_batch.py augmentations.enabled=false
 """
 
 import argparse
@@ -67,13 +73,8 @@ def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray, alpha: float = 0.45)
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--n_samples",    type=int, default=4)
-    parser.add_argument("--context_size", type=int, default=3)
-    parser.add_argument("--aug",    action="store_true", help="apply augmentations")
-    parser.add_argument("--synth",  action="store_true", help="force synth-only items")
-    parser.add_argument("--split",  default="val")
-    parser.add_argument("--max_subjects", type=int, default=100)
-    parser.add_argument("--out",    default="results/incontext_batch.png")
+    parser.add_argument("--n_samples", type=int, default=4)
+    parser.add_argument("--out",       default="results/incontext_batch.png")
     parser.add_argument("-h", "--help", action="store_true")
     args, hydra_overrides = parser.parse_known_args()
 
@@ -83,31 +84,26 @@ def main():
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(config_name="config", overrides=hydra_overrides)
 
-    classes = resolve_classes(cfg.data.val_classes, cfg.paths.totalseg)
-    # Cap at a few classes for the plot
-    if len(classes) > 8:
-        import random; random.seed(0); classes = random.sample(classes, 8)
-
-    aug_cfg = cfg.augmentations if args.aug else None
-
-    synth_method = cfg.data.synth_method if args.synth else None
-    p_synth = 1.0 if args.synth else 0.0
+    # Mirror train.py's train_ds exactly so the figure reflects the training data.
+    train_classes = resolve_classes(cfg.data.train_classes, cfg.paths.totalseg)
+    synth_method  = cfg.data.synth_method or None
 
     ds = TotalSegInContextDataset(
         root=cfg.paths.totalseg,
-        classes=classes,
+        classes=train_classes,
         image_size=tuple(cfg.data.image_size),
-        split=args.split,
-        context_size=args.context_size,
-        max_subjects=args.max_subjects,
-        aug_cfg=aug_cfg,
+        split="train",
+        context_size=cfg.data.context_size,
+        max_subjects=cfg.data.max_train_subjects,
+        aug_cfg=cfg.augmentations,
         synth_method=synth_method,
         synth_unions=cfg.data.synth_unions,
-        p_synth=p_synth,
+        p_synth=cfg.data.p_synth,
         class_balanced=cfg.data.class_balanced,
+        use_crop=cfg.data.use_crop,
     )
 
-    K  = args.context_size
+    K  = cfg.data.context_size
     N  = min(args.n_samples, len(ds))
     loader = DataLoader(ds, batch_size=N, shuffle=True, num_workers=0,
                         collate_fn=incontext_collate_fn)
@@ -143,10 +139,11 @@ def main():
     for ax in axes.flat:
         ax.set_xticks([]); ax.set_yticks([])
 
-    aug_tag   = " + aug"   if args.aug   else ""
-    synth_tag = " + synth" if args.synth else ""
+    aug_on    = cfg.augmentations is not None and cfg.augmentations.enabled
+    aug_tag   = " + aug"                        if aug_on             else ""
+    synth_tag = f" + synth(p={cfg.data.p_synth})" if synth_method else ""
     fig.suptitle(
-        f"In-context samples  |  split={args.split}  |  K={K}{aug_tag}{synth_tag}",
+        f"Train samples  |  split=train  |  K={K}{aug_tag}{synth_tag}",
         fontsize=11, y=1.01,
     )
     fig.tight_layout()

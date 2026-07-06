@@ -1,0 +1,28 @@
+# @package _global_
+# 3D dataset params, mirroring the dataset block of experiment/multilevel.yaml.
+# Loaded on top of configs/config.yaml + cluster config; drives the
+# experiments/3d/ scripts (build_dataset / plot_dataset_items) and scripts/train.py.
+#   python experiments/3d/plot_dataset_items.py experiment=3d/dataset
+#   python scripts/train.py experiment=3d/dataset
+# Only the params that reach TotalSegInContextDataset are set here — the
+# multilevel-model knobs (resolutions, n_patches_l1, target_sampling, mask_pool)
+# are intentionally omitted.
+
+defaults:
+  - override /augmentations: multiverseg_v2   # matches multilevel's aug_preset
+
+data:
+  source: totalseg              # totalseg | totalsegmri  (3D build_dataset dispatch)
+  image_size: [128, 128, 128]
+  context_size: 1
+  max_ds_len_train: 2000        # samples per train epoch (loader cap, not dataset content)
+  synth_method: seeds3d
+  n_synth_merge_min: 1          # min adjacent SVs merged per synth label (inclusive)
+  n_synth_merge_max: 5          # max adjacent SVs merged per synth label (inclusive)
+  p_synth: 1
+  class_balanced: true
+  use_crop: true
+  random_coloring: false
+  num_labels_per_sample: 1
+  train_classes: not_benchmark
+  val_classes: benchmark
