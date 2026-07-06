@@ -22,7 +22,7 @@ def _():
     DATASET = "omnisynth"
 
     model_configs = {
-        "omnisynth": {"universeg": "uixvcpny", "patchset_cnn": "kq1cent3"},
+        "omnisynth": {"universeg": "ur9l61x5", "patchset_cnn": "um0h88cm"},
     }
 
     runs = {k: {"wandb_name": v} for k, v in model_configs[DATASET].items()}
@@ -109,21 +109,22 @@ def _(PROJECT_NAME, api, runs):
 
 @app.cell
 def _(dp, du, np, pd, re):
-    # --- Unify both tables into one long df with parsed transform features ---
-    # patchset `detail`: "Angelic/964 mode=aug cells=[[0, 1]] tf=r+7,s0.95,dx-0.13,dy+0.01"
+    # Parse `detail` for both runs (same schema):
+    # "Angelic/964 mode=aug cells=[[0, 1]] tf=r+7,s0.95,dx-0.13,dy+0.01"
     _pat = re.compile(
         r"^(?P<character>\S+) mode=(?P<target_mode>\S+) "
         r"cells=(?P<target_pos>\[\[.*?\]\]) tf=(?P<transforms>.+)$"
     )
+    du2 = pd.concat([du, du["detail"].str.extract(_pat)], axis=1)
     dp2 = pd.concat([dp, dp["detail"].str.extract(_pat)], axis=1)
 
-    def _unify(df, model):
+    def _to_long(df, model):
         out = df[["dataset", "character", "target_pos", "transforms", "dice"]].copy()
         out["model"] = model
         return out
 
     long = pd.concat(
-        [_unify(du, "universeg"), _unify(dp2, "patchset_cnn")], ignore_index=True
+        [_to_long(du2, "universeg"), _to_long(dp2, "patchset_cnn")], ignore_index=True
     )
 
     # decode "r+7,s0.95,dx-0.13,dy+0.01" -> numeric aug features
@@ -139,17 +140,21 @@ def _(dp, du, np, pd, re):
     long["scale_dev"] = (long["scale"] - 1).abs()
     long["trans"] = np.hypot(long["dx"], long["dy"])
 
-    # Paired view keeps context_pos (only universeg logs it) so we can measure the
-    # target<->context grid distance for BOTH models on the same seeded samples.
-    _u = du[["dataset", "character", "target_pos", "context_pos",
-             "transforms", "dice"]].rename(columns={"dice": "dice_uni"})
+    # Paired frame — universeg keeps context_pos for grid-distance analysis
+    _u = du2[["dataset", "character", "target_pos", 
+              "transforms", "dice"]].rename(columns={"dice": "dice_uni"})
     _p = dp2[["dataset", "character", "target_pos",
               "transforms", "dice"]].rename(columns={"dice": "dice_pat"})
     mg = _u.merge(_p, on=["dataset", "character", "target_pos", "transforms"])
     mg["delta"] = mg["dice_uni"] - mg["dice_pat"]
 
-    # candidate drivers on the paired frame
-    mg["class_id"] = mg["character"].str.split("/").str[1].astype(int)
+    mg["class_id"] = pd.to_numeric(
+        mg["character"].astype(str).str.split("/").str.get(1),
+        errors="coerce"
+    )
+    mg.dropna(subset=["class_id"], inplace=True)
+    mg["class_id"] = mg["class_id"].astype(int)
+
     _mtf = mg["transforms"].str.extract(
         r"r(?P<rot>[+-]?\d+),s(?P<scale>[\d.]+),"
         r"dx(?P<dx>[+-]?[\d.]+),dy(?P<dy>[+-]?[\d.]+)"
@@ -160,10 +165,16 @@ def _(dp, du, np, pd, re):
     _t = mg["target_pos"].map(cell_rc)
     _c = mg["context_pos"].map(cell_rc)
     mg["tc_dist"] = [abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(_t, _c)]
-    mg = mg.merge(ink_area_by_class(), on="class_id", how="left")  # object size
+    mg = mg.merge(ink_area_by_class(), on="class_id", how="left")
     print(f"long: {len(long)} rows | paired: {len(mg)} rows "
           f"| ink NaN: {mg.ink_frac.isna().sum()}")
     return long, mg
+
+
+@app.cell
+def _(mg):
+    mg.head()
+    return
 
 
 @app.cell
