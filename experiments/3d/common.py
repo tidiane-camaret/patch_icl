@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -71,6 +71,32 @@ def build_dataset(cfg, split: str) -> TotalSegInContextDataset:
         num_labels_per_sample=d.get("num_labels_per_sample", 1),
         n_synth_merge_min=d.get("n_synth_merge_min", 1),
         n_synth_merge_max=d.get("n_synth_merge_max", 1),
+    )
+
+
+def train_loader(cfg) -> DataLoader:
+    """Multi-class train loader over build_dataset(cfg, "train") — aug + synth on.
+
+    Uses cfg.train.batch_size/workers; optionally caps samples per epoch via
+    RandomSampler(cfg.data.max_ds_len_train). Mirrors scripts/train.py.
+    """
+    ds = build_dataset(cfg, "train")
+    nw = int(cfg.train.workers)
+    max_len = cfg.data.get("max_ds_len_train", None)
+    sampler = None
+    if max_len is not None:
+        n = min(int(max_len), len(ds))
+        sampler = RandomSampler(ds, replacement=False, num_samples=n)
+    return DataLoader(
+        ds,
+        batch_size=int(cfg.train.batch_size),
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=nw,
+        collate_fn=incontext_collate_fn,
+        pin_memory=DEVICE.type == "cuda",
+        persistent_workers=nw > 0,
+        prefetch_factor=2 if nw > 0 else None,
     )
 
 

@@ -88,3 +88,37 @@ class MedverseModel(InContextModel):
         )
         # pred: [B, 1, D, H, W] continuous map → threshold at 0.5
         return (pred.squeeze(1) > 0.5).long()
+
+    def train_forward(self, target_img, context_imgs, context_masks, l: int = None):
+        """Grad-enabled single-ROI forward for fine-tuning — returns raw logits.
+
+        Mirrors predict()'s preprocessing (per-volume min-max norm, mask channel)
+        but keeps gradients and skips the sliding-window autoregressive path: the
+        input is assumed to fit one ROI (image_size == sw_roi_size at train time).
+
+        Args:
+            target_img    : (B, 1, D, H, W)
+            context_imgs  : (B, K, 1, D, H, W)
+            context_masks : (B, K, D, H, W)
+        Returns:
+            (B, 1, D, H, W) raw logits (no sigmoid).
+        """
+        target_img    = target_img.to(self.device)
+        context_imgs  = context_imgs.to(self.device)
+        context_masks = context_masks.to(self.device).float()
+
+        target_norm = self.model.normalize_3d_volume(target_img)
+        B, K, C, D, H, W = context_imgs.shape
+        ctx_flat = self.model.normalize_3d_volume(context_imgs.view(B * K, C, D, H, W))
+        context_norm = ctx_flat.view(B, K, C, D, H, W)
+        context_out = context_masks.unsqueeze(2)  # (B, K, 1, D, H, W)
+
+        return self.model.forward(
+            target_norm, context_in=context_norm, context_out=context_out,
+            l=(l if l is not None else self.forward_l_arg),
+        )
+
+    def load_finetuned(self, state_dict: dict) -> None:
+        """Load a fine-tuned LightningModel state_dict (as saved by experiments/3d/train.py)."""
+        state = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+        self.model.load_state_dict(state)

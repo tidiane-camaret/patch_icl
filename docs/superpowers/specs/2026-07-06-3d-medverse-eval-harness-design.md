@@ -69,10 +69,30 @@ eval: { model: medverse, split: test, n_subjects: 50, batch_size: 8, workers: 20
 wandb: { project: patch_icl_3d_eval, name: null }
 ```
 
-## train.py interface (designed, deferred)
-`train.py` will import `evaluate.validate` (val step) and
-`common.{build_dataset, make_loader}` (train loader) — same modules, no rework.
-Only the training loop + trainable Medverse forward are Sub-project B.
+## Sub-project B — train.py (Medverse fine-tune)
+
+Decision: full fine-tune, config-driven size, train resolution 128³.
+
+- **`src/benchmark_models/medverse.py`**: add `train_forward(target, ctx_img,
+  ctx_mask, l=None) -> logits` (grad-enabled single-ROI `self.model.forward`, same
+  normalization as `predict`) and `load_finetuned(state_dict)`. `predict` unchanged.
+  `LightningModel.forward` returns raw logits (output block ends in 1×1 conv).
+- **`experiments/3d/common.py`**: add `train_loader(cfg)` — DataLoader over
+  `build_dataset(cfg,"train")` with train batch/workers + optional
+  `RandomSampler(max_ds_len_train)`.
+- **`experiments/3d/evaluate.py`**: add `evaluate_classes(model, cfg, classes,
+  fig_dir=None) -> (rows, cases)`; refactor `eval.py` to use it; `train.py` val step
+  reuses it for mean-Dice checkpoint selection.
+- **`experiments/3d/train.py`**: Hydra `experiment=3d/train`. Full fine-tune
+  `medverse.model.parameters()`, AdamW + cosine-warmup, AMP bf16. Loss =
+  BCE-with-logits + dice_weight·soft_dice(sigmoid(logits)). Val every `eval_every`
+  via `evaluate_classes`; save best `{"model": medverse.model.state_dict(),
+  "model_name":"medverse", image_size, context_size, ...}`.
+- **`configs/experiment/3d/train.yaml`** (`# @package _global_`): data (image_size
+  [128,128,128], synth/class params), train block, minimal eval block (for the
+  val make_loader), model: medverse, wandb.
+- **eval loop closure**: `eval.py` medverse builder loads `cfg.eval.checkpoint`
+  via `load_finetuned` when set.
 
 ## Testing
 Smoke: `python experiments/3d/eval.py experiment=3d/eval eval.model=medverse
