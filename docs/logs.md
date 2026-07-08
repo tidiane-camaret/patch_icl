@@ -2190,3 +2190,19 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   samplers, masks, provenance, copy-task logic all unchanged.
 - preview_omnisynth.py now prints `placement=`; draw with
   `scene.placement=random`. Samples: results/omnisynth_preview_{random,grid}.png.
+
+## 2026-07-08 — omniSynth: max_nb_objects cap
+- Added `scene.max_nb_objects` to `OmniSceneConfig` (0 = no cap). Caps total glyphs
+  (targets + distractors) at `min(grid*grid, max_nb_objects)`; k is clamped to
+  `[1, n_obj]`. `render_scene` fills a random subset of `n_obj` cells (first k of the
+  permutation are targets) and skips the rest — so a cap yields a random subset of
+  occupied grid cells (grid mode) or fewer scattered glyphs (random mode).
+- preview_omnisynth.py prints `max_obj=`; e.g. `scene.max_nb_objects=4`. Samples:
+  results/omnisynth_preview_{random,grid}_cap4.png.
+
+## 2026-07-08 — omniSynth: surface placement + max_nb_objects in configs
+- Added `scene.placement` and `scene.max_nb_objects` to the omniglot scene block
+  (configs/experiment/2d/synth/omniglot.yaml), the single source both train.py and
+  evaluate.py/eval_incontext.py pull via common.build_dataset (OmniSceneConfig(
+  **dict(s.scene)) forwards every key — no whitelist). Set at CLI, e.g.
+  `synth.scene.placement=random synth.scene.max_nb_objects=4`.

@@ -59,7 +59,8 @@ def main():
                              diversity=diversity, scene=scene, sampling=sampling)
 
     print(f"omniSynth preview: split={args.split} target_mode={scene.target_mode} "
-          f"placement={scene.placement} grid={scene.grid} k=[{scene.k_min},{scene.k_max}] "
+          f"placement={scene.placement} grid={scene.grid} max_obj={scene.max_nb_objects} "
+          f"k=[{scene.k_min},{scene.k_max}] "
           f"p_copy={scene.p_copy} n_copy={scene.n_copy} K={K} image_size={args.image_size}")
 
     cols = 2 + K * 2     # query img, query mask, then K contexts (img+mask)

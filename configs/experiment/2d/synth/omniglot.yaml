@@ -11,6 +11,10 @@ diversity:
   val_test_split: 1                # fraction of eval classes -> val (rest -> test)
 scene:
   grid: 4                # grid x grid cells fill the canvas (image_size must divide by grid)
+  placement: grid        # grid: glyphs on cell centres. random: uniform-random positions
+                         # (may overlap). Glyph count is the same either way.
+  max_nb_objects: 0      # cap on total glyphs (targets + distractors); 0 = no cap (fill all
+                         # grid*grid). Filled cells are a random subset; applies to both modes.
   k_min: 1               # target cells ~ U[k_min, k_max]
   k_max: 1
   cell_margin: -0.15     # glyph size = (1-2*margin)*cell. <0 -> glyphs larger than their cell,

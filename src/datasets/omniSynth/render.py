@@ -27,10 +27,13 @@ def render_scene(rng, scene, grid, cell_size, target_sampler, distractor_sampler
     target_sampler may return a bare bitmap or a (bitmap, params) tuple; the latter
     surfaces the per-placement transform. Distractor params are not recorded."""
     n_cells = grid * grid
+    max_obj = getattr(scene, "max_nb_objects", 0)
+    n_obj = min(n_cells, max_obj) if max_obj else n_cells   # 0 -> no cap
     k = int(rng.integers(scene.k_min, scene.k_max + 1))
-    k = max(1, min(k, n_cells))                       # clamp to [1, n_cells]
+    k = max(1, min(k, n_obj))                          # clamp to [1, n_obj]
     cells = rng.permutation(n_cells)
     target_cells = set(cells[:k].tolist())
+    filled_cells = set(cells[:n_obj].tolist())        # k targets first, then distractors
 
     H = W = grid * cell_size
     image = np.zeros((H, W), dtype=np.float32)
@@ -38,6 +41,8 @@ def render_scene(rng, scene, grid, cell_size, target_sampler, distractor_sampler
     random = getattr(scene, "placement", "grid") == "random"
     sorted_targets, transforms, positions = [], [], []
     for cell in range(n_cells):
+        if cell not in filled_cells:                  # unfilled when max_nb_objects caps count
+            continue
         # paste each glyph centred on its cell centre (grid) or a uniform-random canvas
         # position (random; may overlap — union blending keeps every glyph). Tiles are
         # cell-sized for margin>=0 but larger for margin<0 (overflow + overlap).

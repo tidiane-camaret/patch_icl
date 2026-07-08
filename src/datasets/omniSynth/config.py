@@ -19,7 +19,10 @@ class OmniSceneConfig:
     placement: str = "grid"       # grid: glyphs centred on cell centres.
                                   # random: glyphs at uniform-random canvas positions (may
                                   # overlap). Glyph count stays grid*grid either way.
-    k_min: int = 1                # target cells ~ U[k_min, k_max] (clamped to [1, grid*grid])
+    max_nb_objects: int = 0       # cap on total glyphs placed (targets + distractors);
+                                  # 0 = no cap (fill all grid*grid). The filled cells are a
+                                  # random subset; applies to both placement modes.
+    k_min: int = 1                # target cells ~ U[k_min, k_max] (clamped to [1, n_obj])
     k_max: int = 2
     cell_margin: float = 0.1      # glyph size = (1 - 2*margin)*cell. >0: padding inside the
                                   # cell; 0: fills the cell; <0: glyph exceeds the cell and
