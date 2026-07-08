@@ -4,6 +4,8 @@
 # See docs/superpowers/specs/2026-06-29-omnisynth-design.md.
 # Reuses the `synth` package slot, so set data.source=omnisynth to select it.
 # @package synth
+source: omniglot         # object source: omniglot (glyph bank) | medseg | biomedparse
+                         # (real objects — see the `medseg` block below for their params).
 diversity:
   master_seed: 42
   train_zip: images_background.zip   # 30 background alphabets -> train
@@ -15,18 +17,40 @@ scene:
                          # (may overlap). Glyph count is the same either way.
   max_nb_objects: 0      # cap on total glyphs (targets + distractors); 0 = no cap (fill all
                          # grid*grid). Filled cells are a random subset; applies to both modes.
+  placement_tries: 8     # random placement: positions tried per object, keeping the least-
+                         # overlapping (cheap anti-overlap). 1 = fully random (no rejection).
+  placement_max_overlap: 0.25  # accept early once object-mask overlap with placed objects <= this
   k_min: 1               # target cells ~ U[k_min, k_max]
   k_max: 1
   cell_margin: -0.15     # glyph size = (1-2*margin)*cell. <0 -> glyphs larger than their cell,
                          # overflowing into neighbours (union-blended) for more ink / training
                          # signal with small tolerable overlap. 0.1=old inset, 0=fill cell.
   target_mode: aug     # identical | aug | class  (what "same target" means)
-  aug_rotate: 20.0       # deg; aug-mode per-placement jitter
+  aug_rotate: 45.0       # deg; aug-mode per-placement jitter
   aug_scale: 0.2         # +/- log2 scale
   aug_translate: 0.2     # fraction of cell
   p_copy: 0.9            # instCopy (train only): per-item prob of injecting copy slot(s); 0 disables
   n_copy: 3              # number of context slots overwritten with an EXACT copy of the query scene (clamped to K)
+  background: random      # black: zero canvas. random: smooth grey field + noise. image:
+                         # random real full images (medseg/biomedparse) as the canvas.
+  bg_intensity: [0.2, 0.6]   # random-bg base grey level ~ U[lo, hi]
+  bg_structure: 0.15     # amplitude of smooth low-frequency background variation
+  bg_noise: 0.03         # gaussian noise std added to the background
+  bg_source: medseg      # background=image: medseg | biomedparse (roots from the medseg block)
+  bg_datasets: []        # background=image: [] = all datasets; else a subset
+  bg_max_images: 500    # background=image: cap on pooled background images (memory)
 sampling:
   epoch_length: 10000
   eval_subjects_per_task: 50
   eval_seed_namespace: 0
+medseg:                  # params for real-object sources (source=medseg | biomedparse)
+  source_size: 128       # medseg: {name}_{size}.npz;  biomedparse: {..}_{size}.npy store
+  biomedparse_root: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/biomedparse/_npy
+  # each split reads objects from that split's own MedSegBench images (train->train, val->val)
+  train_datasets: []     # [] = all datasets; else subset feeding the train pool
+  val_datasets: []       # [] = all; else subset feeding val (also used as test)
+  max_renditions_per_class: 200   # cap objects kept per class (memory)
+  min_mask_px: 4         # skip masks smaller than this many px (drop near-empty labels)
+  size_mode: canvas      # canvas: keep object size relative to the canvas (aspect kept);
+                         # cell: resize every object to the cell (uniform, glyph-like)
+  size_scale: 0.75        # canvas mode: scale the preserved object size up/down

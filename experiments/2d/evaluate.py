@@ -167,7 +167,8 @@ def _upsample_to(x: torch.Tensor, size) -> torch.Tensor:
 
 @torch.no_grad()
 def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
-             patch_csv=None, synth_csv=None, compute_flops=False, ds_metric_res=None):
+             patch_csv=None, synth_csv=None, compute_flops=False, ds_metric_res=None,
+             per_group=True):
     from torch.utils.flop_counter import FlopCounterMode
     model.eval()
     hard_ds, hard_lab = defaultdict(list), defaultdict(list)   # native hard dice
@@ -200,15 +201,23 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
 
         ac = torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
                             enabled=DEVICE.type == "cuda")
+        sync = DEVICE.type == "cuda"
         if compute_flops and flops is None:
             # Measured once; its FlopCounterMode overhead must not contaminate timing.
             with FlopCounterMode(display=False) as fc, ac:
                 out = model(img, context_in=cin, context_out=cout, mode="val")
             flops = fc.get_total_flops()
         else:
+            # CUDA kernels are async, so bracket the forward with syncs to time the real
+            # GPU compute (not just kernel launch). The first timed batch is dropped as
+            # warmup below (cudnn.benchmark autotune / allocator / lazy init).
+            if sync:
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             with ac:
                 out = model(img, context_in=cin, context_out=cout, mode="val")
+            if sync:
+                torch.cuda.synchronize()
             inf_times.append((time.perf_counter() - t0) / B)
         logit = out["final_logit"].float()
 
@@ -300,30 +309,33 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                             for k, v in m.get("difficulty", {}).items()})
                 synth_rows.append(row)
 
-    extra = {"time/inference_ms": (float(np.mean(inf_times)) * 1000
-                                   if inf_times else float("nan"))}
+    # Drop the first timed batch as warmup so autotune/allocator/lazy-init cost doesn't
+    # inflate the mean (real GPU forward time, thanks to the syncs above).
+    timed = inf_times[1:] if len(inf_times) > 1 else inf_times
+    extra = {"time/inference_ms": (float(np.mean(timed)) * 1000
+                                   if timed else float("nan"))}
     if flops is not None:
         extra["flops_giga"] = flops / 1e9
 
     summary = {}
     summary.update(log_summary(hard_ds, hard_lab, prefix="dice",
-                               metric_label="native", extra=extra))
+                               metric_label="native", extra=extra, per_group=per_group))
     if low_res is not None:   # non-native model: tag its coarse-grid Dice with the resolution
         summary.update(log_summary(dsh_ds, dsh_lab, prefix=f"dice_ds@{low_res}",
-                                   metric_label=f"hard@{low_res}"))
+                                   metric_label=f"hard@{low_res}", per_group=per_group))
         summary.update(log_summary(soft_ds, soft_lab, prefix=f"dice_ds_soft@{low_res}",
-                                   metric_label=f"soft@{low_res}"))
+                                   metric_label=f"soft@{low_res}", per_group=per_group))
     if cos_ds:   # populated only when some batch was non-native
         summary.update(log_summary(cos_ds, cos_lab, prefix="cossim",
-                                   metric_label="cos sim"))
+                                   metric_label="cos sim", per_group=per_group))
         summary.update(log_summary(topk_ds, topk_lab, prefix=f"top{topk_k}",
-                                   metric_label=f"top{topk_k}"))
+                                   metric_label=f"top{topk_k}", per_group=per_group))
     for R in res_list:                                    # fixed-res pooled Dice
         d = dsr[R]
         summary.update(log_summary(d["hd"], d["hl"], prefix=f"dice_ds@{R}",
-                                   metric_label=f"hard@{R}"))
+                                   metric_label=f"hard@{R}", per_group=per_group))
         summary.update(log_summary(d["sd"], d["sl"], prefix=f"dice_ds_soft@{R}",
-                                   metric_label=f"soft@{R}"))
+                                   metric_label=f"soft@{R}", per_group=per_group))
 
     if patch_rows:
         p = Path(patch_csv); p.parent.mkdir(parents=True, exist_ok=True)

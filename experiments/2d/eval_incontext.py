@@ -100,7 +100,8 @@ def main(cfg: DictConfig):
         model, loader, topk_k=int(cfg.eval.get("topk_k", 16)), epoch=0,
         figures=figures, patch_csv=cfg.eval.get("patch_csv"),
         synth_csv=(cfg.eval.get("synth_csv") if cfg.data.get("source") == "synthetic" else None),
-        compute_flops=True, ds_metric_res=cfg.eval.get("ds_metric_res", None))
+        compute_flops=True, ds_metric_res=cfg.eval.get("ds_metric_res", None),
+        per_group=bool(cfg.eval.get("log_per_class", True)))
     summary["samples"] = table
     wandb.log(summary)
     ds_key = next((k for k in summary

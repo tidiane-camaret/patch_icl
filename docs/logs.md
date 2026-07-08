@@ -2206,3 +2206,178 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   evaluate.py/eval_incontext.py pull via common.build_dataset (OmniSceneConfig(
   **dict(s.scene)) forwards every key — no whitelist). Set at CLI, e.g.
   `synth.scene.placement=random synth.scene.max_nb_objects=4`.
+
+## 2026-07-08 — omniSynth: explore MedSegBench as an object source
+- New script experiments/2d/synth/explore_medseg_objects.py: crops every connected
+  component of each MedSegBench mask to its bbox and characterises it as a candidate
+  omniSynth "object" (binary mask = ink/label + intensity patch = texture). Reports
+  per-object bbox/area/fill/intensity/contrast (CSV + text + histograms) and a
+  montage of extracted objects (img | masked | mask). Outputs: results/2d/medseg_objects/.
+- Findings (train, 128, min_area=16, ≤120 imgs/ds, 20k objects across 35 ds):
+  three object regimes — single big blob (busi/isic/kvasir/wbc/pandental,
+  ~1 obj/img, bbox 0.24–0.98 of image), dense small instances (cellnuclei/monusac/
+  nuset/tnbcnuclei/dynamicnuclear, 19–47 obj/img, bbox ~0.06–0.08), and thin vessel
+  networks that shatter into tiny fragments (drive/chasedb1/bbbc010, low fill ~0.2).
+  fill median 0.72 (blob-like); intensity+contrast span the full range (some ds have
+  darker-than-bg objects, e.g. busi/isic contrast ≈ -60; dynamicnuclear img ≈ black).
+- Implications for the bank: filter by min_area + maybe min_fill to drop vessel
+  fragments; pick instance-rich datasets for many-object scenes; carry the intensity
+  patch (not just binary) so pasted objects keep realistic texture/contrast.
+
+## 2026-07-08 — omniSynth: MedSegBench object source
+- New object bank src/datasets/omniSynth/bank_medseg.py (MedSegObjectBank), a drop-in
+  alternative to OmniglotBank exposing the same task_ids/get/alphabet interface. A
+  "class" = (dataset, label_value) [alphabet(cid)="<dataset>/label_<lv>"]; a rendition
+  = one image's WHOLE binary mask for that label (all connected components kept, so
+  multi-component objects stay intact), bbox-cropped + resized into a cell tile, stored
+  as [2,tile,tile] float32: ch0 = intensity (0..1, zeroed outside mask), ch1 = binary
+  mask. Classes split train/val/test by seeded permutation (novel-class, like Omniglot).
+- render.py generalised to 2-channel renditions via _split(tile): glyph 2D bitmap ->
+  img==mask; medseg [2,h,w] -> paste ch0 into image, ch1 into mask. affine_jitter is
+  channel-aware (intensity kept continuous + re-masked, mask re-binarised). Glyph path
+  and all 21 existing tests unchanged.
+- Config: new OmniMedSegConfig + `medseg` block in synth/omniglot.yaml (source=omniglot
+  default). Flip with synth.medseg.source=medseg (+ datasets/train_frac/... overrides).
+  Wired through common.build_dataset, dataset.py (bank selector), preview_omnisynth.py.
+- Tools: experiments/2d/synth/preview_medseg_bank.py (rendition montage) and
+  explore_medseg_objects.py (object stats). Tests: test_bank_medseg.py + 2 render tests.
+  Previews: results/omnisynth_medseg_{random,grid}.png, results/medseg_bank_preview.png.
+- Usage: python experiments/2d/train.py synth=omniglot synth.medseg.source=medseg \
+    synth.scene.placement=random synth.scene.max_nb_objects=6
+
+## 2026-07-08 — omniSynth medseg: split by MedSegBench image splits
+- Changed MedSegObjectBank splitting (superseding the earlier seeded novel-class split).
+  The bank is now scoped to one split: the "train" bank reads each dataset's TRAIN
+  images, the "val" bank its VAL images (no test set — val doubles as test). Config:
+  replaced train_frac/val_test_split/datasets/master_seed with train_datasets and
+  val_datasets ([] = all) selecting which datasets feed each split. Default (both [])
+  = same classes in train and val, but drawn from different underlying images.
+- get_or_build_medseg_bank / MedSegObjectBank take `split`; dataset.py passes its split.
+  task_ids() returns the single scoped pool. Fixes the earlier empty-val edge case with
+  few datasets. Updated omniglot.yaml medseg block, preview scripts, test_bank_medseg.py.
+
+## 2026-07-08 — omniSynth medseg: canvas-relative object sizing
+- Objects no longer uniformly resized to the cell. New OmniMedSegConfig.size_mode:
+  - canvas (default): each object tile is scaled by canvas/source so it keeps its size
+    relative to the full canvas (bbox that filled f of its source image -> ~f of the
+    canvas), aspect ratio preserved, centred in a square tile. Per-placement aug then
+    jitters around this. size_scale multiplies the preserved size.
+  - cell: previous behaviour (every object resized to (1-2*margin)*cell, glyph-like).
+- Wiring: MedSegObjectBank / get_or_build_medseg_bank take image_size (canvas side;
+  defaults to source_size); dataset.py passes it; cache key includes it. No render
+  changes — variable/oversized tiles were already handled by _clamp_center + union paste.
+- Verified: tile px varies per object (busi med 30, isic 88, cellnuclei/drive ~full
+  canvas since their whole-mask bbox spans the image) and rescales exactly with
+  image_size (128->64 halves sizes). Previews: results/omnisynth_medseg_{canvas,cell}.png.
+
+## 2026-07-08 — omniSynth: random background (dark objects stay visible)
+- Problem: dark medseg object textures vanished on the black canvas. Fix mirrors
+  controlSynth's non-black GMM background (bg_center~0.5 off the extremes).
+- OmniSceneConfig.background: "black" (default, zero canvas, unchanged) | "random"
+  (smooth low-freq grey field via upsampled random + gaussian noise; bg_intensity,
+  bg_structure, bg_noise knobs). "black" draws no rng, preserving existing seeds.
+- render.py: image now composited with premultiplied-alpha _composite (canvas*(1-mask)
+  + img_tile) instead of np.maximum, so an object's true texture (bright OR dark)
+  REPLACES the background under its mask rather than being hidden by a lighter bg.
+  Label mask keeps its union paste. For a black canvas _composite == the old maximum,
+  so the glyph path and all prior tests are unchanged (30 pass).
+- Verified: busi target texture (0.005..0.46, incl. near-black) now visible over a
+  0.41 grey bg. Preview: results/omnisynth_medseg_bg_random.png.
+
+## 2026-07-08 — omniSynth: cheap anti-overlap for random placement
+- Rejection sampling in render_scene: for random placement, each object is sampled
+  first, then up to placement_tries candidate centres are drawn and the least-overlapping
+  (vs a running boolean occupancy of already-placed masks) is kept — accepted early once
+  overlap fraction <= placement_max_overlap. New OmniSceneConfig fields placement_tries
+  (default 1 = fully random, no rejection; yaml sets 8) + placement_max_overlap (0.25).
+  Helpers _tile_slices/_occupy/_overlap_frac/_place_random; O(objects*tries), tiny cost.
+- Loop refactor: object sampled before its position (so its mask drives placement). Grid
+  path unchanged incl. rng order (position uses no rng); random path rng order shifts by
+  one (object sample now precedes the position draw) — deterministic, just different scenes.
+- Verified on real medseg objects (5 datasets, size_scale 0.5, 6 obj/scene): overlapped-
+  pixel fraction 0.101 (tries=1) -> 0.033 (4) -> 0.031 (8) -> 0.028 (16); ~3x less overlap
+  at the tries=8 default. Previews: results/omnisynth_medseg_tries{1,8}.png. 31 tests pass.
+
+## 2026-07-08 — omniSynth: BiomedParse object source
+- Added source=biomedparse alongside medseg. New bank_biomedparse.py
+  (BiomedParseObjectBank), same task_ids/get/alphabet interface + [2,tile,tile]
+  rendition format. class = (dataset, target) with target parsed from the mask
+  filename (_parse_mask_stem, '+'->space); alphabet(cid)="<ds_key>/<target>".
+  Reads the pre-resized store <root>/<split>/<ds>/{images,masks}_{size}.npy +
+  index_{size}.npz (reusing biomedparse._discover_stores/_index_from_npz); mask row
+  -> image row via filename stem. split: train->train store, val/test->test store.
+- Factored shared sizing/tiling into bank_common.py (make_object_tile + crop_to_tile);
+  MedSegObjectBank refactored to use it (behaviour identical, its 4 tests still pass).
+- Config: source now omniglot|medseg|biomedparse; added biomedparse_root. dataset.py
+  branches on source; yaml documents it. common.build_dataset unchanged (OmniMedSegConfig
+  carries the selector). 41 datasets / 109 (dataset,target) classes (test split).
+- Verified: bank builds (train 6 / val 4 on a subset), scene renders
+  (results/omnisynth_biomedparse_random.png), train config builds 36/35 classes.
+  Tests: test_bank_biomedparse.py (3). Full suite 34 passed.
+- Usage: python experiments/2d/train.py synth=omniglot synth.medseg.source=biomedparse \
+    synth.scene.placement=random synth.scene.background=random
+
+## 2026-07-08 — omniSynth: un-nest object source selector
+- Moved the object-source selector from synth.medseg.source to a top-level
+  synth.source (omniglot | medseg | biomedparse); the `medseg` block now holds only
+  the real-object params (shared by medseg + biomedparse). Removed `source` from
+  OmniMedSegConfig; added a `source` arg to OmniSynthICLDataset (selector uses it).
+  common.build_dataset reads s.source; preview_omnisynth.py reads cfg.source. Updated
+  omniglot.yaml + bank tests. All 34 tests pass; medseg/biomedparse/omniglot build
+  end-to-end via synth.source.
+
+## 2026-07-08 — eval: option to drop per-class metric keys
+- Added eval.log_per_class (eval_incontext.yaml, default false there) to suppress the
+  per-dataset (dice/dataset/*) and per-class (dice/class/*) breakdown keys in the wandb
+  summary — one-per-letter/object-class entries that the per-sample table already covers.
+  mean + macro aggregates and the console table are always kept.
+- Threaded as per_group through validate() -> log_summary() (common.py); defaults True so
+  train.py and other eval scripts are unchanged. eval_incontext.py passes
+  cfg.eval.get('log_per_class', True). Verified: per_group=False yields only */mean + */macro
+  (identical values), dropping all per-group keys.
+
+## 2026-07-08 — eval: accurate inference timing (cuda sync + warmup)
+- evaluate.py validate(): time/inference_ms now brackets the per-batch forward with
+  torch.cuda.synchronize() (CUDA only), so it measures real GPU forward compute instead
+  of async kernel-launch time. The first timed batch is dropped as warmup (cudnn.benchmark
+  autotune / allocator / lazy init). No-op on CPU. FLOPs batch still excluded from timing.
+
+## 2026-07-09 — omniSynth: real-image backgrounds (scene.background=image)
+- New background mode: scene.background=image uses a random real full image from
+  medseg/biomedparse as the canvas (objects composited over it, as before). Independent
+  of the object source (e.g. biomedparse objects on medseg image backgrounds, or omniglot
+  glyphs on real backgrounds). New scene fields: bg_source (medseg|biomedparse),
+  bg_datasets ([]=all), bg_max_images (pool cap). Roots/source_size reused from the medseg
+  block; split maps train->train, val/test->val (medseg)/test (biomedparse).
+- bank_background.py (BackgroundBank + get_or_build_background_bank): pools full images
+  per split (budget spread across datasets; medseg copies the kept slice, biomedparse
+  keeps memmaps), samples one and resizes to the canvas on demand. Process-shared cache.
+- render_scene/_make_background take an optional background_sampler; dataset.py builds the
+  bank when background=image and threads sampler.sample. render stays PIL-free (sampler
+  returns canvas-sized image). Objects still painted over via _composite (dark textures
+  visible on any background).
+- Tests: test_bank_background.py (2) + a render test; full suite 37 passed. Preview:
+  results/omnisynth_bg_image.png. Usage: synth.scene.background=image
+  synth.scene.bg_source=medseg [synth.scene.bg_datasets=[...]].
+
+## 2026-07-09 — omniSynth: draw targets last (on top of distractors)
+- render_scene now defers target image-compositing to after all distractors, so a
+  distractor overlapping a target can no longer overwrite the target's texture in the
+  image. Placement, occupancy (anti-overlap), rng order, the label mask and target
+  positions/transforms are unchanged — only the target/distractor overlap pixels in the
+  image differ (target wins). Targets keep their mutual paste order.
+- Test: test_targets_drawn_over_distractors (oversized fully-overlapping tiles ->
+  target texture 0.5 survives under 0.9 distractors). Render tests 13 passed.
+
+## 2026-07-09 — omniSynth: fix empty masks for tiny objects
+- Symptom: ~4/10 preview samples (medseg, canvas sizing, size_scale<1) had fully empty
+  target+context masks — all from tiny/sparse classes (idrib microaneurysms, m2caiseg
+  rare labels). min_mask_px filters the SOURCE mask, but the mask vanished downstream.
+- Two vanishing points, both bilinear-resize + 0.5 threshold on sparse masks:
+  1. bank_common.make_object_tile: canvas downsizing blurred tiny masks below 0.5.
+     Fix: if the >=0.5 mask is empty, fall back to >0 (keep any coverage); crop_to_tile
+     also drops any rendition whose tile mask is still empty (excludes hopeless classes).
+  2. render.affine_jitter (target_mode=aug): the warp re-thresholded at 0.5 and could
+     blur/push a tiny mask off-tile. Fix: >0 fallback, then if still empty return the
+     un-jittered base (bank guarantees it is non-empty).
+- Result: empty target masks 4/10 -> 0/200. Full suite 38 passed.

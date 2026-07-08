@@ -15,7 +15,11 @@ import torch
 from torch.utils.data import Dataset
 
 from .bank import get_or_build_bank
-from .config import OmniDiversityConfig, OmniSamplingConfig, OmniSceneConfig
+from .bank_background import get_or_build_background_bank
+from .bank_biomedparse import get_or_build_biomedparse_bank
+from .bank_medseg import get_or_build_medseg_bank
+from .config import (OmniDiversityConfig, OmniMedSegConfig, OmniSamplingConfig,
+                     OmniSceneConfig)
 from .render import make_distractor_sampler, make_target_sampler, render_scene
 
 # target_mode="mix" samples uniformly over these per item.
@@ -27,14 +31,17 @@ def _to_img_tensor(arr):
 
 
 class OmniSynthICLDataset(Dataset):
-    def __init__(self, split="train", context_size=3, image_size=64,
-                 diversity=None, scene=None, sampling=None, deterministic=None):
+    def __init__(self, split="train", context_size=3, image_size=64, source="omniglot",
+                 diversity=None, scene=None, sampling=None, medseg=None,
+                 deterministic=None):
         self.split = split
         self.context_size = context_size
         self.image_size = image_size
+        self.source = source
         self.diversity = diversity or OmniDiversityConfig()
         self.scene = scene or OmniSceneConfig()
         self.sampling = sampling or OmniSamplingConfig()
+        self.medseg = medseg or OmniMedSegConfig()
         self.deterministic = (split != "train") if deterministic is None else deterministic
 
         grid = self.scene.grid
@@ -42,11 +49,27 @@ class OmniSynthICLDataset(Dataset):
             raise ValueError(f"image_size {image_size} not divisible by grid {grid}")
         self.cell_size = image_size // grid
 
-        self.bank = get_or_build_bank(self.diversity, self.cell_size,
-                                      self.scene.cell_margin)
+        # Object source: Omniglot glyphs (default) or real MedSegBench / BiomedParse
+        # objects. All banks expose task_ids/get/alphabet, so downstream is unchanged.
+        if self.source == "medseg":
+            self.bank = get_or_build_medseg_bank(self.medseg, self.cell_size,
+                                                 self.scene.cell_margin, split, image_size)
+        elif self.source == "biomedparse":
+            self.bank = get_or_build_biomedparse_bank(self.medseg, self.cell_size,
+                                                      self.scene.cell_margin, split, image_size)
+        else:
+            self.bank = get_or_build_bank(self.diversity, self.cell_size,
+                                          self.scene.cell_margin)
         self.pool = self.bank.task_ids(split)
         if not self.pool:
             raise ValueError(f"empty class pool for split {split!r}")
+
+        # Optional real-image background (scene.background="image"): a pooled bank of full
+        # medseg/biomedparse images, sampled per scene. None otherwise (black / grey field).
+        self._bg_sampler = None
+        if getattr(self.scene, "background", "black") == "image":
+            bg_bank = get_or_build_background_bank(self.medseg, self.scene, image_size, split)
+            self._bg_sampler = bg_bank.sample
 
         if self.deterministic:
             self._eval_index = []                       # idx -> (class_id, subject_index)
@@ -119,7 +142,8 @@ class OmniSynthICLDataset(Dataset):
 
         def scene(rng):
             return render_scene(rng, self.scene, self.scene.grid, self.cell_size,
-                                target_sampler, distractor_sampler)
+                                target_sampler, distractor_sampler,
+                                background_sampler=self._bg_sampler)
 
         t_img, t_seg, t_k, t_info = scene(rngs[0])
         ctx = [scene(rngs[1 + i]) for i in range(self.context_size)]

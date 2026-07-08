@@ -21,7 +21,8 @@ import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 
 from src.datasets.omniSynth import (
-    OmniDiversityConfig, OmniSamplingConfig, OmniSceneConfig, OmniSynthICLDataset,
+    OmniDiversityConfig, OmniMedSegConfig, OmniSamplingConfig, OmniSceneConfig,
+    OmniSynthICLDataset,
 )
 
 
@@ -34,7 +35,7 @@ def main():
     ap.add_argument("--split", default="train")
     ap.add_argument("--context_size", type=int, default=3)
     ap.add_argument("--image_size", type=int, default=128)
-    ap.add_argument("--n", type=int, default=4)
+    ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--out", default="results/omnisynth_preview.png")
     args, overrides = ap.parse_known_args()
 
@@ -53,10 +54,16 @@ def main():
     scene = OmniSceneConfig(**scene_kw)
     diversity = OmniDiversityConfig(**dict(cfg.diversity))
     sampling = OmniSamplingConfig(**dict(cfg.sampling))
+    medseg = OmniMedSegConfig(**dict(cfg.medseg)) if cfg.get("medseg", None) else None
+    source = cfg.get("source", "omniglot")
 
     K = args.context_size
     ds = OmniSynthICLDataset(split=args.split, context_size=K, image_size=args.image_size,
-                             diversity=diversity, scene=scene, sampling=sampling)
+                             source=source, diversity=diversity, scene=scene,
+                             sampling=sampling, medseg=medseg)
+    if source in ("medseg", "biomedparse"):
+        ds_list = medseg.train_datasets if args.split == "train" else medseg.val_datasets
+        print(f"object source: {source}  {args.split}_datasets={list(ds_list) or 'all'}")
 
     print(f"omniSynth preview: split={args.split} target_mode={scene.target_mode} "
           f"placement={scene.placement} grid={scene.grid} max_obj={scene.max_nb_objects} "

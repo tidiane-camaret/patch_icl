@@ -114,7 +114,8 @@ def build_dataset(cfg, split: str):
         )
     if source == "omnisynth":
         from src.datasets.omniSynth import (
-            OmniDiversityConfig, OmniSamplingConfig, OmniSceneConfig, OmniSynthICLDataset,
+            OmniDiversityConfig, OmniMedSegConfig, OmniSamplingConfig, OmniSceneConfig,
+            OmniSynthICLDataset,
         )
         s = cfg.synth
         # omniglot_root comes from cfg.paths.omniglot when the config tree includes a
@@ -124,13 +125,19 @@ def build_dataset(cfg, split: str):
         div_kwargs = dict(s.diversity)
         if paths is not None and paths.get("omniglot", None):
             div_kwargs["omniglot_root"] = paths.omniglot
+        # Top-level `synth.source` (omniglot | medseg | biomedparse) selects the object
+        # bank; the `medseg` block holds the real-object params for medseg/biomedparse.
+        obj_source = s.get("source", "omniglot")
+        medseg = OmniMedSegConfig(**dict(s.medseg)) if s.get("medseg", None) else None
         return OmniSynthICLDataset(
             split=split,
             context_size=cfg.data.context_size,
             image_size=cfg.data.image_size,
+            source=obj_source,
             diversity=OmniDiversityConfig(**div_kwargs),
             scene=OmniSceneConfig(**dict(s.scene)),
             sampling=OmniSamplingConfig(**dict(s.sampling)),
+            medseg=medseg,
         )
     raise ValueError(
         f"unknown data.source {source!r} "
@@ -292,11 +299,15 @@ def log_summary(
     extra: dict | None = None,
     prefix: str = "dice",
     metric_label: str = "native",
+    per_group: bool = True,
 ) -> dict:
     """Aggregate NaN-filtered Dice scores, print table, return wandb summary dict.
 
     Keys are emitted under `prefix` (e.g. "dice" → dice/mean, dice/dataset/*,
     dice/class/*), so the same routine can log both native and downsampled metrics.
+    per_group=False drops the per-dataset/per-class breakdown keys (many one-per-
+    object-identity entries — the per-sample table already covers them); the console
+    table + the mean/macro aggregates are always kept.
     """
     summary = {}
 
@@ -307,7 +318,8 @@ def log_summary(
         scores = [s for s in per_ds[name] if not np.isnan(s)]
         mean   = float(np.mean(scores)) if scores else float("nan")
         all_scores.extend(scores)
-        summary[f"{prefix}/dataset/{name}"] = mean
+        if per_group:
+            summary[f"{prefix}/dataset/{name}"] = mean
         print(f"{name:>25}  {len(per_ds[name]):>5}  {mean:>14.4f}")
     print("-" * 50)
     valid   = [s for s in all_scores if not np.isnan(s)]
@@ -324,7 +336,8 @@ def log_summary(
         valid_cls = [s for s in scores if not np.isnan(s)]
         if valid_cls:
             m = float(np.mean(valid_cls))
-            summary[f"{prefix}/class/{key}"] = m
+            if per_group:
+                summary[f"{prefix}/class/{key}"] = m
             cell_means.append(m)
     macro = float(np.mean(cell_means)) if cell_means else float("nan")
     summary[f"{prefix}/macro"] = macro

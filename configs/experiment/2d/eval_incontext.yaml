@@ -12,3 +12,9 @@ defaults:
   - eval_base
   - override synth: omniglot
   - _self_
+
+eval:
+  # Per (dataset/label) i.e. per individual letter/object-class metric keys in the wandb
+  # summary. false -> log only the mean/macro aggregates (the per-sample table already
+  # carries per-item detail, so the many one-per-class keys are redundant noise here).
+  log_per_class: false
