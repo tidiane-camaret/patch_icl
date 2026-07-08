@@ -2147,3 +2147,46 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   train_base.yaml). Tolerant load — keeps only name+shape-matching tensors, strips
   `_orig_mod.` prefix, accepts bare state_dict or `{"model": ...}` (mirrors pfn_seg.py).
   Enables retraining, e.g. `... train.checkpoint=.../best.pt`.
+
+## 2026-07-06 — 3D eval: single multi-class loader
+- `evaluate.evaluate_classes` now builds ONE dataset over all val classes
+  (`common.make_eval_loader`) instead of one loader per class. The scan/bbox
+  caches load once per eval instead of ~40×, and the "Loaded scan/bbox cache"
+  spam is gone. Results grouped back per class via each sample's `label_name`;
+  (rows, cases) shape unchanged, so eval.py + train.py val step are untouched.
+- `make_loader(cfg, cls)` kept as a thin wrapper over `make_eval_loader([cls])`.
+- Classes with no samples now yield an `{"class", "error": "no samples"}` row.
+
+## 2026-07-06 — Medverse: train-from-scratch option
+- Added `train.random_init` (default false). When true, `MedverseModel` builds the
+  net from the checkpoint's `hyper_parameters` via `LightningModel(hparams)` and
+  skips loading the pretrained `state_dict` -> fresh random weights, same arch.
+- `base_ckpt: null` still means "stock pretrained Medverse.ckpt"; `random_init: true`
+  is the way to ignore pretrained weights entirely. Wired in train.py build_model.
+
+## 2026-07-06 — 3D train: build val loader once
+- The multi-class val loader was rebuilt every eval epoch (dataset + scan/bbox
+  caches reloaded each time). `evaluate_classes` now accepts an optional prebuilt
+  `loader`; `validate_mean` threads it through; `main()` builds `val_loader` once
+  via `make_eval_loader` before the epoch loop and reuses it. Eliminates the
+  per-epoch "Loaded scan/bbox cache" reloads. eval.py (no loader arg) unchanged.
+
+## 2026-07-07 — TODO: PatchSetCNN refinement-pass ideas (design only)
+- Documented two orthogonal extensions in docs/TODO.md (no code yet):
+  (1) patch-level `sampling` maps for context images — drop the sample-axis mask
+  for full `r×r` attention (~free, breaks "context read-only"), decode all
+  `(K+1)·N` rows via one shared 2-ch `(mask, sampling)` head, discard ctx masks;
+  (2) high-res outputs via the Medverse "pool QK / hi-res V" trick — coarse `A`,
+  per-patch `f×f` sub-cells folded into V channels, `A@V` + `pixel_shuffle(f)` →
+  `R·f` map (only `AV` width + V mem scale by `f²`; scores unchanged; no V proj).
+  They compose: hi-res read-out with `q_tok=s_tok` yields ctx maps at high res.
+  Reference: Medverse MultiContextSpatialCrossAttention3D (/home/dpxuser/repos/Medverse).
+
+## 2026-07-08 — omniSynth: random glyph placement option
+- Added `scene.placement` (grid | random) to `OmniSceneConfig`. `grid` (default)
+  keeps the existing cell-centred layout; `random` pastes each of the grid*grid
+  glyphs at a uniform-random canvas centre (overlap allowed — union blending keeps
+  every glyph). Only the centre choice changes in `render_scene`; k targets,
+  samplers, masks, provenance, copy-task logic all unchanged.
+- preview_omnisynth.py now prints `placement=`; draw with
+  `scene.placement=random`. Samples: results/omnisynth_preview_{random,grid}.png.

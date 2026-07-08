@@ -100,18 +100,23 @@ def train_loader(cfg) -> DataLoader:
     )
 
 
-def make_loader(cfg, cls: str, split: str = "test") -> DataLoader:
-    """Single-class eval loader (deterministic, no aug, no synth, class_balanced off).
+def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
+    """Multi-class eval loader (deterministic, no aug, no synth, class_balanced off).
+
+    Builds ONE dataset over all `classes`, so the scan/bbox caches are loaded once
+    instead of once per class. class_balanced=False makes `dataset.samples` a
+    deterministic (subject, class) list, and shuffle=False keeps samples grouped
+    by class; each item carries its own `label_name` for grouping downstream.
 
     Sources image_size / context_size / use_crop from cfg.data and
     n_subjects / batch_size / workers from cfg.eval, so the eval set is built from
-    the same config surface as training. Used by experiments/3d/eval.py per class.
+    the same config surface as training.
     """
     d, e = cfg.data, cfg.eval
     _, root, is_mri = _source_root(cfg)
     ds = TotalSegInContextDataset(
         root=root,
-        classes=[cls],
+        classes=list(classes),
         image_size=tuple(d.image_size),
         split=split,
         context_size=d.context_size,
@@ -133,3 +138,8 @@ def make_loader(cfg, cls: str, split: str = "test") -> DataLoader:
         persistent_workers=nw > 0,
         prefetch_factor=2 if nw > 0 else None,
     )
+
+
+def make_loader(cfg, cls: str, split: str = "test") -> DataLoader:
+    """Single-class eval loader — thin wrapper over make_eval_loader([cls])."""
+    return make_eval_loader(cfg, [cls], split=split)

@@ -16,6 +16,9 @@ class OmniDiversityConfig:
 @dataclass
 class OmniSceneConfig:
     grid: int = 2                 # grid x grid cells fill the canvas
+    placement: str = "grid"       # grid: glyphs centred on cell centres.
+                                  # random: glyphs at uniform-random canvas positions (may
+                                  # overlap). Glyph count stays grid*grid either way.
     k_min: int = 1                # target cells ~ U[k_min, k_max] (clamped to [1, grid*grid])
     k_max: int = 2
     cell_margin: float = 0.1      # glyph size = (1 - 2*margin)*cell. >0: padding inside the

@@ -2,8 +2,8 @@
 Config-driven 3D in-context eval — the harness twin of experiments/3d/train.py,
 mirroring experiments/2d/eval_incontext.py. Evaluates one model (default medverse)
 on the TotalSegmentator test split over a class list, reporting per-class Dice,
-mean inference time, and GFLOPs. Shares the loader (common.make_loader) and eval
-loop (evaluate.validate) with the rest of the 3D harness.
+mean inference time, and GFLOPs. Shares the loader (common.make_eval_loader) and
+eval loop (evaluate.evaluate_classes) with the rest of the 3D harness.
 
     python experiments/3d/eval.py experiment=3d/eval
     python experiments/3d/eval.py experiment=3d/eval eval.model=native_resenc \

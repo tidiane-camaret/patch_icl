@@ -2,9 +2,10 @@
 Shared 3D in-context eval loop — the single source of truth used by
 experiments/3d/eval.py (now) and experiments/3d/train.py's val step (later).
 
-`validate(model, loader, cls)` runs one single-class loader through
-`model.predict()` and returns a per-class summary row + per-case records, plus
-optional qualitative figures. Mirrors experiments/2d/evaluate.py's role.
+`evaluate_classes(model, cfg, classes)` runs ONE multi-class loader through
+`model.predict()` and groups results back per class, returning per-class summary
+rows + per-case records (plus optional qualitative figures). `validate(model,
+loader, cls)` remains for a single-class loader. Mirrors experiments/2d/evaluate.py.
 
 Ported from scripts/eval.py so the 3D experiments harness is self-contained;
 scripts/eval.py stays as the legacy CLI benchmark.
@@ -135,39 +136,93 @@ def validate(model, loader, cls: str, *, fig_dir: Path | None = None) -> tuple[d
                 "time_ms": round(elapsed_ms / pred.shape[0], 1),
             })
 
+    return _summarize(cls, cases), cases
+
+
+def _summarize(cls: str, cases: list[dict]) -> dict:
+    """Aggregate per-case records into a summary row (mean/std Dice + mean time)."""
     dice_scores = [c["dice"] for c in cases]
     times = [c["time_ms"] for c in cases]
     n = len(dice_scores)
     mean_dice = sum(dice_scores) / n if n else 0.0
     std_dice  = (sum((d - mean_dice) ** 2 for d in dice_scores) / n) ** 0.5 if n > 1 else 0.0
     mean_ms   = sum(times) / len(times) if times else 0.0
-
-    summary = {
+    return {
         "class":        cls,
         "n_samples":    n,
         "mean_dice":    round(mean_dice, 4),
         "std_dice":     round(std_dice, 4),
         "mean_time_ms": round(mean_ms, 1),
     }
-    return summary, cases
 
 
-def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None):
-    """Run `validate` over each class via common.make_loader; return (rows, cases).
+def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
+                     loader=None):
+    """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
-    Shared by experiments/3d/eval.py (benchmark) and train.py's val step. Rows that
-    error carry an "error" key instead of metrics. split defaults to cfg.eval.split.
+    Builds a single dataset over every class (via common.make_eval_loader), so the
+    scan/bbox caches load once rather than once per class. Each sample carries its
+    own `label_name`, so results are grouped back per class after inference —
+    yielding the same (rows, cases) shape as the old per-class loop. Classes with
+    no samples get an "error" row. split defaults to cfg.eval.split.
+
+    Pass a prebuilt `loader` (from common.make_eval_loader) to reuse one dataset
+    across repeated calls — train.py's val step does this so the dataset isn't
+    rebuilt (and caches reloaded) every eval epoch.
+
+    Shared by experiments/3d/eval.py (benchmark) and train.py's val step.
     """
-    from common import make_loader  # local import: common/evaluate are sibling modules
+    from collections import defaultdict
 
-    split = split or cfg.eval.split
+    if loader is None:
+        from common import make_eval_loader  # local import: common/evaluate are siblings
+        split = split or cfg.eval.split
+        loader = make_eval_loader(cfg, classes, split=split)
+
+    cases_by_class: dict[str, list[dict]] = defaultdict(list)
+    figs_saved: set[str] = set()
+
+    for batch in loader:
+        target_img    = batch["image"]
+        context_imgs  = batch["context_in"]
+        context_masks = batch["context_out"]
+        label         = batch["label"]
+        subjects      = batch.get("subjects", [None] * target_img.shape[0])
+        label_names   = batch["label_names"]
+
+        _sync()
+        t0 = time.perf_counter()
+        pred = model.predict(target_img, context_imgs, context_masks)
+        _sync()
+        per_sample_ms = (time.perf_counter() - t0) * 1000 / pred.shape[0]
+
+        pred, label = pred.cpu(), label.cpu()
+
+        for i in range(pred.shape[0]):
+            cls = label_names[i]
+            if fig_dir is not None and cls not in figs_saved:
+                subj = subjects[i] or "s0"
+                save_eval_figure(
+                    target_img=target_img[i].squeeze(0).cpu().numpy(),
+                    gt=label[i].numpy(),
+                    pred=pred[i].numpy(),
+                    ctx_img=context_imgs[i, 0].squeeze(0).cpu().numpy(),
+                    ctx_gt=context_masks[i, 0].cpu().numpy(),
+                    out_path=fig_dir / f"{cls}_{subj}.png",
+                    title=f"{cls}  {subj}  dice={dice_binary(pred[i], label[i]):.3f}",
+                )
+                figs_saved.add(cls)
+            cases_by_class[cls].append({
+                "class":   cls,
+                "subject": subjects[i],
+                "dice":    round(dice_binary(pred[i], label[i]), 4),
+                "time_ms": round(per_sample_ms, 1),
+            })
+
     rows, all_cases = [], []
     for cls in classes:
-        try:
-            loader = make_loader(cfg, cls, split=split)
-            row, cases = validate(model, loader, cls, fig_dir=fig_dir)
-            rows.append(row)
-            all_cases.extend(cases)
-        except Exception as exc:  # noqa: BLE001
-            rows.append({"class": cls, "error": str(exc)})
+        cases = cases_by_class.get(cls, [])
+        all_cases.extend(cases)
+        rows.append(_summarize(cls, cases) if cases
+                    else {"class": cls, "error": "no samples"})
     return rows, all_cases

@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evaluate (dir '3d')
 
 from data.totalseg_classes import resolve_classes
-from common import DEVICE, _source_root, train_loader
+from common import DEVICE, _source_root, train_loader, make_eval_loader
 from evaluate import evaluate_classes
 
 
@@ -140,6 +140,8 @@ def build_model(cfg: DictConfig):
         mk = {"sw_roi_size": tuple(cfg.data.image_size)}  # val predict = single ROI
         if cfg.train.get("base_ckpt"):
             mk["ckpt_path"] = cfg.train.base_ckpt
+        if cfg.train.get("random_init"):
+            mk["random_init"] = True  # train from scratch (ignores pretrained weights)
         return MedverseModel(device=DEVICE, **mk), name
     raise ValueError(f"unknown model {name!r} (medverse)")
 
@@ -177,10 +179,13 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
 
 
 @torch.no_grad()
-def validate_mean(model, cfg, classes):
-    """Mean val Dice via the shared per-class eval loop (uses model.predict)."""
+def validate_mean(model, cfg, classes, loader=None):
+    """Mean val Dice via the shared per-class eval loop (uses model.predict).
+
+    Reuses `loader` (built once in main) so the val dataset isn't rebuilt each epoch.
+    """
     model.model.eval()
-    rows, _ = evaluate_classes(model, cfg, classes, split="val")
+    rows, _ = evaluate_classes(model, cfg, classes, split="val", loader=loader)
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
     return mean_dice, rows
@@ -202,6 +207,7 @@ def main(cfg: DictConfig) -> None:
           f"| sched={cfg.train.get('scheduler','plateau')} | val classes={len(val_classes)}")
 
     loader = train_loader(cfg)
+    val_loader = make_eval_loader(cfg, val_classes, split="val")  # built once, reused every eval
     model, model_name = build_model(cfg)
     net = model.model
     print(f"Trainable params: {sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6:.1f}M")
@@ -235,7 +241,7 @@ def main(cfg: DictConfig) -> None:
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            val_dice, rows = validate_mean(model, cfg, val_classes)
+            val_dice, rows = validate_mean(model, cfg, val_classes, loader=val_loader)
             log["val/dice"] = val_dice
             log.update({f"val/dice/{r['class']}": r["mean_dice"] for r in rows if "mean_dice" in r})
             if not step_per_batch:  # plateau: step on the val metric

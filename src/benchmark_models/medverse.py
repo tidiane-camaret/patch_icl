@@ -33,6 +33,7 @@ class MedverseModel(InContextModel):
         device: torch.device = None,
         forward_l_arg: int = 1,
         sw_roi_size: tuple = (128, 128, 128),
+        random_init: bool = False,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.forward_l_arg = forward_l_arg
@@ -42,9 +43,17 @@ class MedverseModel(InContextModel):
             sys.path.insert(0, MEDVERSE_REPO)
 
         from medverse.lightning_model import LightningModel  # noqa: PLC0415
-        self.model = LightningModel.load_from_checkpoint(
-            ckpt_path, map_location=self.device
-        ).to(self.device).eval()
+        if random_init:
+            # Build the same architecture (from the checkpoint's hparams) but with
+            # freshly initialized weights — the pretrained state_dict is NOT loaded.
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            self.model = LightningModel(ckpt["hyper_parameters"]).to(self.device).eval()
+            print("MedverseModel: RANDOM weight init "
+                  "(architecture from hparams; pretrained weights not loaded)", flush=True)
+        else:
+            self.model = LightningModel.load_from_checkpoint(
+                ckpt_path, map_location=self.device
+            ).to(self.device).eval()
 
     @torch.no_grad()
     def predict(self, target_img, context_imgs, context_masks):

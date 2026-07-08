@@ -35,12 +35,17 @@ def render_scene(rng, scene, grid, cell_size, target_sampler, distractor_sampler
     H = W = grid * cell_size
     image = np.zeros((H, W), dtype=np.float32)
     mask = np.zeros((H, W), dtype=np.float32)
+    random = getattr(scene, "placement", "grid") == "random"
     sorted_targets, transforms, positions = [], [], []
     for cell in range(n_cells):
-        r, c = divmod(cell, grid)
-        # paste each glyph centred on its cell centre. Tiles are cell-sized for margin>=0
-        # (dropping into one cell exactly) but larger for margin<0 (overflow + overlap).
-        cy, cx = r * cell_size + cell_size // 2, c * cell_size + cell_size // 2
+        # paste each glyph centred on its cell centre (grid) or a uniform-random canvas
+        # position (random; may overlap — union blending keeps every glyph). Tiles are
+        # cell-sized for margin>=0 but larger for margin<0 (overflow + overlap).
+        if random:
+            cy, cx = int(rng.integers(0, H)), int(rng.integers(0, W))
+        else:
+            r, c = divmod(cell, grid)
+            cy, cx = r * cell_size + cell_size // 2, c * cell_size + cell_size // 2
         if cell in target_cells:
             res = target_sampler(rng)
             bm, params = res if isinstance(res, tuple) else (res, None)
