@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
-from src.models.bbox_refine import crop_resize, fuse_window, gt_window, max_sum_window
+from src.models.bbox_refine import crop_resize, gt_window, max_sum_window
 
 
 class ConvEncoder(nn.Module):
@@ -109,18 +109,32 @@ class PatchSetCNN(nn.Module):
         query_self_attn: bool = False,
         context_id_embed: bool = False,
         max_context: int = 16,
-        refine: bool = False,
-        refine_crop: int = 64,
+        resolutions: list[int] | None = None,
     ):
         super().__init__()
         self.image_size = image_size
+        # `resolutions` = effective full-image resolutions per level (level 0 = coarse over the
+        # full image). The token grid T is constant across levels and equals resolutions[0]; each
+        # further level k crops the image to c_k = image_size*resolutions[0]/resolutions[k] px so
+        # its T tokens resolve a finer effective resolution. None → single level = plain model.
+        self.resolutions = [resolution] if resolutions is None else [int(r) for r in resolutions]
+        assert len(self.resolutions) <= 2, \
+            "multi-hop refinement (>2 levels) not implemented yet; use resolutions=[T] or [T, R1]"
+        resolution = self.resolutions[0]                 # token grid T (drives the encoder)
         self.resolution = resolution
         self.N = resolution ** 2
         self.query_self_attn = query_self_attn
         self.context_id_embed = context_id_embed
         self.max_context = max_context
-        self.refine = refine
-        self.refine_crop = refine_crop
+        # Derived per-level crop sizes (px in the image_size frame); level 0 is the full image.
+        self.refine_crops = []
+        for rk in self.resolutions[1:]:
+            assert rk % resolution == 0 and (image_size * resolution) % rk == 0, \
+                f"resolutions[k]={rk} must be a multiple of resolutions[0]={resolution} and " \
+                f"divide image_size*resolutions[0]={image_size * resolution}"
+            c = image_size * resolution // rk
+            assert 0 < c <= image_size, f"derived crop {c} out of range for resolutions[k]={rk}"
+            self.refine_crops.append(c)
         self.encoder = ConvEncoder(1, tuple(enc_dims), resolution)
         self.img_embed = nn.Linear(self.encoder.out_ch, e)
         self.mask_embed = nn.Linear(1, e)              # scalar occupancy → e
@@ -224,38 +238,36 @@ class PatchSetCNN(nn.Module):
         return logit                                                      # (B,1,R,R)
 
     def _refine_forward(self, image, context_in, context_out):
-        """Coarse pass → bbox-zoom refine pass → logit-space fusion → (B,1,H,W).
-
-        Crop the target on its densest predicted region (max_sum_window) and each context on
-        its densest GT (gt_window), resize crops back to H, re-segment with the SAME weights,
-        and ADD the refine logit as a residual into the upsampled coarse logit at the bbox."""
+        """Coarse pass over the full image + one bbox-zoom refine pass (SAME weights) → per-level
+        heads. Crop the target on its densest predicted region and each context on its densest GT,
+        resize crops to the encoder input, re-segment at the same T-token grid. No fusion — levels
+        are supervised/metricked separately (the fused stitch is a metric only, built elsewhere)."""
         B, K = context_in.shape[0], context_in.shape[1]
         H, W = image.shape[-2:]
-        s = self.refine_crop
+        c = self.refine_crops[0]                                          # derived crop (px)
 
-        coarse = self._segment(image, context_in, context_out)            # (B,1,R,R)
-        coarse_up = F.interpolate(coarse, size=(H, W), mode="bilinear", align_corners=False)
+        coarse = self._segment(image, context_in, context_out)           # (B,1,T,T)
         prob_up = F.interpolate(torch.sigmoid(coarse).detach(), size=(H, W),
-                                mode="bilinear", align_corners=False)      # bbox selection only
+                                mode="bilinear", align_corners=False)     # bbox selection only
+        tgt_o = max_sum_window(prob_up, c)                               # (B,2) px origin
+        ctx_o = torch.stack([gt_window(context_out[:, k], c) for k in range(K)], dim=1)  # (B,K,2)
 
-        tgt_o = max_sum_window(prob_up, s)                                # (B,2)
-        ctx_o = torch.stack([gt_window(context_out[:, k], s) for k in range(K)], dim=1)  # (B,K,2)
-
-        tgt_img = crop_resize(image, tgt_o, s, H, mode="bilinear")        # (B,1,H,W)
+        tgt_img = crop_resize(image, tgt_o, c, H, mode="bilinear")       # (B,1,H,W)
         ctx_img = crop_resize(context_in.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
-                              s, H, mode="bilinear").reshape(B, K, 1, H, W)
+                              c, H, mode="bilinear").reshape(B, K, 1, H, W)
         ctx_msk = crop_resize(context_out.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
-                              s, H, mode="nearest").reshape(B, K, 1, H, W)
+                              c, H, mode="nearest").reshape(B, K, 1, H, W)
 
-        refine = self._segment(tgt_img, ctx_img, ctx_msk)                 # (B,1,R,R), same weights
-        refine_s = F.interpolate(refine, size=(s, s), mode="bilinear", align_corners=False)
-        return fuse_window(coarse_up, refine_s, tgt_o, s)                 # (B,1,H,W)
+        refine = self._segment(tgt_img, ctx_img, ctx_msk)                # (B,1,T,T), same weights
+        return {"final_logit": coarse, "refine_logit": refine,
+                "refine_origin": tgt_o, "refine_crop": c, "resolutions": self.resolutions}
 
     def forward(self, image, context_in, context_out, mode="train"):
-        """image (B,1,H,W); context_in/out (B,K,1,H,W) → {"final_logit": ...}.
+        """image (B,1,H,W); context_in/out (B,K,1,H,W).
 
-        refine=False → coarse (B,1,R,R). refine=True → native (B,1,H,W) fused output.
-        `mode` is accepted for interface parity with the UniverSeg baseline; unused."""
-        if not self.refine:
+        Single level (len(resolutions)==1): {"final_logit": (B,1,T,T)} — the plain model.
+        Multi level: per-level heads (final_logit=coarse, refine_logit, refine_origin,
+        refine_crop, resolutions). `mode` is accepted for interface parity; unused."""
+        if len(self.resolutions) == 1:
             return {"final_logit": self._segment(image, context_in, context_out)}
-        return {"final_logit": self._refine_forward(image, context_in, context_out)}
+        return self._refine_forward(image, context_in, context_out)
