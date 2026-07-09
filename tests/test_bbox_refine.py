@@ -44,11 +44,13 @@ def test_crop_resize_recovers_region():
 def test_fuse_window_adds_into_window_only():
     H, s = 16, 8
     full = torch.zeros(2, 1, H, H)
-    patch = torch.ones(2, 1, s, s)
+    full[0, 0, 0:s, 0:s] = 1.0                    # non-zero window → additive, not replace
+    full[1, 0, 8:16, 8:16] = 1.0
+    patch = torch.full((2, 1, s, s), 2.0)
     o = torch.tensor([[0, 0], [8, 8]])
     out = fuse_window(full, patch, o, s)
     assert out.shape == (2, 1, H, H)
-    assert (full == 0).all()                      # input not mutated
-    assert out[0, 0, 0:s, 0:s].eq(1).all()        # window filled
-    assert out[0, 0, s:, s:].eq(0).all()          # outside untouched
-    assert out[1, 0, 8:16, 8:16].eq(1).all()
+    assert full[0, 0, 0, 0] == 1.0                # input not mutated
+    assert out[0, 0, 0:s, 0:s].eq(3.0).all()      # 1 + 2 == 3 (additive, not replace)
+    assert out[0, 0, s:, s:].eq(0).all()          # outside window untouched
+    assert out[1, 0, 8:16, 8:16].eq(3.0).all()
