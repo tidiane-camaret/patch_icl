@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
+from src.models.bbox_refine import crop_resize, fuse_window, gt_window, max_sum_window
 
 
 class ConvEncoder(nn.Module):
@@ -108,6 +109,8 @@ class PatchSetCNN(nn.Module):
         query_self_attn: bool = False,
         context_id_embed: bool = False,
         max_context: int = 16,
+        refine: bool = False,
+        refine_crop: int = 64,
     ):
         super().__init__()
         self.image_size = image_size
@@ -116,6 +119,8 @@ class PatchSetCNN(nn.Module):
         self.query_self_attn = query_self_attn
         self.context_id_embed = context_id_embed
         self.max_context = max_context
+        self.refine = refine
+        self.refine_crop = refine_crop
         self.encoder = ConvEncoder(1, tuple(enc_dims), resolution)
         self.img_embed = nn.Linear(self.encoder.out_ch, e)
         self.mask_embed = nn.Linear(1, e)              # scalar occupancy → e
@@ -150,13 +155,11 @@ class PatchSetCNN(nn.Module):
         msk = self.mask_embed(occ) + p
         return torch.stack([img, msk], dim=2)
 
-    def forward(self, image, context_in, context_out, mode="train"):
-        """image (B,1,H,W); context_in/out (B,K,1,H,W). Returns {"final_logit": (B,1,R,R)}.
+    def _segment(self, image, context_in, context_out):
+        """Coarse single-pass segmentation → (B,1,R,R) logits.
 
-        Support = all K·N context patches (known mask occupancy); query = the N target
-        patches (mask = support-mean prior). `mode` is accepted for interface parity
-        with the UniverSeg baseline and is otherwise unused.
-        """
+        image (B,1,H,W); context_in/out (B,K,1,H,W). Support = all K·N context patches
+        (known mask occupancy); query = the N target patches (mask = support-mean prior)."""
         B, K = context_in.shape[0], context_in.shape[1]
         R, N = self.resolution, self.N
         H, W = image.shape[-2:]
@@ -218,4 +221,41 @@ class PatchSetCNN(nn.Module):
 
         q = x[:, sep_t:, 0, :]                                            # (B,Q,e) query img-col
         logit = self.decoder(q).squeeze(-1).reshape(B, 1, R, R)
-        return {"final_logit": logit}
+        return logit                                                      # (B,1,R,R)
+
+    def _refine_forward(self, image, context_in, context_out):
+        """Coarse pass → bbox-zoom refine pass → logit-space fusion → (B,1,H,W).
+
+        Crop the target on its densest predicted region (max_sum_window) and each context on
+        its densest GT (gt_window), resize crops back to H, re-segment with the SAME weights,
+        and ADD the refine logit as a residual into the upsampled coarse logit at the bbox."""
+        B, K = context_in.shape[0], context_in.shape[1]
+        H, W = image.shape[-2:]
+        s = self.refine_crop
+
+        coarse = self._segment(image, context_in, context_out)            # (B,1,R,R)
+        coarse_up = F.interpolate(coarse, size=(H, W), mode="bilinear", align_corners=False)
+        prob_up = F.interpolate(torch.sigmoid(coarse).detach(), size=(H, W),
+                                mode="bilinear", align_corners=False)      # bbox selection only
+
+        tgt_o = max_sum_window(prob_up, s)                                # (B,2)
+        ctx_o = torch.stack([gt_window(context_out[:, k], s) for k in range(K)], dim=1)  # (B,K,2)
+
+        tgt_img = crop_resize(image, tgt_o, s, H, mode="bilinear")        # (B,1,H,W)
+        ctx_img = crop_resize(context_in.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
+                              s, H, mode="bilinear").reshape(B, K, 1, H, W)
+        ctx_msk = crop_resize(context_out.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
+                              s, H, mode="nearest").reshape(B, K, 1, H, W)
+
+        refine = self._segment(tgt_img, ctx_img, ctx_msk)                 # (B,1,R,R), same weights
+        refine_s = F.interpolate(refine, size=(s, s), mode="bilinear", align_corners=False)
+        return fuse_window(coarse_up, refine_s, tgt_o, s)                 # (B,1,H,W)
+
+    def forward(self, image, context_in, context_out, mode="train"):
+        """image (B,1,H,W); context_in/out (B,K,1,H,W) → {"final_logit": ...}.
+
+        refine=False → coarse (B,1,R,R). refine=True → native (B,1,H,W) fused output.
+        `mode` is accepted for interface parity with the UniverSeg baseline; unused."""
+        if not self.refine:
+            return {"final_logit": self._segment(image, context_in, context_out)}
+        return {"final_logit": self._refine_forward(image, context_in, context_out)}
