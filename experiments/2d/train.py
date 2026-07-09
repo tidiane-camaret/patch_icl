@@ -127,6 +127,8 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "query_self_attn": a.get("query_self_attn", False),
             "context_id_embed": a.get("context_id_embed", False),
             "max_context": a.get("max_context", 16),
+            "refine": a.get("refine", False),
+            "refine_crop": a.get("refine_crop", 64),
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}

@@ -1,0 +1,15 @@
+# Experiment 2 — PatchSetCNN with single-level bbox-zoom refinement, on the same
+# omniSynth/MedSeg distribution as experiment 1. Output is native-resolution (fused),
+# so val logs `dice`/`dice_soft` at native res; ds_metric_res keeps the coarse-grid Dice.
+#   python experiments/2d/train.py --config-name 2_omnisynth_medseg_refine
+#   ... vary refine window on the CLI, e.g. arch.refine_crop=48
+defaults:
+  - 1_omnisynth_medseg
+  - _self_
+
+arch:
+  refine: true
+  # refine_crop: 64          # override to change the zoom window
+
+eval:
+  ds_metric_res: [16, 32]    # keep pooled coarse Dice alongside the new native Dice

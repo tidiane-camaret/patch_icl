@@ -23,6 +23,8 @@ arch:
   context_id_embed: true     # learned per-context-image tag so attention can group/tell
                              # apart source images (incl. identical instCopy duplicates)
   max_context: 16            # size of the context-id embedding table (context_size ≤ this)
+  refine: false              # enable coarse→fine bbox-zoom refinement (native-res fused output)
+  refine_crop: 64            # square bbox side length (pixels in the image_size frame)
 
 train:
   lr: 3.0e-4
