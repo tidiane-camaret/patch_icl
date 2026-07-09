@@ -308,12 +308,12 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
             table.add_data(epoch, ds, si, lv, h, dh, s, detail)
 
             if rg is not None:
-                ref_h_ds[ds].append(hard_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
-                ref_h_lab[key].append(hard_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
+                ref_h_ds[ds].append(hard_dice(rg["refine_prob"][b, 0], (rg["refine_target"][b, 0] >= 0.5).float()))
+                ref_h_lab[key].append(hard_dice(rg["refine_prob"][b, 0], (rg["refine_target"][b, 0] >= 0.5).float()))
                 ref_s_ds[ds].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
                 ref_s_lab[key].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
-                fus_h_ds[ds].append(hard_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
-                fus_h_lab[key].append(hard_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
+                fus_h_ds[ds].append(hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float()))
+                fus_h_lab[key].append(hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float()))
                 fus_s_ds[ds].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
                 fus_s_lab[key].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
 
