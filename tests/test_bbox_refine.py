@@ -1,6 +1,6 @@
 import sys; sys.path.insert(0, ".")
 import torch
-from src.models.bbox_refine import max_sum_window, gt_window, crop_resize, fuse_window
+from src.models.bbox_refine import max_sum_window, gt_window, crop_resize, fuse_window, place_window
 
 
 def test_max_sum_window_finds_blob():
@@ -54,3 +54,18 @@ def test_fuse_window_adds_into_window_only():
     assert out[0, 0, 0:s, 0:s].eq(3.0).all()      # 1 + 2 == 3 (additive, not replace)
     assert out[0, 0, s:, s:].eq(0).all()          # outside window untouched
     assert out[1, 0, 8:16, 8:16].eq(3.0).all()
+
+
+def test_place_window_replaces_not_adds():
+    H, s = 16, 8
+    full = torch.zeros(2, 1, H, H)
+    full[0, 0, 0:s, 0:s] = 1.0                    # non-zero window → REPLACE (not add)
+    full[1, 0, 8:16, 8:16] = 1.0
+    patch = torch.full((2, 1, s, s), 2.0)
+    o = torch.tensor([[0, 0], [8, 8]])
+    out = place_window(full, patch, o, s)
+    assert out.shape == (2, 1, H, H)
+    assert full[0, 0, 0, 0] == 1.0                # input not mutated
+    assert out[0, 0, 0:s, 0:s].eq(2.0).all()      # window overwritten to patch (2), not 1+2=3
+    assert out[0, 0, s:, s:].eq(0).all()          # outside window untouched
+    assert out[1, 0, 8:16, 8:16].eq(2.0).all()

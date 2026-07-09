@@ -68,3 +68,15 @@ def fuse_window(full, patch, origin, s):
         r0, c0 = int(origin[b, 0]), int(origin[b, 1])
         out[b, 0, r0:r0 + s, c0:c0 + s] += patch[b, 0]
     return out
+
+
+def place_window(full, patch, origin, s):
+    """Return a clone of full (B,1,H,W) with patch (B,1,s,s) WRITTEN (replace) into the s×s
+    window at each origin (B,2). Overwrite semantics — used to stitch the refine crop into the
+    coarse prediction for the fused metric (cf. additive fuse_window, reserved for a fused loss).
+    Input not mutated. Per-sample loop (B is the small batch dim)."""
+    out = full.clone()
+    for b in range(full.shape[0]):
+        r0, c0 = int(origin[b, 0]), int(origin[b, 1])
+        out[b, 0, r0:r0 + s, c0:c0 + s] = patch[b, 0]
+    return out
