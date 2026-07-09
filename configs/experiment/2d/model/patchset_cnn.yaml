@@ -1,0 +1,32 @@
+# @package _global_
+# PatchSetCNN model defaults (arch + optimizer). Selected as a Hydra group:
+#   defaults: [..., model: patchset_cnn, ...]   or on the CLI:  model=patchset_cnn
+# The `@package _global_` directive above (must be line 1) makes this set the top-level
+# `model:` string plus the arch/train blocks, rather than nesting under `model.*`.
+#
+# enc_dims must have log2(image_size/resolution)+1 entries (stem + one per stride-2
+# stage), e.g. 128->16 needs 4. The encoder concats every stage's map (pooled to R),
+# so per-patch feature dim = sum(enc_dims).
+model: patchset_cnn
+
+arch:
+  resolution: 16              # bottleneck/prediction grid (R×R)
+  enc_dims: [64, 64, 64, 64]  # UniverSeg per-stage widths; stem + 3 stride-2 stages
+                              # (len = log2(128/16)+1 = 4). Encoder concats all → 256 ch
+  e: 256
+  h: 512
+  l: 1
+  a: 4
+  thinking_rows: 1
+  residual_decay: 0.95
+  query_self_attn: true      # let query patches attend to each other (within-target)
+  context_id_embed: true     # learned per-context-image tag so attention can group/tell
+                             # apart source images (incl. identical instCopy duplicates)
+  max_context: 16            # size of the context-id embedding table (context_size ≤ this)
+
+train:
+  lr: 3.0e-4
+  topk_k: 32
+  # patchset_cnn trains with Muon (transformer 2D matrices) + AdamW (rest) + LAWA
+  # checkpoint averaging — the muon_*/lawa_k keys from train_base.yaml are active for
+  # this model (universeg ignores them and stays pure-AdamW). See docs/logs.md.

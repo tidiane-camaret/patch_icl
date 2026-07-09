@@ -1,36 +1,14 @@
 # Train PatchSetCNN — a simple low-resolution in-context segmentation model — on
-# omniSynth. Shared params (data/train/eval/wandb + the omniglot synth block) come
-# from omnisynth_train_base.yaml; only PatchSetCNN-specific keys live here.
-#
-# Prediction is at arch.resolution (R×R); the trainer pools the GT mask to R×R for
-# the loss. enc_dims must have log2(image_size/resolution)+1 entries (one stem + one
-# per stride-2 stage), e.g. 128→16 needs 4. The encoder concatenates every stage's
-# feature map (pooled to R×R), so the per-patch feature dim = sum(enc_dims).
+# omniSynth (omniglot glyphs by default). Shared params (data/train/eval/wandb + the
+# omniglot synth block) come from omnisynth_train_base.yaml; the model's arch + optimizer
+# defaults now live in the `model/patchset_cnn` group (shared with 1_omnisynth_medseg).
 #
 #   python experiments/2d/train.py --config-name patchset_cnn_train
 #   python experiments/2d/train.py --config-name patchset_cnn_train \
 #       synth.scene.target_mode=mix arch.resolution=16
 defaults:
   - omnisynth_train_base
+  - model: patchset_cnn
   - _self_
 
-model: patchset_cnn
-
-arch:
-  resolution: 16              # bottleneck/prediction grid (R×R)
-  enc_dims: [64, 64, 64, 64]  # UniverSeg per-stage widths; stem + 3 stride-2 stages
-                              # (len = log2(128/16)+1 = 4). Encoder concats all → 256 ch
-  e: 256
-  h: 512
-  l: 1
-  a: 4
-  thinking_rows: 1
-  residual_decay: 0.95
-  query_self_attn: true      # let query patches attend to each other (within-target)
-  context_id_embed: true     # learned per-context-image tag so attention can group/tell
-                             # apart source images (incl. identical instCopy duplicates)
-  max_context: 16            # size of the context-id embedding table (context_size ≤ this)
-
-train:
-  lr: 3.0e-4
-  topk_k: 32
+model: patchset_cnn          # (also set by the group; kept for grep-ability)

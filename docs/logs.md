@@ -1,5 +1,7 @@
 # Change log
 
+- 2D trainer: renamed the universeg train metric `train/dice_ds_soft` → `train/dice_soft` (`train.py:331`). It's soft Dice at **native full resolution**, so the `ds` (=downsampled) prefix was a misnomer — it now parallels `train/dice` (native hard) and matches `pfn_seg.py`'s existing `train/dice_soft` (= soft Dice at the model's native pred resolution). Symmetry: universeg logs `dice`/`dice_soft` (native hard/soft); patchset_cnn logs `dice_ds@R`/`dice_ds_soft@R` (coarse hard/soft, correctly `@`-tagged). Scope was train-side only: `evaluate.py`'s `dice_ds_soft@R`/`dice_ds_soft@{low_res}` summaries, the `SAMPLE_COLS` `dice_ds_soft` column, and the `train.py:354` val-summary lookup all refer to genuinely-downsampled values and were left unchanged. Caveat: renames a logged wandb key, so old runs won't align on it.
+- 2D configs: new `model/` Hydra group (`configs/experiment/2d/model/{patchset_cnn,universeg}.yaml`, each `# @package _global_` on line 1 so it sets the top-level `model:` string plus that model's `arch`/`train`/`eval` blocks). This makes `model=patchset_cnn|universeg` a real group override. New runnable leaf `1_omnisynth_medseg.yaml` (defaults: `omnisynth_train_base`, `model: patchset_cnn`, `_self_`) bakes the omniSynth-medseg-scene params held fixed across the sweep — `data.context_size=1`, `arch.resolution=32`, `train.topk_k=64`, `synth.source=medseg`, `synth.scene.{p_copy=0,placement=random,max_nb_objects=8,background=image}` — and runs either model: `python experiments/2d/train.py --config-name 1_omnisynth_medseg model=patchset_cnn|universeg <cli overrides>`. Existing `patchset_cnn_train.yaml`/`universeg_train.yaml` thinned to consume the same `model/` group (single source of truth for model defaults; behavior byte-for-byte unchanged — verified via `--cfg job`). Gotcha: the `@package _global_` directive MUST be the first line; a prose `# @package _global_ ...` comment elsewhere in the header is ignored and the group nests under `model.*` instead (caught in verification: `model:` resolved to a mapping and `lr` stayed at the base default).
 - 2D trainer: qualitative per-sample val log (ported from the old universeg_train.py into the unified train.py). `validate` now builds a `wandb.Table` (`SAMPLE_COLS`: epoch, dataset, character, target_mode, target_pos, context_pos, transforms, dice) logged as `val/samples`; `_fmt_transforms` renders each aug placement as `r..,s..,dx..,dy..` (`-` / empty for identical/class). Needs per-sample provenance, so: `render_scene` now returns a 4th `info` dict (`target_cells` indices + aligned `target_transforms`) and `affine_jitter` returns `(bitmap, params)` with the sampled rotate/scale/dx/dy; `OmniSynthICLDataset` meta gains `target_cells`/`context_cells` as **(row, col) grid positions** (not flat indices — `divmod(cell, grid)`) plus `target_transforms`. instCopy (`is_copy`/`copy_slot`) kept alongside; copied context slots correctly report the query's cells. test_render.py updated for the 4-tuple/2-tuple returns. Verified: render tests pass, 1-epoch smoke run (train→val→table→ckpt) clean, copy vs non-copy context positions correct. The old train-Dice-monitoring part of universeg_train.py was NOT ported (train.py already has it, generalised with cossim/top-k).
 - 2D trainer: added top-k patch-recall metric (`top{k}`, k=`cfg.train.topk_k` default 16). Per sample, recall of the GT-positive patches within the k highest-valued predicted patches: |gt_pos ∩ topk(pred)| / |gt_pos|, where gt_pos = patches with GT>0 capped to k. Reaches 1.0 exactly when ALL true patches are in the model's top-k — denominator is the (sparse) positive count, not k, so a model that found every true patch isn't penalised for GT having < k positives. Purely rank-based on the pred side (threshold/scale-free), complements cossim. Low-res only: gated on the same `logit.shape != lbl.shape` condition as cossim (at native res a patch is a pixel), so it never fires for UniverSeg. `common.topk_overlap` (per-sample) + train `_topk_sum` (batched, on-device scatter/gather); logged for train+val (`train/top{k}`, `top{k}/*`). Verified batched==per-sample, perfect ranking=1.0 (incl. n_pos>k rows), miss-1-of-5=0.8, empty-GT rows skipped. Caveat: when patch count ≤ k (e.g. R=4 → 16 patches, k=16) pred top-k = all patches → recall trivially 1.0; only informative when R×R > k (e.g. R=16 → 256).
 - 2D trainer: log the full resolved Hydra config to wandb (`OmegaConf.to_container(cfg, resolve=True)`) instead of a hand-picked flat dict. All config (train.*, data.*, synth.*, arch.*, ...) is now captured as the single source of truth; removed the flat overlay + `scene`/`target_mode` helper vars that only fed it (no retro-compat kept). `ckpt_meta` unchanged — still saved into the checkpoint. Note: wandb keys are now nested (e.g. `train.lr`, `data.image_size`) rather than flat (`lr`, `image_size`); update any saved wandb filters/groupings accordingly.
@@ -2368,6 +2370,28 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   image differ (target wins). Targets keep their mutual paste order.
 - Test: test_targets_drawn_over_distractors (oversized fully-overlapping tiles ->
   target texture 0.5 survives under 0.9 distractors). Render tests 13 passed.
+
+## 2026-07-09 — 2D trainer: Muon + LAWA for patchset_cnn
+- The `muon_*`/`lawa_k` keys in `train_base.yaml` were dead in the unified
+  `experiments/2d/train.py` (only pfn_seg.py used them). Wired them in so patchset_cnn
+  trains with the same recipe as pfn_seg.py: Muon (Newton-Schulz orthogonalized grads)
+  on the transformer 2D weight matrices (`p.ndim==2 and "transformer" in n` → 8 tensors:
+  qkv_col/qkv_row/mlp.0/mlp.2 per block), AdamW on everything else (encoder convs,
+  embeds, pos, decoder, thinking, ctx-id), plus LAWA checkpoint averaging.
+- Always-on for patchset_cnn, gated by `is_patchset = model_name=="patchset_cnn"`.
+  universeg keeps its exact prior path (single AdamW, no LAWA) — its Muon group would be
+  empty and both Muon and the LAWA queue are skipped, so its baseline is unchanged.
+- Scheduler (cosine+warmup, per-batch) drives AdamW only; Muon LR is constant
+  (`muon_lr_scale·lr`). `train_epoch` now takes an `optimizers` list (zero_grad/step loop).
+- LAWA: deque(maxlen=lawa_k), push CPU state_dict each epoch; before `validate` average
+  the queue into the model (eval + any best-checkpoint save use averaged weights), then
+  restore raw weights so training continues from them. Epoch-1 (len≤1) averaging is a
+  no-op via lawa_average's own guard.
+- Verified on the real PatchSetCNN (CPU): param split 8 Muon / 31 AdamW, 3 train steps
+  decrease loss, LAWA average changes weights and restore recovers them exactly.
+- Comparison caveat: this changes the patchset_cnn recipe, so its current checkpoints are
+  not a clean optimizer before/after vs universeg. Design doc:
+  docs/superpowers/specs/2026-07-09-muon-lawa-patchset-cnn-design.md
 
 ## 2026-07-09 — omniSynth: fix empty masks for tiny objects
 - Symptom: ~4/10 preview samples (medseg, canvas sizing, size_scale<1) had fully empty

@@ -1,0 +1,31 @@
+# Experiment 1 — omniSynth with real MedSegBench objects on real-image backgrounds,
+# random placement. Runnable for EITHER model; pick it on the CLI:
+#   python experiments/2d/train.py --config-name 1_omnisynth_medseg model=patchset_cnn
+#   python experiments/2d/train.py --config-name 1_omnisynth_medseg model=universeg
+# Bakes the params held fixed across the sweep; vary the rest on the CLI, e.g.
+#   ... model=patchset_cnn arch.enc_dims=[64] arch.l=2
+#
+# The `synth:` block below merges onto the omniglot group already selected by
+# omnisynth_train_base (source=medseg swaps the object bank to MedSegBench renditions;
+# background=image draws the canvas from real MedSegBench images).
+defaults:
+  - omnisynth_train_base
+  - model: patchset_cnn      # default model; override on CLI with model=universeg
+  - _self_
+
+data:
+  context_size: 1
+
+arch:
+  resolution: 32             # patchset_cnn prediction grid; unused/harmless for universeg
+
+train:
+  topk_k: 64
+
+synth:
+  source: medseg             # object bank: real MedSegBench renditions (not omniglot glyphs)
+  scene:
+    p_copy: 0                # disable instCopy
+    placement: random        # uniform-random object positions (may overlap)
+    max_nb_objects: 8        # cap on total objects (targets + distractors)
+    background: image         # canvas = random real full images (bg_source=medseg by default)

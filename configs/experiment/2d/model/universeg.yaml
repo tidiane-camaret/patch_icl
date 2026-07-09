@@ -1,0 +1,17 @@
+# @package _global_
+# UniverSeg model defaults. Selected as a Hydra group:
+#   defaults: [..., model: universeg, ...]   or on the CLI:  model=universeg
+# The `@package _global_` directive above (must be line 1) makes this set the top-level
+# `model:` string plus the train/eval blocks, rather than nesting under `model.*`.
+model: universeg
+
+train:
+  lr: 1.0e-4
+  pretrained: false      # fine-tune from pretrained UniverSeg (false = train from scratch)
+
+eval:
+  # UniverSeg predicts at native full-res, so dice_ds / dice_ds_soft are NaN by default.
+  # Also log hard + soft Dice at these downsampled resolutions (GT and pred both avg-pooled
+  # to RxR, hard thresholded at >=0.5) -> comparable to patchset_cnn's low-res grid.
+  # List-capable (e.g. [16, 32]); null or [] disables. Applies to both train and val logs.
+  ds_metric_res: [32]

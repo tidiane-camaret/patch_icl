@@ -1,20 +1,11 @@
 # Fine-tune UniverSeg on omniSynth. All shared params (data/train/eval/wandb + the
-# omniglot synth block) come from omnisynth_train_base.yaml; only UniverSeg-specific
-# keys live here. Override the generator at the CLI, e.g. synth.scene.target_mode=mix:
+# omniglot synth block) come from omnisynth_train_base.yaml; UniverSeg-specific keys
+# (lr/pretrained/ds_metric_res) now live in the `model/universeg` group. Override the
+# generator at the CLI, e.g.:
 #   python experiments/2d/train.py synth.scene.target_mode=mix
 defaults:
   - omnisynth_train_base
+  - model: universeg
   - _self_
 
-model: universeg
-
-train:
-  lr: 1.0e-4
-  pretrained: false      # fine-tune from pretrained UniverSeg (false = train from scratch)
-
-eval:
-  # UniverSeg predicts at native full-res, so dice_ds / dice_ds_soft are NaN by default.
-  # Also log hard + soft Dice at these downsampled resolutions (GT and pred both avg-pooled
-  # to RxR, hard thresholded at >=0.5) -> comparable to patchset_cnn's low-res grid.
-  # List-capable (e.g. [16, 32]); null or [] disables. Applies to both train and val logs.
-  ds_metric_res: [32]
+model: universeg             # (also set by the group; kept for grep-ability)

@@ -38,3 +38,4 @@ results/controlsynth/sweep/*.log
 results/experiments/artifacts/
 artifacts/
 results/experiments/__marimo__/
+results/omnisynth_preview.png

@@ -22,6 +22,7 @@ Usage:
     python experiments/2d/train.py --config-name patchset_cnn_train synth=omniglot
 """
 
+import collections
 import datetime
 import math
 import random
@@ -40,7 +41,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_dataset, make_loader
 from evaluate import validate, _target_like, _upsample_to, _as_res_list
-from pfn_train import soft_dice_loss
+from pfn_train import Muon, lawa_average, soft_dice_loss
 
 
 def _autocast():
@@ -132,7 +133,7 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 
-def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float, float, float, float, float, dict, int | None]:
+def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float, float, float, float, float, dict, int | None]:
     model.train()
     total, n = 0.0, 0
     soft_sum = soft_cnt = hard_sum = hard_cnt = 0.0   # on-device running sums (synced once)
@@ -151,7 +152,8 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
         cin = batch["context_in"].to(DEVICE, non_blocking=True)   # (B,K,1,H,W)
         cout = batch["context_out"].to(DEVICE, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         with _autocast():
             out = model(img, context_in=cin, context_out=cout, mode="train")
             logit = out["final_logit"].float()                    # (B,1,h,w)
@@ -163,7 +165,8 @@ def train_epoch(model, loader, optimizer, scheduler, cfg, epoch) -> tuple[float,
         loss.backward()
         if cfg.train.get("grad_clip", None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
         scheduler.step()
 
         # Monitoring (not the loss): downsampled soft Dice (prob vs occupancy at logit
@@ -255,8 +258,29 @@ def main(cfg: DictConfig):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params/1e6:.2f}M")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr,
+    # ── Optimizers ────────────────────────────────────────────────────────────
+    # patchset_cnn trains with Muon on its transformer 2D weight matrices (Newton-
+    # Schulz orthogonalized grads) + AdamW on everything else + LAWA checkpoint
+    # averaging (cf. pfn_seg.py). universeg has no `transformer` submodule, so its
+    # Muon group is empty and it falls back to plain AdamW with no LAWA — its path
+    # is unchanged. The cosine+warmup scheduler drives AdamW only; Muon is unscheduled.
+    is_patchset = (model_name == "patchset_cnn")
+    muon_params = [p for n, p in model.named_parameters()
+                   if p.requires_grad and p.ndim == 2 and "transformer" in n]
+    adam_params = [p for n, p in model.named_parameters()
+                   if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
+    optimizer = torch.optim.AdamW(adam_params, lr=cfg.train.lr,
                                   weight_decay=cfg.train.get("adam_wd", 0.01))
+    optimizers = [optimizer]
+    if is_patchset and muon_params:
+        optimizers.append(Muon(
+            muon_params,
+            lr=cfg.train.get("muon_lr_scale", 0.1) * cfg.train.lr,
+            momentum=cfg.train.get("muon_momentum", 0.96),
+            weight_decay=cfg.train.get("muon_wd", 0.1),
+        ))
+        print(f"Muon on {len(muon_params)} transformer matrices, "
+              f"AdamW on {len(adam_params)} other tensors, LAWA k={cfg.train.get('lawa_k', 10)}")
     steps_per_epoch = max(1, len(train_loader))
     total_steps = cfg.train.epochs * steps_per_epoch
     warmup_steps = int(cfg.train.get("warmup_epochs", 1) * steps_per_epoch)
@@ -268,6 +292,11 @@ def main(cfg: DictConfig):
         return 0.5 * (1.0 + math.cos(math.pi * prog))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # LAWA checkpoint-averaging buffer (patchset_cnn only): a CPU state_dict is pushed
+    # each epoch; at eval the queue is averaged into the model, evaluated, then the raw
+    # training weights are restored so optimization continues from them.
+    lawa_queue = collections.deque(maxlen=cfg.train.get("lawa_k", 10)) if is_patchset else None
 
     # ── wandb / output dir ──────────────────────────────────────────────────────
     wandb_enabled = bool(cfg.wandb.get("enabled", True))
@@ -294,19 +323,27 @@ def main(cfg: DictConfig):
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
         loss, train_soft, train_hard, train_cos, train_topk, train_dsr, train_lowres = train_epoch(
-            model, train_loader, optimizer, scheduler, cfg, epoch)
+            model, train_loader, optimizers, scheduler, cfg, epoch)
         log = {"epoch": epoch, "train/dice": train_hard, "train/loss": loss,
                "train/lr": scheduler.get_last_lr()[0],
                "time/epoch_s": time.perf_counter() - t0}
-        if train_lowres is None:   # native model (universeg): dice_ds_soft is the full-res soft
-            log["train/dice_ds_soft"] = train_soft
+        if train_lowres is None:   # native model (universeg): full-res soft Dice. Named
+            # dice_soft (no "ds" — not downsampled), parallel to train/dice (full-res hard)
+            # and matching pfn_seg.py's train/dice_soft = soft Dice at native pred resolution.
+            log["train/dice_soft"] = train_soft
         if not math.isnan(train_cos):
             log["train/cossim"] = train_cos
         if not math.isnan(train_topk):
             log[f"train/top{topk_k}"] = train_topk
         log.update({f"train/{k}": v for k, v in train_dsr.items()})   # dice_ds@R / dice_ds_soft@R
 
+        if lawa_queue is not None:   # push this epoch's raw weights to the LAWA buffer
+            lawa_queue.append({k: v.cpu().clone() for k, v in model.state_dict().items()})
+
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
+            # Eval (and any checkpoint saved below) uses LAWA-averaged weights; raw
+            # training weights are restored after so optimization continues from them.
+            saved = lawa_average(lawa_queue, model, DEVICE) if lawa_queue is not None else None
             summary, sample_table, _ = validate(
                 model, val_loader, topk_k=topk_k, epoch=epoch,
                 compute_flops=(epoch == 0),
@@ -336,6 +373,8 @@ def main(cfg: DictConfig):
                     **ckpt_meta,
                 }, ckpt_path)
                 log[f"val/best_{metric}"] = best_dice
+            if saved is not None:   # restore raw training weights after LAWA-averaged eval
+                model.load_state_dict(saved)
         wandb.log(log)
 
     print(f"Done. Best val {metric}={best_dice:.4f}. Checkpoint: {ckpt_path}")
