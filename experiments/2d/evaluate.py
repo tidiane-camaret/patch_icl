@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 
 from common import (DEVICE, hard_dice, soft_dice, cosine_sim, topk_overlap,
                     downsample_mask, log_summary)
+from src.models.bbox_refine import crop_resize, place_window
 
 
 def _overlay_ax(ax, image: np.ndarray, mask: np.ndarray, title: str) -> None:
@@ -165,6 +166,37 @@ def _upsample_to(x: torch.Tensor, size) -> torch.Tensor:
             else F.interpolate(x, size=tuple(size), mode="bilinear", align_corners=False))
 
 
+def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
+    """Per-level + fused tensors for a multi-resolution refine output; None if single-level.
+
+    out: model output; multi-level has coarse `final_logit` (B,1,T,T), `refine_logit` (B,1,T,T),
+    `refine_origin` (B,2 px), `refine_crop` (int px), `resolutions` (list). lbl: (B,1,H,W) GT.
+    Returns detached maps for metrics (call under no_grad):
+      refine_prob   (B,1,T,T)  sigmoid(refine_logit)
+      refine_target (B,1,T,T)  crop_resize(lbl, origin, c, T) — soft cropped GT
+      fused_R/gt_R  (B,1,Rf,Rf) fused prob (coarse with refine placed in the crop) and GT,
+                    both avg-pooled to Rf = resolutions[-1]
+    """
+    if "refine_logit" not in out:
+        return None
+    coarse = out["final_logit"].float()
+    refine = out["refine_logit"].float()
+    origin = out["refine_origin"]
+    c = int(out["refine_crop"])
+    Rf = int(out["resolutions"][-1])
+    T = refine.shape[-1]
+    H = lbl.shape[-1]
+    refine_prob = torch.sigmoid(refine)
+    refine_target = crop_resize(lbl, origin, c, T, mode="bilinear")
+    coarse_up = F.interpolate(torch.sigmoid(coarse), size=(H, H),
+                              mode="bilinear", align_corners=False)
+    refine_up = F.interpolate(refine_prob, size=(c, c), mode="bilinear", align_corners=False)
+    fused = place_window(coarse_up, refine_up, origin, c)              # (B,1,H,H) native stitch
+    return {"refine_prob": refine_prob, "refine_target": refine_target,
+            "fused_R": F.adaptive_avg_pool2d(fused, (Rf, Rf)),
+            "gt_R": F.adaptive_avg_pool2d(lbl, (Rf, Rf)), "Rf": Rf}
+
+
 @torch.no_grad()
 def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
              patch_csv=None, synth_csv=None, compute_flops=False, ds_metric_res=None,
@@ -176,6 +208,11 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
     soft_ds, soft_lab = defaultdict(list), defaultdict(list)   # low-res soft dice_ds_soft
     cos_ds,  cos_lab  = defaultdict(list), defaultdict(list)   # populated only when not native
     topk_ds, topk_lab = defaultdict(list), defaultdict(list)
+    ref_h_ds, ref_h_lab = defaultdict(list), defaultdict(list)   # refine hard dice@Rf
+    ref_s_ds, ref_s_lab = defaultdict(list), defaultdict(list)   # refine soft
+    fus_h_ds, fus_h_lab = defaultdict(list), defaultdict(list)   # fused hard dice_fused@Rf
+    fus_s_ds, fus_s_lab = defaultdict(list), defaultdict(list)   # fused soft
+    fused_res = None                                             # resolutions[-1] when refine
     # Optional fixed-resolution hard/soft Dice on avg-pooled GT vs avg-pooled pred. Lets a
     # native-res model (UniverSeg) report a coarse-grid score comparable to patchset_cnn.
     res_list = _as_res_list(ds_metric_res)
@@ -220,6 +257,9 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 torch.cuda.synchronize()
             inf_times.append((time.perf_counter() - t0) / B)
         logit = out["final_logit"].float()
+        rg = refine_geometry(out, lbl)
+        if rg is not None:
+            fused_res = rg["Rf"]
 
         target   = _target_like(lbl, logit)             # (B,1,hp,wp) soft pooled GT
         prob     = torch.sigmoid(logit)                  # (B,1,hp,wp)
@@ -266,6 +306,16 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
 
             detail = _sample_detail(metas[b]) if metas is not None else ""
             table.add_data(epoch, ds, si, lv, h, dh, s, detail)
+
+            if rg is not None:
+                ref_h_ds[ds].append(hard_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
+                ref_h_lab[key].append(hard_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
+                ref_s_ds[ds].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
+                ref_s_lab[key].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
+                fus_h_ds[ds].append(hard_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
+                fus_h_lab[key].append(hard_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
+                fus_s_ds[ds].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
+                fus_s_lab[key].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
 
             # ── gated: qualitative figure (one per dataset/label) ──
             fig_key = (ds, lv)
@@ -336,6 +386,15 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                                    metric_label=f"hard@{R}", per_group=per_group))
         summary.update(log_summary(d["sd"], d["sl"], prefix=f"dice_ds_soft@{R}",
                                    metric_label=f"soft@{R}", per_group=per_group))
+    if fused_res is not None:                             # refine model: per-level + fused Dice
+        summary.update(log_summary(ref_h_ds, ref_h_lab, prefix=f"dice@{fused_res}",
+                                   metric_label=f"refine@{fused_res}", per_group=per_group))
+        summary.update(log_summary(ref_s_ds, ref_s_lab, prefix=f"dice_soft@{fused_res}",
+                                   metric_label=f"refine soft@{fused_res}", per_group=per_group))
+        summary.update(log_summary(fus_h_ds, fus_h_lab, prefix=f"dice_fused@{fused_res}",
+                                   metric_label=f"fused@{fused_res}", per_group=per_group))
+        summary.update(log_summary(fus_s_ds, fus_s_lab, prefix=f"dice_fused_soft@{fused_res}",
+                                   metric_label=f"fused soft@{fused_res}", per_group=per_group))
 
     if patch_rows:
         p = Path(patch_csv); p.parent.mkdir(parents=True, exist_ok=True)
