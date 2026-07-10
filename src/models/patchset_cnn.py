@@ -119,6 +119,7 @@ class PatchSetCNN(nn.Module):
         max_context: int = 16,
         resolutions: list[int] | None = None,
         refine_mode: str = "reencode",
+        refine_memory: bool = False,
     ):
         super().__init__()
         self.image_size = image_size
@@ -131,6 +132,7 @@ class PatchSetCNN(nn.Module):
         #                   shallow detail but does NOT recompute deep-stage semantics at the crop.
         assert refine_mode in ("reencode", "encode_once"), f"bad refine_mode {refine_mode!r}"
         self.refine_mode = refine_mode
+        self.refine_memory = refine_memory
         # `resolutions` = effective full-image resolutions per level (level 0 = coarse over the
         # full image). The token grid T is constant across levels and equals resolutions[0]; each
         # further level k crops the image to c_k = image_size*resolutions[0]/resolutions[k] px so
@@ -173,6 +175,13 @@ class PatchSetCNN(nn.Module):
             nn.init.normal_(self.ctx_id.weight, std=0.1)
             nn.init.normal_(self.qry_id, std=0.1)
         self.thinking = ThinkingRows(thinking_rows, e)
+        # Cross-level memory: the refine pass attends to the coarse pass's (detached)
+        # thinking rows, prepended as extra rows plus this learned type marker. Only
+        # created when enabled, so default checkpoints gain zero parameters. Inert for
+        # single-level models (no coarse pass to summarize).
+        if refine_memory:
+            self.mem_type = nn.Parameter(torch.zeros(e))
+            nn.init.normal_(self.mem_type, std=0.02)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
         self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, 1))
         # Row-major (i,j) grid coords of the R×R patch lattice, shared by every image.

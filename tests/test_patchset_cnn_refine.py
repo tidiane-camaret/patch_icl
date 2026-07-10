@@ -113,3 +113,20 @@ def test_encode_once_grad_reaches_shared_weights_from_both_heads():
     assert m.decoder[0].weight.grad is not None
     # encoder runs ONCE but the refine crop (grid_sample) is differentiable → grad still flows.
     assert m.encoder.stem[0].weight.grad is not None
+
+
+# ── refine memory ──────────────────────────────────────────────────────
+
+def test_refine_memory_default_off_no_param():
+    m = _model([8, 16])
+    assert m.refine_memory is False
+    assert not hasattr(m, "mem_type")
+    assert "mem_type" not in dict(m.named_parameters())
+
+
+def test_refine_memory_on_creates_mem_type():
+    m = PatchSetCNN(image_size=32, resolution=8, enc_dims=[16], e=32, h=64, l=1, a=2,
+                    thinking_rows=1, resolutions=[8, 16], refine_memory=True)
+    assert m.refine_memory is True
+    assert m.mem_type.shape == (32,)
+    assert "mem_type" in dict(m.named_parameters())
