@@ -174,8 +174,9 @@ def _as_res_list(ds_metric_res) -> list[int]:
     return [int(r) for r in ds_metric_res]
 
 
-SAMPLE_COLS = ["epoch", "dataset", "sample_idx", "label",
-               "dice", "dice_ds", "dice_ds_soft", "detail"]
+# The per-sample wandb Table columns are built dynamically per run in validate(), so they
+# carry the actual resolutions (dice_ds@{T}, dice@{Rf}, ...) and only the columns that apply
+# to the model at hand (native / patchset / refine). See the lazy `table` creation below.
 
 
 def _sample_detail(meta: dict | None) -> str:
@@ -268,13 +269,16 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
     fus_h_ds, fus_h_lab = defaultdict(list), defaultdict(list)   # fused hard dice_fused@Rf
     fus_s_ds, fus_s_lab = defaultdict(list), defaultdict(list)   # fused soft
     fused_res = None                                             # resolutions[-1] when refine
-    # Optional fixed-resolution hard/soft Dice on avg-pooled GT vs avg-pooled pred. Lets a
-    # native-res model (UniverSeg) report a coarse-grid score comparable to patchset_cnn.
+    # Optional fixed-resolution hard/soft Dice on avg-pooled GT vs avg-pooled pred. This is
+    # ONLY for a native-res model (UniverSeg): pooling its native prediction to R×R gives a
+    # coarse-grid score comparable to patchset_cnn's own dice_ds@{low_res}. Non-native models
+    # (patchset_cnn / refine) already emit their native coarse grid, so `ds_metric_res` is
+    # ignored for them (its pooled @R on the coarse-upsampled pred would just be confusing).
     res_list = _as_res_list(ds_metric_res)
     dsr = {R: {"hd": defaultdict(list), "hl": defaultdict(list),
                "sd": defaultdict(list), "sl": defaultdict(list)} for R in res_list}
     low_res = None   # a non-native model's coarse logit side length (e.g. 16 for patchset_cnn)
-    table = wandb.Table(columns=SAMPLE_COLS)
+    table = None                     # lazily built once low_res / fused_res are known (below)
     inf_times, flops, saved = [], None, set()
     warned_patch = False
     patch_rows = [] if patch_csv else None
@@ -320,11 +324,17 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
         prob     = torch.sigmoid(logit)                  # (B,1,hp,wp)
         prob_nat = _upsample_to(prob, lbl.shape[-2:])   # (B,1,H,W)
         native   = logit.shape[-2:] == lbl.shape[-2:]
+        # For refine models the final prediction is the fused native stitch (last level), so
+        # `dice` is scored on it (it is already at H×W). dice_ds/dice_ds_soft/cossim/top-k
+        # still reflect the coarse pass for now.
+        pred_dice = rg["fused"] if rg is not None else prob_nat   # (B,1,H,W)
         if not native and low_res is None:
             low_res = logit.shape[-1]
-        # avg-pool the full-res pred + GT to each requested resolution (batched, once)
-        pooled = {R: (F.adaptive_avg_pool2d(prob_nat, (R, R)),
-                      F.adaptive_avg_pool2d(lbl, (R, R))) for R in res_list}
+        # avg-pool the full-res pred + GT to each requested resolution (batched, once).
+        # Native (UniverSeg) only — see res_list note above; empty for patchset_cnn/refine.
+        pooled = ({R: (F.adaptive_avg_pool2d(prob_nat, (R, R)),
+                       F.adaptive_avg_pool2d(lbl, (R, R))) for R in res_list}
+                  if native else {})
         if native and patch_rows is not None and not warned_patch:
             print("warning: patch_csv is set but this model is native-resolution "
                   "(no low-res grid) — no patch rows will be written.")
@@ -337,7 +347,7 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
             si  = int(batch["sample_idx"][b])
             key = f"{ds}/label_{lv}"
 
-            h = hard_dice(prob_nat[b, 0], lbl[b, 0])     # native hard dice
+            h = hard_dice(pred_dice[b, 0], lbl[b, 0])    # native hard dice (fused for refine)
             hard_ds[ds].append(h); hard_lab[key].append(h)
             if not native:
                 dh = hard_dice(prob[b, 0], (target[b, 0] >= 0.5).float())
@@ -351,7 +361,7 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
             dsh_ds[ds].append(dh); dsh_lab[key].append(dh)
             soft_ds[ds].append(s); soft_lab[key].append(s)
 
-            for R in res_list:                            # fixed-res pooled Dice
+            for R in (res_list if native else []):        # fixed-res pooled Dice (UniverSeg only)
                 p_r, g_r = pooled[R]
                 sr = soft_dice(p_r[b, 0], g_r[b, 0])
                 hr = hard_dice(p_r[b, 0], (g_r[b, 0] >= 0.5).float())
@@ -359,18 +369,39 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 d["sd"][ds].append(sr); d["sl"][key].append(sr)
                 d["hd"][ds].append(hr); d["hl"][key].append(hr)
 
-            detail = _sample_detail(metas[b]) if metas is not None else ""
-            table.add_data(epoch, ds, si, lv, h, dh, s, detail)
-
+            # refine per-sample: refine-level (@Rf, on the crop) + fused (@Rf) Dice — computed
+            # once, fed to both the aggregates and the sample-table row below.
+            refine_row = []
             if rg is not None:
-                ref_h_ds[ds].append(hard_dice(rg["refine_prob"][b, 0], (rg["refine_target"][b, 0] >= 0.5).float()))
-                ref_h_lab[key].append(hard_dice(rg["refine_prob"][b, 0], (rg["refine_target"][b, 0] >= 0.5).float()))
-                ref_s_ds[ds].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
-                ref_s_lab[key].append(soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0]))
-                fus_h_ds[ds].append(hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float()))
-                fus_h_lab[key].append(hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float()))
-                fus_s_ds[ds].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
-                fus_s_lab[key].append(soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0]))
+                rdh = hard_dice(rg["refine_prob"][b, 0], (rg["refine_target"][b, 0] >= 0.5).float())
+                rds = soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0])
+                fdh = hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float())
+                fds = soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0])
+                ref_h_ds[ds].append(rdh); ref_h_lab[key].append(rdh)
+                ref_s_ds[ds].append(rds); ref_s_lab[key].append(rds)
+                fus_h_ds[ds].append(fdh); fus_h_lab[key].append(fdh)
+                fus_s_ds[ds].append(fds); fus_s_lab[key].append(fds)
+                refine_row = [rdh, rds, fdh]              # dice@Rf, dice_soft@Rf, dice_fused@Rf
+
+            # Lazy, resolution-tagged sample table. Columns depend on the model (constant per
+            # run): dice always; dice_ds@{T}/dice_ds_soft@{T} for non-native (coarse grid T);
+            # dice@{Rf}/dice_soft@{Rf}/dice_fused@{Rf} for refine.
+            if table is None:
+                cols = ["epoch", "dataset", "sample_idx", "label", "dice"]
+                if low_res is not None:
+                    cols += [f"dice_ds@{low_res}", f"dice_ds_soft@{low_res}"]
+                if fused_res is not None:
+                    cols += [f"dice@{fused_res}", f"dice_soft@{fused_res}", f"dice_fused@{fused_res}"]
+                cols.append("detail")
+                table = wandb.Table(columns=cols)
+            detail = _sample_detail(metas[b]) if metas is not None else ""
+            row = [epoch, ds, si, lv, h]
+            if low_res is not None:
+                row += [dh, s]                            # dice_ds@{T}, dice_ds_soft@{T}
+            if fused_res is not None:
+                row += refine_row
+            row.append(detail)
+            table.add_data(*row)
 
             # ── gated: qualitative figure (one per dataset/label) ──
             fig_key = (ds, lv)
@@ -447,12 +478,12 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                                    metric_label=f"hard@{low_res}", per_group=per_group))
         summary.update(log_summary(soft_ds, soft_lab, prefix=f"dice_ds_soft@{low_res}",
                                    metric_label=f"soft@{low_res}", per_group=per_group))
-    if cos_ds:   # populated only when some batch was non-native
-        summary.update(log_summary(cos_ds, cos_lab, prefix="cossim",
-                                   metric_label="cos sim", per_group=per_group))
-        summary.update(log_summary(topk_ds, topk_lab, prefix=f"top{topk_k}",
-                                   metric_label=f"top{topk_k}", per_group=per_group))
-    for R in res_list:                                    # fixed-res pooled Dice
+    if cos_ds:   # populated only when non-native — computed on the coarse token grid T=low_res
+        summary.update(log_summary(cos_ds, cos_lab, prefix=f"cossim@{low_res}",
+                                   metric_label=f"cos sim@{low_res}", per_group=per_group))
+        summary.update(log_summary(topk_ds, topk_lab, prefix=f"top{topk_k}@{low_res}",
+                                   metric_label=f"top{topk_k}@{low_res}", per_group=per_group))
+    for R in (res_list if native else []):                # fixed-res pooled Dice (UniverSeg only)
         d = dsr[R]
         summary.update(log_summary(d["hd"], d["hl"], prefix=f"dice_ds@{R}",
                                    metric_label=f"hard@{R}", per_group=per_group))

@@ -1,180 +1,209 @@
-# Single-level bbox-zoom refinement for PatchSetCNN
+# Multi-resolution bbox-zoom refinement for PatchSetCNN
 
-Date: 2026-07-09
-Experiment: `src/models/patchset_cnn.py` (new `refine` mode), trainable/evaluable through the
-existing `experiments/2d/train.py` and `experiments/2d/eval_incontext.py`.
+Date: 2026-07-09 (revised — supersedes the single-composite / additive-fusion approach below)
+Experiment: `src/models/patchset_cnn.py` (multi-level `resolutions` mode), trainable/evaluable
+through the existing `experiments/2d/train.py` and `experiments/2d/eval_incontext.py`.
 
 ## Problem
 
-`PatchSetCNN` predicts a coarse R×R logit over the full image (R=16/32). Small or
+`PatchSetCNN` predicts a coarse T×T token grid over the full image (T=16/32). Small or
 detailed objects lose sharpness at that resolution. We want a **coarse→fine refinement**:
-after a first R×R prediction, crop a square window around the densest predicted region,
-re-segment that crop with the **same model**, and fuse the finer result back — so detail
-is recovered where it matters without a decoder/upsampling head.
+after a first pass over the full image, zoom into the densest region and re-segment it with
+the **same model** at the **same token count**, so the second pass resolves finer detail
+(higher *effective* full-image resolution) at equal compute.
 
-Prior art in `experiments/2d/multilevel/` (zoom_pipeline.py, bbox.py, its own train.py)
-built this around the older `ImagePFN`/`PatchSetPFN` with a **frozen** stage-1 plus
-**separate per-hop** trainable copies and a dedicated training script. This design is
-deliberately simpler: **one shared `PatchSetCNN`** applied twice, folded inside the model's
-`forward`, so the existing unified trainer/eval run it with no changes.
+## Core geometry (the key idea)
+
+`arch.resolutions` is a list of **effective full-image resolutions**, one per level. The
+**token grid `T` is constant across levels** and equals `resolutions[0]` — every pass emits a
+`T×T` grid and costs the same. A pass over a `c`-px crop (resized to the `image_size` encoder
+input) yields `T` tokens spanning `c` px, i.e. effective full-image resolution
+`T · image_size / c`. Setting that equal to the level's target resolution gives the **derived
+crop size**:
+
+```
+c_k = image_size · resolutions[0] / resolutions[k]
+```
+
+For `resolutions=[32, 64]`, `image_size=128`:
+- Level 0 (coarse): `c = 128·32/32 = 128` → the full image, effective resolution 32.
+- Level 1 (refine): `c = 128·32/64 = 64` → a 64px crop, 32×32 tokens, effective resolution 64.
+
+`refine_crop` is therefore **not a configured knob** — it is derived from `resolutions`.
+Constraint: each `resolutions[k]` must be a multiple of `resolutions[0]` such that `c_k` is a
+whole number in `(0, image_size]`.
+
+Because every level uses the same `T`, `_segment` needs **no resolution parameterization** —
+the refine pass is just `_segment` run on the crop (resized to `image_size`). Multi-level is
+active when `len(resolutions) > 1`; a single-element list is the plain model, unchanged.
 
 ## Decisions (from brainstorming)
 
-- **Shared weights, two passes.** The same `PatchSetCNN` (same encoder/transformer/decoder)
-  runs the coarse pass on the full image and the refine pass on the crop. No frozen stage,
-  no per-hop copies.
-- **Bbox source (target): prediction max-prob window**, in **both** train and eval
-  (deployment-faithful). Early-training coarse predictions are near-random, so early refine
-  crops are noisy; accepted, because the additive fusion (below) keeps the coarse pass
-  directly supervised so it learns to localize quickly.
-- **Bbox source (context): densest-GT window** per context image (`gt_window`), mirroring
-  the target's "densest region" selection but using the known context mask.
-- **Single top-1 window** per image (one refine forward). Structured so top-k / a multi-hop
-  ladder is an easy later extension; not built now (YAGNI).
-- **Logit fusion (single loss).** The refine logit is added as a **residual in logit space**
-  into the coarse canvas at the bbox: `fused = upsample(coarse); fused[bbox] += upsample(refine)`.
-  Because the coarse logit still contributes inside the object region, it keeps receiving a
-  direct training signal there (it must stay accurate to place the next bbox), while the
-  refine pass learns a correction. One `sigmoid(fused)` → the trainer's existing single
-  BCE + soft-Dice loss. No auxiliary losses, no trainer change.
-- **Native-resolution output.** The fused canvas is at `image_size` (H×W). This is the point
-  of the experiment — recover detail the coarse grid can't represent — and it makes the
-  output directly comparable to the UniverSeg native-Dice baseline.
-- **No query-prior seeding** for the refine pass. `PatchSetCNN` already derives its query
-  occupancy prior from the (cropped) context masks; the additive coarse logit supplies the
-  rest. The refine pass is an ordinary `forward` call on the cropped images — identical
-  interface — which keeps the code readable.
+- **Per-level losses now; unified/fused loss later.** Each level is supervised on its own
+  grid against the appropriately pooled/cropped GT. Stitching the levels into a single fused
+  prediction is used for **metrics only** for now; a fused *loss* is deferred.
+- **Effective-resolution semantics** for `resolutions` (full-image), constant token count, derived crop (above).
+- **Bbox source (target): prediction max-prob window** in both train and eval (deployment-faithful).
+- **Bbox source (context): densest-GT window** per context image.
+- **Single top-1 window / single refine level to start** (`resolutions=[32,64]`), structured so
+  a third entry (e.g. `128` → 32px crop) chains another level with no redesign.
+- **Fused metric named `_fused`** (`dice_fused@R`, `dice_fused_soft@R`): the stitched
+  full-image prediction (coarse with the refine crop placed in), scored — no loss on it yet.
+- **Checkpoint selection** is on `dice_fused@{resolutions[-1]}` (the fused full-image metric at
+  the finest effective resolution) when the refine model is active — it tracks the actual
+  final-prediction quality. Plain single-level models keep the existing selection metric.
 
 ## Architecture
 
-### `PatchSetCNN` changes (`src/models/patchset_cnn.py`) — minimal, default-off
+### `PatchSetCNN` changes (`src/models/patchset_cnn.py`)
 
-1. **Constructor**: add `refine: bool = False`, `refine_crop: int = 64` (square-bbox side
-   length in the H×W image frame). Defaults reproduce today's behavior exactly.
-2. **Refactor** the current `forward` body into a private
-   `self._segment(image, context_in, context_out) -> (B,1,R,R)` returning the coarse logit.
-   Both passes call it — guaranteeing identical weights and behavior.
-3. **`forward`**:
-   - `refine=False` → `return {"final_logit": self._segment(...)}` — byte-for-byte unchanged
-     `(B,1,R,R)`.
-   - `refine=True` → run the two-pass flow and return `{"final_logit": fused}` `(B,1,H,W)`.
+1. **Constructor**: replace `refine`/`refine_crop` with `resolutions: list[int] | None = None`.
+   `None` → `[resolution]` (single level = plain model, unchanged). `self.token_res =
+   resolutions[0]` is the token grid `T` (drives the encoder, as `resolution` does today).
+   `self.resolutions = list(resolutions)`. Validate each `resolutions[k]` (k≥1) is a multiple
+   of `resolutions[0]` and yields an integer crop `c_k = image_size·resolutions[0]/resolutions[k]`
+   in `(0, image_size]`; store the derived crop sizes.
+2. **`_segment(image, context_in, context_out) -> (B,1,T,T)`**: the current coarse forward body
+   (unchanged — fixed at the `T` token grid). Both passes call it.
+3. **`forward(image, context_in, context_out, mode="train")`**:
+   - Single level (`len(resolutions)==1`): `return {"final_logit": self._segment(...)}` —
+     byte-for-byte the plain model.
+   - Multi level: run the per-level flow and return per-level heads + geometry (below). No fusion.
 
-Two-pass flow (H,W = image_size; s = refine_crop; R = resolution):
+Multi-level forward (2 levels; H,W = image_size; T = resolutions[0]; c = derived crop):
 
 ```
-coarse   = self._segment(image, context_in, context_out)          # (B,1,R,R) logits
-coarse_up = interpolate(coarse, (H,W), bilinear)                   # logit-space canvas
-prob_up   = interpolate(sigmoid(coarse).detach(), (H,W), bilinear) # for bbox selection only
-
-tgt_o = max_sum_window(prob_up, s)                                 # (B,2) target crop origin
-ctx_o = stack[ gt_window(context_out[:,k], s) for k in K ]         # (B,K,2) context origins
-
-# crop each image/mask to its s×s window and resize back to H (same input distribution the
-# encoder was trained on); context masks use nearest, images/prob use bilinear.
-tgt_img = crop_resize(image,           tgt_o,        s, H, bilinear)   # (B,1,H,W)
-ctx_img = crop_resize(context_in|>BK,  ctx_o|>BK,    s, H, bilinear)   # -> (B,K,1,H,W)
-ctx_msk = crop_resize(context_out|>BK, ctx_o|>BK,    s, H, nearest)    # -> (B,K,1,H,W)
-
-refine  = self._segment(tgt_img, ctx_img, ctx_msk)                # (B,1,R,R) logits, same weights
-refine_s = interpolate(refine, (s,s), bilinear)                   # (B,1,s,s)
-fused   = fuse_window(coarse_up, refine_s, tgt_o, s)              # (B,1,H,W): coarse_up[bbox] += refine_s
-return {"final_logit": fused}
+coarse = self._segment(image, context_in, context_out)             # (B,1,T,T) full image
+prob   = torch.sigmoid(coarse).detach()
+prob_up = interpolate(prob, (H,W), bilinear)                       # for bbox selection
+tgt_o = max_sum_window(prob_up, c)                                 # (B,2) px origin, target
+ctx_o = stack[ gt_window(context_out[:,k], c) for k in K ]         # (B,K,2) px origins, context
+tgt_img = crop_resize(image,           tgt_o,        c, H, bilinear)
+ctx_img = crop_resize(context_in|>BK,  ctx_o|>BK,    c, H, bilinear) |> (B,K,1,H,W)
+ctx_msk = crop_resize(context_out|>BK, ctx_o|>BK,    c, H, nearest) |> (B,K,1,H,W)
+refine = self._segment(tgt_img, ctx_img, ctx_msk)                  # (B,1,T,T) the crop, same weights
+return {
+  "final_logit":  coarse,          # (B,1,T,T)  effective resolutions[0]; drives the existing suite + ckpt
+  "refine_logit": refine,          # (B,1,T,T)  effective resolutions[1]; the crop
+  "refine_origin": tgt_o,          # (B,2) px top-left in the H×W frame
+  "refine_crop":  c,               # int px
+  "resolutions":  self.resolutions,
+}
 ```
 
-`tgt_o`/`ctx_o` come from `argmax` and are **detached** (hard routing constants). Everything
-else is differentiable: gradient reaches the shared weights from both the coarse background
-(loss outside the bbox and, additively, inside it) and the refine residual (inside the bbox).
+Bbox origins come from `argmax` (detached). Both passes share weights via `_segment`.
 
-### New module: `src/models/bbox_refine.py` (pure tensor ops, unit-tested)
+### `bbox_refine.py` addition
 
-Lifted/adapted from `experiments/2d/multilevel/bbox.py` so `src/models/` needs no
-`experiments/` import. Functions:
+- `place_window(full, patch, origin, s) -> (B,1,H,W)` — **replace** variant of `fuse_window`:
+  clones `full` and writes `patch (B,1,s,s)` into the s×s window at each `origin` (overwrite,
+  not add). Used to build the fused/stitched prediction for the metric. `fuse_window`
+  (additive, logit-space) is retained for the deferred fused *loss*.
 
-- `max_sum_window(prob, s) -> (B,2)` — top-left origin of the s×s window with the largest
-  summed value (box-sum via `avg_pool2d` stride-1 + argmax); empty maps (max ≤ ε) center the
-  crop instead of collapsing to the corner. Origins clamped in-bounds.
-- `gt_window(mask, s) -> (B,2)` — same on a binary/soft mask (densest-GT window).
-- `crop_resize(x, origin, s, out, mode) -> (N,C,out,out)` — batched per-sample crop to the
-  s×s bbox at `origin`, resampled to `out×out` via `grid_sample` (align_corners=False,
-  border padding). Resolution-agnostic, vectorized over the batch.
-- `fuse_window(full, patch, origin, s) -> (B,1,H,W)` — the **additive** variant of the
-  reference's `composite_window`: writes `full[b, :, r0:r0+s, c0:c0+s] += patch[b]` into a
-  clone (input not mutated). Per-sample loop over the batch dim (B small).
+### Shared metric helper
 
-The existing `experiments/2d/multilevel/bbox.py` is left untouched.
+Per-level + fused metrics are computed the same way in training and validation, so a single
+helper (in `evaluate.py`, reused by `train.py`) takes `(out_dict, label)` and returns:
+- `dice@{resolutions[0]}` / soft — coarse `final_logit` vs GT pooled to T over the full image.
+- `dice@{resolutions[1]}` / soft — `refine_logit` vs `crop_resize(label, refine_origin, c, T)`.
+- `dice_fused@{resolutions[1]}` / soft — the **fused** (stitched) prediction: build at native
+  `image_size` as `place_window(upsample(sigmoid(coarse),H), upsample(sigmoid(refine),c),
+  refine_origin, c)`, then pool to `resolutions[1]` and score vs GT pooled to `resolutions[1]`.
 
-### `build_model` (`experiments/2d/train.py`) — thread the two flags
+(The coarse level continues to flow through the trainer's/`validate()`'s existing single-logit
+metric suite via `final_logit`, so `dice`, `dice_ds@…`, `cossim`, etc. stay as the effective-32
+level with no relabeling; the two extra families above are added for the refine model.)
 
-In the `patchset_cnn` branch, add to the `arch` dict:
-`"refine": a.get("refine", False), "refine_crop": a.get("refine_crop", 64)`.
-Nothing else in `train.py` changes — the loop already pools GT to `final_logit`'s size and
-computes one BCE + soft-Dice loss, which now lands at native resolution.
+### Training integration (`experiments/2d/train.py`)
+
+- Loss: keep the existing `final_logit` (coarse) BCE+soft-Dice as level 0. When
+  `out["refine_logit"]` is present, add `refine_loss_weight · (BCE + dice_weight·softdice)` of
+  the refine logit vs `crop_resize(label, refine_origin, refine_crop, T)`. `loss = coarse +
+  refine_loss_weight·refine`. New knob `train.refine_loss_weight: 1.0`.
+- Metrics: after the existing coarse metrics, call the shared helper to log `train/dice@64`,
+  `train/dice_fused@64` (+ soft) when the refine head is present.
+- `build_model` (patchset_cnn branch): pass `resolutions` (list) into the `arch` dict instead of
+  `refine`/`refine_crop`, so eval rebuilds identically.
+- Checkpoint selection: when the val summary contains `dice_fused@{resolutions[-1]}`, select on
+  it (best = max); otherwise keep the existing selection metric. The console/`best_*` logging
+  follows the selected metric.
+
+### Eval integration (`experiments/2d/eval_incontext.py` / `evaluate.py`)
+
+`validate()` computes the same shared-helper metrics (`dice@64`, `dice_fused@64`) for the
+refine model, in addition to the existing coarse suite on `final_logit`. `eval_incontext.py`
+needs no change beyond what `validate()` emits. Checkpoint `arch` carries `resolutions`, so the
+model rebuilds with zero drift.
 
 ### Config
 
-- `configs/experiment/2d/model/patchset_cnn.yaml`: add under `arch:` (default off)
+- `configs/experiment/2d/model/patchset_cnn.yaml`: keep `resolution` scalar (token grid for the
+  plain model); the refine leaf sets the list.
+- `configs/experiment/2d/2_omnisynth_medseg_refine.yaml`:
   ```yaml
-  refine: false        # enable coarse→fine bbox-zoom refinement (native-res fused output)
-  refine_crop: 64      # square bbox side length (pixels in the image_size frame)
-  ```
-- New runnable leaf `configs/experiment/2d/2_omnisynth_medseg_refine.yaml`:
-  ```yaml
-  # Experiment 2 — PatchSetCNN with single-level bbox-zoom refinement, on the same
-  # omniSynth/MedSeg distribution as experiment 1.
-  #   python experiments/2d/train.py --config-name 2_omnisynth_medseg_refine
   defaults:
     - 1_omnisynth_medseg
     - _self_
   arch:
-    refine: true
-    # refine_crop: 64
+    resolutions: [32, 64]      # effective full-image resolutions; T=32 tokens/level, refine crop=64px derived
+  train:
+    refine_loss_weight: 1.0
   eval:
-    ds_metric_res: [16, 32]   # keep pooled coarse Dice alongside the new native Dice
+    ds_metric_res: [16, 32]    # coarse-grid pooled Dice, comparable to the plain model
   ```
-  `1_omnisynth_medseg` defaults `model: patchset_cnn`, so this inherits it; enable ad-hoc on
-  any run with `arch.refine=true`.
 
-## Metrics / eval
+## Metrics summary
 
-`final_logit` is native H×W, so `validate()` treats the model like a native predictor:
+| metric | level | grid | vs |
+|---|---|---|---|
+| `dice`, `dice_ds@…`, `cossim`, … | coarse (eff. 32) | T×T full image | existing suite on `final_logit` |
+| `dice@64` (+ soft) | refine (eff. 64) | T×T on the crop | `crop_resize(GT, origin, c, T)` |
+| `dice_fused@64` (+ soft) | fused/stitched (eff. 64) | 64×64 full image | GT pooled to 64 |
 
-- `dice/mean`, `dice_soft/mean` — hard/soft Dice of the fused native output vs GT. With
-  native output the trainer's checkpoint-selection metric becomes `dice` (no `cossim`), which
-  is the right target for a refinement model.
-- `dice_ds@16 / dice_ds@32` (and their `_soft`) — from `eval.ds_metric_res: [16, 32]`: the
-  fused output avg-pooled to R×R, so coarse-grid Dice stays comparable to the non-refine
-  PatchSetCNN runs.
-- No changes to `evaluate.py` / `eval_incontext.py`; the checkpoint's `arch` block now carries
-  `refine`/`refine_crop`, so eval rebuilds the refine model automatically.
+Checkpoint metric: `dice_fused@{resolutions[-1]}` (= `dice_fused@64` here) for the refine model;
+the existing metric for plain single-level models.
 
 ## Edge cases
 
-- **Empty coarse prediction** (max window ≤ ε): `max_sum_window` centers the crop; refine runs
-  on the centered window and its residual is fused normally (near-zero where nothing is there).
+- **Empty coarse prediction**: `max_sum_window` centers the crop; the refine level still runs
+  and is scored, its contribution near-zero where nothing is present.
 - **Empty context GT**: `gt_window` centers that context's crop.
-- **Object larger than `refine_crop`**: only the in-bbox part is sharpened; outside the bbox
-  the fused output is the coarse prediction (by construction). Default `refine_crop=64` covers
-  typical omniSynth objects; tune via config.
-- **Multiple objects**: single top-1 window refines the densest one; others stay coarse
-  (accepted for now; top-k is the documented extension).
+- **Non-integer / out-of-range crop**: rejected at construction by the `resolutions` validation.
+- **Object larger than the crop**: only the in-crop part is refined/fused; outside the crop the
+  fused prediction is the coarse value (by construction).
 
 ## Testing
 
-- `tests` for `bbox_refine.py`: `max_sum_window`/`gt_window` on hand-built blobs (centered,
-  off-center, border→clamped, empty→centered); `crop_resize` crop-then-place round-trip;
-  `fuse_window` adds into the right window and leaves the rest unchanged; in-bounds invariants.
-- `PatchSetCNN` forward tests: `refine=False` output shape unchanged `(B,1,R,R)` and equal to
-  a direct `_segment` call; `refine=True` returns `(B,1,H,W)`, is finite, and a fused-loss
-  backward populates `decoder`/`encoder` grads (both passes contribute).
-- Smoke run: `python experiments/2d/train.py --config-name 2_omnisynth_medseg_refine
-  train.epochs=1 data.max_train_subjects=...` (tiny) to confirm the loss decreases and a
-  checkpoint that reloads under `eval_incontext.py`.
+- `bbox_refine.py`: existing tests + `place_window` (replace into the right window, input not
+  mutated, distinct from additive `fuse_window`).
+- `PatchSetCNN`: single-level (`resolutions=[32]` / default) output unchanged `(B,1,T,T)` equal
+  to `_segment`; multi-level (`resolutions=[32,64]`) returns the per-level dict with correct
+  shapes, derived crop, detached origins; gradient reaches shared weights from BOTH heads;
+  `resolutions` validation rejects a bad list (e.g. `[32, 48]` → non-integer crop).
+- Shared metric helper: on a hand-built case, `dice@64` uses the cropped GT and `dice_fused@64`
+  equals coarse Dice when the refine logit matches the coarse crop (fused ≡ coarse when refine
+  adds nothing), and improves when refine is correct inside the crop.
+- Smoke run: `train.py --config-name 2_omnisynth_medseg_refine train.epochs=1
+  data.max_train_samples=64 eval.max_per_label=4 wandb.enabled=false` — loss decreases,
+  `dice@64` / `dice_fused@64` logged, checkpoint reloads under `eval_incontext.py`.
 
 ## Out of scope (YAGNI)
 
-- Multi-hop zoom ladder and top-k windows (single level / single window now; structure allows
-  adding a loop and NMS-style selection later).
+- Fused **loss** on the stitched prediction (metric only for now).
+- >2 levels / top-k windows (structured to extend; not built).
 - Teacher-forced or scheduled bbox source (prediction-driven chosen).
-- Query-prior seeding of the refine pass (additive coarse logit supplies the prior).
-- Re-encoding vs encode-once feature caching (each pass is a plain `forward`; the coarse and
-  refine encodes are separate and cheap at this resolution — no shared-feature plumbing).
+- Query-prior seeding of the refine pass.
+
+---
+
+## Superseded approach (2026-07-09 original): single native composite via additive logit fusion
+
+The original design produced one native-resolution `final_logit` by additively fusing the
+refine logit (residual) into the upsampled coarse logit at the bbox, trained under the
+trainer's single BCE+soft-Dice loss. It was implemented (branch `patchset-refine`, commits
+`4a2d836`..`704c5cd`) and then revised because: (a) it gave no independent per-level training
+signal or per-level metrics, and (b) attempts to control the refine pass's resolution exposed a
+geometric conflict (a single fused canvas forces one global resolution; a sub-image crop cannot
+be both "effective 64 over the full image" and a genuine higher-token grid without either
+landing at native 128 or discarding the refine detail). The per-level design above replaces it;
+`fuse_window` is retained for the future fused-loss experiment.

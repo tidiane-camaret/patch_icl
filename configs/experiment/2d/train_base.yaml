@@ -42,6 +42,7 @@ train:
 eval:
   batch_size: 16
   workers: 8
+  log_per_class: false   # per-(dataset,class) val breakdowns; set false to log only the means
   out_dir: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/2d_train
 
 wandb:

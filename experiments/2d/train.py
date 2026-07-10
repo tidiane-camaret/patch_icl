@@ -189,8 +189,12 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
         with torch.no_grad():
             prob = torch.sigmoid(logit)
             prob_nat = _upsample_to(prob, lbl.shape[-2:])
+            rg = refine_geometry(out, lbl)
+            # Refine models: `dice` (native hard) is scored on the fused native stitch (last
+            # level), not the coarse pred. Other monitors stay on the coarse pass for now.
+            pred_nat = rg["fused"] if rg is not None else prob_nat
             ss, sc = _soft_sum(prob, target)
-            hs, hc = _hard_sum(prob_nat, lbl)
+            hs, hc = _hard_sum(pred_nat, lbl)
             soft_sum += ss; soft_cnt += sc; hard_sum += hs; hard_cnt += hc
             if logit.shape[-2:] != lbl.shape[-2:]:   # low res: cossim + top-k + hard@nativeres
                 low_res = logit.shape[-1]
@@ -199,14 +203,15 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
                 cos_sum += cs; cos_cnt += cc; topk_sum += ts; topk_cnt += tc
                 hlr, clr = _hard_sum(prob, (target >= 0.5).float())   # hard Dice at the coarse grid
                 lr_hard_sum += hlr; lr_hard_cnt += clr
-            for R in res_list:   # fixed-res pooled Dice (GT + pred avg-pooled to RxR)
+            # fixed-res pooled Dice (UniverSeg only — see main(): ds_metric_res is ignored for
+            # non-native patchset_cnn/refine, which already report their own coarse grid).
+            for R in (res_list if logit.shape[-2:] == lbl.shape[-2:] else []):
                 p_r = F.adaptive_avg_pool2d(prob_nat, (R, R))
                 g_r = F.adaptive_avg_pool2d(lbl, (R, R))
                 ss_r, sc_r = _soft_sum(p_r, g_r)
                 hs_r, hc_r = _hard_sum(p_r, (g_r >= 0.5).float())
                 d = dsr_sums[R]
                 d["ss"] += ss_r; d["sc"] += sc_r; d["hs"] += hs_r; d["hc"] += hc_r
-            rg = refine_geometry(out, lbl)
             if rg is not None:
                 rh, rhc = _hard_sum(rg["refine_prob"], (rg["refine_target"] >= 0.5).float())
                 fh, fhc = _hard_sum(rg["fused_R"], (rg["gt_R"] >= 0.5).float())
@@ -217,14 +222,15 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
         total += loss.item()
         n += 1
         post = {"loss": f"{total / n:.4f}",
-                "dice": f"{float(soft_sum) / max(float(soft_cnt), 1):.4f}",
+                # native hard Dice on the fused-upsampled pred (fused for refine) — matches train/dice
+                "dice": f"{float(hard_sum) / max(float(hard_cnt), 1):.4f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.1e}"}
         if cos_cnt:
             post["cos"] = f"{float(cos_sum) / float(cos_cnt):.4f}"
             post[f"top{topk_k}"] = f"{float(topk_sum) / float(topk_cnt):.4f}"
         pbar.set_postfix(**post)
     dsr_out = {}
-    for R in res_list:                          # universeg: user-requested fixed resolutions
+    for R in (res_list if low_res is None else []):   # universeg only (native): fixed res @R
         d = dsr_sums[R]
         dsr_out[f"dice_ds@{R}"] = float(d["hs"]) / max(float(d["hc"]), 1)
         dsr_out[f"dice_ds_soft@{R}"] = float(d["ss"]) / max(float(d["sc"]), 1)
@@ -243,16 +249,18 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
 
 
 def _select_metric(summary: dict) -> tuple[str, float]:
-    """Checkpoint-selection metric from a val summary: prefer the fused refine metric
-    (dice_fused@R, hard — not its _soft sibling), else cossim, else dice. Returns
+    """Checkpoint-selection metric from a val summary. A refine model (identified by a
+    dice_fused@R key) selects on native `dice` — which for refine is the fused prediction
+    scored at full resolution. Otherwise: cossim if present, else dice. Returns
     (metric_key_without_'/mean', mean_value)."""
-    fused = next((k for k in summary
-                  if k.startswith("dice_fused@") and "soft" not in k and k.endswith("/mean")),
-                 None)
-    if fused is not None:
-        return fused[: -len("/mean")], summary[fused]
-    m = "cossim" if "cossim/mean" in summary else "dice"
-    return m, summary.get(f"{m}/mean", float("nan"))
+    is_refine = any(k.startswith("dice_fused@") and k.endswith("/mean") for k in summary)
+    if is_refine:
+        return "dice", summary.get("dice/mean", float("nan"))
+    cossim = next((k for k in summary
+                   if k.startswith("cossim@") and k.endswith("/mean")), None)
+    if cossim is not None:
+        return cossim[: -len("/mean")], summary[cossim]
+    return "dice", summary.get("dice/mean", float("nan"))
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -368,10 +376,10 @@ def main(cfg: DictConfig):
             # dice_soft (no "ds" — not downsampled), parallel to train/dice (full-res hard)
             # and matching pfn_seg.py's train/dice_soft = soft Dice at native pred resolution.
             log["train/dice_soft"] = train_soft
-        if not math.isnan(train_cos):
-            log["train/cossim"] = train_cos
+        if not math.isnan(train_cos):   # coarse-grid metrics: tag with the token grid T=low_res
+            log[f"train/cossim@{train_lowres}"] = train_cos
         if not math.isnan(train_topk):
-            log[f"train/top{topk_k}"] = train_topk
+            log[f"train/top{topk_k}@{train_lowres}"] = train_topk
         log.update({f"train/{k}": v for k, v in train_dsr.items()})   # dice_ds@R / dice_ds_soft@R
 
         if lawa_queue is not None:   # push this epoch's raw weights to the LAWA buffer
@@ -384,15 +392,19 @@ def main(cfg: DictConfig):
             summary, sample_table, _ = validate(
                 model, val_loader, topk_k=topk_k, epoch=epoch,
                 compute_flops=(epoch == 0),
-                ds_metric_res=cfg.eval.get("ds_metric_res", None))
+                ds_metric_res=cfg.eval.get("ds_metric_res", None),
+                per_group=bool(cfg.eval.get("log_per_class", True)))
             metric, mean_dice = _select_metric(summary)
             log.update(summary)
             log["val/samples"] = sample_table
             ds_soft_key = next((k for k in summary
                                 if k.startswith("dice_ds_soft") and k.endswith("/mean")), None)
             ds_soft = summary.get(ds_soft_key, float("nan")) if ds_soft_key else float("nan")
+            topk_key = next((k for k in summary
+                             if k.startswith(f"top{topk_k}@") and k.endswith("/mean")), None)
+            topk_val = summary.get(topk_key, float("nan")) if topk_key else float("nan")
             tqdm.write(f"  [e{epoch}] train loss={loss:.4f}"
-                       f"  val {metric}={mean_dice:.4f} top{topk_k}={summary.get(f'top{topk_k}/mean', float('nan')):.4f}"
+                       f"  val {metric}={mean_dice:.4f} top{topk_k}={topk_val:.4f}"
                        f" ds_soft={ds_soft:.4f}"
                        f" dice={summary.get('dice/mean', float('nan')):.4f}"
                        f"  (best {metric}={max(best_dice, mean_dice):.4f})")

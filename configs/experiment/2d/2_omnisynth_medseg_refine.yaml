@@ -1,7 +1,7 @@
 # Experiment 2 — PatchSetCNN with multi-resolution per-level bbox-zoom refinement, on the same
 # omniSynth/MedSeg distribution as experiment 1. resolutions = effective full-image resolutions;
 # token count is constant (T=32), the refine crop is derived (128·32/64 = 64px). Per-level losses
-# (coarse@32 + refine@64 on the crop); checkpoint selects on dice_fused@64.
+# (coarse@32 + refine@64 on the crop); checkpoint selects on native `dice` (the fused pred).
 #   python experiments/2d/train.py --config-name 2_omnisynth_medseg_refine
 #   ... deeper zoom: arch.resolutions=[32,128]   (32px crop, effective 128)
 defaults:
@@ -14,5 +14,6 @@ arch:
 train:
   refine_loss_weight: 1.0    # weight of the refine-level loss relative to the coarse loss
 
-eval:
-  ds_metric_res: [16, 32]    # coarse-grid pooled Dice, comparable to the plain model
+# NB: no `eval.ds_metric_res` — the fixed-res @R pooled Dice is UniverSeg-only (it makes a
+# native model comparable to patchset's coarse grid). patchset_cnn/refine report their own
+# dice_ds@{token grid}, so ds_metric_res is ignored for this model even if set.

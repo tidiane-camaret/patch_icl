@@ -268,7 +268,8 @@ class PatchSetCNN(nn.Module):
 
         Single level (len(resolutions)==1): {"final_logit": (B,1,T,T)} — the plain model.
         Multi level: per-level heads (final_logit=coarse, refine_logit, refine_origin,
-        refine_crop, resolutions). `mode` is accepted for interface parity; unused."""
+        refine_ctx_origin, refine_crop, resolutions). `mode` is accepted for interface
+        parity; unused."""
         if len(self.resolutions) == 1:
             return {"final_logit": self._segment(image, context_in, context_out)}
         return self._refine_forward(image, context_in, context_out)

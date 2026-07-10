@@ -1,12 +1,26 @@
 # 10_patchset_cnn_2_lvls
 ## Q : on omnisynth, behavior of 2nd lvl 32-> 128 ? 
-omnisynth : 4x4 grid, 1 ctx
-- Q1 : level 0 : resolution 32, get log gt/pred bbox overlap
-- Q2 : level 1 (resolution 128, omnisynth : 4x4 grid, 1 ctx)
+experiments/2d/train.py --config-name 2_omnisynth_medseg_refine model=patchset_cnn arch.l=2 train.batch_size=32 eval.batch_size=32
+- Q1 : arch.resolution = [32,64] , loss per level, no info exchange between level : does level 1 actually refines the pred ?
+- Q2 : behavior when encode once + crop features instead of encoding crop
+- Q2 : level 1 can attend to level 0 register : does it help the prediction ? 
+- Q3 : single loss on fused level logits : see behavior
+- Q4 : attention all <-> all (no mask), sampling head for tgt and context, guided by final loss
 ## R : 
 
 
+# 9_patchset_omnisynth_medseg_instcopy_effect 
+## Q : on a harder task than glyphs, do instcopy help ICL ?
+experiments/2d/train.py --config-name 1_omnisynth_medseg model=patchset_cnn arch.l=2 train.batch_size=32 eval.batch_size=32
+synth.scene.p_copy=0 : 4gm0xbda
+synth.scene.p_copy=0.4 : xij74it0
+## R : 
 
+## Q : do tgt repetition helps generalization ? 
+experiments/2d/train.py --config-name patchset_cnn_train synth=omniglot data.context_size=1 synth.scene.grid=2 arch.resolution=16
+synth.scene.p_copy=0.9 : yr9md63v
+synth.scene.p_copy=0.4 : 0qsegdq8
+synth.scene.p_copy=0 : um0h88cm
 
 # 8_patchset_enc_nb_feature stages
 ## Q : base config : arch.enc_dims=[64, 64, 64, 64]. do we need all those ? 

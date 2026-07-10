@@ -1,5 +1,46 @@
 # Change log
 
+## 2026-07-10 — metrics: tag cossim/top-k with the token grid; resolution-tagged sample table
+
+- **`cossim` and `top{k}` now carry their resolution**: logged as `cossim@{T}` / `top{k}@{T}`
+  (val, `evaluate.py`) and `train/cossim@{T}` / `train/top{k}@{T}` (train), where T = the coarse
+  token grid (`low_res`, e.g. 32). They were always computed on that grid but were previously
+  untagged. `_select_metric` (`train.py`) and the train console top-k lookup were updated to
+  find the tagged keys; the cossim fallback now matches `cossim@*`.
+- **Per-sample wandb `val/samples` table columns are now resolution-tagged and model-adaptive**
+  (built lazily per run in `validate()`, replacing the static `SAMPLE_COLS`):
+  - always: `dice` (native hard — fused pred for refine models);
+  - non-native (patchset/refine): `dice_ds@{T}`, `dice_ds_soft@{T}` (coarse grid);
+  - refine: `dice@{Rf}`, `dice_soft@{Rf}`, `dice_fused@{Rf}` (per-sample, previously only
+    aggregated). Native (UniverSeg) tables now carry just `dice` (no meaningless NaN columns).
+
+## 2026-07-10 — metrics: `ds_metric_res` (@R pooled Dice) is now UniverSeg-only
+
+- The fixed-resolution `dice_ds@R` / `dice_ds_soft@R` metrics (from `eval.ds_metric_res`) are
+  now computed **only for native models (UniverSeg)**, in both `validate()` (`evaluate.py`) and
+  `train_epoch` (`train.py`). Their purpose is to pool UniverSeg's native prediction to R×R so
+  it is comparable to patchset_cnn's coarse grid. For non-native patchset_cnn/refine those
+  `@R` metrics were always computed on the *coarse-upsampled* pred — confusing and redundant
+  with the model's own `dice_ds@{token grid}` — so `ds_metric_res` is now ignored for them.
+- Removed the dead `eval.ds_metric_res` from `configs/experiment/2d/2_omnisynth_medseg_refine.yaml`
+  (patchset/refine); it lives in `configs/experiment/2d/model/universeg.yaml` (`[32]`), the
+  correct home now that it is UniverSeg-only. patchset_cnn/refine still report their native
+  coarse grid as `dice_ds@{low_res}` / `dice_ds_soft@{low_res}`.
+
+## 2026-07-10 — refine: `dice` scored on the fused prediction + checkpoint selects on it
+
+- For multi-resolution refine `PatchSetCNN` models, the headline **`dice`** metric (native
+  hard Dice) is now computed on the **fused** prediction of the last level (`rg["fused"]`, at
+  full H×W) instead of the coarse `final_logit`. Applies in both `validate()` (`evaluate.py`)
+  and `train_epoch` (`train.py`, `train/dice`). Non-refine models (UniverSeg, plain
+  patchset_cnn) are unchanged.
+- **Checkpoint selection** (`_select_metric`, `train.py`) for refine models now selects on
+  native `dice` (the fused full-res hard Dice) rather than `dice_fused@{last res}`. Non-refine
+  selection (cossim → dice) is unchanged.
+- Scoped step-by-step: only `dice` moved to the fused pred for now. `dice_ds@R` /
+  `dice_ds_soft@R`, cossim, and top-k still reflect the coarse pass; `dice_fused@R` /
+  `dice@R` per-level metrics remain as diagnostics.
+
 ## 2026-07-10 — eval: coarse→fine refine qualitative figure (save_refine_figure)
 
 - **`save_refine_figure`** added to `experiments/2d/evaluate.py`: 2×3 PNG panel showing the coarse→fine refinement for a refine `PatchSetCNN` checkpoint. Row 0 = target, row 1 = first context. Col 0: full frame + GT contour + res0 (coarse) pred heatmap + bbox rectangle. Col 1: bbox crop + GT contour + res1 (refine) pred heatmap. Col 2: full frame + GT contour + fused (place_window stitch) pred. All overlaid with lime GT contours and yellow/cyan bbox rectangles.
