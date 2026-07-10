@@ -130,3 +130,58 @@ def test_refine_memory_on_creates_mem_type():
     assert m.refine_memory is True
     assert m.mem_type.shape == (32,)
     assert "mem_type" in dict(m.named_parameters())
+
+
+# ── refine memory injection (Task 2) ──────────────────────────────────────
+
+def _mem_model(refine_mode="reencode"):
+    torch.manual_seed(0)
+    return PatchSetCNN(image_size=32, resolution=8, enc_dims=[16], e=32, h=64, l=1, a=2,
+                       thinking_rows=1, resolutions=[8, 16], refine_mode=refine_mode,
+                       refine_memory=True)
+
+
+@pytest.mark.parametrize("mode", ["reencode", "encode_once"])
+def test_refine_memory_shapes_unchanged(mode):
+    m = _mem_model(mode)
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["final_logit"].shape == (2, 1, 8, 8)
+    assert out["refine_logit"].shape == (2, 1, 8, 8)
+
+
+@pytest.mark.parametrize("mode", ["reencode", "encode_once"])
+def test_refine_memory_coarse_unaffected(mode):
+    # Coarse head is a plain full-image segment: memory must not leak into it.
+    m = _mem_model(mode)
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    assert torch.allclose(out["final_logit"], m._segment(img, cin, cout), atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["reencode", "encode_once"])
+def test_mem_type_receives_gradient(mode):
+    # If refine routes through the memory rows, mem_type gets a gradient.
+    m = _mem_model(mode)
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    out["refine_logit"].mean().backward()
+    assert m.mem_type.grad is not None
+    assert m.mem_type.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("mode", ["reencode", "encode_once"])
+def test_memory_is_detached(mode):
+    # Capture the `mem` tensor passed into the refine _attn; it must carry no grad history.
+    m = _mem_model(mode)
+    img, cin, cout = _batch()
+    seen = []
+    orig = m._attn
+    def spy(*a, **kw):
+        seen.append(kw.get("mem", a[4] if len(a) > 4 else None))
+        return orig(*a, **kw)
+    m._attn = spy
+    m(img, context_in=cin, context_out=cout)
+    mems = [x for x in seen if x is not None]
+    assert len(mems) == 1                      # exactly the refine pass carries memory
+    assert mems[0].grad_fn is None and not mems[0].requires_grad

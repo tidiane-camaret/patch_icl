@@ -212,23 +212,28 @@ class PatchSetCNN(nn.Module):
         occ = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W), (self.resolution,) * 2)
         return occ.reshape(B, K * self.N, 1)
 
-    def _segment(self, image, context_in, context_out):
+    def _segment(self, image, context_in, context_out, mem=None, return_think=False):
         """Coarse single-pass segmentation → (B,1,R,R) logits.
 
         image (B,1,H,W); context_in/out (B,K,1,H,W). Support = all K·N context patches
-        (known mask occupancy); query = the N target patches (mask = support-mean prior)."""
+        (known mask occupancy); query = the N target patches (mask = support-mean prior).
+        mem/return_think are forwarded to _attn (cross-level memory injection)."""
         B, K = context_in.shape[0], context_in.shape[1]
         H, W = image.shape[-2:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)          # (B,T,1,H,W)
         T = imgs.shape[1]
         feat_map = self.encoder(imgs.reshape(B * T, 1, H, W))              # (B*T,Cf,R,R) pooled
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        return self._attn(sup_feat, qry_feat, self._occupancy(context_out), K)
+        return self._attn(sup_feat, qry_feat, self._occupancy(context_out), K,
+                          mem=mem, return_think=return_think)
 
-    def _attn(self, sup_feat, qry_feat, sup_occ, K):
+    def _attn(self, sup_feat, qry_feat, sup_occ, K, mem=None, return_think=False):
         """Set-of-patches attention half (encoder-independent) → (B,1,R,R) logits. Shared by the
         single-level model and by both coarse+refine passes. sup_feat (B,K·N,Cf), qry_feat
-        (B,N,Cf), sup_occ (B,K·N,1); query mask prior = support-mean occupancy."""
+        (B,N,Cf), sup_occ (B,K·N,1); query mask prior = support-mean occupancy.
+
+        mem (B,T1,e): optional detached coarse thinking rows prepended for cross-level memory.
+        return_think: if True, returns (logit, think) where think is (B,n_think,e)."""
         B, R, N = sup_feat.shape[0], self.resolution, self.N
         qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, 1)        # (B,Q,1) prior
 
@@ -258,9 +263,18 @@ class PatchSetCNN(nn.Module):
             sup_tok = sup_tok + ctx_emb.view(1, K * N, 1, e_dim)
             qry_tok = qry_tok + self.qry_id.view(1, 1, 1, e_dim)
 
-        x = torch.cat([sup_tok, qry_tok], dim=1)                          # (B,S+Q,2,e)
+        # Optional cross-level memory rows (coarse thinking), prepended into the support
+        # block so every row (support + query) attends to them. mem: (B,T1,e), detached.
+        sep = K * N
+        rows = [sup_tok, qry_tok]
+        if mem is not None:
+            T1 = mem.shape[1]
+            m = (mem + self.mem_type).unsqueeze(2).expand(mem.shape[0], T1, 2, mem.shape[-1])
+            rows = [m] + rows                                             # [memory | support | query]
+            sep += T1
+        x = torch.cat(rows, dim=1)                                        # (B, (T1+)S+Q, 2, e)
 
-        x, sep_t = self.thinking(x, K * N)
+        x, sep_t = self.thinking(x, sep)      # -> [thinking | memory | support | query]
         # Default: every row attends to the train set (thinking + support) only. With
         # query_self_attn, query patches additionally attend to each other (within-target
         # spatial reasoning); they carry the prior (not GT), so this leaks no labels.
@@ -274,6 +288,8 @@ class PatchSetCNN(nn.Module):
 
         q = x[:, sep_t:, 0, :]                                            # (B,Q,e) query img-col
         logit = self.decoder(q).squeeze(-1).reshape(B, 1, R, R)
+        if return_think:
+            return logit, x[:, :self.thinking.n].mean(dim=2)             # (B, n_think, e)
         return logit                                                      # (B,1,R,R)
 
     def _select_bbox(self, coarse, context_out, c):
@@ -302,7 +318,11 @@ class PatchSetCNN(nn.Module):
         H, W = image.shape[-2:]
         c = self.refine_crops[0]                                          # derived crop (px)
 
-        coarse = self._segment(image, context_in, context_out)           # (B,1,T,T)
+        if self.refine_memory:
+            coarse, coarse_think = self._segment(image, context_in, context_out,
+                                                 return_think=True)       # (B,1,T,T), (B,n,e)
+        else:
+            coarse, coarse_think = self._segment(image, context_in, context_out), None
         tgt_o, ctx_o = self._select_bbox(coarse, context_out, c)
 
         tgt_img = crop_resize(image, tgt_o, c, H, mode="bilinear")       # (B,1,H,W)
@@ -311,7 +331,8 @@ class PatchSetCNN(nn.Module):
         ctx_msk = crop_resize(context_out.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
                               c, H, mode="nearest").reshape(B, K, 1, H, W)
 
-        refine = self._segment(tgt_img, ctx_img, ctx_msk)                # (B,1,T,T), same weights
+        mem = coarse_think.detach() if coarse_think is not None else None
+        refine = self._segment(tgt_img, ctx_img, ctx_msk, mem=mem)       # (B,1,T,T), same weights
         return {"final_logit": coarse, "refine_logit": refine,
                 "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
                 "refine_crop": c, "resolutions": self.resolutions}
@@ -332,7 +353,11 @@ class PatchSetCNN(nn.Module):
 
         # ── coarse: pool the full maps to the token grid ────────────────────────
         sup_c, qry_c = self._grid_tokens(self.encoder.pool_maps(maps, R), B, T, K)
-        coarse = self._attn(sup_c, qry_c, self._occupancy(context_out), K)   # (B,1,T,T)
+        if self.refine_memory:
+            coarse, coarse_think = self._attn(sup_c, qry_c, self._occupancy(context_out), K,
+                                              return_think=True)             # (B,1,T,T), (B,n,e)
+        else:
+            coarse, coarse_think = self._attn(sup_c, qry_c, self._occupancy(context_out), K), None
 
         # ── bbox selection, then crop the SAME maps (image-major: contexts, then target) ──
         tgt_o, ctx_o = self._select_bbox(coarse, context_out, c)
@@ -341,7 +366,8 @@ class PatchSetCNN(nn.Module):
         sup_r, qry_r = self._grid_tokens(refine_feat, B, T, K)
         ctx_msk = crop_resize(context_out.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
                               c, H, mode="nearest").reshape(B, K, 1, H, W)
-        refine = self._attn(sup_r, qry_r, self._occupancy(ctx_msk), K)   # (B,1,T,T), same weights
+        mem = coarse_think.detach() if coarse_think is not None else None
+        refine = self._attn(sup_r, qry_r, self._occupancy(ctx_msk), K, mem=mem)  # same weights
         return {"final_logit": coarse, "refine_logit": refine,
                 "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
                 "refine_crop": c, "resolutions": self.resolutions}
