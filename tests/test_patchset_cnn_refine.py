@@ -56,3 +56,19 @@ def test_grad_reaches_shared_weights_from_both_heads():
     loss.backward()
     assert m.decoder[0].weight.grad is not None
     assert m.encoder.stem[0].weight.grad is not None
+
+
+def test_multi_level_returns_ctx_origin():
+    m = _model([8, 16])                       # image_size 32 → crop = 16
+    img, cin, cout = _batch(B=2, K=2, H=32)
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["refine_ctx_origin"].shape == (2, 2, 2)          # (B, K, 2)
+    # origins are in-bounds top-left px for a crop of size 16 on a 32 image
+    assert (out["refine_ctx_origin"] >= 0).all()
+    assert (out["refine_ctx_origin"] <= 32 - 16).all()
+
+
+def test_single_level_has_no_ctx_origin():
+    m = _model([8])
+    img, cin, cout = _batch(H=32)
+    assert "refine_ctx_origin" not in m(img, context_in=cin, context_out=cout)

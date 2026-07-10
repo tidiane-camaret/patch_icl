@@ -260,7 +260,8 @@ class PatchSetCNN(nn.Module):
 
         refine = self._segment(tgt_img, ctx_img, ctx_msk)                # (B,1,T,T), same weights
         return {"final_logit": coarse, "refine_logit": refine,
-                "refine_origin": tgt_o, "refine_crop": c, "resolutions": self.resolutions}
+                "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
+                "refine_crop": c, "resolutions": self.resolutions}
 
     def forward(self, image, context_in, context_out, mode="train"):
         """image (B,1,H,W); context_in/out (B,K,1,H,W).

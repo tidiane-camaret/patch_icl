@@ -193,6 +193,7 @@ def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
     refine_up = F.interpolate(refine_prob, size=(c, c), mode="bilinear", align_corners=False)
     fused = place_window(coarse_up, refine_up, origin, c)              # (B,1,H,H) native stitch
     return {"refine_prob": refine_prob, "refine_target": refine_target,
+            "fused": fused,
             "fused_R": F.adaptive_avg_pool2d(fused, (Rf, Rf)),
             "gt_R": F.adaptive_avg_pool2d(lbl, (Rf, Rf)), "Rf": Rf}
 

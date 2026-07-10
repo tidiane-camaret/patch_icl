@@ -40,3 +40,11 @@ def test_fused_takes_refine_inside_window():
     f = rg["fused_R"][0, 0]
     assert f[:4, :4].mean() > 0.99            # crop region takes refine (prob 1)
     assert f[4:, 4:].mean() < 0.01            # outside stays coarse (prob 0)
+
+
+def test_returns_native_fused_map():
+    out = _out()
+    lbl = (torch.rand(2, 1, 16, 16) > 0.5).float()
+    rg = refine_geometry(out, lbl)
+    assert rg["fused"].shape == (2, 1, 16, 16)                  # native H×H
+    assert (rg["fused"] >= 0).all() and (rg["fused"] <= 1).all()   # probabilities
