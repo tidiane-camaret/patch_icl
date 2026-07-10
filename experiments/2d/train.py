@@ -40,7 +40,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DEVICE, build_dataset, make_loader
-from evaluate import validate, _target_like, _upsample_to, _as_res_list
+from evaluate import validate, _target_like, _upsample_to, _as_res_list, refine_geometry
+from src.models.bbox_refine import crop_resize
 from pfn_train import Muon, lawa_average, soft_dice_loss
 
 
@@ -127,8 +128,7 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "query_self_attn": a.get("query_self_attn", False),
             "context_id_embed": a.get("context_id_embed", False),
             "max_context": a.get("max_context", 16),
-            "refine": a.get("refine", False),
-            "refine_crop": a.get("refine_crop", 64),
+            "resolutions": list(a.resolutions) if a.get("resolutions", None) is not None else None,
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}
@@ -145,6 +145,9 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
     dsr_sums = {R: {"ss": 0.0, "sc": 0.0, "hs": 0.0, "hc": 0.0} for R in res_list}
     low_res = None                              # non-native model's coarse logit side length
     lr_hard_sum = lr_hard_cnt = 0.0            # hard Dice at that native low res (patchset_cnn)
+    refine_hard_sum = refine_hard_cnt = 0.0   # refine hard Dice at Rf (on the crop)
+    fused_hard_sum = fused_hard_cnt = 0.0      # fused hard Dice at Rf (stitched full image)
+    fused_res = None
     pbar = tqdm(loader, desc=f"train e{epoch}")
     for batch in pbar:
         if batch is None:
@@ -163,6 +166,15 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
         bce = F.binary_cross_entropy_with_logits(logit, target)
         dice = soft_dice_loss(torch.sigmoid(logit), target)
         loss = bce + cfg.train.dice_weight * dice
+
+        if out.get("refine_logit") is not None:            # multi-level: add the refine loss
+            rlogit = out["refine_logit"].float()
+            rtarget = crop_resize(lbl, out["refine_origin"], int(out["refine_crop"]),
+                                  rlogit.shape[-1], mode="bilinear")   # soft cropped GT at T
+            rbce = F.binary_cross_entropy_with_logits(rlogit, rtarget)
+            rdice = soft_dice_loss(torch.sigmoid(rlogit), rtarget)
+            loss = loss + float(cfg.train.get("refine_loss_weight", 1.0)) * (
+                rbce + cfg.train.dice_weight * rdice)
 
         loss.backward()
         if cfg.train.get("grad_clip", None):
@@ -194,6 +206,13 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
                 hs_r, hc_r = _hard_sum(p_r, (g_r >= 0.5).float())
                 d = dsr_sums[R]
                 d["ss"] += ss_r; d["sc"] += sc_r; d["hs"] += hs_r; d["hc"] += hc_r
+            rg = refine_geometry(out, lbl)
+            if rg is not None:
+                rh, rhc = _hard_sum(rg["refine_prob"], (rg["refine_target"] >= 0.5).float())
+                fh, fhc = _hard_sum(rg["fused_R"], (rg["gt_R"] >= 0.5).float())
+                refine_hard_sum += rh; refine_hard_cnt += rhc
+                fused_hard_sum += fh; fused_hard_cnt += fhc
+                fused_res = rg["Rf"]
 
         total += loss.item()
         n += 1
@@ -212,12 +231,28 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
     if low_res is not None:                     # patchset_cnn: tag its native coarse grid too
         dsr_out[f"dice_ds@{low_res}"] = float(lr_hard_sum) / max(float(lr_hard_cnt), 1)
         dsr_out[f"dice_ds_soft@{low_res}"] = float(soft_sum) / max(float(soft_cnt), 1)
+    if fused_res is not None:                   # refine model: per-level + fused train Dice
+        dsr_out[f"dice@{fused_res}"] = float(refine_hard_sum) / max(float(refine_hard_cnt), 1)
+        dsr_out[f"dice_fused@{fused_res}"] = float(fused_hard_sum) / max(float(fused_hard_cnt), 1)
     return (total / max(n, 1),
             float(soft_sum) / max(float(soft_cnt), 1),
             float(hard_sum) / max(float(hard_cnt), 1),
             float(cos_sum) / float(cos_cnt) if cos_cnt else float("nan"),
             float(topk_sum) / float(topk_cnt) if topk_cnt else float("nan"),
             dsr_out, low_res)
+
+
+def _select_metric(summary: dict) -> tuple[str, float]:
+    """Checkpoint-selection metric from a val summary: prefer the fused refine metric
+    (dice_fused@R, hard — not its _soft sibling), else cossim, else dice. Returns
+    (metric_key_without_'/mean', mean_value)."""
+    fused = next((k for k in summary
+                  if k.startswith("dice_fused@") and "soft" not in k and k.endswith("/mean")),
+                 None)
+    if fused is not None:
+        return fused[: -len("/mean")], summary[fused]
+    m = "cossim" if "cossim/mean" in summary else "dice"
+    return m, summary.get(f"{m}/mean", float("nan"))
 
 
 @hydra.main(config_path="../../configs/experiment/2d", config_name="universeg_train",
@@ -350,8 +385,7 @@ def main(cfg: DictConfig):
                 model, val_loader, topk_k=topk_k, epoch=epoch,
                 compute_flops=(epoch == 0),
                 ds_metric_res=cfg.eval.get("ds_metric_res", None))
-            metric = "cossim" if "cossim/mean" in summary else "dice"
-            mean_dice = summary.get(f"{metric}/mean", float("nan"))
+            metric, mean_dice = _select_metric(summary)
             log.update(summary)
             log["val/samples"] = sample_table
             ds_soft_key = next((k for k in summary
