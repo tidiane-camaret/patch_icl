@@ -1,5 +1,21 @@
 # Change log
 
+## 2026-07-10 — train: opt-in batch augmentation for the unified 2D trainer
+
+- **Batch augmentation is opt-in via `augment: true/false` config flag** (default off in
+  `train_base.yaml`). When enabled, the unified `experiments/2d/train.py` applies per-batch
+  augmentation via the existing `_augment_batch` helper during training, loading the
+  `configs/augmentations/<aug_preset>` preset and gating on `cfg.get("augment", False)`
+  in `train_epoch`. Only contexts are geometrically transformed; query (target) image is
+  never augmented (it receives intensity transforms only via the `task`/`aug_preset` knobs).
+  The default `augment: false` preserves all existing run behavior; `augment: true` opts in.
+- Config changes: `train_base.yaml` now defines `augment: false` as a top-level key
+  (sibling to `arch:/train:/eval:`) with a clarified comment; `2_omnisynth_medseg_refine.yaml`
+  adds `augment: true` to enable batch aug for that experiment.
+- Tests: two new config-level tests in `tests/test_train_augment.py`:
+  `test_train_base_augment_defaults_false` (checks default is off) and
+  `test_omnisynth_refine_opts_in` (checks omniSynth refine experiment is on).
+
 ## 2026-07-10 — refine: `arch.refine_memory` flag (cross-level memory token)
 
 - **Opt-in cross-level memory for the refine pass: `arch.refine_memory` (default off).** When enabled

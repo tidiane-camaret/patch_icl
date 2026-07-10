@@ -71,3 +71,13 @@ def test_augmented_batch_trains_one_step():
     loss = out["final_logit"].mean() + out["refine_logit"].mean()
     loss.backward()
     assert torch.isfinite(loss)
+
+
+def test_train_base_augment_defaults_false():
+    c = OmegaConf.load("configs/experiment/2d/train_base.yaml")
+    assert c.get("augment", False) is False
+
+
+def test_omnisynth_refine_opts_in():
+    c = OmegaConf.load("configs/experiment/2d/2_omnisynth_medseg_refine.yaml")
+    assert c.get("augment", False) is True

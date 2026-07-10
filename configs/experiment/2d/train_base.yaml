@@ -51,7 +51,9 @@ wandb:
   name: null          # null = auto-generated
   enabled: true
 
-# Augmentation params live in the single shared file configs/augmentations/<preset>.yaml
-# (2D schema: enabled/geometric/intensity). Loaded into cfg.aug in main().
-# Override a field at the CLI with the +-prefix, e.g. +aug.enabled=false.
+# Augmentation is opt-in in the unified train.py: set `augment: true` to load the
+# configs/augmentations/<aug_preset>.yaml preset (2D schema: enabled/geometric/intensity)
+# into cfg.aug in main() and apply it per-batch in training. Default false keeps runs
+# un-augmented. Override a preset field at the CLI with the +-prefix, e.g. +aug.geometric.rotate.p=0.
+augment: false
 aug_preset: 2d
