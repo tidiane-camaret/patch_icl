@@ -50,10 +50,11 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+_ROOT = str(Path(__file__).resolve().parents[2])   # experiments/2d/train.py -> repo root
 from common import DEVICE, build_dataset, make_loader
 from evaluate import validate, _target_like, _upsample_to, _as_res_list, refine_geometry
 from src.models.bbox_refine import crop_resize
-from pfn_train import Muon, lawa_average, soft_dice_loss
+from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 
 def _autocast():
@@ -148,6 +149,19 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
     raise ValueError(f"unknown model {name!r} (universeg | patchset_cnn)")
 
 
+def _augment_batch(img, cin, cout, aug_cfg):
+    """Augment context pairs + query intensity via pfn_train.augment.
+
+    img (B,1,H,W); cin/cout (B,K,1,H,W). Returns (img, cin, cout). The query GT (lbl)
+    is never passed in, so it stays valid: augment() geometrically transforms contexts
+    only; the query (index K) receives at most intensity/task ops."""
+    K = cin.shape[1]
+    imgs = torch.cat([cin, img.unsqueeze(1)], dim=1)              # (B,T,1,H,W), query at index K
+    msks = torch.cat([cout, torch.zeros_like(img.unsqueeze(1))], dim=1)
+    imgs, msks = augment(imgs, msks, K, aug_cfg)
+    return imgs[:, K], imgs[:, :K], msks[:, :K]                   # img, cin, cout
+
+
 def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float, float, float, float, float, dict, int | None]:
     model.train()
     total, n = 0.0, 0
@@ -169,6 +183,8 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
         lbl = batch["label"].to(DEVICE, non_blocking=True).float()
         cin = batch["context_in"].to(DEVICE, non_blocking=True)   # (B,K,1,H,W)
         cout = batch["context_out"].to(DEVICE, non_blocking=True)
+        if cfg.get("augment", False) and cfg.aug.get("enabled", True):
+            img, cin, cout = _augment_batch(img, cin, cout, cfg.aug)
 
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -285,6 +301,14 @@ def main(cfg: DictConfig):
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
+
+    # Augmentation is opt-in: only when a config sets `augment: true` do we load the
+    # configs/augmentations/<aug_preset>.yaml preset into cfg.aug (mirrors pfn_seg.py).
+    # Default off keeps every existing train.py run byte-identical.
+    if cfg.get("augment", False):
+        _aug = OmegaConf.load(Path(_ROOT) / "configs" / "augmentations" / f"{cfg.aug_preset}.yaml")
+        cfg.aug = OmegaConf.merge(_aug, cfg.aug) if cfg.get("aug", None) else _aug
+        print(f"Augmentation ON (preset={cfg.aug_preset}, enabled={cfg.aug.get('enabled', True)})")
 
     train_loader = make_loader(build_dataset(cfg, "train"), cfg, "train", shuffle=True)
     val_loader = make_loader(build_dataset(cfg, "val"), cfg, "val", shuffle=False)
