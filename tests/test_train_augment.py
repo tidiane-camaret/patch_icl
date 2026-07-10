@@ -75,7 +75,7 @@ def test_augmented_batch_trains_one_step():
 
 def test_train_base_augment_defaults_false():
     c = OmegaConf.load("configs/experiment/2d/train_base.yaml")
-    assert c.get("augment", False) is False
+    assert "augment" in c and c.augment is False   # explicitly declared, not just default
 
 
 def test_omnisynth_refine_opts_in():
