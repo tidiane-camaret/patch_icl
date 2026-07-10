@@ -4,10 +4,10 @@ import torch
 from src.models.patchset_cnn import PatchSetCNN
 
 
-def _model(resolutions, H=32):
+def _model(resolutions, H=32, refine_mode="reencode"):
     torch.manual_seed(0)
     return PatchSetCNN(image_size=H, resolution=resolutions[0], enc_dims=[16], e=32, h=64,
-                       l=1, a=2, thinking_rows=1, resolutions=resolutions)
+                       l=1, a=2, thinking_rows=1, resolutions=resolutions, refine_mode=refine_mode)
 
 
 def _batch(B=2, K=2, H=32):
@@ -72,3 +72,44 @@ def test_single_level_has_no_ctx_origin():
     m = _model([8])
     img, cin, cout = _batch(H=32)
     assert "refine_ctx_origin" not in m(img, context_in=cin, context_out=cout)
+
+
+# ── encode_once refine mode ────────────────────────────────────────────────
+
+def test_default_refine_mode_is_reencode():
+    assert _model([8, 16]).refine_mode == "reencode"
+
+
+def test_invalid_refine_mode_rejected():
+    with pytest.raises(AssertionError):
+        _model([8, 16], refine_mode="bogus")
+
+
+def test_encode_once_same_heads_and_shapes():
+    m = _model([8, 16], refine_mode="encode_once")
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["final_logit"].shape == (2, 1, 8, 8)     # coarse, T=8
+    assert out["refine_logit"].shape == (2, 1, 8, 8)    # refine, same T
+    assert out["refine_origin"].shape == (2, 2)
+    assert out["refine_ctx_origin"].shape == (2, 2, 2)
+    assert out["refine_crop"] == 16
+    assert out["resolutions"] == [8, 16]
+
+
+def test_encode_once_coarse_matches_single_pass():
+    # The coarse head is a full-image _segment, so it must equal the plain single-level model.
+    m = _model([8, 16], refine_mode="encode_once")
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    assert torch.allclose(out["final_logit"], m._segment(img, cin, cout), atol=1e-5)
+
+
+def test_encode_once_grad_reaches_shared_weights_from_both_heads():
+    m = _model([8, 16], refine_mode="encode_once")
+    img, cin, cout = _batch()
+    out = m(img, context_in=cin, context_out=cout)
+    (out["final_logit"].mean() + out["refine_logit"].mean()).backward()
+    assert m.decoder[0].weight.grad is not None
+    # encoder runs ONCE but the refine crop (grid_sample) is differentiable → grad still flows.
+    assert m.encoder.stem[0].weight.grad is not None

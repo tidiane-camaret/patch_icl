@@ -1,5 +1,53 @@
 # Change log
 
+## 2026-07-10 — train: fix compile flag namespace mismatch (`train.compile` → `arch.compile`)
+
+- The compile knob was **still dead**: the config defines it at `arch.compile` (`train_base.yaml:23`)
+  but `train.py` read `cfg.train.get("compile", False)` — a key that exists nowhere, so it always
+  resolved `False` and the model ran eager regardless of `arch.compile=true`. `pfn_seg.py:327` reads
+  the correct `cfg.arch.compile`; `train.py` had drifted. Now reads `cfg.arch.get("compile", False)`.
+- Also ported two things from `pfn_seg.py`: (1) compile Muon's `_newtonschulz5_batched` (pure tensor
+  ops) alongside `model.transformer`, and (2) the node-local triton/inductor cache guard
+  (`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` on `/tmp` keyed by hostname) to avoid the NFS GLIBC
+  cache-poisoning issue. Scope is unchanged: only `model.transformer` + Newton–Schulz compile; the
+  encoder/bbox crop/pool stay eager (graph-break).
+
+## 2026-07-10 — train: wire the (previously dead) `train.compile` flag for patchset_cnn
+
+- `experiments/2d/train.py` defined `train.compile` (via `train_base.yaml`) but never read it — the
+  model always ran eager. Now, when `train.compile` is set, it compiles **only** `model.transformer`
+  (`torch.compile(..., dynamic=True)`), mirroring `multilevel/train.py` which compiles just its
+  trainable PatchSetPFNs. The transformer is pure tensor ops so it graph-compiles cleanly; the
+  encoder + bbox crop/pool (`grid_sample`, `adaptive_avg_pool2d` with data-dependent windows) stay
+  eager (they graph-break). UniverSeg has no `.transformer` so it is untouched (`hasattr` guard).
+- Checkpoint reload made robust to the mid-key `_orig_mod.` prefix that submodule-compile leaves
+  (`transformer._orig_mod.…`): warm-start (`train.py`) and `eval_incontext.py` now strip with
+  `.replace("_orig_mod.", "")` instead of `removeprefix` (leading-only). Verified the stripped keys
+  strict-load into a fresh model and the Muon `"transformer" in n` filter still selects the 2D
+  matrices post-compile. (Local `torch.compile` couldn't be exercised — broken `torch._inductor`
+  import in this env; runs on the GPU cluster where multilevel already compiles.)
+
+## 2026-07-10 — refine: `arch.refine_mode` flag (reencode | encode_once)
+
+- **New prototype for the 2-level refine pass, behind `arch.refine_mode`** (`patchset_cnn.py`,
+  default `reencode` = unchanged behavior):
+  - `reencode` (old): re-run the whole model (encoder + attention) on the upsampled crop — every
+    stage recomputed at the finer scale. 2× encoder passes.
+  - `encode_once` (new, à la `experiments/2d/multilevel/zoom_pipeline`): encode all K+1 images
+    ONCE into native multi-scale maps, then run the attention half twice — on the full pooled
+    features (coarse) and on the SAME maps cropped to each bbox and pooled back to the T grid
+    (refine). ~half the encoder compute; grid_sample crop is differentiable so grad still reaches
+    the encoder from the refine loss. Tradeoff: the refine pass reuses stem/shallow detail but
+    does NOT recompute deep-stage semantics at the crop scale.
+- Refactor enabling this: `ConvEncoder.forward` split into `encode_maps` (native multi-scale list)
+  + `pool_maps`; `_segment` split into `_grid_tokens`/`_occupancy` feature build + a shared `_attn`
+  (encoder-independent attention half, now reused by the single-level model and both refine passes);
+  bbox selection factored into `_select_bbox`. New `bbox_refine.crop_pool_maps` crops native maps
+  (origin/s rescaled per map resolution) and pools to the token grid.
+- Verified: coarse head identical across modes; encoder stem runs 2× (reencode) vs 1× (encode_once)
+  on B·T images; grad reaches encoder+decoder from both heads. Tests in
+  `tests/test_patchset_cnn_refine.py` (12 passed). Wire via `arch.refine_mode` in the experiment cfg.
+
 ## 2026-07-10 — metrics: tag cossim/top-k with the token grid; resolution-tagged sample table
 
 - **`cossim` and `top{k}` now carry their resolution**: logged as `cossim@{T}` / `top{k}@{T}`

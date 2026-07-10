@@ -28,7 +28,8 @@ def _load_model(ckpt: dict):
     """Rebuild the trained model from a train.py checkpoint (dispatch on model_name)."""
     name = ckpt.get("model_name")
     img = ckpt["image_size"]
-    state = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()}
+    # `replace` (not `removeprefix`): compiling model.transformer leaves `_orig_mod.` mid-key.
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
     if name == "universeg":
         from src.models.universeg_baseline import UniverSegBaseline
         model = UniverSegBaseline(pretrained=True, input_size=img).to(DEVICE)

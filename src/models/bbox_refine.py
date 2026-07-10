@@ -59,6 +59,23 @@ def crop_resize(x, origin, s, out, mode="bilinear"):
     return F.grid_sample(x, grid, mode=mode, align_corners=False, padding_mode="border")
 
 
+def crop_pool_maps(maps, origin, s, out, frame):
+    """Encode-once refine: crop each native multi-scale feature map to the s×s bbox and pool
+    to out×out, then concat over channels → (N, sum(C_i), out, out).
+
+    `origin` (N,2) and `s` are given in the `frame` (full-image) pixel frame; each map lives at
+    its own native resolution, so both are rescaled by (map_res / frame) before cropping. Cropping
+    the un-pooled maps (esp. the full-res stem) lets a small bbox resolve real detail — pooling
+    first would cap the effective resolution at the token grid. grid_sample is differentiable, so
+    gradient still reaches the encoder from the refine pass."""
+    feats = []
+    for m in maps:
+        m = m.float()
+        scale = m.shape[-1] / frame
+        feats.append(crop_resize(m, origin * scale, s * scale, out, mode="bilinear"))
+    return torch.cat(feats, dim=1)
+
+
 def fuse_window(full, patch, origin, s):
     """Return a clone of full (B,1,H,W) with patch (B,1,s,s) ADDED into the s×s window at
     each origin (B,2). Additive (logit-space) fusion; input not mutated. Per-sample loop

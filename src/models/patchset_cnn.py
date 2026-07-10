@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
-from src.models.bbox_refine import crop_resize, gt_window, max_sum_window
+from src.models.bbox_refine import crop_pool_maps, crop_resize, gt_window, max_sum_window
 
 
 class ConvEncoder(nn.Module):
@@ -83,14 +83,22 @@ class ConvEncoder(nn.Module):
             return F.interpolate(f, size=(R, R), mode="area")
         return F.interpolate(f, size=(R, R), mode="bilinear", align_corners=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        R = self.resolution
+    def encode_maps(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """(B,in,H,W) → list of native-resolution multi-scale maps [stem@H, stage1@H/2, …].
+
+        Left un-pooled so a caller can crop them to a bbox and pool to a FINER effective grid
+        (the encode-once refine path) instead of re-running the conv stack per scale."""
         feats = [self.stem(x)]                         # full-res stem features
         for stage in self.stages:
             feats.append(stage(feats[-1]))             # successively downsampled stages
-        # Resample every scale to the token grid R×R and concat along channels.
-        feats = [self._resample(f, R) for f in feats]
-        return torch.cat(feats, dim=1)                 # (B, sum(dims), R, R)
+        return feats
+
+    def pool_maps(self, feats: list[torch.Tensor], R: int) -> torch.Tensor:
+        """Resample every scale to R×R and concat along channels → (B, sum(dims), R, R)."""
+        return torch.cat([self._resample(f, R) for f in feats], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pool_maps(self.encode_maps(x), self.resolution)
 
 
 class PatchSetCNN(nn.Module):
@@ -110,9 +118,19 @@ class PatchSetCNN(nn.Module):
         context_id_embed: bool = False,
         max_context: int = 16,
         resolutions: list[int] | None = None,
+        refine_mode: str = "reencode",
     ):
         super().__init__()
         self.image_size = image_size
+        # Two-level refine strategies (ignored when single-level):
+        #   "reencode"    — re-run the whole model (encoder + attention) on the upsampled crop;
+        #                   every stage is recomputed at the finer scale. 2× encoder passes.
+        #   "encode_once" — encode all K+1 images ONCE, run the attention half twice: on the full
+        #                   pooled features (coarse) and on the SAME maps cropped to each bbox and
+        #                   pooled back (refine). ~half the encoder compute; refine reuses stem/
+        #                   shallow detail but does NOT recompute deep-stage semantics at the crop.
+        assert refine_mode in ("reencode", "encode_once"), f"bad refine_mode {refine_mode!r}"
+        self.refine_mode = refine_mode
         # `resolutions` = effective full-image resolutions per level (level 0 = coarse over the
         # full image). The token grid T is constant across levels and equals resolutions[0]; each
         # further level k crops the image to c_k = image_size*resolutions[0]/resolutions[k] px so
@@ -169,28 +187,40 @@ class PatchSetCNN(nn.Module):
         msk = self.mask_embed(occ) + p
         return torch.stack([img, msk], dim=2)
 
+    def _grid_tokens(self, feat_map, B, T, K):
+        """(B*T,Cf,R,R) pooled feature map → (sup_feat (B,K·N,Cf), qry_feat (B,N,Cf)), row-major
+        cells, image-major support order (context images first, target last)."""
+        Cf = feat_map.shape[1]
+        feat = feat_map.flatten(2).transpose(1, 2).reshape(B, T, self.N, Cf)  # (B,T,N,Cf)
+        return (feat[:, :K].reshape(B, K * self.N, Cf),                       # (B,S,Cf)  S=K·N
+                feat[:, K:].reshape(B, self.N, Cf))                           # (B,Q,Cf)  Q=N
+
+    def _occupancy(self, context_out):
+        """context_out (B,K,1,H,W) → support occupancy (B,K·N,1): avg-pool each mask to the
+        token grid R×R, image-major. Query prior (= support-mean) is derived inside _attn."""
+        B, K = context_out.shape[0], context_out.shape[1]
+        H, W = context_out.shape[-2:]
+        occ = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W), (self.resolution,) * 2)
+        return occ.reshape(B, K * self.N, 1)
+
     def _segment(self, image, context_in, context_out):
         """Coarse single-pass segmentation → (B,1,R,R) logits.
 
         image (B,1,H,W); context_in/out (B,K,1,H,W). Support = all K·N context patches
         (known mask occupancy); query = the N target patches (mask = support-mean prior)."""
         B, K = context_in.shape[0], context_in.shape[1]
-        R, N = self.resolution, self.N
         H, W = image.shape[-2:]
-
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)          # (B,T,1,H,W)
         T = imgs.shape[1]
+        feat_map = self.encoder(imgs.reshape(B * T, 1, H, W))              # (B*T,Cf,R,R) pooled
+        sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
+        return self._attn(sup_feat, qry_feat, self._occupancy(context_out), K)
 
-        # ── encode all images → per-patch features (B,T,N,Cf) ───────────────────
-        feat = self.encoder(imgs.reshape(B * T, 1, H, W))                  # (B*T,Cf,R,R)
-        Cf = feat.shape[1]
-        feat = feat.flatten(2).transpose(1, 2).reshape(B, T, N, Cf)        # (B,T,N,Cf)
-        sup_feat = feat[:, :K].reshape(B, K * N, Cf)                       # (B,S,Cf)  S=K·N
-        qry_feat = feat[:, K:].reshape(B, N, Cf)                           # (B,Q,Cf)  Q=N
-
-        # ── support mask occupancy; query prior = support-mean ──────────────────
-        occ = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W), (R, R))
-        sup_occ = occ.reshape(B, K * N, 1)                                # (B,S,1)
+    def _attn(self, sup_feat, qry_feat, sup_occ, K):
+        """Set-of-patches attention half (encoder-independent) → (B,1,R,R) logits. Shared by the
+        single-level model and by both coarse+refine passes. sup_feat (B,K·N,Cf), qry_feat
+        (B,N,Cf), sup_occ (B,K·N,1); query mask prior = support-mean occupancy."""
+        B, R, N = sup_feat.shape[0], self.resolution, self.N
         qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, 1)        # (B,Q,1) prior
 
         # ── per-channel standardize features by SUPPORT-patch stats ─────────────
@@ -237,20 +267,34 @@ class PatchSetCNN(nn.Module):
         logit = self.decoder(q).squeeze(-1).reshape(B, 1, R, R)
         return logit                                                      # (B,1,R,R)
 
+    def _select_bbox(self, coarse, context_out, c):
+        """coarse logits (B,1,T,T) → (tgt_o (B,2), ctx_o (B,K,2)) top-left px crop origins in the
+        image frame: target on its densest PREDICTED mass (detached — selection only, no grad),
+        each context on its densest GT. Shared by both refine modes."""
+        K = context_out.shape[1]
+        H, W = context_out.shape[-2:]
+        prob_up = F.interpolate(torch.sigmoid(coarse).detach(), size=(H, W),
+                                mode="bilinear", align_corners=False)
+        tgt_o = max_sum_window(prob_up, c)                               # (B,2) px origin
+        ctx_o = torch.stack([gt_window(context_out[:, k], c) for k in range(K)], dim=1)  # (B,K,2)
+        return tgt_o, ctx_o
+
     def _refine_forward(self, image, context_in, context_out):
+        if self.refine_mode == "encode_once":
+            return self._refine_encode_once(image, context_in, context_out)
+        return self._refine_reencode(image, context_in, context_out)
+
+    def _refine_reencode(self, image, context_in, context_out):
         """Coarse pass over the full image + one bbox-zoom refine pass (SAME weights) → per-level
         heads. Crop the target on its densest predicted region and each context on its densest GT,
-        resize crops to the encoder input, re-segment at the same T-token grid. No fusion — levels
-        are supervised/metricked separately (the fused stitch is a metric only, built elsewhere)."""
+        resize crops to the encoder input, re-segment at the same T-token grid (2× encoder passes).
+        No fusion — levels are supervised/metricked separately (the fused stitch is a metric only)."""
         B, K = context_in.shape[0], context_in.shape[1]
         H, W = image.shape[-2:]
         c = self.refine_crops[0]                                          # derived crop (px)
 
         coarse = self._segment(image, context_in, context_out)           # (B,1,T,T)
-        prob_up = F.interpolate(torch.sigmoid(coarse).detach(), size=(H, W),
-                                mode="bilinear", align_corners=False)     # bbox selection only
-        tgt_o = max_sum_window(prob_up, c)                               # (B,2) px origin
-        ctx_o = torch.stack([gt_window(context_out[:, k], c) for k in range(K)], dim=1)  # (B,K,2)
+        tgt_o, ctx_o = self._select_bbox(coarse, context_out, c)
 
         tgt_img = crop_resize(image, tgt_o, c, H, mode="bilinear")       # (B,1,H,W)
         ctx_img = crop_resize(context_in.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
@@ -259,6 +303,36 @@ class PatchSetCNN(nn.Module):
                               c, H, mode="nearest").reshape(B, K, 1, H, W)
 
         refine = self._segment(tgt_img, ctx_img, ctx_msk)                # (B,1,T,T), same weights
+        return {"final_logit": coarse, "refine_logit": refine,
+                "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
+                "refine_crop": c, "resolutions": self.resolutions}
+
+    def _refine_encode_once(self, image, context_in, context_out):
+        """Encode all K+1 images ONCE (native multi-scale maps), then run the attention half twice:
+        on the full-image pooled features (coarse) and on the SAME maps cropped to each bbox and
+        pooled back to the T grid (refine). ~half the encoder passes of _refine_reencode; the refine
+        pass reuses stem/shallow detail but does NOT recompute deep-stage semantics at the crop."""
+        B, K = context_in.shape[0], context_in.shape[1]
+        R = self.resolution
+        H, W = image.shape[-2:]
+        c = self.refine_crops[0]                                          # derived crop (px)
+        imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)         # (B,T,1,H,W)
+        T = imgs.shape[1]
+
+        maps = self.encoder.encode_maps(imgs.reshape(B * T, 1, H, W))     # native multi-scale, ONCE
+
+        # ── coarse: pool the full maps to the token grid ────────────────────────
+        sup_c, qry_c = self._grid_tokens(self.encoder.pool_maps(maps, R), B, T, K)
+        coarse = self._attn(sup_c, qry_c, self._occupancy(context_out), K)   # (B,1,T,T)
+
+        # ── bbox selection, then crop the SAME maps (image-major: contexts, then target) ──
+        tgt_o, ctx_o = self._select_bbox(coarse, context_out, c)
+        origins = torch.cat([ctx_o, tgt_o.unsqueeze(1)], dim=1).reshape(B * T, 2)  # (B*T,2)
+        refine_feat = crop_pool_maps(maps, origins, c, R, H)             # (B*T,Cf,R,R)
+        sup_r, qry_r = self._grid_tokens(refine_feat, B, T, K)
+        ctx_msk = crop_resize(context_out.reshape(B * K, 1, H, W), ctx_o.reshape(B * K, 2),
+                              c, H, mode="nearest").reshape(B, K, 1, H, W)
+        refine = self._attn(sup_r, qry_r, self._occupancy(ctx_msk), K)   # (B,1,T,T), same weights
         return {"final_logit": coarse, "refine_logit": refine,
                 "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
                 "refine_crop": c, "resolutions": self.resolutions}

@@ -10,6 +10,7 @@ defaults:
 
 arch:
   resolutions: [32, 64]      # effective full-image resolutions; T=32 tokens/level, crop=64px derived
+  refine_mode: reencode      # reencode: re-run encoder on the crop | encode_once: encode once, attend twice
 
 train:
   refine_loss_weight: 1.0    # weight of the refine-level loss relative to the coarse loss

@@ -25,10 +25,21 @@ Usage:
 import collections
 import datetime
 import math
+import os
 import random
+import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+# Node-local compile caches: ~/.triton and ~/.cache live on shared NFS, so a
+# cuda_utils.so compiled on a node with a newer GLIBC poisons the cache for
+# nodes with an older GLIBC ("GLIBC_2.34 not found"). Key the cache by hostname
+# on local /tmp so each node compiles its own artifacts. Must be set before torch.
+_cache_root = os.path.join(tempfile.gettempdir(), f"{os.environ.get('USER', 'user')}_compile_{socket.gethostname()}")
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "inductor"))
 
 import hydra
 import numpy as np
@@ -129,6 +140,7 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "context_id_embed": a.get("context_id_embed", False),
             "max_context": a.get("max_context", 16),
             "resolutions": list(a.resolutions) if a.get("resolutions", None) is not None else None,
+            "refine_mode": a.get("refine_mode", "reencode"),
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}
@@ -285,7 +297,9 @@ def main(cfg: DictConfig):
     if cfg.train.get("checkpoint", None):
         raw = torch.load(cfg.train.checkpoint, map_location="cpu", weights_only=False)
         sd = raw["model"] if isinstance(raw, dict) and "model" in raw else raw
-        sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+        # `replace` (not `removeprefix`): compiling a submodule (model.transformer) leaves the
+        # `_orig_mod.` prefix MID-key (transformer._orig_mod.…), not just leading.
+        sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         model_sd = model.state_dict()
         compatible = {k: v for k, v in sd.items()
                       if k in model_sd and v.shape == model_sd[k].shape}
@@ -302,6 +316,19 @@ def main(cfg: DictConfig):
     model = model.to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params/1e6:.2f}M")
+
+    # Compile only the transformer submodule (like multilevel/train.py compiles its trainable
+    # PatchSetPFNs): it is pure tensor ops so it graph-compiles cleanly, whereas the encoder's
+    # crop/pool/grid_sample (adaptive_avg_pool2d with data-dependent windows) would graph-break.
+    # The encoder still runs eager. UniverSeg has no `.transformer`, so it is left untouched.
+    if cfg.arch.get("compile", False) and hasattr(model, "transformer"):
+        model.transformer = torch.compile(model.transformer, dynamic=True)
+        # Muon's Newton–Schulz orthogonalization is pure tensor ops → compile it too
+        # (cf. pfn_seg.py); the encoder's crop/pool/grid_sample stays eager.
+        import pfn_train
+        pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
+        print("Compiled model.transformer + Newton–Schulz (dynamic=True); "
+              "encoder + bbox crop/pool run eager")
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     # patchset_cnn trains with Muon on its transformer 2D weight matrices (Newton-
