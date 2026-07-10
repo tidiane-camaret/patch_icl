@@ -21,6 +21,7 @@ arch:
   thinking_rows: 8
   residual_decay: 0.95
   compile: true        # torch.compile (slow first batch; graph-breaks at the frozen encoder)
+  refine_memory: false   # refine pass attends to detached coarse thinking rows (multi-res only)
 
 train:
   epochs: 200

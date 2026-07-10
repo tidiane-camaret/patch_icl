@@ -141,6 +141,7 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "max_context": a.get("max_context", 16),
             "resolutions": list(a.resolutions) if a.get("resolutions", None) is not None else None,
             "refine_mode": a.get("refine_mode", "reencode"),
+            "refine_memory": a.get("refine_memory", False),
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}

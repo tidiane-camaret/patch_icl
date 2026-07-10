@@ -185,3 +185,23 @@ def test_memory_is_detached(mode):
     mems = [x for x in seen if x is not None]
     assert len(mems) == 1                      # exactly the refine pass carries memory
     assert mems[0].grad_fn is None and not mems[0].requires_grad
+
+
+# ── build_model checkpoint rebuild ────────────────────────────────────────
+
+def test_build_model_arch_dict_carries_refine_memory():
+    import sys as _sys
+    from pathlib import Path
+    _sys.path.insert(0, str(Path("experiments/2d").resolve()))
+    from omegaconf import OmegaConf
+    from train import build_model
+    cfg = OmegaConf.create({
+        "model": "patchset_cnn",
+        "data": {"image_size": 32},
+        "arch": {"resolution": 8, "enc_dims": [16], "e": 32, "h": 64, "l": 1, "a": 2,
+                 "thinking_rows": 1, "residual_decay": 0.95, "resolutions": [8, 16],
+                 "refine_memory": True},
+    })
+    model, name, meta = build_model(cfg)
+    assert meta["arch"]["refine_memory"] is True
+    assert model.refine_memory is True

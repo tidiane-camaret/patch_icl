@@ -1,5 +1,21 @@
 # Change log
 
+## 2026-07-10 — refine: `arch.refine_memory` flag (cross-level memory token)
+
+- **Opt-in cross-level memory for the refine pass: `arch.refine_memory` (default off).** When enabled
+  in multi-resolution mode, the refine pass prepends a learnable memory token (type-only adapter,
+  `mem_type`, no projection) to the sequence before attention. The memory attends to the detached
+  coarse pass's thinking rows (`mem_type` + coarse thinking, `.detach()`), allowing the refine
+  pass to selectively condition on coarse-level reasoning without backprop through the coarse
+  encoder. Mirrors `multilevel/`'s `stage1_think` design but with shared weights.
+- Wiring: `PatchSetCNN(..., refine_memory=...)` constructor (Task 1); `_attn(..., mem=...,
+  return_think=False)` dual-purpose signature (Task 2 — produces thinking for refine, consumes
+  memory token for coarse); config flag + checkpoint rebuild (Task 3 — `build_model` adds to
+  `arch` dict, `train_base.yaml` exposes `arch.refine_memory: false`). Single-level mode is inert
+  (constructor-only param, no refine forward).
+- Tests: round-trip checkpoint via `build_model`, wiring, gradient flow to `mem_type`, detach
+  verification. Both refine modes (`reencode`/`encode_once`) supported.
+
 ## 2026-07-10 — train: fix compile flag namespace mismatch (`train.compile` → `arch.compile`)
 
 - The compile knob was **still dead**: the config defines it at `arch.compile` (`train_base.yaml:23`)
