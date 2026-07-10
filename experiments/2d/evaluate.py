@@ -16,6 +16,7 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 from common import (DEVICE, hard_dice, soft_dice, cosine_sim, topk_overlap,
                     downsample_mask, log_summary)
@@ -84,6 +85,59 @@ def save_figure(
             _overlay_ax(axes[1, col], ctx_images[col], ctx_gts[col], f"Ctx {col} + GT")
         else:
             axes[1, col].axis("off")
+
+    fig.suptitle(title, fontsize=9)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _refine_overlay_ax(ax, image, title, *, gt=None, pred=None, pred_extent=None, boxes=()):
+    """Gray base + optional pred heat (Reds) + optional GT contour (lime) + bbox rectangles.
+    pred_extent stretches a coarse pred map over the crop; None = pixel-aligned to `image`."""
+    ax.imshow(image, cmap="gray", vmin=0, vmax=1)
+    if pred is not None:
+        ax.imshow(pred, cmap="Reds", alpha=0.45, vmin=0, vmax=1, extent=pred_extent)
+    if gt is not None and float(gt.max()) > 0:      # contour needs a level present
+        ax.contour(gt, levels=[0.5], colors="lime", linewidths=1.0)
+    for (r0, c0, s, color) in boxes:
+        ax.add_patch(Rectangle((c0 - 0.5, r0 - 0.5), s, s, fill=False, edgecolor=color, lw=1.5))
+    ax.set_title(title, fontsize=8)
+    ax.axis("off")
+
+
+def save_refine_figure(
+    tgt_image, tgt_gt, ctx_image, ctx_gt,          # full-frame (H,W)
+    coarse_pred, fused_pred,                       # target preds (H,W): res0, fused
+    refine_pred,                                   # target refine pred (T,T)
+    tgt_box, ctx_box,                              # (r0, c0, size) int px
+    out_path, title="",
+):
+    """2×3 refine panel. Row 0 = target, row 1 = first context; col 2 row 1 is empty.
+    Col 0: full frame + GT contour + (res0 pred / bbox). Col 1: bbox crop + GT contour +
+    (res1 pred on target). Col 2: full frame + GT contour + fused pred (target only)."""
+    tr0, tc0, tc = tgt_box
+    cr0, cc0, cc = ctx_box
+    tgt_crop     = tgt_image[tr0:tr0 + tc, tc0:tc0 + tc]
+    tgt_crop_gt  = tgt_gt[tr0:tr0 + tc, tc0:tc0 + tc]
+    ctx_crop     = ctx_image[cr0:cr0 + cc, cc0:cc0 + cc]
+    ctx_crop_gt  = ctx_gt[cr0:cr0 + cc, cc0:cc0 + cc]
+    # refine_pred is T×T over the tc×tc crop: stretch it across the crop's display extent
+    crop_extent  = (-0.5, tc - 0.5, tc - 0.5, -0.5)
+
+    fig, axes = plt.subplots(2, 3, figsize=(9.6, 6.5), squeeze=False)
+    fig.subplots_adjust(hspace=0.35, wspace=0.05)
+
+    _refine_overlay_ax(axes[0, 0], tgt_image, "Target + GT + res0 pred",
+                       gt=tgt_gt, pred=coarse_pred, boxes=[(tr0, tc0, tc, "yellow")])
+    _refine_overlay_ax(axes[1, 0], ctx_image, "Ctx0 + GT",
+                       gt=ctx_gt, boxes=[(cr0, cc0, cc, "cyan")])
+    _refine_overlay_ax(axes[0, 1], tgt_crop, "Target crop + GT + res1 pred",
+                       gt=tgt_crop_gt, pred=refine_pred, pred_extent=crop_extent)
+    _refine_overlay_ax(axes[1, 1], ctx_crop, "Ctx0 crop + GT", gt=ctx_crop_gt)
+    _refine_overlay_ax(axes[0, 2], tgt_image, "Target + GT + fused pred",
+                       gt=tgt_gt, pred=fused_pred)
+    axes[1, 2].axis("off")
 
     fig.suptitle(title, fontsize=9)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +389,23 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                     pred_lowres=low, gt_lowres=glow)
                 if figures.get("to_wandb"):
                     wandb.log({f"figures/{ds}/label_{lv}": wandb.Image(str(fig_path))})
+                if rg is not None:               # refine model: extra coarse→fine panel
+                    c_px = int(out["refine_crop"])
+                    fig_path_refine = Path(figures["out_dir"]) / f"{ds}_l{lv}_refine.png"
+                    tr0, tc0 = (int(v) for v in out["refine_origin"][b])
+                    cr0, cc0 = (int(v) for v in out["refine_ctx_origin"][b, 0])
+                    save_refine_figure(
+                        tgt_image=img[b, 0].cpu().numpy(), tgt_gt=lbl[b, 0].cpu().numpy(),
+                        ctx_image=cin[b, 0, 0].cpu().numpy(), ctx_gt=cout[b, 0, 0].cpu().numpy(),
+                        coarse_pred=prob_nat[b, 0].cpu().numpy(),
+                        fused_pred=rg["fused"][b, 0].cpu().numpy(),
+                        refine_pred=rg["refine_prob"][b, 0].cpu().numpy(),
+                        tgt_box=(tr0, tc0, c_px), ctx_box=(cr0, cc0, c_px),
+                        out_path=fig_path_refine,
+                        title=f"{ds} label={lv} sample={si} refine")
+                    if figures.get("to_wandb"):
+                        wandb.log({f"figures_refine/{ds}/label_{lv}":
+                                   wandb.Image(str(fig_path_refine))})
 
             # ── gated: per-low-res-patch CSV (only meaningful when not native) ──
             if patch_rows is not None and not native:

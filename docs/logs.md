@@ -1,5 +1,12 @@
 # Change log
 
+## 2026-07-10 — eval: coarse→fine refine qualitative figure (save_refine_figure)
+
+- **`save_refine_figure`** added to `experiments/2d/evaluate.py`: 2×3 PNG panel showing the coarse→fine refinement for a refine `PatchSetCNN` checkpoint. Row 0 = target, row 1 = first context. Col 0: full frame + GT contour + res0 (coarse) pred heatmap + bbox rectangle. Col 1: bbox crop + GT contour + res1 (refine) pred heatmap. Col 2: full frame + GT contour + fused (place_window stitch) pred. All overlaid with lime GT contours and yellow/cyan bbox rectangles.
+- **`_refine_overlay_ax`** helper: gray base + optional Reds heatmap (with optional extent for T×T→crop stretch) + optional lime GT contour + bbox `Rectangle` patches. `from matplotlib.patches import Rectangle` added to the imports.
+- **Wired into `validate()`**: inside the gated `if figures and fig_key not in saved` block, immediately after `save_figure`, a `if rg is not None` branch writes `{ds}_l{lv}_refine.png` alongside the standard `{ds}_l{lv}.png` panel; optionally logs to `figures_refine/{ds}/label_{lv}` in wandb. Controlled by the existing `eval.save_figures` / `eval.max_figures` gates. Plain checkpoints (`rg is None`) are unaffected.
+- **Verified**: unit tests (`tests/test_refine_figure.py`, 2 tests) pass; 1-epoch CPU smoke (omniSynth, bs=2, 8 samples, size=64) trains to `best.pt`, eval re-loads and emits `dice/mean=0.0308` + 4 `*_refine.png` panels in the eval out_dir alongside the standard `*.png` panels.
+
 ## 2026-07-10 — Config + docs: multi-resolution refine (arch.resolutions) wired end-to-end
 
 - **`PatchSetCNN` refine reworked to multi-resolution per-level** (`src/models/patchset_cnn.py`, `src/models/bbox_refine.py`): constructor arg is now `resolutions: list[int]` (effective full-image resolutions), replacing the old `refine: bool` / `refine_crop: int` flags. Token count is constant at T = `resolutions[0]`² tokens; the refine crop is derived as `image_size · R0 / Rk` (e.g. 128 · 32/64 = 64 px for `resolutions=[32,64]`). Per-level losses: coarse `@resolutions[0]` + one refine loss per additional level, weighted by `train.refine_loss_weight`. Old `refine`/`refine_crop` arch flags removed from `configs/experiment/2d/model/patchset_cnn.yaml`.
