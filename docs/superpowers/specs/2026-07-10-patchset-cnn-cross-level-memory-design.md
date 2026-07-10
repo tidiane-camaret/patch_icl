@@ -129,10 +129,16 @@ break (that lives in the eager encoder, outside `model.transformer`).
 2. **Shapes.** `refine_memory=True` forward runs for both `refine_mode`s;
    `final_logit` / `refine_logit` shapes unchanged.
 3. **Wiring is real.**
-   - `mem_type` receives a non-None gradient after a refine-loss backward.
-   - Perturbing the captured `coarse_think` changes `refine_logit` (refine
-     attends to memory) but leaves `final_logit` unchanged (detach: coarse pass
-     is independent of the memory).
+   - `mem_type` receives a non-None gradient after a refine-loss backward
+     (proves the refine pass actually routes through the memory rows).
+   - Perturbing the captured `coarse_think` before injection changes
+     `refine_logit` (refine attends to memory).
+   - **Detach:** the tensor passed as `mem` into the refine `_attn` has no grad
+     history (`grad_fn is None` / `requires_grad=False`), so refine-loss gradient
+     cannot flow back through the memory path into the coarse pass. (Note: coarse
+     and refine share weights, so the coarse *parameters* still receive gradient
+     from the refine loss via the refine pass's ordinary forward — detach only
+     cuts the memory-row path, which is what this asserts.)
 
 ## Out of scope
 
