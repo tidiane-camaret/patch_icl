@@ -27,13 +27,16 @@ dependencies = [
     "pytorch-lightning>=2.6.4",
     "tabulate>=0.10.0",
     "monai>=1.5.2",
+    "marimo>=0.23.14",
 ]
 
 # Pick exactly one of these at sync time:
-#   uv sync --extra cu124   # older Ampere/Hopper boxes
+#   uv sync --extra cu121   # Ampere w/ older driver (CUDA 12.3, e.g. thor RTX A6000)
+#   uv sync --extra cu124   # older Ampere/Hopper boxes (driver CUDA >=12.4, e.g. nero)
 #   uv sync --extra cu128   # Blackwell (sm_120, e.g. RTX PRO 6000)
 #   uv sync --extra cpu     # laptop / CI
 [project.optional-dependencies]
+cu121 = ["torch>=2.5.1", "torchvision>=0.20.0"]
 cu124 = ["torch>=2.5.1", "torchvision>=0.20.0"]
 cu128 = ["torch>=2.5.1", "torchvision>=0.20.0"]
 cpu   = ["torch>=2.5.1", "torchvision>=0.20.0"]
@@ -41,6 +44,7 @@ cpu   = ["torch>=2.5.1", "torchvision>=0.20.0"]
 [tool.uv]
 conflicts = [
     [
+        { extra = "cu121" },
         { extra = "cu124" },
         { extra = "cu128" },
         { extra = "cpu" },
@@ -49,15 +53,22 @@ conflicts = [
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cu121", extra = "cu121" },
     { index = "pytorch-cu124", extra = "cu124" },
     { index = "pytorch-cu128", extra = "cu128" },
     { index = "pytorch-cpu",   extra = "cpu"   },
 ]
 torchvision = [
+    { index = "pytorch-cu121", extra = "cu121" },
     { index = "pytorch-cu124", extra = "cu124" },
     { index = "pytorch-cu128", extra = "cu128" },
     { index = "pytorch-cpu",   extra = "cpu"   },
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

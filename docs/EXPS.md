@@ -3,7 +3,7 @@
 experiments/2d/train.py --config-name 2_omnisynth_medseg_refine model=patchset_cnn arch.l=2 train.batch_size=32 eval.batch_size=32
 - Q1 : arch.resolution = [32,64] , loss per level, no info exchange between level : does level 1 actually refines the pred ?
 - Q2 : behavior when encode once + crop features instead of encoding crop
-- Q2 : level 1 can attend to level 0 register : does it help the prediction ? 
+- Q2 : level 1 can attend to level 0 register : does it help the prediction ? R 
 - Q3 : single loss on fused level logits : see behavior
 - Q4 : attention all <-> all (no mask), sampling head for tgt and context, guided by final loss
 ## R : 

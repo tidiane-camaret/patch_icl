@@ -231,6 +231,8 @@ def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
       refine_target (B,1,T,T)  crop_resize(lbl, origin, c, T) — soft cropped GT
       fused_R/gt_R  (B,1,Rf,Rf) fused prob (coarse with refine placed in the crop) and GT,
                     both avg-pooled to Rf = resolutions[-1]
+      coarse_nat    (B,1,H,H)  coarse-only prob upsampled to native — the refine-off counterfactual
+      coarse_R      (B,1,Rf,Rf) coarse-only prob avg-pooled to Rf (compare vs fused_R at same res)
     """
     if "refine_logit" not in out:
         return None
@@ -250,7 +252,9 @@ def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
     return {"refine_prob": refine_prob, "refine_target": refine_target,
             "fused": fused,
             "fused_R": F.adaptive_avg_pool2d(fused, (Rf, Rf)),
-            "gt_R": F.adaptive_avg_pool2d(lbl, (Rf, Rf)), "Rf": Rf}
+            "gt_R": F.adaptive_avg_pool2d(lbl, (Rf, Rf)), "Rf": Rf,
+            "coarse_nat": coarse_up,                                   # refine-off counterfactual @native
+            "coarse_R": F.adaptive_avg_pool2d(coarse_up, (Rf, Rf))}    # coarse-only @Rf (vs fused_R)
 
 
 @torch.no_grad()
@@ -268,6 +272,8 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
     ref_s_ds, ref_s_lab = defaultdict(list), defaultdict(list)   # refine soft
     fus_h_ds, fus_h_lab = defaultdict(list), defaultdict(list)   # fused hard dice_fused@Rf
     fus_s_ds, fus_s_lab = defaultdict(list), defaultdict(list)   # fused soft
+    coh_ds, coh_lab = defaultdict(list), defaultdict(list)       # coarse-only hard dice_coarse@native
+    coR_ds, coR_lab = defaultdict(list), defaultdict(list)       # coarse-only hard dice_coarse@Rf
     fused_res = None                                             # resolutions[-1] when refine
     # Optional fixed-resolution hard/soft Dice on avg-pooled GT vs avg-pooled pred. This is
     # ONLY for a native-res model (UniverSeg): pooling its native prediction to R×R gives a
@@ -377,11 +383,17 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 rds = soft_dice(rg["refine_prob"][b, 0], rg["refine_target"][b, 0])
                 fdh = hard_dice(rg["fused_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float())
                 fds = soft_dice(rg["fused_R"][b, 0], rg["gt_R"][b, 0])
+                # Coarse-only counterfactual (refine off): coarse pred at native + at Rf. Directly
+                # comparable to `h` (fused native) and `fdh` (fused@Rf) → the exact refine delta.
+                coh = hard_dice(rg["coarse_nat"][b, 0], lbl[b, 0])
+                coR = hard_dice(rg["coarse_R"][b, 0], (rg["gt_R"][b, 0] >= 0.5).float())
                 ref_h_ds[ds].append(rdh); ref_h_lab[key].append(rdh)
                 ref_s_ds[ds].append(rds); ref_s_lab[key].append(rds)
                 fus_h_ds[ds].append(fdh); fus_h_lab[key].append(fdh)
                 fus_s_ds[ds].append(fds); fus_s_lab[key].append(fds)
-                refine_row = [rdh, rds, fdh]              # dice@Rf, dice_soft@Rf, dice_fused@Rf
+                coh_ds[ds].append(coh); coh_lab[key].append(coh)
+                coR_ds[ds].append(coR); coR_lab[key].append(coR)
+                refine_row = [rdh, rds, fdh, coR, coh]    # dice@Rf, dice_soft@Rf, dice_fused@Rf, dice_coarse@Rf, dice_coarse
 
             # Lazy, resolution-tagged sample table. Columns depend on the model (constant per
             # run): dice always; dice_ds@{T}/dice_ds_soft@{T} for non-native (coarse grid T);
@@ -391,7 +403,8 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 if low_res is not None:
                     cols += [f"dice_ds@{low_res}", f"dice_ds_soft@{low_res}"]
                 if fused_res is not None:
-                    cols += [f"dice@{fused_res}", f"dice_soft@{fused_res}", f"dice_fused@{fused_res}"]
+                    cols += [f"dice@{fused_res}", f"dice_soft@{fused_res}", f"dice_fused@{fused_res}",
+                             f"dice_coarse@{fused_res}", "dice_coarse"]
                 cols.append("detail")
                 table = wandb.Table(columns=cols)
             detail = _sample_detail(metas[b]) if metas is not None else ""
@@ -498,6 +511,11 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                                    metric_label=f"fused@{fused_res}", per_group=per_group))
         summary.update(log_summary(fus_s_ds, fus_s_lab, prefix=f"dice_fused_soft@{fused_res}",
                                    metric_label=f"fused soft@{fused_res}", per_group=per_group))
+        # Coarse-only (refine off) at the same resolutions: refine delta = fused − coarse.
+        summary.update(log_summary(coR_ds, coR_lab, prefix=f"dice_coarse@{fused_res}",
+                                   metric_label=f"coarse@{fused_res}", per_group=per_group))
+        summary.update(log_summary(coh_ds, coh_lab, prefix="dice_coarse",
+                                   metric_label="coarse@native", per_group=per_group))
 
     if patch_rows:
         p = Path(patch_csv); p.parent.mkdir(parents=True, exist_ok=True)

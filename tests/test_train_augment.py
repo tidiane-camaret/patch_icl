@@ -1,9 +1,13 @@
 import sys; sys.path.insert(0, ".")
 sys.path.insert(0, "experiments/2d")
 import torch
-from omegaconf import OmegaConf
+from pathlib import Path
+from omegaconf import OmegaConf, open_dict
 from train import _augment_batch
 from src.models.patchset_cnn import PatchSetCNN
+
+
+ROOT = Path("configs/experiment/2d")
 
 
 def _geom_only_cfg():
@@ -74,8 +78,16 @@ def test_augmented_batch_trains_one_step():
 
 
 def test_train_base_augment_defaults_false():
-    c = OmegaConf.load("configs/experiment/2d/train_base.yaml")
+    c = OmegaConf.load(ROOT / "train_base.yaml")
     assert "augment" in c and c.augment is False   # explicitly declared, not just default
+
+
+def test_structured_cfg_accepts_loaded_aug_block():
+    c = OmegaConf.load(ROOT / "train_base.yaml")
+    aug = OmegaConf.load("configs/augmentations/2d.yaml")
+    with open_dict(c):
+        c.aug = aug
+    assert c.aug.enabled is True
 
 
 def test_omnisynth_refine_opts_in():

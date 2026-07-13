@@ -1,81 +1,103 @@
 """Render a few omniSynth items (query image+mask + contexts) to a PNG for eyeballing.
 
-Pulls every generator param from the omniglot config (default
-configs/experiment/2d/synth/omniglot.yaml) so the preview matches what training
-sees. Copies are train-only, so --split defaults to train to make p_copy/n_copy
-visible; each row is annotated with is_copy / copy_slot.
+Hydra-driven, exactly like experiments/2d/train.py: pass an experiment `--config-name`
+and the preview builds the *same* dataset training sees (via common.build_dataset), so
+the generator params, object source, backgrounds and instCopy all match. Copies are
+train-only, so the preview defaults to the train split to make p_copy/n_copy visible;
+each row is annotated with is_copy / copy_slot.
 
-Any trailing `key=value` args are OmegaConf dotlist overrides on the loaded config
-(scene/diversity/sampling blocks), applied after --config is loaded.
+Any generator param is a native Hydra override on cfg.synth / cfg.data, e.g.
+`synth.scene.target_mode=class`, `synth.scene.p_copy=0`, `data.context_size=1`,
+`data.image_size=64`. The preview-only knobs live under a `preview` block and are appended
+on the CLI with `+preview.<k>=<v>`: split, n, out, and `augment` (run items through the
+experiment's aug_preset, matching what the model sees when the config sets `augment: true`).
 
-Run: .venv311/bin/python experiments/2d/synth/preview_omnisynth.py
-     .venv311/bin/python experiments/2d/synth/preview_omnisynth.py --split val --mode class
-     .venv311/bin/python experiments/2d/synth/preview_omnisynth.py --split val scene.grid=2 scene.k_max=3
+Run: python experiments/2d/synth/preview_omnisynth.py
+     python experiments/2d/synth/preview_omnisynth.py --config-name 2_omnisynth_medseg_refine
+     python experiments/2d/synth/preview_omnisynth.py --config-name 2_omnisynth_medseg_refine \\
+         +preview.augment=true +preview.split=val +preview.n=6 synth.scene.target_mode=class
 """
-import argparse
-import sys; sys.path.insert(0, ".")
+import sys
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from omegaconf import OmegaConf
+import hydra
+import torch
+from omegaconf import DictConfig, OmegaConf
 
-from src.datasets.omniSynth import (
-    OmniDiversityConfig, OmniMedSegConfig, OmniSamplingConfig, OmniSceneConfig,
-    OmniSynthICLDataset,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))    # experiments/2d -> `common`
+_ROOT = Path(__file__).resolve().parents[3]                     # repo root (resolve out paths)
+from common import build_dataset
+from pfn_train import augment                                   # same batch augmenter as train.py
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/experiment/2d/synth/omniglot.yaml",
-                    help="omniSynth generator config (diversity/scene/sampling blocks)")
-    ap.add_argument("--mode", default=None, choices=["identical", "aug", "class"],
-                    help="override scene.target_mode (default: use the config's value)")
-    ap.add_argument("--split", default="train")
-    ap.add_argument("--context_size", type=int, default=3)
-    ap.add_argument("--image_size", type=int, default=128)
-    ap.add_argument("--n", type=int, default=10)
-    ap.add_argument("--out", default="results/omnisynth_preview.png")
-    args, overrides = ap.parse_known_args()
+def _augment_item(item, K, aug_cfg):
+    """Run one dataset item through the batch augmenter (B=1), mirroring
+    train.py._augment_batch: contexts get geometric+intensity, the query image gets at
+    most task-intensity ops, and the query mask (item['label']) is left untouched — so
+    what the preview draws is exactly what the model sees when `augment: true`."""
+    img = item["image"].float().unsqueeze(0)            # (1,1,H,W)
+    cin = item["context_in"].float().unsqueeze(0)       # (1,K,1,H,W)
+    cout = item["context_out"].float().unsqueeze(0)
+    imgs = torch.cat([cin, img.unsqueeze(1)], dim=1)    # (1,T,1,H,W), query at index K
+    msks = torch.cat([cout, torch.zeros_like(img.unsqueeze(1))], dim=1)
+    imgs, msks = augment(imgs, msks, K, aug_cfg)
+    item = dict(item)
+    item["image"], item["context_in"], item["context_out"] = imgs[0, K], imgs[0, :K], msks[0, :K]
+    return item
 
-    cfg = OmegaConf.load(args.config)
-    # Any leftover `key=value` args are OmegaConf dotlist overrides on the loaded
-    # config, e.g. `scene.grid=2 scene.k_max=3 sampling.epoch_length=10`.
-    if overrides:
-        bad = [o for o in overrides if "=" not in o]
-        if bad:
-            ap.error(f"unrecognized arguments: {' '.join(bad)} "
-                     "(config overrides must be dotlist key=value, e.g. scene.grid=2)")
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
-    scene_kw = dict(cfg.scene)
-    if args.mode is not None:
-        scene_kw["target_mode"] = args.mode
-    scene = OmniSceneConfig(**scene_kw)
-    diversity = OmniDiversityConfig(**dict(cfg.diversity))
-    sampling = OmniSamplingConfig(**dict(cfg.sampling))
-    medseg = OmniMedSegConfig(**dict(cfg.medseg)) if cfg.get("medseg", None) else None
-    source = cfg.get("source", "omniglot")
 
-    K = args.context_size
-    ds = OmniSynthICLDataset(split=args.split, context_size=K, image_size=args.image_size,
-                             source=source, diversity=diversity, scene=scene,
-                             sampling=sampling, medseg=medseg)
-    if source in ("medseg", "biomedparse"):
-        ds_list = medseg.train_datasets if args.split == "train" else medseg.val_datasets
-        print(f"object source: {source}  {args.split}_datasets={list(ds_list) or 'all'}")
+@hydra.main(config_path="../../../configs/experiment/2d", config_name="1_omnisynth_medseg",
+            version_base=None)
+def main(cfg: DictConfig):
+    pv = cfg.get("preview", {})           # preview-only knobs: `+preview.<k>=<v>`
+    split = pv.get("split", "train")
+    n = int(pv.get("n", 10))
+    out = Path(pv.get("out", "results/omnisynth_preview.png"))
+    if not out.is_absolute():
+        out = _ROOT / out
+    out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"omniSynth preview: split={args.split} target_mode={scene.target_mode} "
+    K = cfg.data.context_size
+    image_size = cfg.data.image_size
+    ds = build_dataset(cfg, split)        # same OmniSynthICLDataset the trainer uses
+
+    # Opt-in augmentation: `+preview.augment=true` loads the same aug_preset the trainer
+    # uses (cfg.aug_preset, merged with any cfg.aug) and runs each item through it, so the
+    # preview matches training when the experiment sets `augment: true`.
+    do_aug = bool(pv.get("augment", False))
+    aug_cfg = None
+    if do_aug:
+        preset = cfg.get("aug_preset", "2d")
+        aug_cfg = OmegaConf.load(_ROOT / "configs" / "augmentations" / f"{preset}.yaml")
+        if cfg.get("aug", None):
+            aug_cfg = OmegaConf.merge(aug_cfg, cfg.aug)
+        do_aug = bool(aug_cfg.get("enabled", True))
+        print(f"augment {'ON' if do_aug else 'OFF (enabled=false)'} (preset={preset})")
+
+    s = cfg.synth
+    scene = s.scene
+    obj_source = s.get("source", "omniglot")
+    if obj_source in ("medseg", "biomedparse"):
+        med = s.get("medseg", {})
+        ds_list = med.get("train_datasets", []) if split == "train" else med.get("val_datasets", [])
+        print(f"object source: {obj_source}  {split}_datasets={list(ds_list) or 'all'}")
+
+    print(f"omniSynth preview: split={split} target_mode={scene.target_mode} "
           f"placement={scene.placement} grid={scene.grid} max_obj={scene.max_nb_objects} "
           f"k=[{scene.k_min},{scene.k_max}] "
-          f"p_copy={scene.p_copy} n_copy={scene.n_copy} K={K} image_size={args.image_size}")
+          f"p_copy={scene.p_copy} n_copy={scene.n_copy} K={K} image_size={image_size}")
 
     cols = 2 + K * 2     # query img, query mask, then K contexts (img+mask)
-    fig, axes = plt.subplots(args.n, cols, figsize=(cols * 1.4, args.n * 1.4))
-    axes = axes.reshape(args.n, cols)
-    for i in range(args.n):
+    fig, axes = plt.subplots(n, cols, figsize=(cols * 1.4, n * 1.4))
+    axes = axes.reshape(n, cols)
+    for i in range(n):
         item = ds[i]
         m = item["meta"]
+        if do_aug:
+            item = _augment_item(item, K, aug_cfg)
         print(f"  sample {i}: class={m['class_id']} alphabet={m['alphabet']} "
               f"target_mode={m['target_mode']} k_target={m['k_target']} "
               f"is_copy={m['is_copy']} copy_slot={m['copy_slot']}")
@@ -90,11 +112,12 @@ def main():
             if i == 0:
                 ax.set_title(title, fontsize=7)
         axes[i, 0].set_ylabel(f"copy={m['is_copy']}\nslot={m['copy_slot']}", fontsize=6)
-    fig.suptitle(f"omniSynth {args.split} / target_mode={scene.target_mode} "
-                 f"/ p_copy={scene.p_copy} n_copy={scene.n_copy}")
+    fig.suptitle(f"omniSynth {split} / target_mode={scene.target_mode} "
+                 f"/ p_copy={scene.p_copy} n_copy={scene.n_copy}"
+                 f"{' / augmented' if do_aug else ''}")
     fig.tight_layout()
-    fig.savefig(args.out, dpi=120)
-    print(f"wrote {args.out}")
+    fig.savefig(out, dpi=120)
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":

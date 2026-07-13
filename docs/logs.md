@@ -1,5 +1,47 @@
 # Change log
 
+## 2026-07-13 — patchset_cnn refine: log coarse-only counterfactual + fix exp10 version bug
+- Goal: measure precisely where the added refine level (2-level patchset_cnn) contributes to
+  the final prediction on medsegbench (run ttt6kmnk, crashed at epoch 67/500).
+- `experiments/2d/evaluate.py`: `refine_geometry` now also returns `coarse_nat` (coarse prob
+  upsampled to native — the refine-OFF counterfactual) and `coarse_R` (coarse pooled to Rf).
+  `validate` logs per-sample `dice_coarse` (native) + `dice_coarse@{Rf}` and their summaries,
+  so the exact refine delta is `dice − dice_coarse` at matched resolution.
+- `results/experiments/10_patchset_cnn_2_lvls.py`: fixed `get_latest_table`, which selected the
+  artifact by LEXICAL version max (`"v9" > "v67"`) and so analyzed a stale epoch-9 table; now
+  parses the integer suffix. Added analysis cells (micro-vs-macro, coarse-conditioned collapse,
+  per-dataset stage decomposition, direct refine delta when the counterfactual is present).
+- Finding: the refine ENCODER helps on its crop (+0.05 macro over coarse) but the single-bbox
+  STITCH gives it back (−0.065 macro; worst on thin/multi-region targets: drive/chasedb1 −0.21,
+  m2caiseg −0.10, dynamicnuclear −0.09). Net final native ≈ coarse. It cannot rescue coarse
+  misses (coarse@32==0 → 86% still empty). Micro metric is a 42%-weight m2caiseg thermometer.
+
+## 2026-07-13 — thor node: cu121 venv for RTX A6000 (driver 12.3)
+- thor = RTX A6000 (Ampere sm_86), driver 545.29.02 → CUDA 12.3. The cu124 torch build
+  (used on nero) is one driver-minor too new: torch warns "driver too old (found 12030)"
+  and CUDA falls back to unavailable.
+- Added a `cu121` extra to pyproject.toml (optional-dep + `pytorch-cu121` index + torch/
+  torchvision sources + conflicts entry), mirroring the existing cu124/cu128/cpu pattern.
+- Created env: `UV_PROJECT_ENVIRONMENT=.venv_thor uv sync --extra cu121` → torch 2.5.1+cu121,
+  torchvision 0.20.1+cu121. Verified `torch.cuda.is_available()` + GPU matmul on the A6000.
+- Run on thor with `.venv_thor/bin/python`.
+
+## 2026-07-12 — preview_omnisynth: Hydra config like train.py
+- Rewrote experiments/2d/synth/preview_omnisynth.py from argparse (--config <yaml>) to
+  `@hydra.main` so it takes an experiment `--config-name` (e.g. 2_omnisynth_medseg_refine),
+  composing the full training config chain.
+- Builds the dataset via `common.build_dataset(cfg, split)` — the exact path the trainer
+  uses — so the preview matches training (source, backgrounds, instCopy, cfg.paths.omniglot).
+- Old flags are now native Hydra overrides: `--mode class` -> `synth.scene.target_mode=class`,
+  `--context_size 1` -> `data.context_size=1`, `--image_size` -> `data.image_size`. Only
+  split/n/out remain preview-specific, appended as `+preview.split=val +preview.n=6 +preview.out=...`.
+- out paths resolve against repo root (robust to Hydra cwd). Verified: renders exp-2's
+  medseg-on-image distribution to a PNG.
+- Added `+preview.augment=true`: loads the experiment's aug_preset (cfg.aug_preset merged
+  with cfg.aug) and runs each item through pfn_train.augment (mirroring train.py._augment_batch)
+  — contexts get geometric+intensity, query image gets task-intensity only, query mask
+  untouched. Lets the preview match what the model sees when a config sets `augment: true`.
+
 ## 2026-07-10 — train: opt-in batch augmentation for the unified 2D trainer
 
 - **Batch augmentation is opt-in via `augment: true/false` config flag** (default off in

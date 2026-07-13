@@ -46,7 +46,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -307,7 +307,8 @@ def main(cfg: DictConfig):
     # Default off keeps every existing train.py run byte-identical.
     if cfg.get("augment", False):
         _aug = OmegaConf.load(Path(_ROOT) / "configs" / "augmentations" / f"{cfg.aug_preset}.yaml")
-        cfg.aug = OmegaConf.merge(_aug, cfg.aug) if cfg.get("aug", None) else _aug
+        with open_dict(cfg):
+            cfg.aug = OmegaConf.merge(_aug, cfg.aug) if cfg.get("aug", None) else _aug
         print(f"Augmentation ON (preset={cfg.aug_preset}, enabled={cfg.aug.get('enabled', True)})")
 
     train_loader = make_loader(build_dataset(cfg, "train"), cfg, "train", shuffle=True)
