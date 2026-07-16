@@ -1,5 +1,53 @@
 # Change log
 
+## 2026-07-15 — flops_giga is now per-sample (batch-size invariant)
+- `validate()` (`experiments/2d/evaluate.py`) divided the FlopCounterMode total by `img.shape[0]`,
+  so `flops_giga` is per-sample instead of per-batch. It was measured on one val batch, so it
+  scaled linearly with `eval.batch_size` — a bs=64→128 change doubled it (~3700→7500) with no
+  real model change. **Break in scale vs prior logged runs** (which were per-batch @ bs=64):
+  new numbers are ~old/64 (≈58 GFLOP/sample for the scatter PatchSetCNN).
+
+## 2026-07-14 — PatchSetCNN full (unmasked) sample-axis attention
+- New `full_attn` flag (`PatchSetCNN.__init__`, default `False`). When set, the sample-axis
+  drops the read-only mask entirely → dense `r×r` attention: every row (thinking + support +
+  query) attends to every row, so context representations become target-aware. Breaks the
+  "context is read-only" invariant intentionally; **no GT leak** (query rows still carry only
+  the support-mean occupancy prior, never GT).
+- `pfn_seg_2d.TransformerEncoderLayer/Stack.forward` gain `full_attn: bool = False`. The
+  sample-axis branch is now 3-way: explicit `attn_mask` > `full_attn` (unmasked full `k,v`) >
+  default read-only slice `k[:, :, :sep]`. Cost ≈0 — full drops the `masked_fill`/mask tensor
+  and re-enables the fused (flash) SDPA kernel, so it is marginally cheaper + lower-memory.
+- Precedence: `full_attn` supersets `query_self_attn`'s connectivity, so in `_attn_core` the
+  mask is only built when `query_self_attn and not full_attn`. Threaded through `build_model`
+  (`experiments/2d/train.py`) into the checkpoint `arch` and exposed in `model/patchset_cnn.yaml`
+  (default `false`). Verified: full ≠ read-only output, full_attn wins over qsa, 35 tests pass.
+
+## 2026-07-13 — scatter sampling diagnostic + tuned params
+- `experiments/2d/multilevel/plot_scatter_sampling.py`: loads a scatter PatchSetCNN checkpoint,
+  runs its COARSE pass on the training source (omnisynth_medseg), and sweeps `sample_patches` params
+  over the real coarse map — prints behavior metrics (core@uncertainty, GT-boundary recall, cluster
+  adjacency, coverage) + a tier-colored figure (diverse sources × configs).
+- Finding on scarlet-disco-163 (scatter, epoch 11): GT-boundary recall already strong (84%→93% at
+  n_total=1024); cluster↔explore is driven by `temperature`/`floor` (not blur_sigma at large fg_core);
+  uncertainty focus was diluted by the big `n_fg_core=256`. Also fixed the eval top-left dump
+  (always-stochastic seeded sampling + wider blur, commit 21841c1).
+- Tuned `3_omnisynth_medseg_scatter.yaml` sample block: `n_fg_core 256→64`, `n_boundary_core 0→64`,
+  `temperature 1→0.5`, `blur_sigma 4→3` → uncertainty focus 36%→39%, cluster 0.40→0.55, boundary
+  recall 91% @ n_total=1024 (clustered on boundary/uncertainty while still exploring ~25% of the grid).
+
+## 2026-07-13 — scatter refine qualitative figure
+- `_refine_scatter` (`src/models/patchset_cnn.py`) now also returns the sampler tier flags —
+  `refine_is_core`/`refine_is_fg` (B,M) for the query and `refine_sup_idx`/`refine_sup_is_core`/
+  `refine_sup_is_fg` (B,K,M) for the support (previously discarded). Additive — loss/metrics ignore them.
+- `evaluate.py`: `save_scatter_figure` (2×3 tier-colored panel — target sampled cells | coarse | fused,
+  ctx0 support cells) + a `validate()` branch keyed on `refine_idx`, logged to `figures_scatter/…`.
+  Cells map Rf-grid→pixels; tiers colored boundary=red / fg-core=orange / neighbor=cyan (as plot_sampling).
+- Fills the gap where scatter eval figures previously showed only the coarse pred (the bbox refine panel
+  is skipped for scatter). Tests: tier-key shapes + figure smoke test.
+
+## 2026-07-13 — scatter refine mode: unconstrained scatter sampling + config + checkpoint persistence
+- Added `refine_mode="scatter"` to `PatchSetCNN`: coarse@T=32 → scatter-refine@Rf=64 sampling M=256 cells per image via boundary/foreground-aware Gumbel-top-k (`src/models/scatter_sampling.py`); per-level losses (coarse BCE+Dice + refine on gathered cells); fused native prediction via `composite_predictions`; `build_model` persists `arch["sample"]` (plain dict via `OmegaConf.to_container`) so `eval.py` rebuilds with zero drift; config `configs/experiment/2d/3_omnisynth_medseg_scatter.yaml` launches the run.
+
 ## 2026-07-13 — patchset_cnn refine: log coarse-only counterfactual + fix exp10 version bug
 - Goal: measure precisely where the added refine level (2-level patchset_cnn) contributes to
   the final prediction on medsegbench (run ttt6kmnk, crashed at epoch 67/500).
@@ -2595,3 +2643,32 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
      blur/push a tiny mask off-tile. Fix: >0 fallback, then if still empty return the
      un-jittered base (bank guarantees it is non-empty).
 - Result: empty target masks 4/10 -> 0/200. Full suite 38 passed.
+
+## 2026-07-14 — Per-level soft-Dice eps: empirical A/B on small objects
+- Exp 4 (`4_loss_eps_per_lvl.yaml`, run 9j69mib5, eps {32:0.01, 64:0.1}) vs exp 3
+  baseline (run 03ypf2pk, eps=1). A/B on the deterministic val set (3450 paired samples),
+  using the per-sample columns logged by evaluate.py. B still training (ep34) vs A (ep39),
+  so numbers are a lower bound.
+- Result — gain is confined to small objects, exactly as the loss theory predicted:
+    ≤32px final dice 0.246→0.339 (+0.09); complete-miss (dice==0) 64%→45%
+    33-128px +0.03; ≥129px ≈0; MICRO final 0.701→0.727 (all from small buckets)
+- Mechanism confirmed: coarse-grid survival identical (GT property) and cossim@32 (ranking)
+  barely moves; the coarse OCCUPANCY jumps (dice_soft@32 0.167→0.237) — the loss now turns
+  surviving small-object cells ON instead of suppressing them (eps=1 inverted ∂dice/∂p below
+  g*≈0.37). Added the payoff cell + `artifacts/12_eps_ab_payoff.png` to
+  results/experiments/12_small_occupancies.py; cached tables in `artifacts/12_eps_ab.csv`.
+
+## 2026-07-14 — Notebook 12 refactor: 3-way occupancy analysis
+- Extracted `get_latest_table` (+ SZ_EDGES/SZ_LABELS, add_szbin) to shared
+  `results/experiments/nb_common.py`; notebook 11 now imports it.
+- Rewrote `12_small_occupancies.py` (simplified): kept one compact g* loss-theory cell,
+  replaced the eps-scheme design/per-stage cells with a 3-run occupancy comparison —
+  patchset_eps1 (03ypf2pk) vs patchset_epslvl (9j69mib5, per-lvl eps) vs universeg (08zmho80).
+  Reads one cached CSV (`artifacts/12_occ_runs.csv`); backfills universeg's missing GT size
+  cols from the patchset table (model-independent). Fixed savefig to absolute __file__ paths
+  (was FileNotFoundError under marimo's CWD).
+- Findings (final trained dice by size): universeg leads ONLY ≤32px (0.362); the eps fix
+  lifts patchset ≤32px 0.246→0.341 (gap to uv now −0.021), complete-miss 64%→45%. At 33-128px
+  patchset already beats universeg 0.680 vs 0.571 (uv misses 15% completely). ≥129px all tie.
+  Mechanism: cossim@32 flat, coarse occupancy dice_ds_soft@32 +0.069 / dice_coarse +0.081 —
+  fix activates surviving cells, survival itself unchanged (0.277, GT property).

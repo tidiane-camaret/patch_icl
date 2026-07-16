@@ -1,3 +1,10 @@
+# 12_small_occupancies
+## Q : on omnisynth_medseg, how to retain small occupany objects ?
+
+# 11_1rst_lvl_weaknesses
+## Q : on omnisynth_medseg, what explains 1rst level failures ?
+## R : mostly explained by tgt cell occupancy (objects < 32 px)
+
 # 10_patchset_cnn_2_lvls
 ## Q : on omnisynth, behavior of 2nd lvl 32-> 128 ? 
 experiments/2d/train.py --config-name 2_omnisynth_medseg_refine model=patchset_cnn arch.l=2 train.batch_size=32 eval.batch_size=32

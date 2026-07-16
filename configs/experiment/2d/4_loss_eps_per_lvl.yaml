@@ -1,0 +1,17 @@
+# Experiment 4 — identical to exp 3 (PatchSetCNN scatter refine, omniSynth/MedSeg) but with a
+# PER-LEVEL soft-Dice smoothing eps. The default eps=1.0 suppresses small objects at the coarse
+# 32² grid: on that grid a sub-cell object's total mass ≪ 1, so the eps=1 constant dominates and
+# the loss is minimized by predicting ~0 (∂dice/∂p inverts for low-mass targets). The effect
+# vanishes as the grid refines — eps=1 already activates ~85% of small objects at 64² and is
+# irrelevant at 128² (binary target). So each level gets its own eps: ~1e-2 at the 32² coarse
+# head, ~1e-1 at the 64² scatter-refine head. Everything else matches exp 3 → clean A/B.
+# See results/experiments/12_small_occupancies.py for the derivation and the omniSynth study.
+#   python experiments/2d/train.py --config-name 4_loss_eps_per_lvl
+defaults:
+  - 3_omnisynth_medseg_scatter
+  - _self_
+
+train:
+  dice_eps:            # {resolution: eps}; resolutions must match arch.resolutions [32, 64]
+    32: 0.01           # coarse token grid — the stage the eps=1 pathology breaks
+    64: 0.1            # scatter-refine fine grid — mild suppression, small eps closes it

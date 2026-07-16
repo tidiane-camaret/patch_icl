@@ -36,6 +36,11 @@ import torch.nn.functional as F
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
 from src.models.bbox_refine import crop_pool_maps, crop_resize, gt_window, max_sum_window
+from src.models.scatter_sampling import sample_patches, idx_to_ij, gather_grid
+
+
+DEFAULT_SAMPLE = dict(n_total=256, tau=0.30, blur_sigma=1.0, floor=0.005,
+                      n_fg_core=64, n_fg_core_ctx=64, temperature=1.0, n_boundary_core=0)
 
 
 class ConvEncoder(nn.Module):
@@ -115,11 +120,13 @@ class PatchSetCNN(nn.Module):
         residual_decay: float = 0.95,
         fourier_bands: int = 8,
         query_self_attn: bool = False,
+        full_attn: bool = False,
         context_id_embed: bool = False,
         max_context: int = 16,
         resolutions: list[int] | None = None,
         refine_mode: str = "reencode",
         refine_memory: bool = False,
+        sample: dict | None = None,
     ):
         super().__init__()
         self.image_size = image_size
@@ -130,8 +137,13 @@ class PatchSetCNN(nn.Module):
         #                   pooled features (coarse) and on the SAME maps cropped to each bbox and
         #                   pooled back (refine). ~half the encoder compute; refine reuses stem/
         #                   shallow detail but does NOT recompute deep-stage semantics at the crop.
-        assert refine_mode in ("reencode", "encode_once"), f"bad refine_mode {refine_mode!r}"
+        #   "scatter"     — encode once; pool to the fine grid Rf; sample M query cells from the
+        #                   coarse prediction and M support cells from each context's true mask;
+        #                   run the attention core on that sampled set.
+        assert refine_mode in ("reencode", "encode_once", "scatter"), \
+            f"bad refine_mode {refine_mode!r}"
         self.refine_mode = refine_mode
+        self.sample = {**DEFAULT_SAMPLE, **(sample or {})}
         self.refine_memory = refine_memory
         # `resolutions` = effective full-image resolutions per level (level 0 = coarse over the
         # full image). The token grid T is constant across levels and equals resolutions[0]; each
@@ -144,6 +156,12 @@ class PatchSetCNN(nn.Module):
         self.resolution = resolution
         self.N = resolution ** 2
         self.query_self_attn = query_self_attn
+        # full_attn drops the sample-axis read-only mask entirely: every row (thinking +
+        # support + query) attends to every row, so context representations become
+        # target-aware. No label leak (query rows carry only the support-mean occupancy
+        # prior, never GT). Supersets query_self_attn's connectivity, so it takes
+        # precedence when both are set.
+        self.full_attn = full_attn
         self.context_id_embed = context_id_embed
         self.max_context = max_context
         # Derived per-level crop sizes (px in the image_size frame); level 0 is the full image.
@@ -189,9 +207,12 @@ class PatchSetCNN(nn.Module):
         jj = torch.arange(resolution).repeat(resolution)
         self.register_buffer("ij_base", torch.stack([ii, jj], dim=-1), persistent=False)  # (N,2)
 
-    def _tokens(self, feat, occ, ij):
-        """feat (B,M,Cf); occ (B,M,1); ij (B,M,2) → (B,M,2,e) = [img-token | mask-token]."""
-        p = self.pos(ij, self.resolution)              # (B,M,e) Fourier position feature
+    def _tokens(self, feat, occ, ij, res=None):
+        """feat (B,M,Cf); occ (B,M,1); ij (B,M,2) -> (B,M,2,e) = [img-token | mask-token].
+        `res` is the grid resolution used to normalize the Fourier position (defaults to the
+        token grid T; the scatter refine passes the fine grid Rf)."""
+        res = self.resolution if res is None else res
+        p = self.pos(ij, res)                          # (B,M,e) Fourier position feature
         img = self.img_embed(feat) + p
         msk = self.mask_embed(occ) + p
         return torch.stack([img, msk], dim=2)
@@ -228,69 +249,69 @@ class PatchSetCNN(nn.Module):
                           mem=mem, return_think=return_think)
 
     def _attn(self, sup_feat, qry_feat, sup_occ, K, mem=None, return_think=False):
-        """Set-of-patches attention half (encoder-independent) → (B,1,R,R) logits. Shared by the
-        single-level model and by both coarse+refine passes. sup_feat (B,K·N,Cf), qry_feat
-        (B,N,Cf), sup_occ (B,K·N,1); query mask prior = support-mean occupancy.
+        """Grid path: full R x R query lattice, support-mean prior. Wraps _attn_core with the
+        grid defaults so the coarse / single-level output is unchanged."""
+        B, N = sup_feat.shape[0], self.N
+        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, 1)          # (B,Q,1) prior
+        sup_ij = self.ij_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 2)  # (B,S,2)
+        qry_ij = self.ij_base.unsqueeze(0).expand(B, N, 2)                   # (B,Q,2)
+        return self._attn_core(sup_feat, qry_feat, sup_occ, qry_occ, sup_ij, qry_ij,
+                               self.resolution, K, self.N, mem=mem,
+                               return_think=return_think, flat_out=False)
 
-        mem (B,T1,e): optional detached coarse thinking rows prepended for cross-level memory.
-        return_think: if True, returns (logit, think) where think is (B,n_think,e)."""
-        B, R, N = sup_feat.shape[0], self.resolution, self.N
-        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, 1)        # (B,Q,1) prior
+    def _attn_core(self, sup_feat, qry_feat, sup_occ, qry_occ, sup_ij, qry_ij, res, K,
+                   ctx_count, mem=None, return_think=False, flat_out=False):
+        """Set-of-patches attention half over an arbitrary support/query set.
 
-        # ── per-channel standardize features by SUPPORT-patch stats ─────────────
+        sup_feat (B,S,Cf), qry_feat (B,Q,Cf), sup_occ (B,S,1), qry_occ (B,Q,1); sup_ij/qry_ij
+        are (·,2) grid coords normalized by `res`. ctx_count = patches per context image (N for
+        the grid path, M for scatter) — used to broadcast the per-context id embedding.
+        flat_out=False -> (B,1,res,res); flat_out=True -> (B,Q). return_think adds (B,n_think,e)."""
+        B = sup_feat.shape[0]
+
+        # per-channel standardize features by SUPPORT-patch stats
         mu = sup_feat.mean(dim=1, keepdim=True)
         sig = sup_feat.std(dim=1, keepdim=True) + 1e-8
         sup_feat = ((sup_feat - mu) / sig).clamp(-10, 10)
         qry_feat = ((qry_feat - mu) / sig).clamp(-10, 10)
 
-        # ── per-patch (i,j) grid coords ─────────────────────────────────────────
-        sup_ij = self.ij_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 2)   # (B,S,2)
-        qry_ij = self.ij_base.unsqueeze(0).expand(B, N, 2)                    # (B,Q,2)
+        sup_tok = self._tokens(sup_feat, sup_occ, sup_ij, res)              # (B,S,2,e)
+        qry_tok = self._tokens(qry_feat, qry_occ, qry_ij, res)             # (B,Q,2,e)
 
-        # ── set-of-patches transformer: rows = [support | query], cols = [img|mask]
-        sup_tok = self._tokens(sup_feat, sup_occ, sup_ij)                 # (B,S,2,e)
-        qry_tok = self._tokens(qry_feat, qry_occ, qry_ij)                 # (B,Q,2,e)
-
-        # Per-image identity: same tag for all N patches of a context image (image-major
-        # order in sup_*), added to both cols; the target image gets its own tag. Lets the
-        # attention group patches by source image (and tell apart identical context copies).
         if self.context_id_embed:
             assert K <= self.max_context, \
                 f"context_size {K} exceeds max_context {self.max_context}"
             e_dim = sup_tok.shape[-1]
             ctx_emb = self.ctx_id(torch.arange(K, device=sup_tok.device))  # (K,e)
-            ctx_emb = ctx_emb.repeat_interleave(N, dim=0)                  # (S,e) image-major
-            sup_tok = sup_tok + ctx_emb.view(1, K * N, 1, e_dim)
+            ctx_emb = ctx_emb.repeat_interleave(ctx_count, dim=0)          # (K*ctx_count,e) image-major
+            sup_tok = sup_tok + ctx_emb.view(1, K * ctx_count, 1, e_dim)
             qry_tok = qry_tok + self.qry_id.view(1, 1, 1, e_dim)
 
-        # Optional cross-level memory rows (coarse thinking), prepended into the support
-        # block so every row (support + query) attends to them. mem: (B,T1,e), detached.
-        sep = K * N
+        sep = K * ctx_count
         rows = [sup_tok, qry_tok]
         if mem is not None:
             T1 = mem.shape[1]
             m = (mem + self.mem_type).unsqueeze(2).expand(mem.shape[0], T1, 2, mem.shape[-1])
-            rows = [m] + rows                                             # [memory | support | query]
+            rows = [m] + rows                                              # [memory | support | query]
             sep += T1
-        x = torch.cat(rows, dim=1)                                        # (B, (T1+)S+Q, 2, e)
+        x = torch.cat(rows, dim=1)
 
         x, sep_t = self.thinking(x, sep)      # -> [thinking | memory | support | query]
-        # Default: every row attends to the train set (thinking + support) only. With
-        # query_self_attn, query patches additionally attend to each other (within-target
-        # spatial reasoning); they carry the prior (not GT), so this leaks no labels.
         attn_mask = None
-        if self.query_self_attn:
+        if self.query_self_attn and not self.full_attn:
             r = x.shape[1]
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
-            attn_mask[:, :sep_t] = True           # all rows → thinking + support
-            attn_mask[sep_t:, sep_t:] = True       # query patches → query patches
-        x = self.transformer(x, sep_t, attn_mask=attn_mask)
+            attn_mask[:, :sep_t] = True            # all rows -> thinking + support
+            attn_mask[sep_t:, sep_t:] = True        # query -> query
+        x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn)
 
-        q = x[:, sep_t:, 0, :]                                            # (B,Q,e) query img-col
-        logit = self.decoder(q).squeeze(-1).reshape(B, 1, R, R)
+        q = x[:, sep_t:, 0, :]                                             # (B,Q,e) query img-col
+        logit = self.decoder(q).squeeze(-1)                               # (B,Q)
+        if not flat_out:
+            logit = logit.reshape(B, 1, res, res)
         if return_think:
-            return logit, x[:, :self.thinking.n].mean(dim=2)             # (B, n_think, e)
-        return logit                                                      # (B,1,R,R)
+            return logit, x[:, :self.thinking.n].mean(dim=2)             # (B,n_think,e)
+        return logit
 
     def _select_bbox(self, coarse, context_out, c):
         """coarse logits (B,1,T,T) → (tgt_o (B,2), ctx_o (B,K,2)) top-left px crop origins in the
@@ -305,6 +326,8 @@ class PatchSetCNN(nn.Module):
         return tgt_o, ctx_o
 
     def _refine_forward(self, image, context_in, context_out):
+        if self.refine_mode == "scatter":
+            return self._refine_scatter(image, context_in, context_out)
         if self.refine_mode == "encode_once":
             return self._refine_encode_once(image, context_in, context_out)
         return self._refine_reencode(image, context_in, context_out)
@@ -371,6 +394,77 @@ class PatchSetCNN(nn.Module):
         return {"final_logit": coarse, "refine_logit": refine,
                 "refine_origin": tgt_o, "refine_ctx_origin": ctx_o,
                 "refine_crop": c, "resolutions": self.resolutions}
+
+    def _refine_scatter(self, image, context_in, context_out):
+        """Coarse pass at T + unconstrained scatter refine at the fine grid Rf.
+
+        Encode once; pool to Rf. Sample M query cells from the coarse prediction (prev_pred) and
+        M support cells/context from the true mask fraction; run the attention core on that set.
+        Returns per-sampled-cell logits + their flat Rf-grid indices (scattered back downstream)."""
+        assert len(self.resolutions) == 2, "scatter refine requires resolutions=[T, Rf]"
+        B, K = context_in.shape[0], context_in.shape[1]
+        H, W = image.shape[-2:]
+        T, Rf = self.resolution, self.resolutions[-1]
+        Nf = Rf * Rf
+        s = self.sample
+        M = int(s["n_total"])
+        # Always stochastic (Gumbel neighbor fill), even in eval: deterministic (stochastic=False)
+        # top-k ties on the flat proximity field beyond the blurred halo all resolve to the lowest
+        # index → a top-left corner dump. eval is seeded upstream (eval_incontext.py sets
+        # torch.manual_seed), so stochastic sampling stays reproducible while spreading neighbors.
+        stoch = True
+
+        imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)          # (B,Timgs,1,H,W)
+        Timgs = imgs.shape[1]
+        maps = self.encoder.encode_maps(imgs.reshape(B * Timgs, 1, H, W))  # native multi-scale, ONCE
+
+        # ── coarse at the token grid T ──
+        sup_c, qry_c = self._grid_tokens(self.encoder.pool_maps(maps, T), B, Timgs, K)
+        if self.refine_memory:
+            coarse, coarse_think = self._attn(sup_c, qry_c, self._occupancy(context_out), K,
+                                              return_think=True)             # (B,1,T,T), (B,n,e)
+        else:
+            coarse, coarse_think = self._attn(sup_c, qry_c, self._occupancy(context_out), K), None
+
+        # ── fine features at Rf ──
+        fine = self.encoder.pool_maps(maps, Rf)                            # (B*Timgs,Cf,Rf,Rf)
+        Cf = fine.shape[1]
+        feat = fine.flatten(2).transpose(1, 2).reshape(B, Timgs, Nf, Cf)   # (B,Timgs,Nf,Cf)
+
+        # ── query: sample from the coarse prediction upsampled to Rf (prev_pred) ──
+        coarse_prob = torch.sigmoid(coarse).detach()                       # (B,1,T,T)
+        q_map = F.interpolate(coarse_prob, size=(Rf, Rf), mode="bilinear",
+                              align_corners=False).reshape(B, Nf)           # (B,Nf)
+        qidx, q_is_core, q_is_fg = sample_patches(
+            q_map, M, s["tau"], s["blur_sigma"], s["floor"], Rf,
+            temperature=s["temperature"], stochastic=stoch,
+            n_fg_core=s["n_fg_core"], n_boundary_core=s["n_boundary_core"])
+        qry_feat = gather_grid(feat[:, -1], qidx)                          # (B,M,Cf)  target is last
+        qry_ij = idx_to_ij(qidx, Rf)                                       # (B,M,2)
+        qry_occ = gather_grid(q_map, qidx).unsqueeze(-1)                  # (B,M,1) coarse-prob prior
+
+        # ── support: sample from each context's true mask fraction at Rf ──
+        ctx_frac = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W),
+                                         (Rf, Rf)).reshape(B * K, Nf)       # (B*K,Nf)
+        sidx, s_is_core, s_is_fg = sample_patches(
+            ctx_frac, M, s["tau"], s["blur_sigma"], s["floor"], Rf,
+            temperature=s["temperature"], stochastic=stoch,
+            n_fg_core=s["n_fg_core_ctx"], n_boundary_core=s["n_boundary_core"])
+        ctx_feat = feat[:, :K].reshape(B * K, Nf, Cf)
+        sup_feat = gather_grid(ctx_feat, sidx).reshape(B, K * M, Cf)
+        sup_occ = gather_grid(ctx_frac, sidx).reshape(B, K * M, 1)
+        sup_ij = idx_to_ij(sidx, Rf).reshape(B, K * M, 2)
+
+        mem = coarse_think.detach() if coarse_think is not None else None
+        refine_logit = self._attn_core(sup_feat, qry_feat, sup_occ, qry_occ, sup_ij, qry_ij,
+                                       Rf, K, M, mem=mem, flat_out=True)     # (B,M)
+        return {"final_logit": coarse, "refine_logit": refine_logit, "refine_idx": qidx,
+                "refine_grid_res": Rf, "resolutions": self.resolutions,
+                # tier flags for the scatter qualitative figure (unused by loss/metrics)
+                "refine_is_core": q_is_core, "refine_is_fg": q_is_fg,
+                "refine_sup_idx": sidx.reshape(B, K, M),
+                "refine_sup_is_core": s_is_core.reshape(B, K, M),
+                "refine_sup_is_fg": s_is_fg.reshape(B, K, M)}
 
     def forward(self, image, context_in, context_out, mode="train"):
         """image (B,1,H,W); context_in/out (B,K,1,H,W).

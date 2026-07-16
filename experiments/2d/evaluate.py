@@ -21,6 +21,7 @@ from matplotlib.patches import Rectangle
 from common import (DEVICE, hard_dice, soft_dice, cosine_sim, topk_overlap,
                     downsample_mask, log_summary)
 from src.models.bbox_refine import crop_resize, place_window
+from src.models.scatter_sampling import gather_grid, composite_predictions, idx_to_ij
 
 
 def _overlay_ax(ax, image: np.ndarray, mask: np.ndarray, title: str) -> None:
@@ -145,6 +146,53 @@ def save_refine_figure(
     plt.close(fig)
 
 
+def _scatter_cells_ax(ax, image, gt, ij, is_core, is_fg, grid_res, title):
+    """Gray image + lime GT contour + sampled cells colored by tier (Rf grid -> image px).
+    ij: (M,2) row/col on the grid_res grid; is_core/is_fg: (M,) bool. Tiers are a partition:
+    fg-core (orange) subset of core; boundary-core (red) = core & ~fg; neighbor (cyan) = ~core."""
+    ax.imshow(image, cmap="gray", vmin=0, vmax=1)
+    if gt is not None and float(gt.max()) > 0:
+        ax.contour(gt, levels=[0.5], colors="lime", linewidths=1.0)
+    scale = image.shape[0] / grid_res
+    y = (ij[:, 0] + 0.5) * scale
+    x = (ij[:, 1] + 0.5) * scale
+    fg = is_fg.astype(bool)
+    bcore = is_core.astype(bool) & ~fg
+    neigh = ~is_core.astype(bool)
+    ax.scatter(x[neigh], y[neigh], s=12, c="cyan", marker="s", edgecolors="none",
+               label=f"neighbor ({int(neigh.sum())})")
+    ax.scatter(x[bcore], y[bcore], s=12, c="red", marker="s", edgecolors="none",
+               label=f"boundary ({int(bcore.sum())})")
+    ax.scatter(x[fg], y[fg], s=12, c="orange", marker="s", edgecolors="none",
+               label=f"fg-core ({int(fg.sum())})")
+    ax.legend(loc="upper right", fontsize=5, framealpha=0.6)
+    ax.set_title(title, fontsize=8)
+    ax.axis("off")
+
+
+def save_scatter_figure(tgt_image, tgt_gt, coarse_pred, fused_pred,
+                        qry_ij, qry_is_core, qry_is_fg,
+                        ctx_image, ctx_gt, sup_ij, sup_is_core, sup_is_fg,
+                        grid_res, out_path, title=""):
+    """2×3 scatter-refine panel. Row 0 (target): [GT + tier-colored query cells | coarse native
+    pred | fused native pred]. Row 1: [ctx0 GT + tier-colored support cells | blank | blank].
+    Cells live on the grid_res grid and are scaled to image pixels."""
+    fig, axes = plt.subplots(2, 3, figsize=(9.6, 6.5), squeeze=False)
+    fig.subplots_adjust(hspace=0.35, wspace=0.05)
+    _scatter_cells_ax(axes[0, 0], tgt_image, tgt_gt, qry_ij, qry_is_core, qry_is_fg,
+                      grid_res, "Target + GT + sampled cells")
+    _refine_overlay_ax(axes[0, 1], tgt_image, "Target + coarse pred", gt=tgt_gt, pred=coarse_pred)
+    _refine_overlay_ax(axes[0, 2], tgt_image, "Target + fused pred", gt=tgt_gt, pred=fused_pred)
+    _scatter_cells_ax(axes[1, 0], ctx_image, ctx_gt, sup_ij, sup_is_core, sup_is_fg,
+                      grid_res, "Ctx0 + GT + support cells")
+    axes[1, 1].axis("off")
+    axes[1, 2].axis("off")
+    fig.suptitle(title, fontsize=9)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _fmt_transforms(transforms) -> str:
     """One compact 'r..,s..,dx..,dy..' string per target placement (aug mode);
     empty when the mode applies no per-placement jitter (identical/class)."""
@@ -221,6 +269,36 @@ def _upsample_to(x: torch.Tensor, size) -> torch.Tensor:
             else F.interpolate(x, size=tuple(size), mode="bilinear", align_corners=False))
 
 
+def _refine_geometry_scatter(out: dict, lbl: torch.Tensor) -> dict:
+    """Scatter-refine geometry: per-sampled-cell prob/target + fused stitch (coarse with refined
+    cells scattered in). Returns the SAME keys as the bbox refine_geometry so downstream metrics
+    are model-agnostic. refine_prob/target are (B,1,M) so callers' [b,0] indexing yields (M,)."""
+    coarse = out["final_logit"].float()                       # (B,1,T,T)
+    refine_logit = out["refine_logit"].float()                # (B,M)
+    idx = out["refine_idx"]                                    # (B,M)
+    Rf = int(out["refine_grid_res"])
+    B, H = lbl.shape[0], lbl.shape[-1]
+    Nf = Rf * Rf
+    refine_prob = torch.sigmoid(refine_logit)                 # (B,M)
+    gt_Rf = F.adaptive_avg_pool2d(lbl, (Rf, Rf)).reshape(B, Nf)
+    refine_target = gather_grid(gt_Rf, idx)                    # (B,M)
+    coarse_prob = torch.sigmoid(coarse)
+    coarse_up = F.interpolate(coarse_prob, size=(H, H), mode="bilinear", align_corners=False)
+    coarse_Rf = F.interpolate(coarse_prob, size=(Rf, Rf), mode="bilinear",
+                              align_corners=False).reshape(B, Nf)   # bilinear (matches coarse_nat)
+    # NOTE: bilinear (not adaptive_avg_pool2d) keeps the non-sampled background consistent with
+    # coarse_nat so that fused differs from coarse ONLY at the scattered cells.
+    fused_flat = composite_predictions(coarse_Rf, idx, refine_prob)             # (B,Nf)
+    fused_R = fused_flat.reshape(B, 1, Rf, Rf)
+    fused = F.interpolate(fused_R, size=(H, H), mode="bilinear", align_corners=False)
+    return {"refine_prob": refine_prob.unsqueeze(1),          # (B,1,M)
+            "refine_target": refine_target.unsqueeze(1),      # (B,1,M)
+            "fused": fused,                                    # (B,1,H,H)
+            "fused_R": fused_R, "gt_R": gt_Rf.reshape(B, 1, Rf, Rf), "Rf": Rf,
+            "coarse_nat": coarse_up,                           # (B,1,H,H)
+            "coarse_R": coarse_Rf.reshape(B, 1, Rf, Rf)}       # (B,1,Rf,Rf)
+
+
 def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
     """Per-level + fused tensors for a multi-resolution refine output; None if single-level.
 
@@ -233,9 +311,14 @@ def refine_geometry(out: dict, lbl: torch.Tensor) -> dict | None:
                     both avg-pooled to Rf = resolutions[-1]
       coarse_nat    (B,1,H,H)  coarse-only prob upsampled to native — the refine-off counterfactual
       coarse_R      (B,1,Rf,Rf) coarse-only prob avg-pooled to Rf (compare vs fused_R at same res)
+    If `out` contains `refine_idx` (scatter mode), dispatches to `_refine_geometry_scatter`, which
+    returns the same keys but with `refine_prob`/`refine_target` shaped `(B,1,M)` (per sampled cell)
+    instead of `(B,1,T,T)`; bbox keys (`refine_origin`, `refine_crop`) are absent in that case.
     """
     if "refine_logit" not in out:
         return None
+    if out.get("refine_idx") is not None:
+        return _refine_geometry_scatter(out, lbl)
     coarse = out["final_logit"].float()
     refine = out["refine_logit"].float()
     origin = out["refine_origin"]
@@ -308,7 +391,9 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
             # Measured once; its FlopCounterMode overhead must not contaminate timing.
             with FlopCounterMode(display=False) as fc, ac:
                 out = model(img, context_in=cin, context_out=cout, mode="val")
-            flops = fc.get_total_flops()
+            # Per-sample, so flops_giga is invariant to eval.batch_size (total-batch
+            # FLOPs scaled linearly with bs — a bs=64→128 change doubled the number).
+            flops = fc.get_total_flops() / img.shape[0]
         else:
             # CUDA kernels are async, so bracket the forward with syncs to time the real
             # GPU compute (not just kernel launch). The first timed batch is dropped as
@@ -355,6 +440,18 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
 
             h = hard_dice(pred_dice[b, 0], lbl[b, 0])    # native hard dice (fused for refine)
             hard_ds[ds].append(h); hard_lab[key].append(h)
+
+            # GT size/occupancy (model-independent) — logged for every model so downstream
+            # analysis can bucket by object size without regenerating the deterministic val set.
+            # size = native foreground px; occ = foreground fraction. ctx_* averaged over the K
+            # context masks. (cout is (B,K,1,H,W).)
+            tgt_fg   = lbl[b, 0] > 0
+            tgt_size = float(tgt_fg.sum())
+            tgt_occ  = float(tgt_fg.float().mean())
+            ctx_fg   = cout[b, :, 0] > 0                              # (K,H,W)
+            ctx_size = float(ctx_fg.float().sum()) / max(K, 1)        # mean fg px per context
+            ctx_occ  = float(ctx_fg.float().mean())                  # mean fg fraction over K
+
             if not native:
                 dh = hard_dice(prob[b, 0], (target[b, 0] >= 0.5).float())
                 s  = soft_dice(prob[b, 0], target[b, 0])
@@ -362,6 +459,11 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 t  = topk_overlap(prob[b, 0], target[b, 0], topk_k)
                 cos_ds[ds].append(c); cos_lab[key].append(c)
                 topk_ds[ds].append(t); topk_lab[key].append(t)
+                # Coarse-grid survival: how much of the target survives avg-pooling to the token
+                # grid T. tgt_cells@T = # cells with pooled GT ≥0.5 (0 = object lost at pooling);
+                # tgt_peak@T = best single-cell occupancy. Both explain small-object coarse misses.
+                tgt_cells = float((target[b, 0] >= 0.5).sum())
+                tgt_peak  = float(target[b, 0].max())
             else:
                 dh = s = float("nan")                    # native: no coarse grid
             dsh_ds[ds].append(dh); dsh_lab[key].append(dh)
@@ -396,21 +498,28 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                 refine_row = [rdh, rds, fdh, coR, coh]    # dice@Rf, dice_soft@Rf, dice_fused@Rf, dice_coarse@Rf, dice_coarse
 
             # Lazy, resolution-tagged sample table. Columns depend on the model (constant per
-            # run): dice always; dice_ds@{T}/dice_ds_soft@{T} for non-native (coarse grid T);
-            # dice@{Rf}/dice_soft@{Rf}/dice_fused@{Rf} for refine.
+            # run): dice always; dice_ds@{T}/dice_ds_soft@{T}/cossim@{T}/top{k}@{T} for non-native
+            # (coarse grid T); dice@{Rf}/dice_soft@{Rf}/dice_fused@{Rf} for refine.
+            # cossim/top-k are the RANKING metrics — the coarse pred's job is to rank target cells
+            # above background (for the scatter sampler), not to hit exact occupancy, so they matter
+            # per-sample (esp. for small objects whose hard/soft dice collapse at the 32² grid).
             if table is None:
-                cols = ["epoch", "dataset", "sample_idx", "label", "dice"]
+                cols = ["epoch", "dataset", "sample_idx", "label", "dice",
+                        "tgt_size", "tgt_occ", "ctx_size", "ctx_occ"]
                 if low_res is not None:
-                    cols += [f"dice_ds@{low_res}", f"dice_ds_soft@{low_res}"]
+                    cols += [f"dice_ds@{low_res}", f"dice_ds_soft@{low_res}",
+                             f"cossim@{low_res}", f"top{topk_k}@{low_res}",
+                             f"tgt_cells@{low_res}", f"tgt_peak@{low_res}"]
                 if fused_res is not None:
                     cols += [f"dice@{fused_res}", f"dice_soft@{fused_res}", f"dice_fused@{fused_res}",
                              f"dice_coarse@{fused_res}", "dice_coarse"]
                 cols.append("detail")
                 table = wandb.Table(columns=cols)
             detail = _sample_detail(metas[b]) if metas is not None else ""
-            row = [epoch, ds, si, lv, h]
+            row = [epoch, ds, si, lv, h, tgt_size, tgt_occ, ctx_size, ctx_occ]
             if low_res is not None:
-                row += [dh, s]                            # dice_ds@{T}, dice_ds_soft@{T}
+                # dice_ds@{T}, dice_ds_soft@{T}, cossim@{T}, top{k}@{T}, tgt_cells@{T}, tgt_peak@{T}
+                row += [dh, s, c, t, tgt_cells, tgt_peak]
             if fused_res is not None:
                 row += refine_row
             row.append(detail)
@@ -433,7 +542,7 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                     pred_lowres=low, gt_lowres=glow)
                 if figures.get("to_wandb"):
                     wandb.log({f"figures/{ds}/label_{lv}": wandb.Image(str(fig_path))})
-                if rg is not None:               # refine model: extra coarse→fine panel
+                if rg is not None and out.get("refine_origin") is not None:  # bbox-refine coarse→fine panel
                     c_px = int(out["refine_crop"])
                     fig_path_refine = Path(figures["out_dir"]) / f"{ds}_l{lv}_refine.png"
                     tr0, tc0 = (int(v) for v in out["refine_origin"][b])
@@ -450,6 +559,25 @@ def validate(model, loader, *, topk_k=16, epoch=0, figures=None,
                     if figures.get("to_wandb"):
                         wandb.log({f"figures_refine/{ds}/label_{lv}":
                                    wandb.Image(str(fig_path_refine))})
+                elif rg is not None and out.get("refine_idx") is not None:  # scatter panel
+                    Rf_g = int(out["refine_grid_res"])
+                    fig_path_scatter = Path(figures["out_dir"]) / f"{ds}_l{lv}_scatter.png"
+                    q_ij = idx_to_ij(out["refine_idx"][b:b + 1], Rf_g)[0].cpu().numpy()      # (M,2)
+                    s_ij = idx_to_ij(out["refine_sup_idx"][b, 0:1], Rf_g)[0].cpu().numpy()   # ctx0 (M,2)
+                    save_scatter_figure(
+                        tgt_image=img[b, 0].cpu().numpy(), tgt_gt=lbl[b, 0].cpu().numpy(),
+                        coarse_pred=prob_nat[b, 0].cpu().numpy(),
+                        fused_pred=rg["fused"][b, 0].cpu().numpy(),
+                        qry_ij=q_ij, qry_is_core=out["refine_is_core"][b].cpu().numpy(),
+                        qry_is_fg=out["refine_is_fg"][b].cpu().numpy(),
+                        ctx_image=cin[b, 0, 0].cpu().numpy(), ctx_gt=cout[b, 0, 0].cpu().numpy(),
+                        sup_ij=s_ij, sup_is_core=out["refine_sup_is_core"][b, 0].cpu().numpy(),
+                        sup_is_fg=out["refine_sup_is_fg"][b, 0].cpu().numpy(),
+                        grid_res=Rf_g, out_path=fig_path_scatter,
+                        title=f"{ds} label={lv} sample={si} scatter")
+                    if figures.get("to_wandb"):
+                        wandb.log({f"figures_scatter/{ds}/label_{lv}":
+                                   wandb.Image(str(fig_path_scatter))})
 
             # ── gated: per-low-res-patch CSV (only meaningful when not native) ──
             if patch_rows is not None and not native:

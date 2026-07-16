@@ -1,0 +1,30 @@
+# Experiment 3 — PatchSetCNN with UNCONSTRAINED SCATTER refinement, same omniSynth/MedSeg
+# distribution as experiments 1 & 2. resolutions=[T, Rf]: coarse token grid T=32, fine scatter
+# grid Rf=64. The refine level samples cfg.arch.sample.n_total cells from the coarse prediction
+# (query) and the true mask (support), refines them, and scatters them back. Per-level losses
+# (coarse@32 + refine on the sampled cells); checkpoint selects on native `dice` (fused).
+#   python experiments/2d/train.py --config-name 3_omnisynth_medseg_scatter
+defaults:
+  - 1_omnisynth_medseg
+  - _self_
+
+arch:
+  resolutions: [32, 64]      # T=32 coarse token grid; Rf=64 fine scatter grid
+  l: 2
+  thinking_rows: 4
+  refine_memory: true
+  refine_mode: scatter
+  sample:                    # tuned via plot_scatter_sampling.py on a trained coarse pred:
+    n_total: 1024             # M sampled cells per image (query and per-context support)
+    tau: 0.30                # boundary-core band |p-0.5| < tau
+    blur_sigma: 3.0          # neighbor proximity-field blur (minor shape knob at this budget)
+    floor: 0.005             # uniform floor keeping far cells reachable (a little exploration)
+    n_fg_core: 64            # forced fg quota (query) — small so the core stays boundary/uncertainty-
+    n_fg_core_ctx: 64        #   dominated rather than filled with confident interior cells
+    temperature: 0.5         # Gumbel temp — primary cluster↔explore dial (0.5 = tighter clusters)
+    n_boundary_core: 64      # cap the boundary core to a fixed uncertain-cell budget
+
+train:
+  refine_loss_weight: 1.0
+
+augment: true

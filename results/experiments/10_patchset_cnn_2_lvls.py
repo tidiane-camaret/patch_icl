@@ -24,8 +24,8 @@ def _():
     DATASET = "omnisynth_medseg"  # or "medsegbench"
 
     model_configs = {
-        "medsegbench": {"patchset_cnn": "ttt6kmnk"},
-        "omnisynth_medseg": {"patchset_cnn": "mp31d05x", "universeg": "08zmho80"},
+        "medsegbench": {"patchset_cnn": "ttt6kmnk", "universeg": "0vbveu7u"},
+        "omnisynth_medseg": {"patchset_cnn_scatter": "udp9kny5", "patchset_cnn": "mp31d05x", "universeg": "08zmho80"},
     }
 
     runs = {k: {"wandb_name": v} for k, v in model_configs[DATASET].items()}
@@ -35,15 +35,7 @@ def _():
 
 @app.function
 def get_latest_table(run, table_key_substring="val/samples.table.json"):
-    """Find and download the *latest* version of a logged table artifact for a run.
-
-    NOTE: the previous version selected `max(..., key=lambda a: a.version)`, but a.version
-    is the string "v9"/"v67", so it did a LEXICAL compare where "v9" > "v67" — silently
-    returning an early-epoch table. We parse the integer suffix instead.
-
-    `vnum` is a nested local (not a separate cell/@app.function) so this stays a
-    self-contained @app.function — a marimo @app.function may only reference imports and
-    other top-level defs, never a name defined inside a cell."""
+    """Find and download the *latest* version of a logged table artifact for a run."""
     import re
 
     def vnum(a):
@@ -225,6 +217,7 @@ def _(paired, plt):
                  title="green = patchset better · red = universeg better")
         _fig.tight_layout()
     _fig
+    return
 
 
 @app.cell
@@ -249,6 +242,78 @@ def _(C, F64, N, R, dp, np, plt):
     _ax.legend(fontsize=8)
     _fig.tight_layout()
     _fig
+    return
+
+
+@app.cell
+def _(runs):
+    # ── 6. Scatter vs bbox vs universeg (omnisynth_medseg). HEAVY caveat: epochs differ
+    # (scatter@5, bbox@174, universeg@410) → absolute dice favors the trained models. The
+    # training-progress-INDEPENDENT signal is scatter's own refine delta (fused − coarse),
+    # which scatter logs (dice_coarse) because it was eval'd after the counterfactual patch.
+    _sc = runs.get("patchset_cnn_scatter", {}).get("df")
+    _bb = runs.get("patchset_cnn", {}).get("df")
+    _uv = runs.get("universeg", {}).get("df")
+    if _sc is None or _bb is None or _uv is None:
+        print("need patchset_cnn_scatter + patchset_cnn + universeg runs in this DATASET config.")
+    else:
+        _sc = _sc.copy()
+        _sc["src"] = _sc["dataset"].str.split("/").str[1]
+        _sc["d_nat"] = _sc["dice"] - _sc["dice_coarse"]
+        _pd_ = _sc.groupby("src").agg(coarse=("dice_coarse", "mean"), fused=("dice", "mean"),
+                                      d=("d_nat", "mean"))
+        print(f"epochs: scatter={sorted(_sc['epoch'].unique())} bbox={sorted(_bb['epoch'].unique())} "
+              f"uv={sorted(_uv['epoch'].unique())}")
+        print("\nSCATTER refine delta (fused − coarse) — its own, epoch-independent:")
+        print(f"  MICRO {_sc.dice_coarse.mean():.3f} -> {_sc.dice.mean():.3f}  Δ {_sc.d_nat.mean():+.3f}"
+              f"   |   MACRO {_pd_.coarse.mean():.3f} -> {_pd_.fused.mean():.3f}  Δ {_pd_.d.mean():+.3f}")
+        print(f"  helps {(_sc.d_nat > 1e-3).mean() * 100:.0f}% of samples, hurts "
+              f"{(_sc.d_nat < -1e-3).mean() * 100:.0f}%; positive on {(_pd_.d > 0).sum()}/{len(_pd_)} sources")
+        _key = ["dataset", "sample_idx", "label"]
+        _m = (_sc[_key + ["dice"]].merge(_bb[_key + ["dice"]], on=_key, suffixes=("_sc", "_bb"))
+              .merge(_uv[_key + ["dice"]].rename(columns={"dice": "dice_uv"}), on=_key))
+        _m["src"] = _m["dataset"].str.split("/").str[1]
+        _g = _m.groupby("src")[["dice_sc", "dice_bb", "dice_uv"]].mean()
+        print(f"\n3-way native dice (EPOCH-CAVEATED — scatter has 35× fewer epochs):")
+        print(f"  MICRO  sc {_m.dice_sc.mean():.3f}  bb {_m.dice_bb.mean():.3f}  uv {_m.dice_uv.mean():.3f}")
+        print(f"  MACRO  sc {_g.dice_sc.mean():.3f}  bb {_g.dice_bb.mean():.3f}  uv {_g.dice_uv.mean():.3f}")
+        print("  → scatter@5 already matches bbox@174: its working refine (+0.08) offsets its")
+        print("    undertrained coarse; the trajectory should surpass bbox as the coarse catches up.")
+    return
+
+
+@app.cell
+def _(np, pd, plt, runs):
+    # ── plot C: refine-mechanism SIGN FLIP per source (@64, confound-free).
+    # scatter (fused−coarse) ADDS on every source; bbox stitch (fused−refinecrop) LOSES on
+    # every source — mirror images, largest on the thin/multi-region sources scatter targets.
+    # NOTE: different references (scatter vs its coarse; bbox vs its optimistic crop score) —
+    # scatter's is the true refine contribution; bbox's shows the stitch erasing the crop gain.
+    _sc = runs.get("patchset_cnn_scatter", {}).get("df")
+    _bb = runs.get("patchset_cnn", {}).get("df")
+    if _sc is None or _bb is None:
+        _fig = None
+    else:
+        _sc = _sc.copy(); _bb = _bb.copy()
+        _sc["src"] = _sc["dataset"].str.split("/").str[1]
+        _bb["src"] = _bb["dataset"].str.split("/").str[1]
+        _scd = _sc.groupby("src").apply(
+            lambda g: (g["dice_fused@64"] - g["dice_coarse@64"]).mean(), include_groups=False)
+        _bbs = _bb.groupby("src").apply(
+            lambda g: (g["dice_fused@64"] - g["dice@64"]).mean(), include_groups=False)
+        _df = pd.concat([_scd.rename("scatter"), _bbs.rename("bbox")], axis=1).sort_values("scatter")
+        _y = np.arange(len(_df)); _h = 0.4
+        _fig, _ax = plt.subplots(figsize=(9, 10))
+        _ax.barh(_y + _h / 2, _df.scatter, _h, color="tab:green", label="scatter: refine ADDS over coarse (fused−coarse)")
+        _ax.barh(_y - _h / 2, _df.bbox, _h, color="tab:red", label="bbox: stitch LOSES vs crop (fused−refinecrop)")
+        _ax.axvline(0, color="k", lw=0.8)
+        _ax.set_yticks(_y); _ax.set_yticklabels(_df.index, fontsize=7)
+        _ax.set_xlabel("Δ hard dice @64"); _ax.legend(fontsize=8, loc="lower right")
+        _ax.set_title(f"Refine-mechanism sign flip per source (@64)\n"
+                      f"scatter macro {_df.scatter.mean():+.3f} vs bbox macro {_df.bbox.mean():+.3f}")
+        _fig.tight_layout()
+    _fig
+    return
 
 
 if __name__ == "__main__":

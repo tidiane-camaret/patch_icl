@@ -54,12 +54,33 @@ _ROOT = str(Path(__file__).resolve().parents[2])   # experiments/2d/train.py -> 
 from common import DEVICE, build_dataset, make_loader
 from evaluate import validate, _target_like, _upsample_to, _as_res_list, refine_geometry
 from src.models.bbox_refine import crop_resize
+from src.models.scatter_sampling import gather_grid
 from pfn_train import Muon, augment, lawa_average, soft_dice_loss
 
 
 def _autocast():
     return torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16,
                           enabled=DEVICE.type == "cuda")
+
+
+def _dice_eps_fn(cfg):
+    """Resolve the soft-Dice smoothing eps per prediction resolution.
+
+    cfg.train.dice_eps may be: absent/None -> constant 1.0 (unchanged default); a scalar ->
+    that constant for every level; or a mapping {resolution: eps} (with optional 'default').
+    Rationale (results/experiments/12_small_occupancies.py): eps=1 suppresses small objects at
+    the coarse 32² grid but is nearly inert at 64² and irrelevant at 128², so each refine level
+    wants its OWN eps (~1e-2 @32, ~1e-1 @64). Returns fn(resolution:int) -> eps:float.
+    """
+    de = cfg.train.get("dice_eps", None)
+    if de is None:
+        return lambda res: 1.0
+    if isinstance(de, (int, float)):
+        val = float(de)
+        return lambda res: val
+    table = {int(k): float(v) for k, v in de.items() if str(k) != "default"}
+    default = float(de.get("default", 1.0))
+    return lambda res: table.get(int(res), default)
 
 
 def _soft_sum(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
@@ -138,11 +159,13 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "thinking_rows": a.thinking_rows, "residual_decay": a.residual_decay,
             "fourier_bands": a.get("fourier_bands", 8),
             "query_self_attn": a.get("query_self_attn", False),
+            "full_attn": a.get("full_attn", False),
             "context_id_embed": a.get("context_id_embed", False),
             "max_context": a.get("max_context", 16),
             "resolutions": list(a.resolutions) if a.get("resolutions", None) is not None else None,
             "refine_mode": a.get("refine_mode", "reencode"),
             "refine_memory": a.get("refine_memory", False),
+            "sample": OmegaConf.to_container(a.get("sample"), resolve=True) if a.get("sample", None) is not None else None,
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}
@@ -168,6 +191,7 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
     soft_sum = soft_cnt = hard_sum = hard_cnt = 0.0   # on-device running sums (synced once)
     cos_sum = cos_cnt = topk_sum = topk_cnt = 0.0
     topk_k = int(cfg.train.get("topk_k", 16))
+    dice_eps = _dice_eps_fn(cfg)                # per-resolution soft-Dice smoothing (see fn docstring)
     res_list = _as_res_list(cfg.eval.get("ds_metric_res", None))   # fixed-res pooled Dice
     dsr_sums = {R: {"ss": 0.0, "sc": 0.0, "hs": 0.0, "hc": 0.0} for R in res_list}
     low_res = None                              # non-native model's coarse logit side length
@@ -193,15 +217,21 @@ def train_epoch(model, loader, optimizers, scheduler, cfg, epoch) -> tuple[float
             logit = out["final_logit"].float()                    # (B,1,h,w)
         target = _target_like(lbl, logit)                         # pooled to logit res
         bce = F.binary_cross_entropy_with_logits(logit, target)
-        dice = soft_dice_loss(torch.sigmoid(logit), target)
+        dice = soft_dice_loss(torch.sigmoid(logit), target, eps=dice_eps(logit.shape[-1]))
         loss = bce + cfg.train.dice_weight * dice
 
         if out.get("refine_logit") is not None:            # multi-level: add the refine loss
             rlogit = out["refine_logit"].float()
-            rtarget = crop_resize(lbl, out["refine_origin"], int(out["refine_crop"]),
-                                  rlogit.shape[-1], mode="bilinear")   # soft cropped GT at T
+            if out.get("refine_idx") is not None:          # scatter: GT gathered at sampled cells
+                Rf = int(out["refine_grid_res"])
+                gt_Rf = F.adaptive_avg_pool2d(lbl, (Rf, Rf)).reshape(lbl.shape[0], Rf * Rf)
+                rtarget = gather_grid(gt_Rf, out["refine_idx"])                # (B,M)
+            else:                                          # bbox: soft cropped GT at T
+                Rf = rlogit.shape[-1]
+                rtarget = crop_resize(lbl, out["refine_origin"], int(out["refine_crop"]),
+                                      Rf, mode="bilinear")
             rbce = F.binary_cross_entropy_with_logits(rlogit, rtarget)
-            rdice = soft_dice_loss(torch.sigmoid(rlogit), rtarget)
+            rdice = soft_dice_loss(torch.sigmoid(rlogit), rtarget, eps=dice_eps(Rf))
             loss = loss + float(cfg.train.get("refine_loss_weight", 1.0)) * (
                 rbce + cfg.train.dice_weight * rdice)
 

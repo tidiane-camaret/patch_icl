@@ -138,7 +138,8 @@ class TransformerEncoderLayer(nn.Module):
         self.norm3 = LowerPrecisionRMSNorm(e)
         self.mlp = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
 
-    def forward(self, src: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, src: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
+                full_attn: bool = False) -> torch.Tensor:
         b, r, c, e = src.shape
         a, d = self.a, self.d
 
@@ -155,18 +156,23 @@ class TransformerEncoderLayer(nn.Module):
 
         # ── Sample-axis: cross-image attention per patch position ───────────────
         # Default: every row (context + query) attends only to the train set
-        # (thinking+context rows, k_t/v_t = [:sep]). With an explicit attn_mask, the
-        # connectivity is given as an (r×r) bool table instead (e.g. queries also
-        # attending to queries for within-image spatial reasoning).
+        # (thinking+context rows, k_t/v_t = [:sep]). `full_attn` drops that slice for a
+        # dense unmasked r×r attention (every row, incl. thinking+support, attends to
+        # every row) — same fused SDPA kernel, no mask tensor, so it is marginally
+        # cheaper; it makes context representations target-aware (breaks read-only). With
+        # an explicit attn_mask, the connectivity is an (r×r) bool table instead (e.g.
+        # queries also attending to queries for within-image spatial reasoning).
         x = src.permute(0, 2, 1, 3).reshape(b * c, r, e)
         res = x
         x = self.norm2(x)
         qkv = self.qkv_row(x).reshape(b * c, r, 3, a, d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        if attn_mask is None:
-            x = batched_sdpa(q, k[:, :, :sep, :], v[:, :, :sep, :])
-        else:
+        if attn_mask is not None:
             x = batched_sdpa(q, k, v, attn_mask=attn_mask)
+        elif full_attn:
+            x = batched_sdpa(q, k, v)
+        else:
+            x = batched_sdpa(q, k[:, :, :sep, :], v[:, :, :sep, :])
         x = x.transpose(1, 2).reshape(b * c, r, e)
         # contiguous() here ensures the next layer's feature-axis reshape is a view
         src = (res + x).reshape(b, c, r, e).permute(0, 2, 1, 3).contiguous()
@@ -181,10 +187,11 @@ class TransformerEncoderStack(nn.Module):
         self.residual_decay = residual_decay
         self.blocks = nn.ModuleList([TransformerEncoderLayer(a, e, h) for _ in range(l)])
 
-    def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
+                full_attn: bool = False) -> torch.Tensor:
         for i, block in enumerate(self.blocks):
             x = x * (self.residual_decay ** i)
-            x = block(x, sep, attn_mask=attn_mask)
+            x = block(x, sep, attn_mask=attn_mask, full_attn=full_attn)
         return x
 
 

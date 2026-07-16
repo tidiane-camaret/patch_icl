@@ -20,6 +20,9 @@ arch:
   thinking_rows: 1
   residual_decay: 0.95
   query_self_attn: true      # let query patches attend to each other (within-target)
+  full_attn: false           # drop the read-only mask: every row (thinking+support+query)
+                             # attends to every row → target-aware context reps. Supersets
+                             # query_self_attn (takes precedence when both set). No GT leak.
   context_id_embed: true     # learned per-context-image tag so attention can group/tell
                              # apart source images (incl. identical instCopy duplicates)
   max_context: 16            # size of the context-id embedding table (context_size ≤ this)
