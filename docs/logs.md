@@ -2672,3 +2672,34 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   patchset already beats universeg 0.680 vs 0.571 (uv misses 15% completely). ≥129px all tie.
   Mechanism: cossim@32 flat, coarse occupancy dice_ds_soft@32 +0.069 / dice_coarse +0.081 —
   fix activates surviving cells, survival itself unchanged (0.277, GT property).
+
+## PatchSetCNN: shaped mask token (mask_patch_size)
+- Added `mask_patch_size` (p) to `PatchSetCNN` (src/models/patchset_cnn.py). Mask token was a
+  single scalar (avg-pool occupancy) → `Linear(1,e)`. p>1 now resamples each patch's mask to a
+  fixed p×p tile → `Linear(p²,e)`, so a *shaped* occupancy (which sub-region of the cell is
+  foreground) reaches the transformer, not just the fraction. Mirrors experiments/2d/multilevel
+  (`_mask_tiles`, `mask_prior=patch`, PatchSetPFN.mask_embed=Linear(p²,e)).
+- New module helper `_mask_tiles` (bilinear-resize to grid*p, exact reshape to per-cell p²).
+  Generalized `_occupancy` (grid + encode_once paths), `_attn` query-prior expand, and the
+  scatter path (support = true-mask tiles, query = coarse-prob tiles). p=1 keeps the scalar
+  avg-pool branch → default runs byte-identical.
+- Wired `arch.mask_patch_size` through train.py build_model + configs/.../model/patchset_cnn.yaml.
+  RESOLUTION-AGNOSTIC by design: each cell's native mask patch (image_size//resolution px, which
+  varies with resolution) is resized to a FIXED p×p tile, so `mask_embed` is always `Linear(p²,e)`
+  and shareable/transferable across resolutions. Default p=8; `1` = scalar avg-pool occupancy.
+  Verified mask_embed.in stays 64 at resolution 32 (4px/cell) and 16 (8px/cell). Smoke-tested
+  single-level / scatter / encode_once at p∈{1,8}.
+
+## PatchSetCNN: tiled decoder (decode_patch) — reconstruct higher/original res
+- Added `decode_patch` (d) to `PatchSetCNN`. Decoder head was `Linear(e,h)→GELU→Linear(h,1)`
+  (one logit per query token → R×R prediction). Now `Linear(h,d²)`: each of the R² query tokens
+  decodes a d×d block, tiled (inverse of `_mask_tiles`, verified exact round-trip) into an
+  (R·d)×(R·d) map — a higher-res mask with NO upsampling stage. d = image_size//resolution
+  reconstructs the ORIGINAL input resolution (e.g. 128/32=4 → full 128×128). d=1 = unchanged
+  default (checkpoint-compatible).
+- Guarded: tiled decode asserts on the scatter/flat_out path (d must be 1 there). Grid +
+  encode_once/reencode refine paths tile fine (refine_logit becomes (B,1,R·d,R·d)).
+- Loss/metrics are res-agnostic in train.py (_target_like pools GT to the logit size); with d>1
+  the logit hits native res so it trains/monitors like a native model. NOTE a `dice_eps.{32}`
+  entry no longer matches when the logit side becomes R·d (falls back to default 1.0).
+- Wired arch.decode_patch through train.py build_model + model/patchset_cnn.yaml (default 1).

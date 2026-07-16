@@ -26,6 +26,14 @@ arch:
   context_id_embed: true     # learned per-context-image tag so attention can group/tell
                              # apart source images (incl. identical instCopy duplicates)
   max_context: 16            # size of the context-id embedding table (context_size ≤ this)
+  mask_patch_size: 1         # mask-token input, RESOLUTION-AGNOSTIC: each cell's native mask patch
+                             # (image_size//resolution px) is resized to a FIXED p×p tile → the
+                             # mask_embed is always Linear(p²,e), shareable across resolutions.
+                             # 1 = scalar avg-pool occupancy (fraction only); p>1 = shaped tile.
+  mask_patch_decode_size: 1  # decoder OUTPUT tile: 1 = one logit per query token → R×R prediction.
+                             # d>1 = each token decodes a d×d block, tiled into an (R·d)×(R·d) map
+                             # (no upsampling). d = image_size//resolution reconstructs the ORIGINAL
+                             # resolution directly (e.g. 128/32 = 4 → full 128×128 output).
 
 train:
   lr: 3.0e-4

@@ -43,6 +43,23 @@ DEFAULT_SAMPLE = dict(n_total=256, tau=0.30, blur_sigma=1.0, floor=0.005,
                       n_fg_core=64, n_fg_core_ctx=64, temperature=1.0, n_boundary_core=0)
 
 
+def _mask_tiles(mask_hw: torch.Tensor, grid_res: int, p: int) -> torch.Tensor:
+    """(B,1,Hf,Wf) → (B, grid_res², p²): per-cell p×p mask tile, row-major cell order.
+
+    Resizes to grid_res*p first when needed (bilinear — e.g. upsampling a coarse prior or a
+    native mask coarser than grid_res*p); for Hf == grid_res*p it is an exact reshape. Mirrors
+    experiments/2d/multilevel/pipeline._mask_tiles, giving each patch a shaped mask token
+    (p²-vector into mask_embed) instead of a single scalar occupancy."""
+    target = grid_res * p
+    if mask_hw.shape[-1] != target or mask_hw.shape[-2] != target:
+        mask_hw = F.interpolate(mask_hw.float(), size=(target, target),
+                                mode="bilinear", align_corners=False)
+    B = mask_hw.shape[0]
+    return (mask_hw.reshape(B, 1, grid_res, p, grid_res, p)
+                   .permute(0, 2, 4, 3, 5, 1)
+                   .reshape(B, grid_res * grid_res, p * p))
+
+
 class ConvEncoder(nn.Module):
     """Single-stream conv encoder with multi-scale feature concatenation.
 
@@ -127,6 +144,8 @@ class PatchSetCNN(nn.Module):
         refine_mode: str = "reencode",
         refine_memory: bool = False,
         sample: dict | None = None,
+        mask_patch_size: int = 8,
+        mask_patch_decode_size: int = 1,
     ):
         super().__init__()
         self.image_size = image_size
@@ -175,7 +194,14 @@ class PatchSetCNN(nn.Module):
             self.refine_crops.append(c)
         self.encoder = ConvEncoder(1, tuple(enc_dims), resolution)
         self.img_embed = nn.Linear(self.encoder.out_ch, e)
-        self.mask_embed = nn.Linear(1, e)              # scalar occupancy → e
+        # Mask token input — RESOLUTION-AGNOSTIC. Each cell's native mask patch (image_size //
+        # token-grid px, which varies with resolution) is resized to a FIXED p×p tile, so the
+        # mask_embed is always Linear(p², e) and can be shared/transferred across resolutions.
+        # p==1 → scalar avg-pool occupancy (Linear(1,e), fraction only); p>1 → a shaped occupancy
+        # tile (which part of the cell is foreground), not just the fraction.
+        self.mask_patch_size = int(mask_patch_size)
+        assert self.mask_patch_size >= 1, "mask_patch_size must be >= 1"
+        self.mask_embed = nn.Linear(self.mask_patch_size ** 2, e)   # occupancy tile p² → e
         self.pos = FourierPositionalEncoding(e, fourier_bands)   # (i,j) → e, added to both cols
         # Optional per-context-image identity: a learned tag added to all patches of a
         # given context image (shared across its N patches, both cols), so the otherwise
@@ -201,7 +227,15 @@ class PatchSetCNN(nn.Module):
             self.mem_type = nn.Parameter(torch.zeros(e))
             nn.init.normal_(self.mem_type, std=0.02)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
-        self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, 1))
+        # Decoder head: each query token emits mask_patch_decode_size² logits. d==1 → one logit
+        # per token (prediction at the token grid R, the original low-res behavior). d>1 → each
+        # token decodes a d×d block that tiles back into an (R·d)×(R·d) map, so the transformer
+        # reconstructs a HIGHER-res mask with no upsampling stage. d = image_size // resolution
+        # reconstructs exactly the original input resolution (R·d = image_size).
+        self.mask_patch_decode_size = int(mask_patch_decode_size)
+        assert self.mask_patch_decode_size >= 1, "mask_patch_decode_size must be >= 1"
+        self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(),
+                                     nn.Linear(h, self.mask_patch_decode_size ** 2))
         # Row-major (i,j) grid coords of the R×R patch lattice, shared by every image.
         ii = torch.arange(resolution).repeat_interleave(resolution)
         jj = torch.arange(resolution).repeat(resolution)
@@ -226,12 +260,18 @@ class PatchSetCNN(nn.Module):
                 feat[:, K:].reshape(B, self.N, Cf))                           # (B,Q,Cf)  Q=N
 
     def _occupancy(self, context_out):
-        """context_out (B,K,1,H,W) → support occupancy (B,K·N,1): avg-pool each mask to the
-        token grid R×R, image-major. Query prior (= support-mean) is derived inside _attn."""
+        """context_out (B,K,1,H,W) → support mask-token input (B,K·N,p²), image-major, row-major
+        cells. p=1: scalar avg-pool occupancy per patch (unchanged default). p>1: each patch's
+        mask resampled to a p×p tile. Query prior (= support-mean) is derived inside _attn."""
         B, K = context_out.shape[0], context_out.shape[1]
         H, W = context_out.shape[-2:]
-        occ = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W), (self.resolution,) * 2)
-        return occ.reshape(B, K * self.N, 1)
+        p = self.mask_patch_size
+        if p == 1:
+            occ = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W), (self.resolution,) * 2)
+            return occ.reshape(B, K * self.N, 1)
+        tiles = torch.stack([_mask_tiles(context_out[:, k], self.resolution, p) for k in range(K)],
+                            dim=1)                                     # (B,K,N,p²)
+        return tiles.reshape(B, K * self.N, p * p)
 
     def _segment(self, image, context_in, context_out, mem=None, return_think=False):
         """Coarse single-pass segmentation → (B,1,R,R) logits.
@@ -252,7 +292,7 @@ class PatchSetCNN(nn.Module):
         """Grid path: full R x R query lattice, support-mean prior. Wraps _attn_core with the
         grid defaults so the coarse / single-level output is unchanged."""
         B, N = sup_feat.shape[0], self.N
-        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, 1)          # (B,Q,1) prior
+        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # (B,Q,p²) prior
         sup_ij = self.ij_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 2)  # (B,S,2)
         qry_ij = self.ij_base.unsqueeze(0).expand(B, N, 2)                   # (B,Q,2)
         return self._attn_core(sup_feat, qry_feat, sup_occ, qry_occ, sup_ij, qry_ij,
@@ -306,9 +346,19 @@ class PatchSetCNN(nn.Module):
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn)
 
         q = x[:, sep_t:, 0, :]                                             # (B,Q,e) query img-col
-        logit = self.decoder(q).squeeze(-1)                               # (B,Q)
-        if not flat_out:
-            logit = logit.reshape(B, 1, res, res)
+        out = self.decoder(q)                                             # (B,Q,d²)
+        d = self.mask_patch_decode_size
+        if flat_out:
+            assert d == 1, "tiled decode (mask_patch_decode_size>1) unsupported on the scatter/flat path"
+            logit = out.squeeze(-1)                                       # (B,Q)
+        elif d == 1:
+            logit = out.reshape(B, 1, res, res)                          # one logit per token
+        else:
+            # tile each query cell's d×d block into an (res·d)×(res·d) map (row-major cells,
+            # row-major within-tile), i.e. the inverse of _mask_tiles.
+            logit = (out.reshape(B, res, res, d, d)
+                        .permute(0, 1, 3, 2, 4)
+                        .reshape(B, 1, res * d, res * d))
         if return_think:
             return logit, x[:, :self.thinking.n].mean(dim=2)             # (B,n_think,e)
         return logit
@@ -441,7 +491,11 @@ class PatchSetCNN(nn.Module):
             n_fg_core=s["n_fg_core"], n_boundary_core=s["n_boundary_core"])
         qry_feat = gather_grid(feat[:, -1], qidx)                          # (B,M,Cf)  target is last
         qry_ij = idx_to_ij(qidx, Rf)                                       # (B,M,2)
-        qry_occ = gather_grid(q_map, qidx).unsqueeze(-1)                  # (B,M,1) coarse-prob prior
+        p = self.mask_patch_size
+        if p == 1:
+            qry_occ = gather_grid(q_map, qidx).unsqueeze(-1)             # (B,M,1) coarse-prob prior
+        else:                                                            # p×p coarse-prob tile prior
+            qry_occ = gather_grid(_mask_tiles(coarse_prob, Rf, p), qidx)  # (B,M,p²)
 
         # ── support: sample from each context's true mask fraction at Rf ──
         ctx_frac = F.adaptive_avg_pool2d(context_out.reshape(B * K, 1, H, W),
@@ -452,7 +506,12 @@ class PatchSetCNN(nn.Module):
             n_fg_core=s["n_fg_core_ctx"], n_boundary_core=s["n_boundary_core"])
         ctx_feat = feat[:, :K].reshape(B * K, Nf, Cf)
         sup_feat = gather_grid(ctx_feat, sidx).reshape(B, K * M, Cf)
-        sup_occ = gather_grid(ctx_frac, sidx).reshape(B, K * M, 1)
+        if p == 1:
+            sup_occ = gather_grid(ctx_frac, sidx).reshape(B, K * M, 1)
+        else:                                                            # p×p true-mask tile per patch
+            ctx_tiles = torch.stack([_mask_tiles(context_out[:, k], Rf, p) for k in range(K)],
+                                    dim=1).reshape(B * K, Nf, p * p)     # (B*K,Nf,p²)
+            sup_occ = gather_grid(ctx_tiles, sidx).reshape(B, K * M, p * p)
         sup_ij = idx_to_ij(sidx, Rf).reshape(B, K * M, 2)
 
         mem = coarse_think.detach() if coarse_think is not None else None

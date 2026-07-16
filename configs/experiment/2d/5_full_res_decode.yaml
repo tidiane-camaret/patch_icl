@@ -1,0 +1,15 @@
+# Experiment 5 - decode target patches at full resolution (R·d = 128px) rather than the coarse grid (R = 32px)
+defaults:
+  - 1_omnisynth_medseg
+  - _self_
+
+arch:
+  thinking_rows: 8
+  mask_patch_size: 4
+  mask_patch_decode_size: 4
+  full_attn: true    
+
+
+augment: true   
+aug_preset: 2d_strong
+

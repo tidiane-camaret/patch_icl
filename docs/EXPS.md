@@ -1,3 +1,6 @@
+# 12_medsegbench_biomedparse_comp
+## Q : comp of in-domain (medsegbench) and out-of-domain (biomedparse) 
+
 # 12_small_occupancies
 ## Q : on omnisynth_medseg, how to retain small occupany objects ?
 
