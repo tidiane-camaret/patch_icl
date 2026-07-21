@@ -1,34 +1,32 @@
 # @package _global_
-# 3D in-context eval config for experiments/3d/eval.py — layered on config.yaml
-# (paths/cluster come from there). Generic single-model eval, default medverse.
-#   python experiments/3d/eval.py experiment=3d/eval
-#   python experiments/3d/eval.py experiment=3d/eval eval.model=native_resenc \
+# 3D in-context eval entrypoint (experiments/3d/eval.py, config_name=eval). Composes a
+# dataset group; the model is chosen by eval.model (loaded by name in eval.py).
+#   python experiments/3d/eval.py                                   # medverse on totalseg (test)
+#   python experiments/3d/eval.py eval.model=native_resenc \
 #       eval.checkpoint=results/checkpoints/resenc_in_context_best.pt
-#   python experiments/3d/eval.py experiment=3d/eval data.source=totalsegmri
-
-data:
-  source: totalseg            # totalseg | totalsegmri
-  image_size: [128, 128, 128]
-  context_size: 1             # K reference (image, mask) pairs
-  use_crop: true
-  val_classes: benchmark      # eval class list (benchmark | not_benchmark | split name | [list])
-
+#   python experiments/3d/eval.py dataset=omnisynth3d eval.split=val   # eval on omniSynth-3D
+defaults:
+  - cluster: nfs
+  - augmentations: multiverseg
+  - dataset: totalseg
+  - _self_
+  - optional experiment:
+hydra:
+  searchpath:
+    - file://${oc.env:PWD}/configs
 eval:
   model: medverse             # medverse | native_resenc | native_vit | multilevel | nninteractive
   split: test
-  n_subjects: 50              # max test subjects per class
+  n_subjects: 50
   batch_size: 8
   workers: 20
   seed: 0
   save_figures: true
   max_figures: 200
   out_dir: ${paths.results}/3d_eval
-  # medverse-specific (ignored by other models)
   medverse_ckpt: null         # override Medverse.ckpt path; null = adapter default
   sw_roi_size: null           # sliding-window ROI; null = adapter default (128³)
-  # non-medverse models
   checkpoint: null            # trained best.pt (required for native_*/multilevel/nninteractive)
-
 wandb:
   project: patch_icl_3d_eval  # null to disable
   name: null

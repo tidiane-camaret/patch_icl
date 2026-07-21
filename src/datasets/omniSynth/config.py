@@ -86,3 +86,25 @@ class OmniSamplingConfig:
     epoch_length: int = 10000
     eval_subjects_per_task: int = 4
     eval_seed_namespace: int = 0
+
+
+@dataclass
+class OmniTotalSegConfig:
+    """3D omniSynth: TotalSegmentator organs on a 3D canvas. Reads the precomputed
+    per-class tile caches under {tiles_root}/T{size[0]}/{split}/ (built by
+    scripts/synth3d/build_totalseg_tiles.py). Free placement only; target_mode is
+    restricted to identical | class in v1 (no 3D affine aug)."""
+    tiles_root: str = ""
+    size: tuple = (64, 64, 64)
+    classes: tuple = ()               # () = all classes present; else subset of names
+    n_objects: int = 4                # total organs placed per scene (targets + distractors)
+    k_min: int = 1                    # target count ~ U[k_min, k_max], clamped to [1, n_objects]
+    k_max: int = 2
+    placement_tries: int = 4          # anti-overlap: candidates tried per object (>1 = rejection)
+    placement_max_overlap: float = 0.1
+    target_mode: str = "class"        # identical | class (aug deferred)
+    background: str = "black"         # black | noise
+    lru_classes: int = 64             # #class tile-files kept in RAM
+    eval_seed_namespace: int = 0
+    eval_subjects_per_task: int = 4
+    epoch_length: int = 10000

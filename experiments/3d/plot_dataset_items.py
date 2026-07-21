@@ -12,12 +12,12 @@ for multi-label / random-coloured items).
 
 Usage
 -----
-  python experiments/3d/plot_dataset_items.py                     # train split
-  python experiments/3d/plot_dataset_items.py --split val
+  python experiments/3d/plot_dataset_items.py                        # totalseg train split
+  python experiments/3d/plot_dataset_items.py dataset=omnisynth3d --split val
   python experiments/3d/plot_dataset_items.py --n_samples 6 --out results/x.png
-  # Hydra overrides are forwarded, just like train.py:
-  python experiments/3d/plot_dataset_items.py data.source=totalsegmri cluster=meta
-  python experiments/3d/plot_dataset_items.py data.p_synth=1.0        # synth-only view
+  # Hydra overrides forwarded after the argparse flags:
+  python experiments/3d/plot_dataset_items.py dataset=omnisynth3d synth3d.tiles_root=results/3d/omni_tiles
+  python experiments/3d/plot_dataset_items.py cluster=meta           # totalseg on meta cluster
 """
 
 import argparse
@@ -90,15 +90,16 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--split",     default="train", choices=["train", "val", "test"])
     parser.add_argument("--n_samples", type=int, default=4)
-    parser.add_argument("--out",       default="results/dataset_items.png")
+    parser.add_argument("--out",       default="results/3d/dataset_items.png")
     parser.add_argument("-h", "--help", action="store_true")
     args, hydra_overrides = parser.parse_known_args()
 
     if args.help:
         parser.print_help(); return
 
-    with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
-        cfg = compose(config_name="config", overrides=hydra_overrides)
+    with initialize_config_dir(config_dir=str(ROOT / "configs" / "experiment" / "3d"),
+                               version_base="1.3"):
+        cfg = compose(config_name="train", overrides=hydra_overrides)
 
     ds = build_dataset(cfg, args.split)
 
@@ -138,13 +139,21 @@ def main():
     for ax in axes.flat:
         ax.set_xticks([]); ax.set_yticks([])
 
-    source    = cfg.data.get("source", "totalseg")
-    aug_on    = args.split == "train" and cfg.augmentations.enabled
-    synth_on  = args.split == "train" and bool(cfg.data.synth_method)
-    aug_tag   = " + aug"                          if aug_on   else ""
-    synth_tag = f" + synth(p={cfg.data.p_synth})" if synth_on else ""
+    source = cfg.data.get("source", "totalseg")
+    if source == "omnisynth3d":
+        # omniSynth 3D composes scenes itself (no task-aug / supervoxel-synth path); its
+        # scene knobs live in cfg.synth3d, so surface those instead of the totalseg tags.
+        s3 = cfg.synth3d
+        extra = (f"  |  n_obj={s3.n_objects}  k={s3.k_min}-{s3.k_max}"
+                 f"  mode={s3.target_mode}  bg={s3.background}")
+    else:
+        aug_on    = args.split == "train" and cfg.augmentations.enabled
+        synth_on  = args.split == "train" and bool(cfg.data.synth_method)
+        aug_tag   = " + aug"                          if aug_on   else ""
+        synth_tag = f" + synth(p={cfg.data.p_synth})" if synth_on else ""
+        extra     = f"{aug_tag}{synth_tag}"
     fig.suptitle(
-        f"{source}  |  split={args.split}  |  K={K}{aug_tag}{synth_tag}",
+        f"{source}  |  split={args.split}  |  K={K}{extra}",
         fontsize=11, y=1.01,
     )
     fig.tight_layout()

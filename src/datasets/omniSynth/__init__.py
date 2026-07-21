@@ -6,13 +6,16 @@ target (mask = ink pixels of the target characters within those cells) and the r
 pipeline via data.source=omnisynth.
 """
 from .config import (OmniDiversityConfig, OmniMedSegConfig, OmniSceneConfig,
-                     OmniSamplingConfig)
+                     OmniSamplingConfig, OmniTotalSegConfig)
 from .dataset import OmniSynthICLDataset
+from .dataset3d import OmniSynth3DICLDataset
 
 __all__ = [
     "OmniDiversityConfig",
     "OmniMedSegConfig",
     "OmniSceneConfig",
     "OmniSamplingConfig",
+    "OmniTotalSegConfig",
     "OmniSynthICLDataset",
+    "OmniSynth3DICLDataset",
 ]

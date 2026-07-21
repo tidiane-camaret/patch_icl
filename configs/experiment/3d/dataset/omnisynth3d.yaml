@@ -1,0 +1,23 @@
+# @package _global_
+# omniSynth 3D dataset — TotalSegmentator organs on a synthetic canvas. Composed as
+# `dataset=omnisynth3d`; the single source of truth for the synth3d scene params.
+# Prerequisite: build the tile cache once, e.g.
+#   python scripts/synth3d/build_totalseg_tiles.py --split train --size 64 64 64
+data:
+  source: omnisynth3d
+  image_size: [128, 128, 128]
+  context_size: 1
+
+synth3d:
+  tiles_root: ${paths.totalseg}/omni_tiles
+  size: [128, 128, 128]
+  classes: []            # [] = all classes present in the cache
+  n_objects: 8
+  k_min: 1
+  k_max: 1
+  placement_tries: 4
+  placement_max_overlap: 0.1
+  target_mode: class     # identical | class
+  background: noise       # black | noise
+  eval_subjects_per_task: 4
+  epoch_length: 10000
