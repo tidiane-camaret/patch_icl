@@ -1,5 +1,33 @@
 # Change log
 
+## 2026-07-21 — 3D config layout: train/eval entrypoints + dataset/model groups
+- refactor(3d-config): `configs/experiment/3d/` reorganized into `train.yaml`/`eval.yaml`
+  entrypoints that compose `dataset/{totalseg,omnisynth3d}` + `model/medverse` groups,
+  overridable by an `optional experiment:` preset. `hydra.searchpath`
+  (`file://${oc.env:PWD}/configs`, run from repo root) keeps the global cluster→paths
+  chain. The 3 hydra entrypoints (train.py/eval.py/plot_dataset_items.py) now point at
+  the 3D config root. Old flat files removed; synth3d block de-duplicated (one source in
+  dataset/omnisynth3d.yaml). New usage: `train.py dataset=omnisynth3d`,
+  `eval.py dataset=omnisynth3d eval.split=val`. Spec: 2026-07-21-3d-config-layout-design.md.
+
+## 2026-07-21 — omniSynth 3D (TotalSegmentator organs on a 3D canvas)
+- feat(omnisynth3d): extends omniSynth to compose 3D in-context scenes by painting bbox-cropped
+  TotalSegmentator organs at random 3D positions on a D×H×W canvas. Emits the
+  `TotalSegInContextDataset` contract (image/label/context_in/context_out/subject/label_name/
+  spacing), so the 3D pipeline + `incontext_collate_fn` consume it unchanged. Selected via
+  `data.source=omnisynth3d` (config group `configs/experiment/3d/dataset/omnisynth3d.yaml`,
+  selected via `dataset=omnisynth3d`).
+- Free placement only, native (canvas-relative) organ sizes, contour-based compositing +
+  anti-overlap (mask, never bbox). target_mode ∈ {identical, class} (aug/3D-rotation deferred).
+- Dataloading-optimized: one-time build script `scripts/synth3d/build_totalseg_tiles.py` crops
+  every organ into per-class fp16 `[2,T,T,T]` tile caches (`<root>/T{D}/{split}/class_{lv}.pkl`);
+  `TotalSegObjectBank` reads them with an LRU — no full-volume reads/cropping in the hot path.
+  Cubic-canvas only. New modules: bank_common3d, bank_totalseg, render3d, dataset3d (+config
+  OmniTotalSegConfig). 2D omniSynth path untouched. New 3D tests 24/24; full suite 62.
+  Spec: 2026-07-21-omnisynth-3d-design.md; plan: 2026-07-21-omnisynth-3d.md.
+- Pre-training TODO: on the first real-data build, visually spot-check tile intensity range /
+  mask coverage — CT is normalized as clip(≥0)/per-volume-max (validate HU/air handling).
+
 ## 2026-07-16 — sim_prior experiment config (6_sim_prior)
 - feat(patchset): sim_prior — max-cosine similarity query prior (PFENet-style) seeding the query
   mask token; single-level, zero params, off by default. Config 6_sim_prior (A/B vs 5). Targets

@@ -40,7 +40,7 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     return source, root, source == "totalsegmri"
 
 
-def build_dataset(cfg, split: str) -> TotalSegInContextDataset:
+def build_dataset(cfg, split: str):
     """Construct the 3D in-context dataset for `split`, dispatching on cfg.data.source.
 
     Split-aware, matching scripts/train.py: the 'train' split enables
@@ -48,6 +48,30 @@ def build_dataset(cfg, split: str) -> TotalSegInContextDataset:
     knob (including the newer random_coloring / num_labels_per_sample /
     n_synth_merge_*) is forwarded, so the dataset is identical to training.
     """
+    if cfg.data.get("source", "totalseg") == "omnisynth3d":
+        from src.datasets.omniSynth.dataset3d import OmniSynth3DICLDataset
+        from src.datasets.omniSynth.config import OmniTotalSegConfig
+        s = cfg.get("synth3d")
+        if s is None:
+            raise ValueError("data.source=omnisynth3d requires a `synth3d` config block")
+        tiles_root = s.get("tiles_root", None) or cfg.paths.get("totalseg")
+        cfg3d = OmniTotalSegConfig(
+            tiles_root=tiles_root,
+            size=tuple(s.get("size", cfg.data.image_size)),
+            classes=tuple(s.get("classes", ()) or ()),
+            n_objects=int(s.get("n_objects", 4)),
+            k_min=int(s.get("k_min", 1)), k_max=int(s.get("k_max", 2)),
+            placement_tries=int(s.get("placement_tries", 4)),
+            placement_max_overlap=float(s.get("placement_max_overlap", 0.1)),
+            target_mode=s.get("target_mode", "class"),
+            background=s.get("background", "black"),
+            lru_classes=int(s.get("lru_classes", 64)),
+            eval_seed_namespace=int(s.get("eval_seed_namespace", 0)),
+            eval_subjects_per_task=int(s.get("eval_subjects_per_task", 4)),
+            epoch_length=int(s.get("epoch_length", 10000)),
+        )
+        return OmniSynth3DICLDataset(split=split, context_size=cfg.data.context_size,
+                                     cfg=cfg3d)
     d = cfg.data
     _, root, is_mri = _source_root(cfg)
     class_spec = d.train_classes if split == "train" else d.val_classes
@@ -113,6 +137,20 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
     the same config surface as training.
     """
     d, e = cfg.data, cfg.eval
+    if d.get("source") == "omnisynth3d":
+        # omniSynth3D composes its own deterministic multi-class eval scenes; route
+        # through build_dataset (the same OmniSynth3DICLDataset the trainer uses,
+        # deterministic for val/test). Its pool already spans every tile-cache class,
+        # so the `classes` arg isn't re-applied here — each item carries its own
+        # label_name for the same per-class grouping downstream.
+        ds = build_dataset(cfg, split)
+        nw = int(e.get("workers", 4))
+        return DataLoader(
+            ds, batch_size=int(e.get("batch_size", 8)), shuffle=False,
+            num_workers=nw, collate_fn=incontext_collate_fn,
+            pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
+            prefetch_factor=2 if nw > 0 else None,
+        )
     _, root, is_mri = _source_root(cfg)
     ds = TotalSegInContextDataset(
         root=root,

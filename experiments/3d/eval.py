@@ -5,11 +5,10 @@ on the TotalSegmentator test split over a class list, reporting per-class Dice,
 mean inference time, and GFLOPs. Shares the loader (common.make_eval_loader) and
 eval loop (evaluate.evaluate_classes) with the rest of the 3D harness.
 
-    python experiments/3d/eval.py experiment=3d/eval
-    python experiments/3d/eval.py experiment=3d/eval eval.model=native_resenc \
+    python experiments/3d/eval.py
+    python experiments/3d/eval.py eval.model=native_resenc \
         eval.checkpoint=results/checkpoints/resenc_in_context_best.pt
-    python experiments/3d/eval.py experiment=3d/eval data.source=totalsegmri \
-        eval.n_subjects=20 data.val_classes='[liver,spleen]'
+    python experiments/3d/eval.py dataset=omnisynth3d eval.split=val   # eval on omniSynth-3D
 """
 
 import datetime
@@ -57,15 +56,27 @@ def _build_model(cfg: DictConfig):
                       image_size=image_size, device=DEVICE)
 
 
-@hydra.main(config_path="../../configs", config_name="config", version_base="1.3")
+@hydra.main(config_path="../../configs/experiment/3d", config_name="eval", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     random.seed(cfg.eval.seed)
     torch.manual_seed(cfg.eval.seed)
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    _, root, is_mri = _source_root(cfg)
-    classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
+    source = cfg.data.get("source", "totalseg")
+    if source == "omnisynth3d":
+        # Classes come from the omniSynth3D tile-cache pool (the label_names the
+        # dataset emits), not label_stats.csv. Build the bank once to list them.
+        from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
+        s3 = cfg.synth3d
+        root = s3.get("tiles_root") or cfg.paths.totalseg
+        bank = get_or_build_totalseg_bank(
+            root, tuple(s3.get("size", cfg.data.image_size)),
+            cfg.eval.split, tuple(s3.get("classes", ()) or ()))
+        classes = [bank.alphabet(c) for c in bank.task_ids()]
+    else:
+        _, root, is_mri = _source_root(cfg)
+        classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
     image_size = tuple(cfg.data.image_size)
     K = cfg.data.context_size
     model_name = cfg.eval.model

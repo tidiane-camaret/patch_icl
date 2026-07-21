@@ -1,0 +1,23 @@
+# @package _global_
+# Medverse model + fine-tune recipe (optimizer/scheduler/loss/lr/batch), composed as
+# `model=medverse`. Loss/optimizer/scheduler follow the Medverse/Neuroverse3D (Hu 2025)
+# recipe. 128³ inputs only (Medverse runs level=1, no AR).
+model: medverse
+train:
+  batch_size: 4
+  optimizer: adam               # adam | adamw
+  lr: 3.0e-5
+  weight_decay: 0.0
+  scheduler: plateau            # plateau | cosine | constant
+  lr_factor: 0.5
+  lr_patience: 5
+  lr_min_factor: 0.01           # min_lr = lr * lr_min_factor
+  warmup_epochs: 1              # cosine only (scheduler-coupled)
+  loss: smooth_l1               # smooth_l1 | bce_dice
+  smooth_l1_beta: 1.0
+  loss_scale: 50.0
+  dice_weight: 1.0              # bce_dice only
+  base_ckpt: null               # override the pretrained Medverse.ckpt
+  random_init: true             # true -> train from scratch (ignore pretrained weights)
+data:
+  max_ds_len_train: 200         # fine-tune sample cap (overrides dataset/totalseg's 2000)

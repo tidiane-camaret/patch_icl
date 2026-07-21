@@ -1,0 +1,32 @@
+# @package _global_
+# 3D in-context training entrypoint (experiments/3d/train.py, config_name=train).
+#   python experiments/3d/train.py                       # medverse on totalseg
+#   python experiments/3d/train.py dataset=omnisynth3d   # train on omniSynth-3D
+#   python experiments/3d/train.py train.loss=bce_dice   # ad-hoc overrides
+#   python experiments/3d/train.py +experiment=<preset>  # ablation layer
+defaults:
+  - cluster: nfs
+  - augmentations: multiverseg
+  - dataset: totalseg
+  - model: medverse
+  - _self_
+  - optional experiment:
+hydra:
+  searchpath:
+    - file://${oc.env:PWD}/configs
+train:
+  epochs: 100
+  workers: 8
+  seed: 42
+  eval_every: 1
+  grad_clip: 1.0
+  checkpoint: null              # resume/warm-start fine-tuned weights
+  out_dir: ${paths.results}/3d_train
+eval:                           # per-class validation during training
+  split: val
+  n_subjects: 20
+  batch_size: 4
+  workers: 8
+wandb:
+  project: patch_icl_3d_exps
+  name: null

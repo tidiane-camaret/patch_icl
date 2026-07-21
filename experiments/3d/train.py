@@ -10,8 +10,9 @@ deferred (see docs/superpowers/specs/2026-07-06-3d-medverse-eval-harness-design.
 
 Best checkpoint (by mean val Dice) is saved so experiments/3d/eval.py can reload it.
 
-    python experiments/3d/train.py experiment=3d/medverse
-    python experiments/3d/train.py experiment=3d/medverse train.loss=bce_dice train.optimizer=adamw
+    python experiments/3d/train.py                       # medverse on totalseg (default)
+    python experiments/3d/train.py dataset=omnisynth3d   # train on omniSynth-3D
+    python experiments/3d/train.py train.loss=bce_dice train.optimizer=adamw
 """
 
 import datetime
@@ -191,15 +192,26 @@ def validate_mean(model, cfg, classes, loader=None):
     return mean_dice, rows
 
 
-@hydra.main(config_path="../../configs", config_name="config", version_base="1.3")
+@hydra.main(config_path="../../configs/experiment/3d", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     random.seed(cfg.train.seed)
     torch.manual_seed(cfg.train.seed)
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    _, root, is_mri = _source_root(cfg)
-    val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
+    if cfg.data.get("source", "totalseg") == "omnisynth3d":
+        # omniSynth3D val classes come from the tile-cache pool (the label_names the
+        # dataset emits), not label_stats.csv — mirrors eval.py's resolution.
+        from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
+        s3 = cfg.synth3d
+        root = s3.get("tiles_root") or cfg.paths.totalseg
+        bank = get_or_build_totalseg_bank(
+            root, tuple(s3.get("size", cfg.data.image_size)),
+            "val", tuple(s3.get("classes", ()) or ()))
+        val_classes = [bank.alphabet(c) for c in bank.task_ids()]
+    else:
+        _, root, is_mri = _source_root(cfg)
+        val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
     image_size = tuple(cfg.data.image_size)
     print(f"Device: {DEVICE} | model={cfg.get('model','medverse')} | size={image_size} "
           f"| K={cfg.data.context_size} | loss={cfg.train.get('loss','smooth_l1')} "
