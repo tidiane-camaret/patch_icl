@@ -10,9 +10,23 @@ TotalSegmentator organs at random 3D positions onto a `D×H×W` canvas. Reuse
 omniSynth's existing bank + dataset-orchestration layers; add a **parallel
 `render3d.py`** for volumetric composition (the 2D `render.py` is left untouched).
 
-Output matches the existing 3D in-context contract
-(`{image, label, context_in, context_out}` as `[C, D, H, W]` tensors) so
-`ResEncInContext3D` / `ViTInContext3D` consume it with no changes.
+Output matches the existing **3D pipeline** contract emitted by
+`TotalSegInContextDataset` (verified against `src/totalseg_dataloader_incontext.py`)
+so `ResEncInContext3D` / `ViTInContext3D` and `incontext_collate_fn` consume it
+with no changes:
+
+| key | shape | dtype |
+|---|---|---|
+| `image` | `(1, D, H, W)` | float32 |
+| `label` | `(D, H, W)` (no channel dim) | int64 |
+| `context_in` | `(K, 1, D, H, W)` | float32 |
+| `context_out` | `(K, D, H, W)` (no channel dim) | int64 |
+| `subject` | — | str |
+| `label_name` | — | str |
+| `spacing` | `(3,)` | float32 |
+
+Note this differs from the 2D omniSynth contract (which carries a channel dim on
+the label and a `meta` dict) — the 3D dataset packages the 3D-pipeline contract.
 
 **Primary non-functional constraint: dataloading time.** Every design fork below
 is resolved in favour of the fastest hot path.
@@ -132,13 +146,16 @@ build_dataset(cfg, split)            # source=omnisynth3d
          render_scene_3d(query rng)          → image, mask, k, info
          render_scene_3d(context rng) × K
          optional copy-slot injection (train)
-       return {
-         image:       [1, D, H, W],
-         label:       [1, D, H, W],
-         context_in:  [K, 1, D, H, W],
-         context_out: [K, 1, D, H, W],
-         meta: {class_id, class_name, k_target, target_centroids, context_centroids, ...}
+       return {                              # TotalSegInContextDataset contract
+         image:       [1, D, H, W] float32,
+         label:       [D, H, W]    int64,
+         context_in:  [K, 1, D, H, W] float32,
+         context_out: [K, D, H, W]    int64,
+         subject:     f"omni_{class_id}_{sample_index}",
+         label_name:  class_name,
+         spacing:     [3] float32 (ones — synthetic canvas),
        }
+       # collated by the existing incontext_collate_fn
 ```
 
 ## Testing
