@@ -1,0 +1,10 @@
+# Experiment 6 - max-cosine similarity query prior (PFENet-style) on top of full-res decode.
+# Seeds the query mask token with a localized foreground-similarity prior instead of the flat
+# support-mean, to help the small-object needle-in-haystack. A/B against 5_full_res_decode.
+# Design: docs/superpowers/specs/2026-07-16-similarity-prior-query-seed-design.md
+defaults:
+  - 5_full_res_decode
+  - _self_
+
+arch:
+  sim_prior: true

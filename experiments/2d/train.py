@@ -168,6 +168,7 @@ def build_model(cfg) -> tuple[torch.nn.Module, str, dict]:
             "sample": OmegaConf.to_container(a.get("sample"), resolve=True) if a.get("sample", None) is not None else None,
             "mask_patch_size": a.get("mask_patch_size", 8),
             "mask_patch_decode_size": a.get("mask_patch_decode_size", 1),
+            "sim_prior": a.get("sim_prior", False),
         }
         model = PatchSetCNN(image_size=cfg.data.image_size, **arch)
         return model, name, {"arch": arch}

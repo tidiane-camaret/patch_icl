@@ -1,5 +1,10 @@
 # Change log
 
+## 2026-07-16 — sim_prior experiment config (6_sim_prior)
+- feat(patchset): sim_prior — max-cosine similarity query prior (PFENet-style) seeding the query
+  mask token; single-level, zero params, off by default. Config 6_sim_prior (A/B vs 5). Targets
+  small-object needle-in-haystack. Spec: 2026-07-16-similarity-prior-query-seed-design.md
+
 ## 2026-07-15 — flops_giga is now per-sample (batch-size invariant)
 - `validate()` (`experiments/2d/evaluate.py`) divided the FlopCounterMode total by `img.shape[0]`,
   so `flops_giga` is per-sample instead of per-batch. It was measured on one val batch, so it

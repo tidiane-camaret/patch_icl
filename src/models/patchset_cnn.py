@@ -146,6 +146,7 @@ class PatchSetCNN(nn.Module):
         sample: dict | None = None,
         mask_patch_size: int = 8,
         mask_patch_decode_size: int = 1,
+        sim_prior: bool = False,
     ):
         super().__init__()
         self.image_size = image_size
@@ -181,6 +182,10 @@ class PatchSetCNN(nn.Module):
         # prior, never GT). Supersets query_self_attn's connectivity, so it takes
         # precedence when both are set.
         self.full_attn = full_attn
+        # Max-cosine similarity query prior (PFENet-style): when True, _attn seeds the query
+        # mask token with a localized foreground-similarity prior instead of the flat
+        # support-mean. Adds NO parameters (checkpoint-compatible); grid/single-level path only.
+        self.sim_prior = bool(sim_prior)
         self.context_id_embed = context_id_embed
         self.max_context = max_context
         # Derived per-level crop sizes (px in the image_size frame); level 0 is the full image.
@@ -288,11 +293,48 @@ class PatchSetCNN(nn.Module):
         return self._attn(sup_feat, qry_feat, self._occupancy(context_out), K,
                           mem=mem, return_think=return_think)
 
+    def _similarity_prior(self, qry_feat, sup_feat, sup_occ):
+        """Max-cosine similarity prior mask (PFENet, Tian et al. 2020) → (prior, valid).
+
+        qry_feat (B,N,Cf), sup_feat (B,S,Cf), sup_occ (B,S,p²). For each query cell, the MAX
+        cosine similarity between its feature and the FOREGROUND support-cell features
+        (occupancy≥0.5), min-max normalized per image to [0,1]. `max` (not softmax-mean) is
+        imbalance-robust — the whole point for a needle. Returns a DETACHED (B,N) prior and a
+        (B,) bool `valid` marking images with ≥1 fg support cell (callers fall back to the flat
+        support-mean prior for the rest)."""
+        occ = sup_occ.mean(dim=-1)                                   # (B,S) scalar occupancy
+        fg = occ >= 0.5                                              # (B,S) foreground cells
+        q = F.normalize(qry_feat, dim=-1)
+        s = F.normalize(sup_feat, dim=-1)
+        sim = torch.bmm(q, s.transpose(1, 2))                       # (B,N,S) cosine
+        neg_inf = torch.finfo(sim.dtype).min
+        sim = sim.masked_fill(~fg.unsqueeze(1), neg_inf)            # keep only fg exemplars
+        prior = sim.max(dim=-1).values                              # (B,N) max-cosine to any fg
+        valid = fg.any(dim=-1)                                      # (B,)
+        prior = prior.masked_fill(~valid.unsqueeze(1), 0.0)        # degenerate rows -> 0 (finite)
+        lo = prior.amin(dim=1, keepdim=True)
+        hi = prior.amax(dim=1, keepdim=True)
+        prior = (prior - lo) / (hi - lo).clamp_min(1e-6)          # per-image min-max -> [0,1]
+        return prior.detach(), valid
+
     def _attn(self, sup_feat, qry_feat, sup_occ, K, mem=None, return_think=False):
         """Grid path: full R x R query lattice, support-mean prior. Wraps _attn_core with the
-        grid defaults so the coarse / single-level output is unchanged."""
+        grid defaults so the coarse / single-level output is unchanged.
+
+        When self.sim_prior is set the flat support-mean query prior is replaced by the localized
+        max-cosine similarity prior (_similarity_prior), per-image, falling back to the mean for
+        images with no foreground support cell. NB: this gate lives here in _attn, so it fires on
+        EVERY grid-path pass — the single-level _segment AND the coarse/refine grid passes of the
+        two-level refine modes (_refine_encode_once, _refine_scatter). The scatter/flat path
+        (_attn_core called directly) is unaffected. The shipped 6_sim_prior config is single-level."""
         B, N = sup_feat.shape[0], self.N
-        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # (B,Q,p²) prior
+        mean_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # (B,Q,p²) flat prior
+        if self.sim_prior:
+            prior, valid = self._similarity_prior(qry_feat, sup_feat, sup_occ)        # (B,N), (B,)
+            prior_tile = prior.unsqueeze(-1).expand(B, N, sup_occ.shape[-1])          # uniform-fill p² tile
+            qry_occ = torch.where(valid.view(B, 1, 1), prior_tile, mean_occ)          # fallback for no-fg images
+        else:
+            qry_occ = mean_occ
         sup_ij = self.ij_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 2)  # (B,S,2)
         qry_ij = self.ij_base.unsqueeze(0).expand(B, N, 2)                   # (B,Q,2)
         return self._attn_core(sup_feat, qry_feat, sup_occ, qry_occ, sup_ij, qry_ij,
