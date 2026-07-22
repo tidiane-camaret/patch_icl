@@ -77,9 +77,9 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
 
     def _render_subject(self, subj, anchor_cls, specs, scene_rng):
         image_t, anchor_t = self._load(subj, anchor_cls)          # fast path
-        img = image_t.squeeze(0).numpy().astype(np.float32).copy()  # (D,H,W)
+        img = image_t.squeeze(0).numpy().astype(np.float32)  # (D,H,W)
         label = np.zeros(img.shape, dtype=np.int64)
-        stats = anchor_stats(anchor_t.numpy())
+        stats = anchor_stats(anchor_t.cpu().numpy())
         if stats is not None:
             centroid, extent, _ = stats
             base = self.scale_frac * float(np.mean(extent))
@@ -105,10 +105,16 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
             anchor_cls = self.active_classes[item_rng.integers(len(self.active_classes))]
 
         subs = self.label_to_subjects[anchor_cls]
-        order = item_rng.permutation(len(subs))
-        chosen = [subs[i] for i in order[:self.context_size + 1]]
-        while len(chosen) < self.context_size + 1:
-            chosen.append(chosen[int(item_rng.integers(len(chosen)))])
+        ordered = [subs[i] for i in item_rng.permutation(len(subs))]
+        target = ordered[0]
+        context_pool = ordered[1:]                        # excludes the target (no leakage)
+        contexts = list(context_pool[:self.context_size])
+        while len(contexts) < self.context_size:
+            if context_pool:
+                contexts.append(context_pool[int(item_rng.integers(len(context_pool)))])
+            else:
+                contexts.append(target)                   # only fallback: self-context (rare)
+        chosen = [target] + contexts
 
         specs = self._draw_specs(item_rng)
         scene_seeds = item_rng.integers(0, 2 ** 32, size=len(chosen))

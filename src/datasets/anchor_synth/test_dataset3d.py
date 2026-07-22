@@ -58,6 +58,7 @@ def test_anchor_not_emitted_as_label(tmp_path):
     anchor_mask = (np.load(tmp_path / f"{item['subject']}/label_{SIZE}x{SIZE}x{SIZE}.npy") == idx)
     # the label is the drawn object, not the anchor organ
     assert not np.array_equal(item["label"].numpy() > 0, anchor_mask)
+    assert int(item["label"].max()) <= 1        # n_objects=1 here: only bg(0) or object(1)
 
 
 def test_deterministic_across_instances(tmp_path):
