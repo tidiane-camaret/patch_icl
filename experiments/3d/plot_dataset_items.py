@@ -146,6 +146,12 @@ def main():
         s3 = cfg.synth3d
         extra = (f"  |  n_obj={s3.n_objects}  k={s3.k_min}-{s3.k_max}"
                  f"  mode={s3.target_mode}  bg={s3.background}")
+    elif source == "anchor_synth3d":
+        # anchor_synth3d draws synthetic objects at anchor-relative positions on real CT;
+        # its knobs live in cfg.anchor_synth (no task-aug / supervoxel-synth path).
+        a = cfg.anchor_synth
+        extra = (f"  |  obj={a.object_source}/{a.shape}  n_obj={a.n_objects}"
+                 f"  offset={a.offset_range}  scale={a.scale_frac}  Δ={a.contrast_delta}")
     else:
         aug_on    = args.split == "train" and cfg.augmentations.enabled
         synth_on  = args.split == "train" and bool(cfg.data.synth_method)

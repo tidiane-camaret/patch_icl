@@ -66,9 +66,9 @@ def main(cfg: DictConfig) -> None:
 
     source = cfg.data.get("source", "totalseg")
     if source == "anchor_synth3d":
-        a = cfg.anchor_synth
+        from common import resolve_anchor_classes
         root = cfg.paths.get("totalseg")
-        classes = resolve_classes(a.get("anchor_classes") or (), totalseg_root=root)
+        classes = resolve_anchor_classes(cfg.anchor_synth, root)
     elif source == "omnisynth3d":
         # Classes come from the omniSynth3D tile-cache pool (the label_names the
         # dataset emits), not label_stats.csv. Build the bank once to list them.

@@ -50,6 +50,11 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
         self.epoch_length = int(epoch_length)
         self.anchor_deterministic = (split != "train") if deterministic is None else deterministic
 
+        if not self.active_classes:
+            raise ValueError(
+                f"AnchorSynth3DICLDataset: no anchor class has any subject in split "
+                f"{split!r} (classes={list(self.classes)!r}). Check anchor_classes / root.")
+
         if self.anchor_deterministic:
             self._eval_index = [(cls, s) for cls in self.active_classes
                                 for s in range(self.eval_subjects_per_task)]

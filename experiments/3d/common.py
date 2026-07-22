@@ -40,6 +40,16 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     return source, root, source == "totalsegmri"
 
 
+def resolve_anchor_classes(anchor_cfg, root):
+    """Anchor pool for anchor_synth3d: resolve `anchor_classes`, expanding an empty
+    list to all 117 TotalSegmentator classes (the documented `[]` = all)."""
+    classes = resolve_classes(anchor_cfg.get("anchor_classes") or (), totalseg_root=root)
+    if not classes:
+        from data.totalseg_classes import ALL_CLASSES
+        classes = list(ALL_CLASSES[:117])
+    return classes
+
+
 def build_dataset(cfg, split: str):
     """Construct the 3D in-context dataset for `split`, dispatching on cfg.data.source.
 
@@ -79,7 +89,7 @@ def build_dataset(cfg, split: str):
         if a is None:
             raise ValueError("data.source=anchor_synth3d requires an `anchor_synth` block")
         root = cfg.paths.get("totalseg")
-        classes = resolve_classes(a.get("anchor_classes") or (), totalseg_root=root)
+        classes = resolve_anchor_classes(a, root)
         is_train = split == "train"
         return AnchorSynth3DICLDataset(
             root=root, classes=classes, image_size=tuple(cfg.data.image_size),
