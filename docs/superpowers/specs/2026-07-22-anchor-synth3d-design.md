@@ -43,7 +43,12 @@ target is the blob near the anchor, not the anchor itself.
 
 ## Architecture (approach A: subclass the existing dataset)
 
-### `src/datasets/anchor_synth3d.py` — `AnchorSynth3DICLDataset(TotalSegInContextDataset)`
+New code lives in a small package `src/datasets/anchor_synth/`:
+`dataset3d.py` (the dataset), `shapes.py` (object generators), `draw.py`
+(placement + compositing helpers). This mirrors `controlSynth/`'s `shapes/`
+subpackage convention while keeping the dataset the single entry point.
+
+### `src/datasets/anchor_synth/dataset3d.py` — `AnchorSynth3DICLDataset(TotalSegInContextDataset)`
 
 Subclasses `TotalSegInContextDataset` to inherit, unchanged:
 
@@ -75,11 +80,34 @@ Overrides `__getitem__`:
    task spec (offset(s), scale, contrast, anchor class) for the eval sample table.
 
 New constructor params (all with defaults so the base signature is unaffected):
-`object_source ("blob"|"organ")`, `n_objects`, `anchor_classes`, `offset_range`,
-`scale_frac`, `scale_jitter`, `rotate_jitter`, `contrast_delta`, `edge_blur`,
-`deterministic`, `eval_seed_namespace`, `eval_subjects_per_task`.
+`object_source ("blob"|"organ")`, `shape ("blob"|"elongated"|"mix")`, `n_objects`,
+`anchor_classes`, `offset_range`, `scale_frac`, `scale_jitter`, `rotate_jitter`,
+`contrast_delta`, `edge_blur`, `boundary_complexity`, `deterministic`,
+`eval_seed_namespace`, `eval_subjects_per_task`.
 
-### `src/datasets/anchor_synth/draw.py` — pure, unit-testable helpers
+### `src/datasets/anchor_synth/shapes.py` — object generators (pure, testable)
+
+Follows `controlSynth/shapes/blob.py`'s approach, extended to 3D: a base
+ellipsoid whose radius is modulated by **low-frequency radial harmonics** for
+organic, irregular (non-spherical) shapes — fully **analytic**, no scipy in the
+default path.
+
+- `make_object(size, params, rng) -> alpha_tile`
+  Evaluates a rotated ellipsoid field `((x/ax)^2 + (y/ay)^2 + (z/az)^2) <= r(θ,φ)`
+  on a `size³` grid, where `r(θ,φ)` is a product of a few low-order harmonics
+  (`1 + Σ a_k cos(k·angle + φ_k)`, the 3D analog of `_radial_harmonics`). A `shape`
+  param selects the base geometry (`blob` = near-isotropic, `elongated` =
+  eccentric axes, `mix` = sampled per task). Semi-axes/eccentricity/orientation are
+  jittered from `params`. Returns a soft `alpha` tile in `[0, 1]`; `edge_blur`
+  controls edge softness (analytic falloff at the level set, not a scipy blur).
+
+- `roughen(alpha, c, rng) -> alpha` *(optional, opt-in)*
+  Mirrors `controlSynth/shapes/boundary.py`: perturbs the tile's signed-distance
+  field with smoothed noise and re-thresholds for heavier irregularity. Uses scipy
+  (`distance_transform_edt`, `gaussian_filter`), so it is the explicitly-opt-in
+  heavier path (`boundary_complexity > 0`); default `0` keeps the analytic hot path.
+
+### `src/datasets/anchor_synth/draw.py` — placement/compositing helpers (pure, testable)
 
 No dataset/IO dependencies (constructed with plain numpy arrays), so testable with
 trivial inputs:
@@ -88,12 +116,6 @@ trivial inputs:
   Computed via **axis-projection reductions** (`mask.any(axis=(1,2))`, etc.), not
   full `np.nonzero` or scipy. `extent` is the per-axis bbox side length; `centroid`
   is the bbox centre (cheap and robust; no weighted centre-of-mass needed).
-
-- `make_blob(size, params, rng) -> alpha_tile`
-  An **analytic** soft blob: a small ellipsoid or union of a few Gaussians, with
-  jittered semi-axes and orientation baked directly into the analytic evaluation
-  (no scipy `rotate`/`zoom`). Returns a float `alpha` tile in `[0, 1]` with soft
-  edges controlled by `edge_blur`.
 
 - `place_object(image, alpha_tile, center, contrast_delta) -> object_mask`
   Composites on the **local sub-volume slice** only (like `render3d._slices_3d`):
@@ -111,8 +133,9 @@ trivial inputs:
   pre-resized `ct_{size}.npy` / `label_{size}.npy` fast path (no interpolation).
 - Anchor stats via **axis projections** — sub-millisecond at 128³, versus a full
   `nonzero` scan.
-- **Analytic** blob generation with per-scene jitter baked into params — the blob
-  hot path calls no scipy `rotate`/`zoom`.
+- **Analytic** object generation (radial-harmonics-perturbed ellipsoid) with
+  per-scene jitter baked into params — the default shape path calls no scipy. The
+  scipy-based `roughen`/`boundary_complexity` step is opt-in and off by default.
 - Object composited on a **small local slice**, never a full-volume operation.
 - Base geometric/intensity augmentation is **off by default**: the per-task object
   drawing *is* the randomization, keeping scipy warps out of the hot path.
@@ -144,10 +167,10 @@ uses per-subject sub-RNGs.
 - **`configs/experiment/3d/dataset/anchor_synth3d.yaml`** (mirrors
   `omnisynth3d.yaml`): `data.source: anchor_synth3d`, `data.image_size`,
   `data.context_size`, plus an `anchor_synth` block:
-  `object_source`, `n_objects`, `anchor_classes` (`[]`=all; also accepts
+  `object_source`, `shape`, `n_objects`, `anchor_classes` (`[]`=all; also accepts
   `benchmark`/`not_benchmark`), `offset_range`, `scale_frac`, `scale_jitter`,
-  `rotate_jitter`, `contrast_delta`, `edge_blur`, `eval_subjects_per_task`,
-  `eval_seed_namespace`, `epoch_length`.
+  `rotate_jitter`, `contrast_delta`, `edge_blur`, `boundary_complexity`,
+  `eval_subjects_per_task`, `eval_seed_namespace`, `epoch_length`.
 - **`experiments/3d/common.py`**: add an `anchor_synth3d` branch to `build_dataset`
   (construct `AnchorSynth3DICLDataset` with `root = cfg.paths.totalseg`, anchor
   classes resolved via `resolve_classes`, `deterministic = split != "train"`) and to
@@ -158,9 +181,11 @@ uses per-subject sub-RNGs.
 
 ## Testing
 
-- **Unit tests** (`src/datasets/anchor_synth/`): blob shape/size scales with
-  requested size; offset→center mapping + in-volume clamp; soft-edge blend (interior
-  contrast ≈ Δ over local background, mask = α>0.5); determinism given a seeded RNG.
+- **Unit tests** (`src/datasets/anchor_synth/`): `make_object` size scales with the
+  requested size and harmonics produce non-spherical (irregular) shapes; `shape`
+  variants differ; optional `roughen` changes the boundary; offset→center mapping +
+  in-volume clamp; soft-edge blend (interior contrast ≈ Δ over local background,
+  mask = α>0.5); determinism given a seeded RNG.
 - **One integration test**: build `AnchorSynth3DICLDataset` with a small
   `max_subjects`, assert the contract tensor shapes/dtypes, that `label ⊆` the drawn
   object region, that anchor voxels are **not** in the label, and that the K+1 share
@@ -169,6 +194,9 @@ uses per-subject sub-RNGs.
 ## Out of scope (v1)
 
 - Multi-anchor tasks (distinct anchor per object).
-- Learned/real texture synthesis for blobs beyond local-background + contrast delta.
+- Learned/real texture synthesis for objects beyond local-background + contrast delta.
+- Additional morphologies beyond blob/elongated + SDF roughening (e.g. tubular,
+  annular, scattered from `controlSynth/shapes/`) — easy to add later via
+  `shapes.py`, out of scope for v1.
 - Heavy base augmentation in the hot path (available via `object_source="organ"`
   and the existing aug config, but off by default).
