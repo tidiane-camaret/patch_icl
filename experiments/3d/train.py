@@ -273,7 +273,13 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
-    if cfg.data.get("source", "totalseg") == "omnisynth3d":
+    if cfg.data.get("source") == "anchor_synth3d":
+        # anchor_synth3d val classes = the anchor pool (each item's label_name is its
+        # anchor class), mirroring build_dataset/eval.py resolution.
+        from common import resolve_anchor_classes
+        root = cfg.paths.get("totalseg")
+        val_classes = resolve_anchor_classes(cfg.anchor_synth, root)
+    elif cfg.data.get("source", "totalseg") == "omnisynth3d":
         # omniSynth3D val classes come from the tile-cache pool (the label_names the
         # dataset emits), not label_stats.csv — mirrors eval.py's resolution.
         from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
