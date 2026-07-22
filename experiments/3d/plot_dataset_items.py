@@ -174,10 +174,9 @@ def main():
         a = cfg.anchor_synth
         aug_on  = args.split == "train" and cfg.augmentations.enabled
         aug_tag = " + aug" if aug_on else ""
-        sz_max  = int(a.object_size_max_frac * min(cfg.data.image_size))
         extra = (f"  |  obj={a.object_source}/{a.shape}  n_obj={a.n_objects}"
-                 f"  offset={a.offset_range}  size={a.object_size_min}-{sz_max}vx"
-                 f"  Δ={a.contrast_delta}{aug_tag}")
+                 f"  anchors={a.n_anchors}  size_frac={a.object_size_frac_min}-"
+                 f"{a.object_size_frac_max}  Δ={a.contrast_delta}{aug_tag}")
     else:
         aug_on    = args.split == "train" and cfg.augmentations.enabled
         synth_on  = args.split == "train" and bool(cfg.data.synth_method)

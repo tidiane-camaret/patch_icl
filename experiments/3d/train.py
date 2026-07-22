@@ -274,11 +274,9 @@ def main(cfg: DictConfig) -> None:
         torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
     if cfg.data.get("source") == "anchor_synth3d":
-        # anchor_synth3d val classes = the anchor pool (each item's label_name is its
-        # anchor class), mirroring build_dataset/eval.py resolution.
-        from common import resolve_anchor_classes
-        root = cfg.paths.get("totalseg")
-        val_classes = resolve_anchor_classes(cfg.anchor_synth, root)
+        # anchor_synth3d groups val by object shape (each item's label_name = its shape).
+        from common import anchor_shapes
+        val_classes = anchor_shapes(cfg)
     elif cfg.data.get("source", "totalseg") == "omnisynth3d":
         # omniSynth3D val classes come from the tile-cache pool (the label_names the
         # dataset emits), not label_stats.csv — mirrors eval.py's resolution.
