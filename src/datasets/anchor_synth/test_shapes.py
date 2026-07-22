@@ -43,6 +43,31 @@ def test_elongated_is_anisotropic():
     assert max(sides) >= 1.6 * min(sides)            # clearly elongated
 
 
+def test_tubular_is_a_tube():
+    # a swept-sphere tube: non-empty, in range, elongated, and thin in cross-section
+    rng = np.random.default_rng(11)
+    spec = sample_object_spec(rng, shape="tubular")
+    assert spec["kind"] == "tube"
+    a = render_object(40, spec)
+    assert a.min() >= 0.0 and a.max() <= 1.0
+    m = a > 0.5
+    assert m.sum() > 0
+    sides = []
+    for ax in range(3):
+        proj = m.any(axis=tuple(i for i in range(3) if i != ax))
+        idx = np.nonzero(proj)[0]
+        sides.append(idx[-1] - idx[0] + 1)
+    assert max(sides) >= 1.8 * min(sides)               # long and thin
+    # a tube fills far less of its bbox than a solid ellipsoid would
+    bbox = np.prod([s for s in sides])
+    assert m.sum() < 0.5 * bbox
+
+
+def test_tubular_deterministic_for_spec():
+    spec = sample_object_spec(np.random.default_rng(12), shape="tubular")
+    assert np.array_equal(render_object(28, spec), render_object(28, spec))
+
+
 def test_small_rotation_is_near_identity():
     R = small_rotation(np.random.default_rng(3), max_deg=10.0)
     assert R.shape == (3, 3)

@@ -9,7 +9,7 @@ data:
 
 anchor_synth:
   object_source: blob        # blob (analytic) | organ (not implemented in v1)
-  shape: mix                 # blob | elongated | mix
+  shape: mix                 # blob | elongated | tubular | mix (mix samples all three)
   n_objects: 1               # objects (labels) per task; all share the one anchor
   anchor_classes: []         # [] = all; or a list / "benchmark" / "not_benchmark"
   offset_range: 0.6          # per-axis offset ~ U[-r, r], in units of anchor extent

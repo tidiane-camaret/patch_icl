@@ -39,11 +39,40 @@ def small_rotation(rng, max_deg):
     return np.eye(3) + np.sin(ang) * K + (1.0 - np.cos(ang)) * (K @ K)
 
 
+def _bezier(P0, P1, P2, m):
+    """m points along the quadratic Bézier through P0, P1(control), P2. (m, 3)."""
+    t = np.linspace(0.0, 1.0, m)[:, None]
+    return (1 - t) ** 2 * P0 + 2 * (1 - t) * t * P1 + t ** 2 * P2
+
+
 def sample_object_spec(rng, shape="blob", eccentricity=3.0, n_harmonics=4,
                        harmonic_amp=0.30, edge_blur=0.08):
-    """Draw a reproducible object geometry (axes, orientation, angular bumps)."""
+    """Draw a reproducible object geometry. `kind`="ellipsoid" (blob/elongated:
+    axes + angular bumps) or "tube" (tubular: a swept sphere along a curved
+    centerline). Both carry `R0` (base orientation) and `edge_blur`."""
     if shape == "mix":
-        shape = str(rng.choice(("blob", "elongated")))
+        shape = str(rng.choice(("blob", "elongated", "tubular")))
+
+    if shape == "tubular":
+        # Capsule / swept-sphere along a gently curved centerline (cheap: a handful
+        # of sample points; render unions spheres via point-to-centerline distance).
+        R0 = _rand_rotation(rng)
+        axis = np.array([1.0, 0.0, 0.0])
+        half = float(rng.uniform(0.55, 0.72))                    # half-length in [-1,1]
+        perp = rng.standard_normal(3)
+        perp = perp - (perp @ axis) * axis
+        perp = perp / (np.linalg.norm(perp) + 1e-9)
+        bend = float(rng.uniform(0.0, 0.5)) * half               # curvature offset
+        m = 24
+        curve = _bezier(-half * axis, bend * perp, half * axis, m)   # (m, 3)
+        r0 = float(rng.uniform(0.10, 0.20))                      # tube caliber
+        taper = float(rng.uniform(0.0, 0.6))                     # thin toward one end
+        radii = np.maximum(r0 * (1.0 - taper * np.linspace(0.0, 1.0, m)), 0.03)
+        return {"kind": "tube", "curve": curve, "radii": radii,
+                "R0": R0, "edge_blur": float(edge_blur)}
+
+    # ellipsoid path — original draw order preserved (axes, R0, terms) so existing
+    # blob/elongated specs stay byte-identical.
     axes = np.array([rng.uniform(0.85, 1.0) for _ in range(3)], dtype=np.float64)
     if shape == "elongated":
         axes[:] = 1.0 / np.sqrt(float(eccentricity))
@@ -54,7 +83,8 @@ def sample_object_spec(rng, shape="blob", eccentricity=3.0, n_harmonics=4,
         u = rng.standard_normal(3)
         u = u / (np.linalg.norm(u) + 1e-9)
         terms.append((u, float(rng.uniform(-harmonic_amp, harmonic_amp))))
-    return {"axes": axes, "R0": R0, "terms": terms, "edge_blur": float(edge_blur)}
+    return {"kind": "ellipsoid", "axes": axes, "R0": R0, "terms": terms,
+            "edge_blur": float(edge_blur)}
 
 
 def render_object(size, spec, R_extra=None):
@@ -63,6 +93,20 @@ def render_object(size, spec, R_extra=None):
     z, y, x = _unit_grid(size)
     pts = np.stack([z.ravel(), y.ravel(), x.ravel()], 0)          # (3, N)
     R = spec["R0"] if R_extra is None else (R_extra @ spec["R0"])
+
+    if spec.get("kind") == "tube":
+        curve = (R @ spec["curve"].T).T                          # (M, 3) world coords
+        radii = spec["radii"]                                    # (M,)
+        # squared distance from every centerline point to every voxel, via
+        # ||c-p||^2 = |c|^2 - 2 c·p + |p|^2 (no (M,3,N) temporary).
+        csq = (curve ** 2).sum(1)[:, None]                       # (M, 1)
+        psq = (pts ** 2).sum(0)[None, :]                         # (1, N)
+        dist = np.sqrt(np.clip(csq - 2.0 * (curve @ pts) + psq, 0.0, None))  # (M, N)
+        val = (radii[:, None] - dist).max(0)                     # union of spheres (N,)
+        blur = max(1e-3, float(spec["edge_blur"]) * float(radii.max()))
+        alpha = np.clip(val / blur + 0.5, 0.0, 1.0)
+        return alpha.reshape(z.shape).astype(np.float32)
+
     pr = (R @ pts) / spec["axes"][:, None]                        # ellipsoid frame
     rr = np.sqrt((pr ** 2).sum(0))                               # radius (N,)
     dirs = pr / (rr + 1e-6)                                      # unit dirs (3, N)
