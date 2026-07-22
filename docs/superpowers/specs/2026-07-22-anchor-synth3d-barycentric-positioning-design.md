@@ -15,10 +15,21 @@ length**. That side length is **orientation-dependent** — reorienting the scan
 changes each axis extent — so the intended "anchor-relative" position is not a
 stable, frame-invariant quantity.
 
-Object **size** was already decoupled from the anchor (independent draw). This
-change decouples **position** from any single anchor's orientation-dependent
+This change decouples **position** from any single anchor's orientation-dependent
 geometry by expressing it in **barycentric coordinates over 4 landmark organs**,
 which is invariant to rigid reorientation and to global scale.
+
+**Size is scaled by the anchor frame.** An earlier change had made object size an
+independent absolute voxel count. That means a fixed-voxel object is a *different
+anatomical fraction* in each subject (different FOV / body size), so the object
+visibly changes size between the target and the K contexts — the model sees
+inconsistent examples. Size is now `size_frac · L`, where `L` is the **mean
+pairwise distance** between the 4 anchor centroids (an orientation-invariant frame
+length, computed per scene from the same centroids used for positioning). Because
+`size_frac` is shared across the K+1 scenes and `L` tracks each subject's anatomy,
+the object occupies the **same anatomical fraction** — hence the same apparent
+size relative to the visible landmarks — in every scene. A multi-organ `L` is also
+large and stable, avoiding the tiny-object failure of single-anchor `extent`.
 
 ## Mechanism
 
@@ -66,9 +77,21 @@ Per scene, in `_render_subject`:
 `offset_to_center` are removed; a new `barycentric_center(centroids, weights,
 size, vol_shape)` replaces them in `draw.py`.
 
-Per-object **size** (independent draw), **shape** geometry, and **contrast** are
-unchanged and still shared across scenes; **rotation** (`rotate_jitter`) and a
-small size `scale_jitter` still vary per scene.
+### Size (frame-relative)
+
+- Draw `size_frac ~ U[object_size_frac_min, object_size_frac_max]` **once per
+  object** (shared across scenes).
+- Per scene, compute the frame length `L = mean_{i<j} ‖cᵢ − cⱼ‖` from that
+  scene's 4 anchor centroids (reusing the centroids loaded for positioning), then
+  `size = max(object_size_min_vox, round(size_frac · L · jit))`, where `jit =
+  1 + U[−scale_jitter, scale_jitter]` is the small per-scene jitter (now the only
+  source of within-task size variation) and `object_size_min_vox` is an absolute
+  floor guarding against empty/degenerate renders.
+
+`object_size_min` / `object_size_max_frac` (absolute-voxel sizing) are removed and
+replaced by `object_size_frac_min` / `object_size_frac_max` (fractions of `L`) and
+`object_size_min_vox`. **Shape** geometry and **contrast** remain shared across
+scenes; **rotation** (`rotate_jitter`) still varies per scene.
 
 ### Edge cases
 
@@ -90,12 +113,17 @@ extrapolation: 0.3        # affine expansion around barycenter (0 = strictly ins
 weight_concentration: 1.0 # Dirichlet alpha for base weights (1 = uniform on simplex)
 max_select_tries: 20      # retries to find a co-occurring anchor set
 anchor_classes: []        # allowed anchor POOL ([] = all) — object not tied to one class
-# removed: offset_range
+object_size_frac_min: 0.3 # object side ~ U[min,max] * L (L = mean pairwise anchor dist)
+object_size_frac_max: 0.8
+object_size_min_vox: 6     # absolute voxel floor (guards empty/degenerate renders)
+# removed: offset_range, object_size_min, object_size_max_frac
 ```
 
-Unchanged: `object_source`, `shape`, `n_objects`, `object_size_min`,
-`object_size_max_frac`, `scale_jitter`, `rotate_jitter`, `contrast_delta`,
-`edge_blur`, `boundary_complexity`, `eval_subjects_per_task`,
+Defaults for `object_size_frac_*` are starting points to be tuned against the
+occupancy probe.
+
+Unchanged: `object_source`, `shape`, `n_objects`, `scale_jitter`, `rotate_jitter`,
+`contrast_delta`, `edge_blur`, `boundary_complexity`, `eval_subjects_per_task`,
 `eval_seed_namespace`, `epoch_length`.
 
 ## Eval / determinism
@@ -134,10 +162,12 @@ plot/analyze scripts only — not by metric reporting.
 - `src/datasets/anchor_synth/draw.py` — add `barycentric_center`; remove
   `offset_to_center`.
 - `src/datasets/anchor_synth/dataset3d.py` — init co-occurrence structures +
-  `eligible_subjects`; subject-first selection in `__getitem__`; weights in
-  `_draw_specs`; barycentric center + multi-anchor centroid load in
-  `_render_subject`; `label_name = shape`; extended meta. Remove `offset_range`;
-  add `n_anchors`, `extrapolation`, `weight_concentration`, `max_select_tries`.
+  `eligible_subjects`; subject-first selection in `__getitem__`; weights +
+  `size_frac` in `_draw_specs`; barycentric center, multi-anchor centroid load,
+  and frame-length (`L`) size in `_render_subject`; `label_name = shape`; extended
+  meta. Remove `offset_range` / `object_size_min` / `object_size_max_frac`; add
+  `n_anchors`, `extrapolation`, `weight_concentration`, `max_select_tries`,
+  `object_size_frac_min/max`, `object_size_min_vox`.
 - `experiments/3d/common.py` — forward new knobs; `anchor_shapes(cfg)` helper;
   val-class resolution → shapes.
 - `experiments/3d/train.py` — anchor_synth3d val branch uses `anchor_shapes`.
@@ -152,6 +182,9 @@ plot/analyze scripts only — not by metric reporting.
 - Unit: `barycentric_center` — weights summing to 1 reproduce the barycenter at
   `u = 1/n`; a one-hot weight lands on that centroid; extrapolation with a
   negative weight lands outside the hull; result always in-bounds.
+- Unit: frame length `L` = mean pairwise distance is invariant to a shared rigid
+  rotation of the centroids, and object voxel size scales linearly with `L` (a
+  scene with 2× the anchor spread yields a ~2× larger object).
 - Dataset (synthetic fake root with ≥ n_anchors co-occurring classes): item
   contract (shapes/dtypes), object drawn (`label.sum() > 0`), same anchor set
   across target+contexts, `label_name` ∈ shapes, determinism across instances.
