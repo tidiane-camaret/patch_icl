@@ -1,5 +1,31 @@
 # Change log
 
+## anchor_synth3d: barycentric multi-anchor positioning + frame-relative size
+
+Replaced the single-anchor offset placement (position `= centroid + offset·extent`,
+size `= frac·image`) with an affine-invariant scheme over **4 landmark organs**.
+Per item (subject-first): pick a target subject, choose 4 co-occurring anchor
+classes present in it (contexts drawn from their co-occurrence set, target
+excluded), draw shared **barycentric weights** (`Σwᵢ=1`, mildly affine via
+`extrapolation=0.3`) and a shared `size_frac`. Position `= Σ wᵢ·centroidᵢ`; object
+side `= size_frac · L` where `L` = mean pairwise centroid distance (orientation-
+invariant frame length). Because the weights and `size_frac` are shared across the
+K+1 scenes while `centroids`/`L` are per-subject, both the anatomical position and
+the apparent size (fraction of the anatomy) are consistent across target and
+contexts — fixing the orientation-dependent `extent` and the FOV-dependent absolute
+size. Anchors are landmarks only; label = the drawn object. Validation groups by
+object **shape** (`label_name`; `anchor_shapes(cfg)`). New geometry helpers in
+`draw.py` (`affine_weights`, `frame_length`, `barycentric_center`); `offset_to_center`
+removed. New knobs: `n_anchors`, `extrapolation`, `weight_concentration`,
+`max_select_tries`, `object_size_frac_min/max`, `object_size_min_vox` (replace
+`offset_range`/`object_size_min`/`object_size_max_frac`). Design + plan:
+docs/superpowers/specs/2026-07-22-anchor-synth3d-barycentric-positioning-design.md,
+docs/superpowers/plans/2026-07-23-anchor-synth3d-barycentric-positioning.md.
+Verification (val, real data): overall zero-rate **0.9%** (was ~11%); per-shape
+occupancy median blob≈1810, elongated≈780, tubular≈150 vox @128³. Apparent size is
+consistent by construction; residual within-task voxel-size CV≈0.14 is dominated by
+the intentional `scale_jitter` (±15%) — lower `scale_jitter` for tighter consistency.
+
 ## anchor_synth3d: decouple object size from the anchor
 
 Object size was tied to the anchor (`size = scale_frac * mean(anchor extent)`), so
