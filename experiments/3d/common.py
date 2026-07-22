@@ -73,6 +73,32 @@ def build_dataset(cfg, split: str):
         )
         return OmniSynth3DICLDataset(split=split, context_size=cfg.data.context_size,
                                      cfg=cfg3d)
+    if cfg.data.get("source") == "anchor_synth3d":
+        from src.datasets.anchor_synth.dataset3d import AnchorSynth3DICLDataset
+        a = cfg.get("anchor_synth")
+        if a is None:
+            raise ValueError("data.source=anchor_synth3d requires an `anchor_synth` block")
+        root = cfg.paths.get("totalseg")
+        classes = resolve_classes(a.get("anchor_classes") or (), totalseg_root=root)
+        is_train = split == "train"
+        return AnchorSynth3DICLDataset(
+            root=root, classes=classes, image_size=tuple(cfg.data.image_size),
+            split=split, context_size=cfg.data.context_size,
+            object_source=a.get("object_source", "blob"),
+            shape=a.get("shape", "blob"), n_objects=int(a.get("n_objects", 1)),
+            offset_range=float(a.get("offset_range", 0.6)),
+            scale_frac=float(a.get("scale_frac", 0.4)),
+            scale_jitter=float(a.get("scale_jitter", 0.15)),
+            rotate_jitter=float(a.get("rotate_jitter", 12.0)),
+            contrast_delta=float(a.get("contrast_delta", 0.15)),
+            edge_blur=float(a.get("edge_blur", 0.08)),
+            boundary_complexity=float(a.get("boundary_complexity", 0.0)),
+            eval_subjects_per_task=int(a.get("eval_subjects_per_task", 4)),
+            eval_seed_namespace=int(a.get("eval_seed_namespace", 0)),
+            epoch_length=int(a.get("epoch_length", 10000)),
+            deterministic=(split != "train"),
+            max_subjects=(cfg.data.get("max_train_subjects") if is_train
+                          else cfg.data.get("max_val_subjects")))
     d = cfg.data
     _, root, is_mri = _source_root(cfg)
     class_spec = d.train_classes if split == "train" else d.val_classes
@@ -138,7 +164,7 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
     the same config surface as training.
     """
     d, e = cfg.data, cfg.eval
-    if d.get("source") == "omnisynth3d":
+    if d.get("source") in ("omnisynth3d", "anchor_synth3d"):
         # omniSynth3D composes its own deterministic multi-class eval scenes; route
         # through build_dataset (the same OmniSynth3DICLDataset the trainer uses,
         # deterministic for val/test). Its pool already spans every tile-cache class,

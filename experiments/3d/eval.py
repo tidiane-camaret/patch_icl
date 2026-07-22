@@ -65,7 +65,12 @@ def main(cfg: DictConfig) -> None:
         torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
     source = cfg.data.get("source", "totalseg")
-    if source == "omnisynth3d":
+    if source == "anchor_synth3d":
+        from data.totalseg_classes import resolve_classes
+        a = cfg.anchor_synth
+        classes = resolve_classes(a.get("anchor_classes") or (),
+                                  totalseg_root=cfg.paths.get("totalseg"))
+    elif source == "omnisynth3d":
         # Classes come from the omniSynth3D tile-cache pool (the label_names the
         # dataset emits), not label_stats.csv. Build the bank once to list them.
         from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank

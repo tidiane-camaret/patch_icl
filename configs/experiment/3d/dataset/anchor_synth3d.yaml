@@ -1,0 +1,24 @@
+# @package _global_
+# anchor_synth3d: synthetic objects drawn at a consistent position relative to a
+# shared anchor organ, on real TotalSegmentator CT backgrounds. Composed as
+# `dataset=anchor_synth3d`. Rides the pre-resized fast path (ct_/label_ npy).
+data:
+  source: anchor_synth3d
+  image_size: [128, 128, 128]
+  context_size: 1
+
+anchor_synth:
+  object_source: blob        # blob (analytic) | organ (not implemented in v1)
+  shape: mix                 # blob | elongated | mix
+  n_objects: 1               # objects (labels) per task; all share the one anchor
+  anchor_classes: []         # [] = all; or a list / "benchmark" / "not_benchmark"
+  offset_range: 0.6          # per-axis offset ~ U[-r, r], in units of anchor extent
+  scale_frac: 0.4            # object size = scale_frac * mean(anchor extent)
+  scale_jitter: 0.15         # per-scene multiplicative size jitter
+  rotate_jitter: 12.0        # per-scene small rotation (deg)
+  contrast_delta: 0.15       # |object - local background| intensity (blends in)
+  edge_blur: 0.08            # soft-edge width (fraction of object radius)
+  boundary_complexity: 0.0   # >0 = scipy SDF-noise roughening (heavier path)
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+  epoch_length: 10000
