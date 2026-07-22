@@ -11,7 +11,9 @@ data:
 synth3d:
   tiles_root: ${paths.totalseg}/omni_tiles
   size: [128, 128, 128]
-  classes: []            # [] = all classes present in the cache
+  classes: []            # [] = all classes present in the cache. Also accepts an explicit
+                         # list, or the keywords "benchmark" / "not_benchmark" (resolved
+                         # against BENCHMARK_CLASSES in data/totalseg_classes.py).
   n_objects: 8
   k_min: 1
   k_max: 1

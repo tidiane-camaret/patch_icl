@@ -3,7 +3,7 @@
 #   python experiments/3d/train.py                       # medverse on totalseg
 #   python experiments/3d/train.py dataset=omnisynth3d   # train on omniSynth-3D
 #   python experiments/3d/train.py train.loss=bce_dice   # ad-hoc overrides
-#   python experiments/3d/train.py +experiment=<preset>  # ablation layer
+#   python experiments/3d/train.py experiment=<preset>   # ablation layer (e.g. 1_medverse_benchmark)
 defaults:
   - cluster: nfs
   - augmentations: multiverseg
@@ -16,6 +16,7 @@ hydra:
     - file://${oc.env:PWD}/configs
 train:
   epochs: 100
+  batch_size: 8
   workers: 8
   seed: 42
   eval_every: 1
@@ -25,7 +26,7 @@ train:
 eval:                           # per-class validation during training
   split: val
   n_subjects: 20
-  batch_size: 4
+  batch_size: 1
   workers: 8
 wandb:
   project: patch_icl_3d_exps

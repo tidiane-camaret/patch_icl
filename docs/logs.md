@@ -1,5 +1,15 @@
 # Change log
 
+## 2026-07-21 — omnisynth3d: `synth3d.classes` accepts "benchmark" keyword
+- feat(omnisynth3d): `synth3d.classes` in the 3D pipeline now flows through
+  `resolve_classes` (data/totalseg_classes.py) at all three call sites that read it —
+  `experiments/3d/common.py:build_dataset`, `train.py` (val-class listing) and
+  `eval.py` — so it accepts the string keywords `"benchmark"` (→ BENCHMARK_CLASSES,
+  47 classes) and `"not_benchmark"` in addition to an explicit list or `[]` (= all cached
+  classes). Previously the train/eval bank builds passed the raw value, so `"benchmark"`
+  was mis-parsed as `tuple("benchmark")` → empty class pool.
+  `configs/.../experiment/1_medverse_benchmark.yaml` now sets `synth3d.classes: benchmark`.
+
 ## 2026-07-21 — 3D config layout: train/eval entrypoints + dataset/model groups
 - refactor(3d-config): `configs/experiment/3d/` reorganized into `train.yaml`/`eval.yaml`
   entrypoints that compose `dataset/{totalseg,omnisynth3d}` + `model/medverse` groups,
@@ -2736,3 +2746,38 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   the logit hits native res so it trains/monitors like a native model. NOTE a `dice_eps.{32}`
   entry no longer matches when the logit side becomes R·d (falls back to default 1.0).
 - Wired arch.decode_patch through train.py build_model + model/patchset_cnn.yaml (default 1).
+
+## 3D experiments: per-sample val/eval detail table (port of 2D sample table)
+- `experiments/3d/evaluate.py`: `evaluate_classes` now enriches each per-case dict with
+  `tgt_size`/`tgt_occ` (target GT fg voxels + fraction) and `ctx_size`/`ctx_occ` (mean over
+  the K contexts) via `_occupancy_stats`, plus a source-adaptive `detail` string
+  (`_sample_detail`: omniSynth3D → "mode=.. class=.. sub=..", totalseg → "").
+- New `build_sample_table(cases, epoch=None)` → wandb.Table with fixed cols
+  [epoch, class, subject, dice, time_ms, tgt_size, tgt_occ, ctx_size, ctx_occ, detail];
+  shared by train + eval so both log the same schema (epoch=-1 for standalone eval).
+- `train.py`: `validate_mean` returns cases; val step logs `val/samples` (mirrors 2D).
+- `eval.py`: replaced the 4-col `cases` table with the full `build_sample_table`.
+- Plumbing for `detail`: omniSynth3D dataset3d emits a `meta` dict (class_id, sample_index,
+  resolved target_mode); `incontext_collate_fn` passes `meta` through when present. TotalSeg
+  items carry no meta → empty detail (columns stay fixed across sources).
+
+## 3D Medverse loss: hardcode paper's cubic smooth-L1, drop beta knob
+- `experiments/3d/train.py` `SmoothL3L1`: removed the `beta` parameter. The general-beta
+  linear branch (`n + β³/3 − β`) was only C1-continuous at β=1 (the sole value used);
+  now hardcoded to the paper's (Hu et al. 2025) form: `L(n)=n³/3` for n<1 else `n−2/3`.
+- `build_loss` calls `SmoothL3L1()` (no beta); dropped `smooth_l1_beta` from
+  configs/experiment/3d/model/medverse.yaml. loss_scale (×50) unchanged.
+
+## 3D training: log val loss + train/val soft-Dice
+- `train.py` `train_epoch` now also accumulates soft Dice (1 − soft-Dice-loss on σ(logits))
+  → logs `train/dice_soft` (alongside existing `train/dice` hard + `train/loss`).
+- `evaluate.py` `evaluate_classes` gained optional `logits_fn`/`loss_fn`: when given (train.py
+  val step passes `model.train_forward` + the training `loss_fn`), each case also gets
+  `soft_dice` (σ(logits) vs GT, threshold-free) + per-sample `loss`; `_summarize` adds
+  `mean_soft_dice`/`mean_loss`. Hard `dice` still comes from `model.predict` (benchmark
+  inference), so `val/dice` is unchanged. eval.py passes neither → its path is byte-identical.
+- `validate_mean` returns (mean_dice, mean_soft, mean_loss, rows, cases); `train.py` logs
+  `val/dice_soft` + `val/loss`. Val soft/loss use a single-ROI logits forward (valid at
+  image_size==sw_roi), self-consistent with the training criterion.
+- `build_sample_table` gained `soft_dice` + `loss` columns (NaN for the eval.py benchmark).
+- Added `soft_dice_binary(prob, target)` helper (eps=1e-6, matches train.py `_soft_dice`).

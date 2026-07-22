@@ -95,4 +95,8 @@ class OmniSynth3DICLDataset(OmniSynthICLDataset):
             "subject":     f"omni_{int(class_id)}_{int(sample_index)}",
             "label_name":  self.bank.alphabet(class_id),
             "spacing":     torch.ones(3, dtype=torch.float32),
+            # Per-sample provenance for the eval/val sample table's `detail` column
+            # (mirrors experiments/2d's synth meta). `mode` is the resolved target mode.
+            "meta":        {"class_id": int(class_id), "sample_index": int(sample_index),
+                            "target_mode": mode, "alphabet": self.bank.alphabet(class_id)},
         }

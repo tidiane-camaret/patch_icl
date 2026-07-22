@@ -14,7 +14,6 @@ train:
   lr_min_factor: 0.01           # min_lr = lr * lr_min_factor
   warmup_epochs: 1              # cosine only (scheduler-coupled)
   loss: smooth_l1               # smooth_l1 | bce_dice
-  smooth_l1_beta: 1.0
   loss_scale: 50.0
   dice_weight: 1.0              # bce_dice only
   base_ckpt: null               # override the pretrained Medverse.ckpt

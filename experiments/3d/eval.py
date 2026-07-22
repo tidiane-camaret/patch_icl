@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 from data.totalseg_classes import resolve_classes
 from src.benchmark_models import load_model
 from common import DEVICE, _source_root
-from evaluate import measure_flops, evaluate_classes
+from evaluate import measure_flops, evaluate_classes, build_sample_table
 
 
 def _build_model(cfg: DictConfig):
@@ -72,7 +72,8 @@ def main(cfg: DictConfig) -> None:
         root = s3.get("tiles_root") or cfg.paths.totalseg
         bank = get_or_build_totalseg_bank(
             root, tuple(s3.get("size", cfg.data.image_size)),
-            cfg.eval.split, tuple(s3.get("classes", ()) or ()))
+            cfg.eval.split, tuple(resolve_classes(s3.get("classes") or (),
+                                                  totalseg_root=cfg.paths.get("totalseg"))))
         classes = [bank.alphabet(c) for c in bank.task_ids()]
     else:
         _, root, is_mri = _source_root(cfg)
@@ -109,7 +110,9 @@ def main(cfg: DictConfig) -> None:
 
     # ── per-class eval (shared loop, also used by train.py's val step) ────────
     rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
-    case_table = wandb.Table(columns=["class", "subject", "dice", "time_ms"]) if wb_on else None
+    # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
+    # per case with Dice, timing, GT/context occupancy stats + source-adaptive `detail`.
+    case_table = build_sample_table(all_cases) if wb_on else None
     for row in rows:
         cls = row["class"]
         if "error" in row:
@@ -122,9 +125,6 @@ def main(cfg: DictConfig) -> None:
             wandb.log({f"class/{cls}/mean_dice": row["mean_dice"],
                        f"class/{cls}/std_dice": row["std_dice"],
                        f"class/{cls}/mean_time_ms": row["mean_time_ms"]})
-    if wb_on:
-        for c in all_cases:
-            case_table.add_data(c["class"], c["subject"], c["dice"], c["time_ms"])
 
     valid = [r for r in rows if "mean_dice" in r]
     if valid:

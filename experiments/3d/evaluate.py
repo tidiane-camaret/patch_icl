@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.flop_counter import FlopCounterMode
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,18 @@ def dice_binary(pred: torch.Tensor, target: torch.Tensor) -> float:
     inter = (pred & target).sum().item()
     union = pred.sum().item() + target.sum().item()
     return (2 * inter + 1) / (union + 1)
+
+
+def soft_dice_binary(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> float:
+    """Threshold-free Dice between a soft probability map and a binary target (any shape).
+
+    Matches the training soft-Dice term (train.py:_soft_dice, eps=1e-6): the shape/overlap
+    signal before the 0.5 threshold used by dice_binary."""
+    p = prob.flatten().float()
+    g = (target.flatten() > 0).float()
+    inter = (p * g).sum().item()
+    den = p.sum().item() + g.sum().item()
+    return (2 * inter + eps) / (den + eps)
 
 
 def _best_slice(mask: np.ndarray) -> int:
@@ -64,6 +77,64 @@ def save_eval_figure(target_img, gt, pred, ctx_img, ctx_gt, out_path: Path, titl
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=100, bbox_inches="tight")
     plt.close(fig)
+
+
+def _sample_detail(meta: dict | None) -> str:
+    """One compact per-sample string for the sample table's `detail` column, adapting
+    to the data source (mirrors experiments/2d/evaluate.py:_sample_detail). omniSynth3D
+    meta -> "mode=<m> class=<id> sub=<i>"; anything else / missing -> "". Keeps the
+    table's columns fixed across sources (totalseg items carry no meta)."""
+    if not meta:
+        return ""
+    if "class_id" in meta:  # omniSynth3D
+        return (f"mode={meta.get('target_mode', '')} "
+                f"class={meta.get('class_id', '')} "
+                f"sub={meta.get('sample_index', -1)}")
+    return ""
+
+
+# The sample-table columns are fixed (medverse is a native-resolution model, so there is
+# no coarse-grid / refine family like 2D's patchset_cnn). One row per eval case, carrying
+# the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
+_SAMPLE_TABLE_COLS = ["epoch", "class", "subject", "dice", "soft_dice", "loss", "time_ms",
+                      "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "detail"]
+
+
+def build_sample_table(cases: list[dict], epoch: int | None = None):
+    """Build a wandb.Table of per-case detail from `evaluate_classes` records.
+
+    Shared by experiments/3d/eval.py (benchmark) and train.py's val step so both log the
+    same schema. `epoch` tags the training epoch (-1 for standalone eval). Cases must be
+    the enriched dicts emitted by evaluate_classes (with tgt_size/ctx_occ/detail/... keys).
+    """
+    import wandb
+    ep = -1 if epoch is None else int(epoch)
+    table = wandb.Table(columns=_SAMPLE_TABLE_COLS)
+    for c in cases:
+        table.add_data(ep, c["class"], c["subject"], c["dice"],
+                       c.get("soft_dice", float("nan")), c.get("loss", float("nan")),
+                       c.get("time_ms", float("nan")),
+                       c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
+                       c.get("ctx_size", float("nan")), c.get("ctx_occ", float("nan")),
+                       c.get("detail", ""))
+    return table
+
+
+def _occupancy_stats(label_i: torch.Tensor, ctx_masks_i: torch.Tensor) -> dict:
+    """GT + context foreground stats for one sample (model-independent).
+
+    label_i: (D,H,W) target GT. ctx_masks_i: (K,D,H,W) context masks. size = foreground
+    voxels; occ = foreground fraction. Context stats are averaged over the K contexts.
+    """
+    tgt_fg = label_i > 0
+    ctx_fg = ctx_masks_i > 0
+    K = max(int(ctx_masks_i.shape[0]), 1)
+    return {
+        "tgt_size": float(tgt_fg.sum()),
+        "tgt_occ":  round(float(tgt_fg.float().mean()), 6),
+        "ctx_size": float(ctx_fg.float().sum()) / K,   # mean fg voxels per context
+        "ctx_occ":  round(float(ctx_fg.float().mean()), 6),
+    }
 
 
 def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> float:
@@ -100,7 +171,7 @@ def validate(model, loader, cls: str, *, fig_dir: Path | None = None) -> tuple[d
     cases: list[dict] = []
     fig_saved = False
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="eval", leave=False):
         target_img    = batch["image"]
         context_imgs  = batch["context_in"]
         context_masks = batch["context_out"]
@@ -147,17 +218,26 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
     mean_dice = sum(dice_scores) / n if n else 0.0
     std_dice  = (sum((d - mean_dice) ** 2 for d in dice_scores) / n) ** 0.5 if n > 1 else 0.0
     mean_ms   = sum(times) / len(times) if times else 0.0
-    return {
+    row = {
         "class":        cls,
         "n_samples":    n,
         "mean_dice":    round(mean_dice, 4),
         "std_dice":     round(std_dice, 4),
         "mean_time_ms": round(mean_ms, 1),
     }
+    # Soft-Dice / loss are only present when evaluate_classes gets a logits_fn/loss_fn
+    # (train.py's val step); absent for the eval.py benchmark path.
+    soft = [c["soft_dice"] for c in cases if "soft_dice" in c]
+    if soft:
+        row["mean_soft_dice"] = round(sum(soft) / len(soft), 4)
+    losses = [c["loss"] for c in cases if "loss" in c]
+    if losses:
+        row["mean_loss"] = round(sum(losses) / len(losses), 4)
+    return row
 
 
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
-                     loader=None):
+                     loader=None, logits_fn=None, loss_fn=None):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -170,6 +250,13 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     across repeated calls — train.py's val step does this so the dataset isn't
     rebuilt (and caches reloaded) every eval epoch.
 
+    `logits_fn(target, ctx_in, ctx_out) -> (B,1,D,H,W) raw logits` enables the soft
+    monitoring metrics: when given, each case also gets `soft_dice` (threshold-free
+    overlap of σ(logits) vs GT) and, if `loss_fn(logits, target)` is also given, a
+    per-sample `loss`. The hard `dice` still comes from model.predict (the benchmark
+    inference), so the reported val/dice is unchanged. eval.py passes neither, so its
+    path is byte-identical. Only used by train.py's val step (medverse.train_forward).
+
     Shared by experiments/3d/eval.py (benchmark) and train.py's val step.
     """
     from collections import defaultdict
@@ -179,16 +266,19 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         split = split or cfg.eval.split
         loader = make_eval_loader(cfg, classes, split=split)
 
+    # Each case dict carries the columns for build_sample_table: class, subject, dice,
+    # time_ms, detail (source-adaptive), + tgt_size/tgt_occ/ctx_size/ctx_occ occupancy stats.
     cases_by_class: dict[str, list[dict]] = defaultdict(list)
     figs_saved: set[str] = set()
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="eval", leave=False):
         target_img    = batch["image"]
         context_imgs  = batch["context_in"]
         context_masks = batch["context_out"]
         label         = batch["label"]
         subjects      = batch.get("subjects", [None] * target_img.shape[0])
         label_names   = batch["label_names"]
+        metas         = batch.get("meta")
 
         _sync()
         t0 = time.perf_counter()
@@ -196,7 +286,19 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         _sync()
         per_sample_ms = (time.perf_counter() - t0) * 1000 / pred.shape[0]
 
+        # Soft monitoring pass (train.py val step only): raw logits -> σ for soft Dice +
+        # the training loss. Single-ROI forward; untimed (timing stays on predict above).
+        prob = None
+        if logits_fn is not None:
+            with torch.no_grad():
+                logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
+            tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
+            prob = torch.sigmoid(logits).cpu()
+            sample_loss = ([float(loss_fn(logits[i:i + 1], tgt[i:i + 1]).item())
+                            for i in range(logits.shape[0])] if loss_fn is not None else None)
+
         pred, label = pred.cpu(), label.cpu()
+        context_masks = context_masks.cpu()
 
         for i in range(pred.shape[0]):
             cls = label_names[i]
@@ -212,12 +314,19 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                     title=f"{cls}  {subj}  dice={dice_binary(pred[i], label[i]):.3f}",
                 )
                 figs_saved.add(cls)
-            cases_by_class[cls].append({
+            case = {
                 "class":   cls,
                 "subject": subjects[i],
                 "dice":    round(dice_binary(pred[i], label[i]), 4),
                 "time_ms": round(per_sample_ms, 1),
-            })
+                "detail":  _sample_detail(metas[i] if metas is not None else None),
+            }
+            case.update(_occupancy_stats(label[i], context_masks[i]))
+            if prob is not None:
+                case["soft_dice"] = round(soft_dice_binary(prob[i, 0], label[i]), 4)
+                if sample_loss is not None:
+                    case["loss"] = sample_loss[i]
+            cases_by_class[cls].append(case)
 
     rows, all_cases = [], []
     for cls in classes:

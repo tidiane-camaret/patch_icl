@@ -993,6 +993,8 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
     }
     if "label_palette" in batch[0]:
         out["label_palette"] = torch.stack([b["label_palette"] for b in batch])  # (B, L+1, 3)
+    if "meta" in batch[0]:
+        out["meta"] = [b["meta"] for b in batch]  # per-sample provenance (sample-table detail)
     return out
 
 

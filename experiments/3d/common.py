@@ -58,7 +58,8 @@ def build_dataset(cfg, split: str):
         cfg3d = OmniTotalSegConfig(
             tiles_root=tiles_root,
             size=tuple(s.get("size", cfg.data.image_size)),
-            classes=tuple(s.get("classes", ()) or ()),
+            classes=tuple(resolve_classes(s.get("classes") or (),
+                                          totalseg_root=cfg.paths.get("totalseg"))),
             n_objects=int(s.get("n_objects", 4)),
             k_min=int(s.get("k_min", 1)), k_max=int(s.get("k_max", 2)),
             placement_tries=int(s.get("placement_tries", 4)),

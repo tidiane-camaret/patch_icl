@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 
 from data.totalseg_classes import resolve_classes
 from common import DEVICE, _source_root, train_loader, make_eval_loader
-from evaluate import evaluate_classes
+from evaluate import evaluate_classes, build_sample_table
 
 
 def _autocast():
@@ -49,15 +49,17 @@ def _autocast():
 # ---------------------------------------------------------------------------
 
 class SmoothL3L1(nn.Module):
-    """Modified smooth-L1 (Neuroverse3D / Hu et al. 2025): cubic below beta, linear above."""
-    def __init__(self, beta: float = 1.0):
-        super().__init__()
-        self.beta = beta
+    """Cubic smooth-L1 segmentation loss (Neuroverse3D / Hu et al. 2025), knee fixed at 1:
 
+        L(n) = (1/3) n^3        if n < 1
+             = n - 2/3          otherwise        (n = |pred - target|)
+
+    C1-continuous at n=1 (both branches -> 1/3, slope -> 1). The knee is hardcoded per
+    the paper, which has no beta parameter; a general-beta form was dropped as its linear
+    branch was only continuous at beta=1 (the sole value ever used)."""
     def forward(self, pred, target):
         n = torch.abs(pred - target)
-        b = self.beta
-        loss = torch.where(n < b, 0.333 * n ** 3 / b ** 2, n + 0.333 * b ** 3 - b)
+        loss = torch.where(n < 1.0, n ** 3 / 3.0, n - 2.0 / 3.0)
         return loss.mean()
 
 
@@ -72,7 +74,7 @@ def build_loss(cfg):
     """Return loss_fn(logits, target) -> scalar, selected by cfg.train.loss."""
     name = cfg.train.get("loss", "smooth_l1")
     if name == "smooth_l1":
-        crit = SmoothL3L1(beta=float(cfg.train.get("smooth_l1_beta", 1.0)))
+        crit = SmoothL3L1()
         scale = float(cfg.train.get("loss_scale", 50.0))
         return lambda logits, target: scale * crit(torch.sigmoid(logits.float()), target)
     if name == "bce_dice":
@@ -154,7 +156,7 @@ def build_model(cfg: DictConfig):
 def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch):
     net = model.model
     net.train()
-    total, dice_sum, n = 0.0, 0.0, 0
+    total, dice_sum, soft_sum, n = 0.0, 0.0, 0.0, 0
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     for batch in pbar:
         lbl  = batch["label"].to(DEVICE, non_blocking=True).float()   # (B,D,H,W)
@@ -173,23 +175,31 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
 
         total += loss.item()
         dice_sum += _hard_dice(logits.float(), target)
+        soft_sum += 1.0 - _soft_dice(torch.sigmoid(logits.float()), target).item()  # soft Dice = 1 - loss form
         n += 1
         pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
-                         lr=f"{optimizer.param_groups[0]['lr']:.1e}")
-    return total / max(n, 1), dice_sum / max(n, 1)
+                         soft=f"{soft_sum/n:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
+    return total / max(n, 1), dice_sum / max(n, 1), soft_sum / max(n, 1)
 
 
 @torch.no_grad()
-def validate_mean(model, cfg, classes, loader=None):
+def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     """Mean val Dice via the shared per-class eval loop (uses model.predict).
 
     Reuses `loader` (built once in main) so the val dataset isn't rebuilt each epoch.
+    Passing `logits_fn`/`loss_fn` adds val soft-Dice + val loss (from single-ROI logits,
+    the training criterion on val). Returns (mean_dice, mean_soft_dice, mean_loss, rows, cases).
     """
     model.model.eval()
-    rows, _ = evaluate_classes(model, cfg, classes, split="val", loader=loader)
+    rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
+                                   logits_fn=model.train_forward, loss_fn=loss_fn)
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
-    return mean_dice, rows
+    soft = [r["mean_soft_dice"] for r in valid if "mean_soft_dice" in r]
+    mean_soft = sum(soft) / len(soft) if soft else float("nan")
+    losses = [c["loss"] for c in cases if "loss" in c]
+    mean_loss = sum(losses) / len(losses) if losses else float("nan")
+    return mean_dice, mean_soft, mean_loss, rows, cases
 
 
 @hydra.main(config_path="../../configs/experiment/3d", config_name="train", version_base="1.3")
@@ -205,9 +215,11 @@ def main(cfg: DictConfig) -> None:
         from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
         s3 = cfg.synth3d
         root = s3.get("tiles_root") or cfg.paths.totalseg
+        classes = resolve_classes(s3.get("classes") or (),
+                                  totalseg_root=cfg.paths.get("totalseg"))
         bank = get_or_build_totalseg_bank(
             root, tuple(s3.get("size", cfg.data.image_size)),
-            "val", tuple(s3.get("classes", ()) or ()))
+            "val", tuple(classes))
         val_classes = [bank.alphabet(c) for c in bank.task_ids()]
     else:
         _, root, is_mri = _source_root(cfg)
@@ -247,19 +259,26 @@ def main(cfg: DictConfig) -> None:
     best = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss, tr_dice = train_epoch(model, loader, optimizer, scheduler, step_per_batch,
-                                    loss_fn, cfg, epoch)
+        loss, tr_dice, tr_soft = train_epoch(model, loader, optimizer, scheduler, step_per_batch,
+                                             loss_fn, cfg, epoch)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
+               "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
-            val_dice, rows = validate_mean(model, cfg, val_classes, loader=val_loader)
+            val_dice, val_soft, val_loss, rows, cases = validate_mean(
+                model, cfg, val_classes, loader=val_loader, loss_fn=loss_fn)
             log["val/dice"] = val_dice
+            log["val/dice_soft"] = val_soft
+            log["val/loss"] = val_loss
             log.update({f"val/dice/{r['class']}": r["mean_dice"] for r in rows if "mean_dice" in r})
+            if wb_on:  # per-sample detail table (mirrors experiments/2d train.py's val/samples)
+                log["val/samples"] = build_sample_table(cases, epoch=epoch)
             if not step_per_batch:  # plateau: step on the val metric
                 scheduler.step(val_dice)
             tqdm.write(f"  [e{epoch}] loss={loss:.4f} train_dice={tr_dice:.4f} "
-                       f"val_dice={val_dice:.4f} (best {max(best, val_dice):.4f})")
+                       f"val_dice={val_dice:.4f} val_soft={val_soft:.4f} val_loss={val_loss:.4f} "
+                       f"(best {max(best, val_dice):.4f})")
             if val_dice > best:
                 best = val_dice
                 torch.save({
