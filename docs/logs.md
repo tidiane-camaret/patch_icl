@@ -2864,3 +2864,15 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
     Triton cache (`GLIBC_2.34 not found` from a cuda_utils.so built on a newer-GLIBC node).
 - `configs/experiment/3d/model/patchset3d.yaml`: added `arch.compile: true` and
   `train.{muon, muon_lr_scale, muon_momentum, muon_wd, lawa_k}`.
+
+## anchor_synth3d dataset
+
+Added `data.source=anchor_synth3d` (`dataset=anchor_synth3d`): pulls K+1 real CT
+scans that share an anchor organ and draws a synthetic blob at a consistent
+anchor-relative position (offset normalized to anchor extent, small per-scene
+scale/rotation jitter, contrast blended to local background). Anchor is a
+landmark only — the label is the drawn object(s). New package
+`src/datasets/anchor_synth/` (analytic shapes + placement); subclasses
+`TotalSegInContextDataset` for the scan cache + fast-path loading. v1 = blob
+objects only; organ objects and multi-anchor deferred. Spec:
+docs/superpowers/specs/2026-07-22-anchor-synth3d-design.md.
