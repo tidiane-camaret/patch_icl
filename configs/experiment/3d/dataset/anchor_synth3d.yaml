@@ -1,7 +1,7 @@
 # @package _global_
-# anchor_synth3d: synthetic objects drawn at a consistent position relative to a
-# shared anchor organ, on real TotalSegmentator CT backgrounds. Composed as
-# `dataset=anchor_synth3d`. Rides the pre-resized fast path (ct_/label_ npy).
+# anchor_synth3d: synthetic objects drawn at a position defined by a barycentric
+# combination of 4 landmark anchor organs, on real TotalSegmentator CT backgrounds.
+# Composed as `dataset=anchor_synth3d`. Rides the pre-resized fast path (ct_/label_ npy).
 data:
   source: anchor_synth3d
   image_size: [128, 128, 128]
@@ -10,7 +10,7 @@ data:
 anchor_synth:
   object_source: blob        # blob (analytic) | organ (not implemented in v1)
   shape: mix                 # blob | elongated | tubular | mix (mix samples all three)
-  n_objects: 1               # objects (labels) per task; all share the one anchor
+  n_objects: 1               # objects (labels) per task; position is barycentric over n_anchors landmarks
   anchor_classes: []         # allowed anchor POOL: [] = all; or a list / "benchmark" / "not_benchmark"
   n_anchors: 4               # landmark organs defining the barycentric frame
   extrapolation: 0.3         # affine expansion around barycenter (0 = strictly inside hull)
