@@ -25,13 +25,20 @@ arch:
   max_context: 16
   full_attn: true
   query_self_attn: true       # KEEP false at dense R=16 — the r×r attn mask is prohibitive there
+  compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:
-  batch_size: 2                # dense R=16 is memory-heavy; raise if it fits
-  optimizer: adamw
+  batch_size: 2                # profiled B=1..8: throughput barely scales (GPU already saturated),
+                               # peak mem 4→28 GB. Raise for gradient quality, not for speed.
+  optimizer: adamw             # only used when muon=false; muon path builds its own AdamW+Muon
   lr: 3.0e-4
   weight_decay: 0.01
   scheduler: cosine
   warmup_epochs: 1
   loss: bce_dice
   dice_weight: 1.0
+  muon: true                   # Muon on transformer 2D matrices + AdamW on the rest + LAWA
+  muon_lr_scale: 0.1           # Muon lr = muon_lr_scale * lr
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  lawa_k: 10                   # LAWA checkpoint-averaging buffer size

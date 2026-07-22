@@ -23,6 +23,8 @@ Techniques from modded-nanoTabPFN:
   - LowerPrecisionRMSNorm: pre-norm, fp32 upcast for bf16/fp16 inputs
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,6 +77,23 @@ def standardize_by_context(feat: torch.Tensor, n_context: int,
 # (symbolic) batch to a concrete value so the loop count is a Python int and
 # torch.compile can unroll it statically.
 _SDPA_MAX_BATCH = 65535
+
+
+# Feature-axis attention in the set-of-patches layout (patchset_cnn / patchset3d) has a
+# tiny sequence (c = 2 img/mask columns) but a huge batch (b·r = every patch of every
+# volume). Flash/SDPA is pathological there — it launches one fused-attention problem per
+# (batch, head) with ~zero useful work, so it costs more than the real r=R³ set attention.
+# A plain q·kᵀ→softmax→·v (fp32 scores, matching SDPA's internal upcast) is ~3× faster
+# incl. backward and numerically equivalent. Only used when the seq is small; larger
+# feature axes (ImagePFN's 2N patch columns) fall back to the fused kernel below.
+_SMALL_SEQ_ATTN = 16
+
+
+def _small_seq_attn(q, k, v):
+    """Manual attention for tiny sequences (q,k,v = (B, heads, seq, d)). fp32 softmax."""
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    s = (q.float() @ k.float().transpose(-2, -1)) * scale
+    return (s.softmax(-1).to(v.dtype) @ v)
 
 
 def batched_sdpa(q, k, v, attn_mask=None):
@@ -150,7 +169,12 @@ class TransformerEncoderLayer(nn.Module):
         res = x
         x = self.norm1(x)
         qkv = self.qkv_col(x).reshape(b * r, c, 3, a, d).permute(2, 0, 3, 1, 4)
-        x = batched_sdpa(qkv[0], qkv[1], qkv[2])
+        # c is tiny in the set-of-patches layout (2 img/mask cols) → manual attention beats
+        # the fused kernel's per-problem overhead; ImagePFN's large c falls back to SDPA.
+        if c <= _SMALL_SEQ_ATTN:
+            x = _small_seq_attn(qkv[0], qkv[1], qkv[2])
+        else:
+            x = batched_sdpa(qkv[0], qkv[1], qkv[2])
         x = x.transpose(1, 2).reshape(b * r, c, e)
         src = (res + x).reshape(b, r, c, e)
 

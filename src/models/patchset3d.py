@@ -19,6 +19,22 @@ from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
 
 
+def _down_to(f: torch.Tensor, R: int) -> torch.Tensor:
+    """Resample a feature/mask volume to R^3. When the source side is an exact integer
+    multiple of R, a strided avg_pool3d gives the identical result as adaptive_avg_pool3d
+    but ~3x faster (incl. backward) at large strides (e.g. 128->16); adaptive is the
+    fallback for non-divisible sides, trilinear the fallback for upsampling."""
+    src = f.shape[-1]
+    if src == R:
+        return f
+    if src > R:
+        if src % R == 0:
+            k = src // R
+            return F.avg_pool3d(f, k, k)
+        return F.adaptive_avg_pool3d(f, (R, R, R))
+    return F.interpolate(f, size=(R, R, R), mode="trilinear", align_corners=False)
+
+
 def _mask_tiles_3d(mask: torch.Tensor, grid_res: int, p: int) -> torch.Tensor:
     """(B,1,Df,Hf,Wf) -> (B, grid_res**3, p**3): per-cell p³ mask tile, row-major cells.
 
@@ -61,11 +77,7 @@ class ConvEncoder3D(nn.Module):
         self.out_ch = sum(dims)
 
     def _resample(self, f: torch.Tensor, R: int) -> torch.Tensor:
-        if f.shape[-1] == R:
-            return f
-        if f.shape[-1] > R:
-            return F.adaptive_avg_pool3d(f, (R, R, R))
-        return F.interpolate(f, size=(R, R, R), mode="trilinear", align_corners=False)
+        return _down_to(f, R)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = [self.stem(x)]
@@ -142,8 +154,7 @@ class PatchSet3D(nn.Module):
         p = self.mask_patch_size
         if p == 1:
             D, H, W = context_out.shape[-3:]
-            occ = F.adaptive_avg_pool3d(context_out.reshape(B * K, 1, D, H, W).float(),
-                                        (self.resolution,) * 3)
+            occ = _down_to(context_out.reshape(B * K, 1, D, H, W).float(), self.resolution)
             return occ.reshape(B, K * self.N, 1)
         tiles = torch.stack([_mask_tiles_3d(context_out[:, k].unsqueeze(1).float(),
                                             self.resolution, p) for k in range(K)], dim=1)

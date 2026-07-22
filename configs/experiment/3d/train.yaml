@@ -26,7 +26,7 @@ train:
 eval:                           # per-class validation during training
   split: val
   n_subjects: 20
-  batch_size: 1
+  batch_size: 8
   workers: 8
 wandb:
   project: patch_icl_3d_exps

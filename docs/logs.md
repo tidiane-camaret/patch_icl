@@ -1,5 +1,37 @@
 # Change log
 
+## PatchSet3D: profile a train step + avg_pool3d resample optimization
+- Profiled one fwd+bwd step (B=1, K=1, 128³, R=16, full_attn, compiled transformer) on an
+  A6000. GPU is already saturated (100% SM, ~memory-bandwidth bound). Breakdown of CUDA time:
+  flash attention fwd+bwd ~48% (backward is 3–4× the forward), 3D conv encoder
+  (conv+GroupNorm+LeakyReLU at 128³) ~25%, adaptive_avg_pool3d ~5%, elementwise tail the rest.
+- **Batch size does NOT scale throughput**: measured 7.84→8.69 samp/s from B=1→B=8 (+11% only);
+  peak mem 4.0→27.6 GB (B=16 OOMs on 49 GB). The workload saturates the GPU at B=1, so raise
+  batch only for gradient quality, not speed. (config comment updated accordingly.)
+- **Optimization applied** (`src/models/patchset3d.py`): new `_down_to(f, R)` replaces
+  `adaptive_avg_pool3d` in `ConvEncoder3D._resample` and the p==1 occupancy pool. When the
+  source side is an integer multiple of R (128/16, 64/16 here) it uses a strided
+  `avg_pool3d(k, k)` — numerically identical (maxdiff 0) but ~3× faster incl. backward at large
+  strides. Net step: 127.6→122.2 ms/it (compiled); ~18% under the original eager path.
+- Larger levers are structural/modeling, not applied: `full_attn=False` (query→support only)
+  is ~11% faster (122→109 ms/it) but changes attention semantics; smaller R cuts the R³ token
+  count quadratically in attention.
+
+## pfn_seg_2d: manual attention for the tiny feature-axis (set-of-patches speedup)
+- Traced where the attention time actually goes (patchset3d, R=16, full_attn). Surprise: the big
+  all-to-all set attention (b·c=2 seqs × r=8200 tokens) is CHEAP under flash (~7.5 ms/step fwd).
+  The hog is the FEATURE-axis attention — in the set-of-patches layout that's a seqlen-2 attention
+  (img+mask columns) batched over b·r=8200 patches × 4 heads. Flash launches ~33k microscopic
+  2×2 attention problems with ~zero useful work, costing ~2.5× the real set attention (~18.6 ms/step
+  fwd). `full_attn=True` was NOT the problem — it correctly uses flash; the seqlen-2 axis was.
+- Fix (`src/models/pfn_seg_2d.py`): `_small_seq_attn` (plain q·kᵀ→fp32 softmax→·v) replaces the
+  fused SDPA on the feature axis when `c <= _SMALL_SEQ_ATTN` (=16). ~3× faster incl. backward,
+  numerically equivalent (end-to-end parity maxdiff 0.008, bf16 noise). Guarded so ImagePFN's large
+  2N patch feature-axis still uses flash; the set-of-patches models (patchset_cnn, patchset3d) get
+  the win. Compiles cleanly (pure tensor ops, unlike the flash library call).
+- Measured (patchset3d compiled, B=1): 122.5 → 95.4 ms/it (~22%). Combined with the earlier compile
+  + avg_pool3d work, ~33% under the original eager path (143 → 95 ms/it).
+
 ## 2026-07-22 — PatchSet3D: single-level 3D set-of-patches in-context segmentation
 - feat(patchset3d): new `PatchSet3D` model (`src/models/patchset3d.py`) — single-level,
   dense R³ token grid, no refine stage. `ConvEncoder3D` downsamples each volume to an
@@ -2811,3 +2843,24 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
   image_size==sw_roi), self-consistent with the training criterion.
 - `build_sample_table` gained `soft_dice` + `loss` columns (NaN for the eval.py benchmark).
 - Added `soft_dice_binary(prob, target)` helper (eps=1e-6, matches train.py `_soft_dice`).
+
+## PatchSet3D: torch.compile + Muon + LAWA (port from 2D trainer)
+- `experiments/3d/train.py`: mirrored experiments/2d/train.py's optimization stack for the
+  `patchset3d` model (medverse path unchanged).
+  - **compile** (`arch.compile`): `torch.compile(net.transformer, dynamic=True)` after the
+    checkpoint load — the conv encoder (adaptive_avg_pool3d / trilinear) stays eager. Also
+    compiles the shared `pfn_train._newtonschulz5_batched`.
+  - **Muon + AdamW** (`train.muon`, default true): Muon on transformer 2D weight matrices
+    (Newton–Schulz orthogonalized grads) + AdamW on everything else. `train_epoch` now takes a
+    list of `optimizers` and iterates zero_grad/step; the scheduler drives AdamW (optimizers[0])
+    only, Muon is unscheduled. `muon_lr_scale`/`muon_momentum`/`muon_wd` config keys.
+  - **LAWA** (`train.lawa_k`): per-epoch CPU state_dict pushed to a deque; at eval the queue is
+    averaged into the model (`lawa_average`), evaluated + checkpointed, then raw weights restored.
+  - Checkpoint save strips the `_orig_mod.` compile prefix so checkpoints stay compile-agnostic;
+    resume also strips it. Reuses `Muon`/`lawa_average` from experiments/2d/pfn_train.py
+    (2D dir appended to sys.path).
+  - Node-local compile caches: set `TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` on /tmp keyed by
+    hostname BEFORE importing torch (cf. 2D trainer) — without this, compile hit the poisoned NFS
+    Triton cache (`GLIBC_2.34 not found` from a cuda_utils.so built on a newer-GLIBC node).
+- `configs/experiment/3d/model/patchset3d.yaml`: added `arch.compile: true` and
+  `train.{muon, muon_lr_scale, muon_momentum, muon_wd, lawa_k}`.

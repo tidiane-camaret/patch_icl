@@ -62,6 +62,7 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.eval.seed)
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
     source = cfg.data.get("source", "totalseg")
     if source == "omnisynth3d":

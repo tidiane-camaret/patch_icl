@@ -15,12 +15,24 @@ Best checkpoint (by mean val Dice) is saved so experiments/3d/eval.py can reload
     python experiments/3d/train.py train.loss=bce_dice train.optimizer=adamw
 """
 
+import collections
 import datetime
 import math
+import os
 import random
+import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+# Node-local compile caches: ~/.triton and ~/.cache live on shared NFS, so a cuda_utils.so
+# compiled on a node with a newer GLIBC poisons the cache for nodes with an older GLIBC
+# ("GLIBC_2.34 not found"). Key the cache by hostname on local /tmp so each node compiles
+# its own artifacts. Must be set BEFORE torch is imported (cf. experiments/2d/train.py).
+_cache_root = os.path.join(tempfile.gettempdir(), f"{os.environ.get('USER', 'user')}_compile_{socket.gethostname()}")
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "inductor"))
 
 import hydra
 import torch
@@ -33,11 +45,13 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evaluate (dir '3d')
+sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from the 2D trainer
 
 from data.totalseg_classes import resolve_classes
 from common import DEVICE, _source_root, train_loader, make_eval_loader
 from evaluate import evaluate_classes, build_sample_table
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
+from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
 
 
 def _autocast():
@@ -171,8 +185,10 @@ def build_model(cfg: DictConfig):
 # Loops
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch,
+def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
                 is_patchset=False):
+    """optimizers is a list: [AdamW] for medverse, [AdamW, Muon] for patchset3d (the
+    scheduler drives AdamW = optimizers[0]; Muon is unscheduled, cf. experiments/2d/train.py)."""
     net = getattr(model, "model", model)
     net.train()
     total, dice_sum, soft_run, n = 0.0, 0.0, 0.0, 0
@@ -181,7 +197,8 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     for batch in pbar:
         lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         with _autocast():
             if is_patchset:
                 out = model(batch["image"].to(DEVICE, non_blocking=True),
@@ -198,7 +215,8 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
         loss.backward()
         if cfg.train.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.train.grad_clip)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
         if step_per_batch:
             scheduler.step()
 
@@ -213,7 +231,7 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
             s, sc = soft_sum(prob, target); gs += s; gsc += sc
             c, cc = cos_sum(prob, target);  gc += c; gcc += cc
         pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
-                         soft=f"{soft_run/n:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
+                         soft=f"{soft_run/n:.4f}", lr=f"{optimizers[0].param_groups[0]['lr']:.1e}")
     grid = {}
     if is_patchset and rd is not None:
         grid[f"dice_ds@{rd}"] = float(gh) / max(float(ghc), 1)
@@ -253,6 +271,7 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.train.seed)
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
     if cfg.data.get("source", "totalseg") == "omnisynth3d":
         # omniSynth3D val classes come from the tile-cache pool (the label_names the
@@ -288,15 +307,56 @@ def main(cfg: DictConfig) -> None:
         ckpt = torch.load(cfg.train.checkpoint, map_location=DEVICE, weights_only=False)
         sd = ckpt["model"] if "model" in ckpt else ckpt
         if is_patchset:
-            net.load_state_dict(sd)
+            # Strip the `_orig_mod.` prefix torch.compile may have left on saved keys.
+            net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in sd.items()})
         else:
             model.load_finetuned(sd)
         print(f"Resumed weights from {cfg.train.checkpoint}")
 
+    # Compile only the transformer submodule (like experiments/2d/train.py): it is pure
+    # tensor ops so it graph-compiles cleanly, whereas the conv encoder's adaptive_avg_pool3d
+    # / trilinear resamples with data-dependent windows would graph-break. Encoder stays eager.
+    # Compiled AFTER the checkpoint load so warm-starting a raw state_dict isn't blocked by the
+    # `_orig_mod.` prefix; the prefix is stripped again when this run saves (see below).
+    # Muon's Newton–Schulz orthogonalization is pure tensor ops → compile it too (cf. 2D).
+    if is_patchset and cfg.arch.get("compile", False) and hasattr(net, "transformer"):
+        net.transformer = torch.compile(net.transformer, dynamic=True)
+        import pfn_train
+        pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
+        print("Compiled net.transformer + Newton–Schulz (dynamic=True); conv encoder runs eager")
+
     loss_fn = build_loss(cfg)
-    optimizer = build_optimizer(cfg, net.parameters())
+    # Optimizers (cf. experiments/2d/train.py): patchset3d trains its transformer 2D weight
+    # matrices with Muon (Newton–Schulz orthogonalized grads) + AdamW on everything else +
+    # LAWA checkpoint averaging. Other models use the single config-driven optimizer. The
+    # cosine/plateau scheduler drives AdamW only (= optimizers[0]); Muon is unscheduled.
+    use_muon = is_patchset and cfg.train.get("muon", True)
+    if use_muon:
+        muon_params = [p for n, p in net.named_parameters()
+                       if p.requires_grad and p.ndim == 2 and "transformer" in n]
+        adam_params = [p for n, p in net.named_parameters()
+                       if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
+        optimizer = torch.optim.AdamW(adam_params, lr=float(cfg.train.lr),
+                                      weight_decay=float(cfg.train.get("weight_decay", 0.01)))
+        optimizers = [optimizer]
+        if muon_params:
+            optimizers.append(Muon(
+                muon_params,
+                lr=cfg.train.get("muon_lr_scale", 0.1) * float(cfg.train.lr),
+                momentum=cfg.train.get("muon_momentum", 0.96),
+                weight_decay=cfg.train.get("muon_wd", 0.1)))
+        print(f"Muon on {len(muon_params)} transformer matrices + AdamW on {len(adam_params)} "
+              f"other tensors, LAWA k={cfg.train.get('lawa_k', 10)}")
+    else:
+        optimizer = build_optimizer(cfg, net.parameters())
+        optimizers = [optimizer]
     steps = max(1, len(loader))
     scheduler, step_per_batch = build_scheduler(cfg, optimizer, cfg.train.epochs * steps, steps)
+
+    # LAWA checkpoint-averaging buffer (patchset3d + Muon only): a CPU state_dict is pushed
+    # each epoch; at eval the queue is averaged into the model, evaluated + saved, then the raw
+    # training weights are restored so optimization continues from them (cf. 2D trainer).
+    lawa_queue = collections.deque(maxlen=cfg.train.get("lawa_k", 10)) if use_muon else None
 
     wb_on = bool(cfg.wandb.get("project"))
     run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
@@ -312,14 +372,20 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
         loss, tr_dice, tr_soft, tr_grid = train_epoch(
-            model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch,
+            model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
             is_patchset=is_patchset)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
         log.update({f"train/{k}": v for k, v in tr_grid.items()})
 
+        if lawa_queue is not None:   # push this epoch's raw weights to the LAWA buffer
+            lawa_queue.append({k: v.cpu().clone() for k, v in net.state_dict().items()})
+
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
+            # Eval (and any checkpoint saved below) uses LAWA-averaged weights; the raw
+            # training weights are restored after so optimization continues from them.
+            saved = lawa_average(lawa_queue, net, DEVICE) if lawa_queue is not None else None
             val_dice, val_soft, val_loss, rows, cases = validate_mean(
                 model, cfg, val_classes, loader=val_loader, loss_fn=loss_fn)
             log["val/dice"] = val_dice
@@ -343,13 +409,18 @@ def main(cfg: DictConfig) -> None:
                        f"(best {max(best, val_dice):.4f})")
             if val_dice > best:
                 best = val_dice
+                # Strip the `_orig_mod.` prefix torch.compile leaves on transformer keys so the
+                # checkpoint is compile-agnostic (eval/resume load into an un-compiled model).
+                sd = {k.replace("_orig_mod.", ""): v for k, v in net.state_dict().items()}
                 torch.save({
-                    "model": net.state_dict(), "model_name": model_name,
+                    "model": sd, "model_name": model_name,
                     "image_size": list(image_size), "context_size": cfg.data.context_size,
                     "best_val_dice": best, "epoch": epoch,
                     "data": OmegaConf.to_container(cfg.data, resolve=True),
                 }, ckpt_path)
                 log["val/best_dice"] = best
+            if saved is not None:   # restore raw training weights after LAWA-averaged eval
+                net.load_state_dict(saved)
         wandb.log(log)
 
     print(f"Done. Best val Dice={best:.4f} -> {ckpt_path}")
