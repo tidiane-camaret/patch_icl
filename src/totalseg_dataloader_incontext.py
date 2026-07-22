@@ -30,6 +30,7 @@ import math
 import os
 import pickle
 import random
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -759,8 +760,17 @@ class TotalSegInContextDataset(Dataset):
             except Exception:
                 continue
 
-        # Pad by resampling if not enough candidates
-        while len(context_in) < self.context_size and len(context_in) > 0:
+        # Pad by resampling if not enough candidates; fall back to target if empty
+        if len(context_in) == 0:
+            warnings.warn(
+                "TotalSegInContextDataset: no context candidates found; "
+                "falling back to target self-context (metrics for this sample "
+                "are leakage-inflated).",
+                stacklevel=2,
+            )
+            context_in.append(image_t.clone())
+            context_out.append(label_t.clone())
+        while len(context_in) < self.context_size:
             i = random.randrange(len(context_in))
             context_in.append(context_in[i].clone())
             context_out.append(context_out[i].clone())

@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 from data.totalseg_classes import resolve_classes
 from common import DEVICE, _source_root, train_loader, make_eval_loader
 from evaluate import evaluate_classes, build_sample_table
+from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 
 
 def _autocast():
@@ -146,25 +147,53 @@ def build_model(cfg: DictConfig):
         if cfg.train.get("random_init"):
             mk["random_init"] = True  # train from scratch (ignores pretrained weights)
         return MedverseModel(device=DEVICE, **mk), name
-    raise ValueError(f"unknown model {name!r} (medverse)")
+    if name == "patchset3d":
+        from src.models.patchset3d import PatchSet3D
+        a = cfg.arch
+        arch = {
+            "resolution": a.resolution, "enc_dims": list(a.enc_dims),
+            "e": a.e, "h": a.h, "l": a.l, "a": a.a,
+            "thinking_rows": a.thinking_rows, "residual_decay": a.residual_decay,
+            "fourier_bands": a.get("fourier_bands", 8),
+            "mask_patch_size": a.get("mask_patch_size", 1),
+            "mask_patch_decode_size": a.get("mask_patch_decode_size", 1),
+            "context_id_embed": a.get("context_id_embed", False),
+            "max_context": a.get("max_context", 16),
+            "full_attn": a.get("full_attn", False),
+            "query_self_attn": a.get("query_self_attn", False),
+            "image_size": list(cfg.data.image_size),
+        }
+        return PatchSet3D(**arch), name
+    raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
 
 
 # ---------------------------------------------------------------------------
 # Loops
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch):
-    net = model.model
+def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch,
+                is_patchset=False):
+    net = getattr(model, "model", model)
     net.train()
-    total, dice_sum, soft_sum, n = 0.0, 0.0, 0.0, 0
+    total, dice_sum, soft_run, n = 0.0, 0.0, 0.0, 0
+    gh = ghc = gs = gsc = gc = gcc = 0.0          # grid-metric running sums
+    rd = None
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     for batch in pbar:
-        lbl  = batch["label"].to(DEVICE, non_blocking=True).float()   # (B,D,H,W)
+        lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
         optimizer.zero_grad(set_to_none=True)
         with _autocast():
-            logits = model.train_forward(batch["image"], batch["context_in"],
-                                         batch["context_out"])          # (B,1,D,H,W)
-            target = lbl.unsqueeze(1)
+            if is_patchset:
+                out = model(batch["image"].to(DEVICE, non_blocking=True),
+                            context_in=batch["context_in"].to(DEVICE, non_blocking=True),
+                            context_out=batch["context_out"].to(DEVICE, non_blocking=True),
+                            mode="train")
+                logits = out["final_logit"].float()                    # (B,1,Rd,Rd,Rd)
+                target = target_like(lbl.unsqueeze(1), logits)         # GT pooled to grid
+            else:
+                logits = model.train_forward(batch["image"], batch["context_in"],
+                                             batch["context_out"])      # (B,1,D,H,W)
+                target = lbl.unsqueeze(1)
             loss = loss_fn(logits, target)
         loss.backward()
         if cfg.train.get("grad_clip"):
@@ -175,11 +204,22 @@ def train_epoch(model, loader, optimizer, scheduler, step_per_batch, loss_fn, cf
 
         total += loss.item()
         dice_sum += _hard_dice(logits.float(), target)
-        soft_sum += 1.0 - _soft_dice(torch.sigmoid(logits.float()), target).item()  # soft Dice = 1 - loss form
+        soft_run += 1.0 - _soft_dice(torch.sigmoid(logits.float()), target).item()
         n += 1
+        if is_patchset:
+            rd = logits.shape[-1]
+            prob = torch.sigmoid(logits.float())
+            h, hc = hard_sum(prob, target); gh += h; ghc += hc
+            s, sc = soft_sum(prob, target); gs += s; gsc += sc
+            c, cc = cos_sum(prob, target);  gc += c; gcc += cc
         pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
-                         soft=f"{soft_sum/n:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
-    return total / max(n, 1), dice_sum / max(n, 1), soft_sum / max(n, 1)
+                         soft=f"{soft_run/n:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
+    grid = {}
+    if is_patchset and rd is not None:
+        grid[f"dice_ds@{rd}"] = float(gh) / max(float(ghc), 1)
+        grid[f"dice_ds_soft@{rd}"] = float(gs) / max(float(gsc), 1)
+        grid[f"cossim@{rd}"] = float(gc) / max(float(gcc), 1)
+    return total / max(n, 1), dice_sum / max(n, 1), soft_run / max(n, 1), grid
 
 
 @torch.no_grad()
@@ -190,9 +230,14 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     Passing `logits_fn`/`loss_fn` adds val soft-Dice + val loss (from single-ROI logits,
     the training criterion on val). Returns (mean_dice, mean_soft_dice, mean_loss, rows, cases).
     """
-    model.model.eval()
+    net = getattr(model, "model", model)
+    net.eval()
+    # NB: for patchset3d, train_forward returns NATIVE-res logits, so val/loss and
+    # val/dice_soft are computed at native res (comparable to Medverse) while train/loss
+    # is at grid res — the two loss scales are intentionally not directly comparable.
     rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
-                                   logits_fn=model.train_forward, loss_fn=loss_fn)
+                                   logits_fn=model.train_forward, loss_fn=loss_fn,
+                                   grid_res=getattr(model, "grid_size", None))
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
     soft = [r["mean_soft_dice"] for r in valid if "mean_soft_dice" in r]
@@ -233,12 +278,19 @@ def main(cfg: DictConfig) -> None:
     loader = train_loader(cfg)
     val_loader = make_eval_loader(cfg, val_classes, split="val")  # built once, reused every eval
     model, model_name = build_model(cfg)
-    net = model.model
+    is_patchset = model_name == "patchset3d"
+    net = getattr(model, "model", model)
+    if is_patchset:
+        net.to(DEVICE)
     print(f"Trainable params: {sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6:.1f}M")
 
     if cfg.train.get("checkpoint"):
         ckpt = torch.load(cfg.train.checkpoint, map_location=DEVICE, weights_only=False)
-        model.load_finetuned(ckpt["model"] if "model" in ckpt else ckpt)
+        sd = ckpt["model"] if "model" in ckpt else ckpt
+        if is_patchset:
+            net.load_state_dict(sd)
+        else:
+            model.load_finetuned(sd)
         print(f"Resumed weights from {cfg.train.checkpoint}")
 
     loss_fn = build_loss(cfg)
@@ -259,11 +311,13 @@ def main(cfg: DictConfig) -> None:
     best = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
-        loss, tr_dice, tr_soft = train_epoch(model, loader, optimizer, scheduler, step_per_batch,
-                                             loss_fn, cfg, epoch)
+        loss, tr_dice, tr_soft, tr_grid = train_epoch(
+            model, loader, optimizer, scheduler, step_per_batch, loss_fn, cfg, epoch,
+            is_patchset=is_patchset)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
+        log.update({f"train/{k}": v for k, v in tr_grid.items()})
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
             val_dice, val_soft, val_loss, rows, cases = validate_mean(
@@ -272,6 +326,14 @@ def main(cfg: DictConfig) -> None:
             log["val/dice_soft"] = val_soft
             log["val/loss"] = val_loss
             log.update({f"val/dice/{r['class']}": r["mean_dice"] for r in rows if "mean_dice" in r})
+            if is_patchset:
+                rd = net.grid_size
+                for mkey, label in (("mean_dice_ds", "dice_ds"),
+                                    ("mean_dice_ds_soft", "dice_ds_soft"),
+                                    ("mean_cossim", "cossim")):
+                    vals = [r[mkey] for r in rows if mkey in r]
+                    if vals:
+                        log[f"val/{label}@{rd}"] = sum(vals) / len(vals)
             if wb_on:  # per-sample detail table (mirrors experiments/2d train.py's val/samples)
                 log["val/samples"] = build_sample_table(cases, epoch=epoch)
             if not step_per_batch:  # plateau: step on the val metric

@@ -30,13 +30,13 @@ from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
 
 
 class FourierPositionalEncoding(nn.Module):
-    """2-D Fourier features of normalized (i,j) → Linear → e. Resolution-generalizable."""
-    def __init__(self, e: int, num_bands: int = 8):
+    """N-D Fourier features of normalized coords → Linear → e. Resolution-generalizable."""
+    def __init__(self, e: int, num_bands: int = 8, n_axes: int = 2):
         super().__init__()
         self.num_bands = num_bands
         freqs = 2.0 ** torch.arange(num_bands).float()      # (L,) geometric: 1,2,4,...
         self.register_buffer("freqs", freqs)
-        self.proj = nn.Linear(4 * num_bands, e)
+        self.proj = nn.Linear(2 * n_axes * num_bands, e)
 
     def forward(self, ij: torch.Tensor, grid_res: int) -> torch.Tensor:
         # ij: (..., 2) integer cell coords on a grid_res×grid_res grid

@@ -39,3 +39,4 @@ results/experiments/artifacts/
 artifacts/
 results/experiments/__marimo__/
 results/omnisynth_preview*.png
+results/3d/*.png

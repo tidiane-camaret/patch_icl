@@ -1,5 +1,35 @@
 # Change log
 
+## 2026-07-22 — PatchSet3D: single-level 3D set-of-patches in-context segmentation
+- feat(patchset3d): new `PatchSet3D` model (`src/models/patchset3d.py`) — single-level,
+  dense R³ token grid, no refine stage. `ConvEncoder3D` downsamples each volume to an
+  R³ feature map; every patch of every volume (target + K contexts) becomes a token;
+  the dimension-agnostic dual-axis transformer (reused verbatim from `pfn_seg_2d`)
+  does in-context matching over that set. Prediction at R³ or tiled to (R·d)³ via
+  `mask_patch_decode_size`; trilinear upsample to native resolution in predict/eval.
+- feat(fourier): generalized `FourierPositionalEncoding(n_axes)` (`src/models/patchset_pfn.py`)
+  — default n_axes=2 unchanged; PatchSet3D passes n_axes=3 for (i,j,k) lattice position.
+- feat(grid-metrics): new `experiments/3d/grid_metrics.py` — `hard_sum`/`soft_sum`/`cos_sum`
+  accumulate `dice_ds`/`dice_ds_soft`/`cossim` at the token-grid resolution; logged as
+  `train/dice_ds@{Rd}` and `val/dice_ds@{Rd}` (patchset3d only). `target_like` pools the
+  native GT to the logit grid for the training loss.
+- feat(config): `configs/experiment/3d/model/patchset3d.yaml` — Hydra model-group config;
+  selects `model=patchset3d`, sets arch (R=16, enc_dims 4×32, e=256, h=512, l=6, a=4)
+  and train recipe (AdamW, lr=3e-4, cosine, bce_dice). Run:
+  `python experiments/3d/train.py model=patchset3d`.
+- fix(evaluate): `experiments/3d/evaluate.py` — GT pooling for grid metrics now calls
+  `.cpu()` before `F.adaptive_avg_pool3d` to guard against label arriving on GPU.
+- fix(patchset3d): `ConvEncoder3D.cbr()` — `Conv3d(..., bias=False)` (bias redundant with
+  GroupNorm affine; prevents dtype mismatch under bfloat16 autocast).
+- fix(train): `experiments/3d/train.py` — `net.to(DEVICE)` for `patchset3d` after
+  `build_model`; model was created on CPU and never moved to GPU.
+- fix(dataloader): `src/totalseg_dataloader_incontext.py` — fall back to target self-context
+  when no context candidates found (prevents empty-stack crash at `eval.n_subjects=2`).
+- smoke: `python experiments/3d/train.py model=patchset3d train.epochs=1 arch.resolution=8
+  arch.mask_patch_decode_size=2 data.max_ds_len_train=8 eval.n_subjects=2 train.batch_size=2
+  wandb.project=null` — completed, `val_dice=0.0002` (epoch 0, random init, expected).
+- Deferred: refine (bbox/scatter), sim_prior query seed, Muon/LAWA optimizer.
+
 ## 2026-07-21 — omnisynth3d: `synth3d.classes` accepts "benchmark" keyword
 - feat(omnisynth3d): `synth3d.classes` in the 3D pipeline now flows through
   `resolve_classes` (data/totalseg_classes.py) at all three call sites that read it —

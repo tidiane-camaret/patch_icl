@@ -1,0 +1,37 @@
+# @package _global_
+# PatchSet3D defaults (arch + optimizer), selected as a Hydra group:
+#   python experiments/3d/train.py model=patchset3d
+# The `@package _global_` directive (line 1) sets the top-level `model:` string plus the
+# arch/train blocks. Single-level 3D set-of-patches model (see
+# docs/superpowers/specs/2026-07-22-patchset3d-design.md).
+#
+# enc_dims needs log2(image_size/resolution)+1 entries (stem + one per stride-2 stage):
+# 128 -> 16 needs 4. Encoder concats every stage (pooled to R³) → per-patch dim = sum(enc_dims).
+model: patchset3d
+
+arch:
+  resolution: 16               # token grid R (prediction at R³, tiled to (R·d)³)
+  enc_dims: [32, 32, 32, 32]   # 3D per-stage widths; stem + 3 stride-2 stages (len=log2(128/16)+1)
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 8
+  residual_decay: 0.95
+  fourier_bands: 8
+  mask_patch_size: 8           # 1 = scalar avg-pool occupancy per cell; p>1 = shaped p³ tile
+  mask_patch_decode_size: 8    # 1 = one logit per token (R³); d>1 tiles to (R·d)³, no upsampling
+  context_id_embed: true
+  max_context: 16
+  full_attn: true
+  query_self_attn: true       # KEEP false at dense R=16 — the r×r attn mask is prohibitive there
+
+train:
+  batch_size: 2                # dense R=16 is memory-heavy; raise if it fits
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: bce_dice
+  dice_weight: 1.0

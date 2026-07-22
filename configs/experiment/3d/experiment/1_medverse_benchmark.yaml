@@ -1,0 +1,29 @@
+# @package _global_
+# Experiment 1 — Medverse benchmark: fine-tune Medverse on omniSynth-3D over the
+# BENCHMARK_CLASSES tile classes (data/totalseg_classes.py), batch_size=1. Applied
+# as an override layer on train.yaml:
+#   python experiments/3d/train.py experiment=1_medverse_benchmark
+# Equivalent to the ad-hoc overrides:
+#   python experiments/3d/train.py dataset=omnisynth3d train.batch_size=1 synth3d.classes=benchmark
+defaults:
+  - override /dataset: omnisynth3d
+
+data:
+  max_ds_len_train: 1000
+
+train:
+  batch_size: 1
+  # UniverSeg (experiments/2d) training recipe: AdamW(1e-4, wd=0.01) + cosine warmup +
+  # BCE-with-logits + soft-Dice. Overrides the Medverse default (adam 3e-5 / plateau /
+  # smooth_l1) from model/medverse.yaml. See experiments/2d/train.py.
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: bce_dice
+  dice_weight: 1.0
+
+synth3d:
+  # "benchmark" -> BENCHMARK_CLASSES; also accepts an explicit list or "not_benchmark".
+  classes: benchmark

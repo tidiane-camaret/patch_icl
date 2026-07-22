@@ -19,8 +19,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
+
+from grid_metrics import hard_sum, soft_sum, cos_sum
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +236,15 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
     losses = [c["loss"] for c in cases if "loss" in c]
     if losses:
         row["mean_loss"] = round(sum(losses) / len(losses), 4)
+    for key in ("dice_ds", "dice_ds_soft", "cossim"):
+        vals = [c[key] for c in cases if key in c]
+        if vals:
+            row[f"mean_{key}"] = round(sum(vals) / len(vals), 4)
     return row
 
 
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
-                     loader=None, logits_fn=None, loss_fn=None):
+                     loader=None, logits_fn=None, loss_fn=None, grid_res=None):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -294,6 +301,10 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
             tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
             prob = torch.sigmoid(logits).cpu()
+            grid_pr = grid_gt = None
+            if grid_res is not None:
+                grid_pr = F.adaptive_avg_pool3d(prob, (grid_res,) * 3)                 # (B,1,g,g,g)
+                grid_gt = F.adaptive_avg_pool3d(label.float().unsqueeze(1).cpu(), (grid_res,) * 3)
             sample_loss = ([float(loss_fn(logits[i:i + 1], tgt[i:i + 1]).item())
                             for i in range(logits.shape[0])] if loss_fn is not None else None)
 
@@ -326,6 +337,11 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 case["soft_dice"] = round(soft_dice_binary(prob[i, 0], label[i]), 4)
                 if sample_loss is not None:
                     case["loss"] = sample_loss[i]
+                if grid_pr is not None:
+                    pr, gt = grid_pr[i:i + 1], grid_gt[i:i + 1]
+                    case["dice_ds"] = round(float(hard_sum(pr, gt)[0]), 4)
+                    case["dice_ds_soft"] = round(float(soft_sum(pr, gt)[0]), 4)
+                    case["cossim"] = round(float(cos_sum(pr, gt)[0]), 4)
             cases_by_class[cls].append(case)
 
     rows, all_cases = [], []
