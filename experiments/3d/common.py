@@ -50,6 +50,16 @@ def resolve_anchor_classes(anchor_cfg, root):
     return classes
 
 
+_ANCHOR_SHAPES = ("blob", "elongated", "tubular")
+
+
+def anchor_shapes(cfg):
+    """Validation 'classes' for anchor_synth3d = the object shapes it emits, which is
+    the val grouping key (label_name). `shape=mix` -> all three, else the single shape."""
+    shape = cfg.anchor_synth.get("shape", "blob")
+    return list(_ANCHOR_SHAPES) if shape == "mix" else [shape]
+
+
 def build_dataset(cfg, split: str):
     """Construct the 3D in-context dataset for `split`, dispatching on cfg.data.source.
 
@@ -96,9 +106,13 @@ def build_dataset(cfg, split: str):
             split=split, context_size=cfg.data.context_size,
             object_source=a.get("object_source", "blob"),
             shape=a.get("shape", "blob"), n_objects=int(a.get("n_objects", 1)),
-            offset_range=float(a.get("offset_range", 0.6)),
-            object_size_min=int(a.get("object_size_min", 4)),
-            object_size_max_frac=float(a.get("object_size_max_frac", 0.1)),
+            n_anchors=int(a.get("n_anchors", 4)),
+            extrapolation=float(a.get("extrapolation", 0.3)),
+            weight_concentration=float(a.get("weight_concentration", 1.0)),
+            max_select_tries=int(a.get("max_select_tries", 20)),
+            object_size_frac_min=float(a.get("object_size_frac_min", 0.3)),
+            object_size_frac_max=float(a.get("object_size_frac_max", 0.8)),
+            object_size_min_vox=int(a.get("object_size_min_vox", 6)),
             scale_jitter=float(a.get("scale_jitter", 0.15)),
             rotate_jitter=float(a.get("rotate_jitter", 12.0)),
             contrast_delta=float(a.get("contrast_delta", 0.15)),
