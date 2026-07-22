@@ -29,12 +29,34 @@ def anchor_stats(mask):
     return centroid, extent, (lo, hi)
 
 
-def offset_to_center(centroid, extent, offset_norm, tile_size, vol_shape):
-    """Voxel centre for an object at centroid + offset_norm * extent, clamped so a
-    `tile_size` cube stays fully inside `vol_shape`."""
-    center = (np.asarray(centroid, dtype=np.float64)
-              + np.asarray(offset_norm, dtype=np.float64)
-              * np.asarray(extent, dtype=np.float64))
+def affine_weights(rng, n, extrapolation=0.0, concentration=1.0):
+    """`n` barycentric weights summing to 1. Base convex `u ~ Dirichlet`, expanded
+    around the barycenter 1/n by (1+extrapolation) so weights may go mildly negative
+    (extrapolation=0 -> strictly inside the hull)."""
+    u = rng.dirichlet([float(concentration)] * int(n))
+    b = 1.0 / int(n)
+    return b + (1.0 + float(extrapolation)) * (u - b)
+
+
+def frame_length(centroids):
+    """Mean pairwise Euclidean distance of centroids (n,3) — an orientation- and
+    translation-invariant characteristic length of the landmark frame."""
+    c = np.asarray(centroids, dtype=np.float64)
+    n = len(c)
+    if n < 2:
+        return 0.0
+    diffs = c[:, None, :] - c[None, :, :]
+    d = np.sqrt((diffs ** 2).sum(-1))
+    iu = np.triu_indices(n, k=1)
+    return float(d[iu].mean())
+
+
+def barycentric_center(centroids, weights, tile_size, vol_shape):
+    """Voxel centre = Σ wᵢ·centroidᵢ, clamped so a `tile_size` cube stays fully
+    inside `vol_shape`."""
+    c = np.asarray(centroids, dtype=np.float64)          # (n, 3)
+    w = np.asarray(weights, dtype=np.float64)            # (n,)
+    center = (w[:, None] * c).sum(0)                     # (3,)
     half = tile_size / 2.0
     return np.clip(center, half, np.asarray(vol_shape, dtype=np.float64) - half)
 
