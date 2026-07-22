@@ -68,7 +68,7 @@ def sample_object_spec(rng, shape="blob", eccentricity=3.0, n_harmonics=4,
         r0 = float(rng.uniform(0.10, 0.20))                      # tube caliber
         taper = float(rng.uniform(0.0, 0.6))                     # thin toward one end
         radii = np.maximum(r0 * (1.0 - taper * np.linspace(0.0, 1.0, m)), 0.03)
-        return {"kind": "tube", "curve": curve, "radii": radii,
+        return {"kind": "tube", "shape": shape, "curve": curve, "radii": radii,
                 "R0": R0, "edge_blur": float(edge_blur)}
 
     # ellipsoid path — original draw order preserved (axes, R0, terms) so existing
@@ -83,7 +83,7 @@ def sample_object_spec(rng, shape="blob", eccentricity=3.0, n_harmonics=4,
         u = rng.standard_normal(3)
         u = u / (np.linalg.norm(u) + 1e-9)
         terms.append((u, float(rng.uniform(-harmonic_amp, harmonic_amp))))
-    return {"kind": "ellipsoid", "axes": axes, "R0": R0, "terms": terms,
+    return {"kind": "ellipsoid", "shape": shape, "axes": axes, "R0": R0, "terms": terms,
             "edge_blur": float(edge_blur)}
 
 

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset
+from src.augmentations import apply_task_aug, apply_intensity_aug
 from src.totalseg_dataset import _ALL_CLASSES_IDX
 from .shapes import sample_object_spec, render_object, small_rotation, roughen
 from .draw import anchor_stats, offset_to_center, place_object
@@ -21,22 +22,33 @@ from .draw import anchor_stats, offset_to_center, place_object
 class AnchorSynth3DICLDataset(TotalSegInContextDataset):
     def __init__(self, root, classes, image_size=(128, 128, 128), split="train",
                  context_size=1, object_source="blob", shape="blob", n_objects=1,
-                 offset_range=0.6, scale_frac=0.4, scale_jitter=0.15,
+                 offset_range=0.6, object_size_min=4, object_size_max_frac=0.1,
+                 scale_jitter=0.15,
                  rotate_jitter=12.0, contrast_delta=0.15, edge_blur=0.08,
                  boundary_complexity=0.0, harmonic_amp=0.30, eccentricity=3.0,
                  n_harmonics=4, deterministic=None, eval_seed_namespace=0,
-                 eval_subjects_per_task=4, epoch_length=10000, max_subjects=None):
+                 eval_subjects_per_task=4, epoch_length=10000, max_subjects=None,
+                 aug_cfg=None):
         if object_source != "blob":
             raise NotImplementedError(
                 f"object_source={object_source!r} not implemented in v1 (blob only)")
         super().__init__(root=root, classes=classes, image_size=image_size,
                          split=split, context_size=context_size,
                          max_subjects=max_subjects, class_balanced=True)
+        # aug_cfg is the multiverseg augmentation block (train only); applied in
+        # __getitem__ since this class fully overrides the parent's __getitem__.
+        # Set AFTER super().__init__, which initialises self.aug_cfg = None.
+        self.aug_cfg = aug_cfg
         self.object_source = object_source
         self.shape = shape
         self.n_objects = int(n_objects)
         self.offset_range = float(offset_range)
-        self.scale_frac = float(scale_frac)
+        # Object size is INDEPENDENT of the anchor (the anchor sets position only):
+        # drawn per object in _draw_specs ~ U[object_size_min, object_size_max] voxels,
+        # where object_size_max = object_size_max_frac * min(image_size) (e.g. 1/10 img).
+        self.object_size_min = int(object_size_min)
+        self.object_size_max = max(self.object_size_min + 1,
+                                   int(round(float(object_size_max_frac) * min(image_size))))
         self.scale_jitter = float(scale_jitter)
         self.rotate_jitter = float(rotate_jitter)
         self.contrast_delta = float(contrast_delta)
@@ -76,6 +88,7 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
                     n_harmonics=self.n_harmonics, harmonic_amp=self.harmonic_amp,
                     edge_blur=self.edge_blur),
                 "offset": rng.uniform(-self.offset_range, self.offset_range, size=3),
+                "size": float(rng.uniform(self.object_size_min, self.object_size_max)),
                 "contrast": float(rng.uniform(-1.0, 1.0) * self.contrast_delta),
             })
         return specs
@@ -86,11 +99,12 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
         label = np.zeros(img.shape, dtype=np.int64)
         stats = anchor_stats(anchor_t.cpu().numpy())
         if stats is not None:
-            centroid, extent, _ = stats
-            base = self.scale_frac * float(np.mean(extent))
+            centroid, extent, _ = stats  # anchor -> object POSITION only
             for lid, spec in enumerate(specs, 1):
+                # size is anchor-independent (drawn in _draw_specs); only a small
+                # per-scene jitter varies across the K+1 scenes.
                 jit = 1.0 + scene_rng.uniform(-self.scale_jitter, self.scale_jitter)
-                size = max(3, int(round(base * jit)))
+                size = max(self.object_size_min, int(round(spec["size"] * jit)))
                 alpha = render_object(size, spec["geom"],
                                       R_extra=small_rotation(scene_rng, self.rotate_jitter))
                 if self.boundary_complexity > 0.0:
@@ -128,17 +142,35 @@ class AnchorSynth3DICLDataset(TotalSegInContextDataset):
                   for subj, s in zip(chosen, scene_seeds)]
 
         image_t, label_t = scenes[0]
-        ctx = scenes[1:]
+        context_in = [c[0] for c in scenes[1:]]
+        context_out = [c[1] for c in scenes[1:]]
+
+        # Augmentation (train only): shared geometric task aug over the K+1 scenes,
+        # then independent per-volume intensity aug — mirrors the real-data path in
+        # TotalSegInContextDataset.__getitem__. Mask nearest-interp preserves the
+        # int64 object ids.
+        if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0:
+            all_images = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)], dim=0)
+            all_masks  = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
+            all_images, all_masks = apply_task_aug(all_images, all_masks, self.aug_cfg.task)
+            for i in range(all_images.shape[0]):
+                all_images[i] = apply_intensity_aug(all_images[i], self.aug_cfg.intensity)
+            image_t     = all_images[0]
+            label_t     = all_masks[0]
+            context_in  = list(all_images[1:])
+            context_out = list(all_masks[1:])
+
         return {
             "image":       image_t,
             "label":       label_t,
-            "context_in":  torch.stack([c[0] for c in ctx]),
-            "context_out": torch.stack([c[1] for c in ctx]),
+            "context_in":  torch.stack(context_in),
+            "context_out": torch.stack(context_out),
             "subject":     chosen[0],
             "label_name":  anchor_cls,
             "spacing":     self._get_spacing(chosen[0]),
             "meta": {"anchor": anchor_cls,
                      "n_objects": self.n_objects,
+                     "shapes": [spec["geom"].get("shape") for spec in specs],
                      "offsets": [spec["offset"].tolist() for spec in specs],
                      "contrasts": [spec["contrast"] for spec in specs]},
         }

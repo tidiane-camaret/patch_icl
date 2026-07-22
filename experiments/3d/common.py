@@ -97,7 +97,8 @@ def build_dataset(cfg, split: str):
             object_source=a.get("object_source", "blob"),
             shape=a.get("shape", "blob"), n_objects=int(a.get("n_objects", 1)),
             offset_range=float(a.get("offset_range", 0.6)),
-            scale_frac=float(a.get("scale_frac", 0.4)),
+            object_size_min=int(a.get("object_size_min", 4)),
+            object_size_max_frac=float(a.get("object_size_max_frac", 0.1)),
             scale_jitter=float(a.get("scale_jitter", 0.15)),
             rotate_jitter=float(a.get("rotate_jitter", 12.0)),
             contrast_delta=float(a.get("contrast_delta", 0.15)),
@@ -107,6 +108,7 @@ def build_dataset(cfg, split: str):
             eval_seed_namespace=int(a.get("eval_seed_namespace", 0)),
             epoch_length=int(a.get("epoch_length", 10000)),
             deterministic=(split != "train"),
+            aug_cfg=(cfg.get("augmentations") if is_train else None),
             max_subjects=(cfg.data.get("max_train_subjects") if is_train
                           else cfg.data.get("max_val_subjects")))
     d = cfg.data

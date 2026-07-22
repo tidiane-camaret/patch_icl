@@ -13,8 +13,9 @@ anchor_synth:
   n_objects: 1               # objects (labels) per task; all share the one anchor
   anchor_classes: []         # [] = all; or a list / "benchmark" / "not_benchmark"
   offset_range: 0.6          # per-axis offset ~ U[-r, r], in units of anchor extent
-  scale_frac: 0.4            # object size = scale_frac * mean(anchor extent)
-  scale_jitter: 0.15         # per-scene multiplicative size jitter
+  object_size_min: 20        # object side ~ U[min, max] voxels — INDEPENDENT of anchor;
+  object_size_max_frac: 0.4  # max side = object_size_max_frac * min(image_size)
+  scale_jitter: 0.15         # per-scene multiplicative size jitter (K+1 consistency)
   rotate_jitter: 12.0        # per-scene small rotation (deg)
   contrast_delta: 0.15       # |object - local background| intensity (blends in)
   edge_blur: 0.08            # soft-edge width (fraction of object radius)

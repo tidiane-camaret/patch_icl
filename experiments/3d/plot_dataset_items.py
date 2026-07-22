@@ -94,7 +94,7 @@ def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray,
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--split",     default="train", choices=["train", "val", "test"])
-    parser.add_argument("--n_samples", type=int, default=4)
+    parser.add_argument("--n_samples", type=int, default=8)
     parser.add_argument("--out",       default="results/3d/dataset_items.png")
     parser.add_argument("--separate_overlay", action="store_true",
                         help="render each volume as a raw-scan column plus a separate "
@@ -168,10 +168,16 @@ def main():
                  f"  mode={s3.target_mode}  bg={s3.background}")
     elif source == "anchor_synth3d":
         # anchor_synth3d draws synthetic objects at anchor-relative positions on real CT;
-        # its knobs live in cfg.anchor_synth (no task-aug / supervoxel-synth path).
+        # scene knobs live in cfg.anchor_synth. On the train split build_dataset also
+        # forwards the multiverseg task+intensity aug (like the totalseg path), so the
+        # plotted items are augmented there.
         a = cfg.anchor_synth
+        aug_on  = args.split == "train" and cfg.augmentations.enabled
+        aug_tag = " + aug" if aug_on else ""
+        sz_max  = int(a.object_size_max_frac * min(cfg.data.image_size))
         extra = (f"  |  obj={a.object_source}/{a.shape}  n_obj={a.n_objects}"
-                 f"  offset={a.offset_range}  scale={a.scale_frac}  Δ={a.contrast_delta}")
+                 f"  offset={a.offset_range}  size={a.object_size_min}-{sz_max}vx"
+                 f"  Δ={a.contrast_delta}{aug_tag}")
     else:
         aug_on    = args.split == "train" and cfg.augmentations.enabled
         synth_on  = args.split == "train" and bool(cfg.data.synth_method)

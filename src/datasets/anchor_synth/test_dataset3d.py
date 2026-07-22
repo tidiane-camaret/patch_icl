@@ -35,7 +35,8 @@ def _ds(root, **kw):
     return AnchorSynth3DICLDataset(
         root=root, classes=[ANCHOR], image_size=(SIZE, SIZE, SIZE),
         split="val", context_size=2, eval_subjects_per_task=2,
-        offset_range=0.2, scale_frac=0.4, contrast_delta=0.3, **kw)
+        offset_range=0.2, object_size_min=3, object_size_max_frac=0.3,
+        contrast_delta=0.3, **kw)
 
 
 def test_contract_shapes_and_object_drawn(tmp_path):

@@ -111,7 +111,8 @@ def main():
     a = cfg.anchor_synth
     print(f"\nanchor_synth3d blend analysis  (split={args.split}, n={len(rows)}/{n} "
           f"non-empty, shell={args.shell}vx)")
-    print(f"config: contrast_delta={a.contrast_delta}  scale_frac={a.scale_frac}  "
+    print(f"config: contrast_delta={a.contrast_delta}  "
+          f"object_size={a.object_size_min}-{a.object_size_max_frac}·img  "
           f"offset_range={a.offset_range}  edge_blur={a.edge_blur}")
     print(f"image intensity range over items: [{min(img_lo):.3f}, {max(img_hi):.3f}]")
     print("-" * 68)

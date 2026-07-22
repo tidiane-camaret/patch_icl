@@ -1,5 +1,39 @@
 # Change log
 
+## anchor_synth3d: decouple object size from the anchor
+
+Object size was tied to the anchor (`size = scale_frac * mean(anchor extent)`), so
+small anchors (thin vessels, small glands) forced `size≈3` and produced empty /
+near-empty labels. Root-caused via an occupancy probe: 13% of train targets (6% val,
+no aug) had zero occupancy — from tubular shapes rendering below the `alpha>0.5`
+label threshold at small sizes, plus the new nearest-interp aug erasing sub-~50-voxel
+objects. Fix: the anchor now sets **position only**; object side is drawn
+independently `~U[object_size_min, object_size_max_frac·min(image_size)]` (default
+**20–51 vox** at 128³), shared across the K+1 scenes with per-scene `scale_jitter`.
+Removed `scale_frac`. Config knobs `object_size_min` / `object_size_max_frac` replace
+it (common.py, dataset3d.py, yaml, tests, plot/analyze captions updated). Also made
+`build_dataset` read `cfg.get("augmentations")` so minimal cfgs (wiring test) don't
+require the key. The resolved per-object shape (from `mix`) is recorded in the spec
+and item `meta["shapes"]` for per-shape analysis. Zero-rate went 13.0→0.4% (train),
+6.1→0.7% (val). Per-shape occupancy (median vox @128³): blob ~6000, elongated ~2500,
+tubular ~360 — tubes stay much smaller (thin caliber), so raise tube radius if more
+balance is wanted.
+
+## anchor_synth3d: apply the multiverseg augmentations
+
+`AnchorSynth3DICLDataset` fully overrides `__getitem__`, so the parent's aug hook
+never ran and `build_dataset` never passed `aug_cfg` for `anchor_synth3d` — the
+`augmentations: multiverseg` config was loaded but dead. Wired it through:
+`build_dataset` now forwards `aug_cfg=(cfg.augmentations if is_train else None)`,
+and the dataset applies shared geometric task aug over the K+1 scenes + independent
+per-volume intensity aug (mirroring the real-data path; mask nearest-interp keeps
+the int64 object ids). val/test remain un-augmented. Built-in per-scene
+scale/rotation jitter is unchanged. Verified: aug wired on train (None on val), and
+on a fixed deterministic scene the aug'd image/mask differ from the un-augmented one.
+`plot_dataset_items.py` builds through `build_dataset`, so `--split train` now shows
+augmented anchor_synth3d items; its caption gains a `+ aug` tag (was mislabelled "no
+task-aug").
+
 ## PatchSet3D: profile a train step + avg_pool3d resample optimization
 - Profiled one fwd+bwd step (B=1, K=1, 128³, R=16, full_attn, compiled transformer) on an
   A6000. GPU is already saturated (100% SM, ~memory-bandwidth bound). Breakdown of CUDA time:
