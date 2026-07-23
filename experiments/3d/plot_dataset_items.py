@@ -94,7 +94,7 @@ def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray,
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--split",     default="train", choices=["train", "val", "test"])
-    parser.add_argument("--n_samples", type=int, default=8)
+    parser.add_argument("--n_samples", type=int, default=12)
     parser.add_argument("--out",       default="results/3d/dataset_items.png")
     parser.add_argument("--separate_overlay", action="store_true",
                         help="render each volume as a raw-scan column plus a separate "

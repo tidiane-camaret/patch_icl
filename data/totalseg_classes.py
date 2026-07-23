@@ -147,6 +147,12 @@ def resolve_classes(
     if not isinstance(value, str):
         return list(value)
 
+    if value == "all":
+        # Every anatomical class (CT: the 117 label.npy classes; the 4 trailing
+        # ALL_CLASSES entries are MRI-only). Classes absent from a given subject split
+        # simply yield no samples downstream.
+        return list(MRI_ALL_CLASSES if is_mri else ALL_CLASSES[:117])
+
     if value == "benchmark":
         return list(MRI_BENCHMARK_CLASSES if is_mri else BENCHMARK_CLASSES)
 

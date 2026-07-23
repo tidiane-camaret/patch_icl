@@ -21,7 +21,9 @@ train:
   seed: 42
   eval_every: 1
   grad_clip: 1.0
-  checkpoint: null              # resume/warm-start fine-tuned weights
+  # train.checkpoint is the weight-source knob; its default is per-model (set in
+  # model/*.yaml so it survives composition). medverse: orig_weights | random | <path>.
+  # patchset3d: null=fresh | <path>=resume.
   out_dir: ${paths.results}/3d_train
 eval:                           # per-class validation during training
   split: val

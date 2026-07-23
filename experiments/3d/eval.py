@@ -52,6 +52,35 @@ def _build_model(cfg: DictConfig):
             model.load_finetuned(ckpt["model"] if "model" in ckpt else ckpt)
             print(f"  Loaded fine-tuned medverse weights from {cfg.eval.checkpoint}")
         return model
+    if name == "patchset3d":
+        # PatchSet3D is used directly as the eval model (it provides .predict, the only
+        # method the shared eval loop needs). The architecture is rebuilt from the
+        # checkpoint's stored `arch` when present (new checkpoints), else from cfg.arch
+        # (re-supply the same model=patchset3d arch.* overrides used at training).
+        from train import build_model
+        if not cfg.eval.get("checkpoint"):
+            raise ValueError("eval.checkpoint is required for patchset3d")
+        ckpt = torch.load(cfg.eval.checkpoint, map_location=DEVICE, weights_only=False)
+        arch = ckpt.get("arch")
+        from omegaconf import open_dict
+        with open_dict(cfg):
+            # build_model dispatches on top-level cfg.model, which is unset unless the
+            # user passed +model=patchset3d — pin it so the arch-from-checkpoint path
+            # (eval.model=patchset3d only) still builds a PatchSet3D, not medverse.
+            cfg.model = "patchset3d"
+            if arch is not None:
+                cfg.arch = OmegaConf.create(arch)   # rebuild from the stored arch
+            elif "arch" not in cfg:
+                raise ValueError(
+                    "checkpoint has no stored arch (older run); re-supply the training "
+                    "arch, e.g. +model=patchset3d arch.l=2")
+        model, _ = build_model(cfg)
+        model = model.to(DEVICE)
+        sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+        model.load_state_dict(sd)
+        model.eval()
+        print(f"  Loaded PatchSet3D from {cfg.eval.checkpoint} (arch l={cfg.arch.l})")
+        return model
     return load_model(name, ckpt_path=cfg.eval.get("checkpoint"),
                       image_size=image_size, device=DEVICE)
 

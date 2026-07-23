@@ -1,5 +1,19 @@
 # Change log
 
+## 3d train: unified `train.checkpoint` weight-source knob
+
+Collapsed the three medverse weight-source knobs (`train.random_init`,
+`train.base_ckpt`, and the path-resume role of `train.checkpoint`) into a single
+`train.checkpoint` accepting: `orig_weights` (fine-tune from the released
+`Medverse.ckpt`, now the medverse default), `random` (train from scratch), or a
+`<path>` to our finetuned `best.pt` (warm-start via `load_finetuned`). `build_model`
+now only special-cases `checkpoint == "random"`; `main()` loads weights only for an
+actual path (sentinels are handled at construction). Patchset3d is unchanged
+(`null`=fresh / `<path>`=resume). Dropped `base_ckpt` (was `null` everywhere;
+`MEDVERSE_CKPT` remains a module constant). `MedverseModel`'s constructor API
+(`random_init`/`ckpt_path`) is untouched. Design:
+docs/superpowers/specs/2026-07-23-unified-train-checkpoint-design.md.
+
 ## anchor_synth3d: barycentric multi-anchor positioning + frame-relative size
 
 Replaced the single-anchor offset placement (position `= centroid + offset·extent`,
@@ -2936,3 +2950,90 @@ landmark only — the label is the drawn object(s). New package
 `TotalSegInContextDataset` for the scan cache + fast-path loading. v1 = blob
 objects only; organ objects and multi-anchor deferred. Spec:
 docs/superpowers/specs/2026-07-22-anchor-synth3d-design.md.
+
+## patchset3d eval support
+
+`experiments/3d/eval.py` can now evaluate a `model=patchset3d` checkpoint. Added
+a `patchset3d` branch to `_build_model` that reuses `train.build_model` to
+instantiate `PatchSet3D` (used directly as the eval model — it provides the
+`.predict` the shared eval loop needs) and loads the checkpoint's `model` state
+dict (`_orig_mod.` stripped). Architecture is rebuilt from the checkpoint's new
+`arch` field; `train.py` now stores `arch` (patchset3d only) alongside the state
+dict so eval no longer needs the `arch.*` overrides re-supplied. Older
+checkpoints without stored arch still work by passing `+model=patchset3d arch.l=...`.
+
+    python experiments/3d/eval.py eval.model=patchset3d \
+        eval.checkpoint=results/checkpoints/3d/<DATE>_<run>/best.pt \
+        dataset=omnisynth3d eval.split=val
+
+## 3D eval reproducibility fix (per-item RNG)
+
+`experiments/3d/eval.py` on the totalseg source was not reproducible across models:
+context selection (`random.shuffle(candidates)`) and organ-crop jitter
+(`random.randint`, crop_jitter=32, use_crop=true) drew from the process-global
+`random`. With `workers>0`, each worker's `random` is seeded by PyTorch as
+`base_seed + worker_id`, and `base_seed` comes from the main-process torch RNG at
+loader-spawn time — which is perturbed *differently by each model's construction*
+(PatchSet3D random init vs medverse pretrained load). Result: two runs saw
+different context (98.4% of samples) and different crops (50.3%), so paired
+medverse-vs-patchset comparisons were not on identical inputs.
+
+Fix: `TotalSegInContextDataset` gains `eval_seed`. When set, `__getitem__` seeds a
+per-item `random.Random(hash((eval_seed, idx)))` (`self._cur_rng`) and routes the
+context shuffle, pad-resample, multi-label extra-class shuffle, and crop jitter
+(`_load_crop`/`_load_crop_multi`) through it — fully reproducible regardless of
+worker count, iteration order, or model. `eval_seed=None` (training) keeps the
+global `random`, so training stochasticity is unchanged. `make_eval_loader` passes
+`eval_seed=cfg.eval.seed` (default 0), covering both the eval entrypoint and
+train-time per-class validation.
+
+## nb 20 (medverse vs patchset3d): all-TotalSeg-class support + per-class dice plot
+
+The new eval runs cover all TotalSegmentator labels (not the earlier 47-class
+subset), which broke `results/experiments/20_medverse_patchset3d_comp.py`:
+- The shape-taxonomy assert crashed with `'tuple' object has no attribute 'isna'`
+  (`D.shape` is the DataFrame `(rows, cols)` tuple, not the `shape` column). Fixed
+  the reference, then replaced the hard assert with a catch-all: unmapped classes
+  now fall into a new `"other"` shape family (added to `SHAPE_ORDER`) and are
+  printed, instead of failing.
+- Removed hardcoded `/47` class counts in cells 0b and 1 — derived from `len(...)`.
+- Added cell 1b (per-class dice analysis + plot): per-class mean dice for every
+  run; for a 2-run pair, a run-vs-run scatter coloured by shape (y=x reference)
+  plus a diverging bar of the largest per-class gaps; for >2 runs, per-class dice
+  sorted with one line per run. Generalises to any RUNS set.
+
+## nb 20: data-driven morphology taxonomy (clustered, auto-labelled)
+
+Replaced the hand-mapped 4-family SHAPE dict (compact/tubular/elongated/bone) with a
+data-driven taxonomy clustered from real-mask geometry. Two reusable helpers added to
+`results/experiments/totalseg_geometry_extract.py`:
+- `load_or_build_geometry(pairs, cache, ...)` — cache-or-rebuild per-(subject,class)
+  geometry; now shared by nb 20 cells 0 and 4 (single cache, no NFS double-read).
+- `shape_families(geom, k=10)` — Ward clustering (scipy, numpy-standardised, no sklearn)
+  on scale-invariant shape descriptors + thickness + fragmentation. Auto-labels each
+  cluster `{thick|mid|thin}_{blob|tube|sheet}` (+ `frag` for multi-component): thickness
+  tercile from surf/vol (primary axis, = the medverse<->patchset dice driver); the shape
+  tag is the Westin coord (linearity/planarity/sphericity) the cluster stands out on vs
+  other clusters (z-score argmax, so it isn't swamped by linearity being globally largest).
+
+Cell 0 now sets N_SHAPE=10 and derives SHAPE/SHAPE_ORDER at runtime; classes with no
+non-empty mask fall back to 'other'. Key finding: geometry does NOT support "bone" as a
+morphology family — bones scatter by actual shape (femur/humerus->thick blob, ribs->thin
+tube, vertebrae->mid sheet, flat bones->mid). k=10 has the best silhouette (0.331) in 8-13
+with no singletons; example families: thick_blob1 = liver/heart/brain/lungs/spleen/bladder,
+thin_tube* = ribs + arteries, mid_sheet = vertebrae.
+
+## nb 21: reusable single 3D training-run val breakdown (21_totalseg_seeds3d.py)
+
+New marimo notebook for the FINAL-epoch val/samples breakdown of one patch_icl_3d_exps run
+(default RUN = d7fk2k9h, patchset3d + seeds3d synth). General/uncluttered: RUN is the only
+knob (N_SHAPE tunes family granularity); class list + shape families are derived from the
+logged data, nothing hardcoded. Aggregate learning curves deliberately omitted (live in W&B).
+Reuses totalseg_geometry_extract.{load_or_build_geometry, shape_families} for morphology (same
+taxonomy as nb 20; here clustered on the evaluated pairs). Caches samples, config+summary, and
+geometry under artifacts/21_<id>_*.{csv,json}. Cells: (0) fetch+cache+cluster+header; (1)
+per-class val dice ranked bar coloured by shape family (+table); (2) per-shape family breakdown
+(macro/micro dice, complete-miss rate, median thickness); (3) per-sample dice vs geometry
+drivers (thickness, volume, target/context occupancy). Finding for d7fk2k9h: dice falls
+monotonically with thinness — thick_blob1 macro≈0.20 (miss 39%) → thin_tube≈0.005 (miss 87%);
+macro val/dice≈0.083, 11/47 classes complete-miss.

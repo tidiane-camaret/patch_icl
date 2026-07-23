@@ -118,6 +118,9 @@ def build_dataset(cfg, split: str):
             contrast_delta=float(a.get("contrast_delta", 0.15)),
             edge_blur=float(a.get("edge_blur", 0.08)),
             boundary_complexity=float(a.get("boundary_complexity", 0.0)),
+            harmonic_amp=float(a.get("harmonic_amp", 0.30)),
+            n_harmonics=int(a.get("n_harmonics", 4)),
+            eccentricity=float(a.get("eccentricity", 3.0)),
             eval_subjects_per_task=int(a.get("eval_subjects_per_task", 4)),
             eval_seed_namespace=int(a.get("eval_seed_namespace", 0)),
             epoch_length=int(a.get("epoch_length", 10000)),
@@ -217,6 +220,9 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
         p_synth=0.0,
         class_balanced=False,
         use_crop=d.use_crop,
+        # Deterministic per-item context shuffle + crop jitter (reproducible across
+        # models/workers/order); see TotalSegInContextDataset.eval_seed.
+        eval_seed=int(e.get("seed", 0)),
     )
     nw = int(e.get("workers", 4))
     return DataLoader(

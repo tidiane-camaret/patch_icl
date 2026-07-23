@@ -156,9 +156,11 @@ def build_model(cfg: DictConfig):
     if name == "medverse":
         from src.benchmark_models.medverse import MedverseModel
         mk = {"sw_roi_size": tuple(cfg.data.image_size)}  # val predict = single ROI
-        if cfg.train.get("base_ckpt"):
-            mk["ckpt_path"] = cfg.train.base_ckpt
-        if cfg.train.get("random_init"):
+        # Weight source is driven entirely by train.checkpoint (see main()'s loader):
+        #   "orig_weights" -> released Medverse.ckpt, "random" -> from scratch,
+        #   <path> -> our finetuned best.pt (built with released weights here, then
+        #   overridden by load_finetuned in main()).
+        if cfg.train.get("checkpoint") == "random":
             mk["random_init"] = True  # train from scratch (ignores pretrained weights)
         return MedverseModel(device=DEVICE, **mk), name
     if name == "patchset3d":
@@ -307,15 +309,19 @@ def main(cfg: DictConfig) -> None:
         net.to(DEVICE)
     print(f"Trainable params: {sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6:.1f}M")
 
-    if cfg.train.get("checkpoint"):
-        ckpt = torch.load(cfg.train.checkpoint, map_location=DEVICE, weights_only=False)
+    # train.checkpoint is the single weight-source knob. Sentinels ("orig_weights",
+    # "random") are handled at model construction (build_model); only an actual path
+    # loads weights here — our finetuned best.pt for medverse, a raw resume for patchset3d.
+    checkpoint = cfg.train.get("checkpoint")
+    if checkpoint and checkpoint not in ("orig_weights", "random"):
+        ckpt = torch.load(checkpoint, map_location=DEVICE, weights_only=False)
         sd = ckpt["model"] if "model" in ckpt else ckpt
         if is_patchset:
             # Strip the `_orig_mod.` prefix torch.compile may have left on saved keys.
             net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in sd.items()})
         else:
             model.load_finetuned(sd)
-        print(f"Resumed weights from {cfg.train.checkpoint}")
+        print(f"Resumed weights from {checkpoint}")
 
     # Compile only the transformer submodule (like experiments/2d/train.py): it is pure
     # tensor ops so it graph-compiles cleanly, whereas the conv encoder's adaptive_avg_pool3d
@@ -421,6 +427,10 @@ def main(cfg: DictConfig) -> None:
                     "image_size": list(image_size), "context_size": cfg.data.context_size,
                     "best_val_dice": best, "epoch": epoch,
                     "data": OmegaConf.to_container(cfg.data, resolve=True),
+                    # arch (patchset3d only): lets eval.py rebuild the exact architecture
+                    # from the checkpoint instead of re-supplying arch.* overrides.
+                    "arch": (OmegaConf.to_container(cfg.arch, resolve=True)
+                             if "arch" in cfg else None),
                 }, ckpt_path)
                 log["val/best_dice"] = best
             if saved is not None:   # restore raw training weights after LAWA-averaged eval

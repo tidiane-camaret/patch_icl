@@ -16,7 +16,7 @@ train:
   loss: smooth_l1               # smooth_l1 | bce_dice
   loss_scale: 50.0
   dice_weight: 1.0              # bce_dice only
-  base_ckpt: null               # override the pretrained Medverse.ckpt
-  random_init: true             # true -> train from scratch (ignore pretrained weights)
+  checkpoint: orig_weights      # weight source: orig_weights (released Medverse.ckpt) |
+                                # random (from scratch) | <path to our finetuned best.pt>
 data:
   max_ds_len_train: 200         # fine-tune sample cap (overrides dataset/totalseg's 2000)
