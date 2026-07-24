@@ -129,13 +129,17 @@ def main(cfg: DictConfig) -> None:
 
     # ── wandb / output dir ───────────────────────────────────────────────────
     wb_on = bool(cfg.wandb.get("project"))
+    # `_global_`-packaged group selections leave no key in cfg; log Hydra's runtime choices
+    # so dataset=/augmentations=/... are visible in wandb (cf. train.py).
+    from hydra.core.hydra_config import HydraConfig
     run = wandb.init(
         project=cfg.wandb.project, name=cfg.wandb.name,
         mode="online" if wb_on else "disabled",
         config={"model": model_name, "source": cfg.data.get("source"),
                 "split": cfg.eval.split, "K": K, "image_size": list(image_size),
                 "n_subjects": cfg.eval.n_subjects, "classes": list(classes),
-                "gflops": round(gflops, 2)},
+                "gflops": round(gflops, 2),
+                "hydra_choices": dict(HydraConfig.get().runtime.choices)},
     )
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
     out_dir = Path(cfg.eval.out_dir) / f"{datetime.date.today():%Y-%m-%d}_{run_name}"

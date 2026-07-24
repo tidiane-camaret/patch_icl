@@ -3037,3 +3037,48 @@ per-class val dice ranked bar coloured by shape family (+table); (2) per-shape f
 drivers (thickness, volume, target/context occupancy). Finding for d7fk2k9h: dice falls
 monotonically with thinness — thick_blob1 macro≈0.20 (miss 39%) → thin_tube≈0.005 (miss 87%);
 macro val/dice≈0.083, 11/47 classes complete-miss.
+
+## fix: log Hydra group choices to wandb (3D train/eval)
+
+`dataset=`, `augmentations=`, `model=`, `cluster=`, `experiment=` config files are all
+`# @package _global_`, so a group selection merges into `data:`/`paths:`/... and leaves no
+key of its own in the composed cfg. wandb logs `OmegaConf.to_container(cfg)`, so the *choice*
+(e.g. which dataset) was never recorded — only Hydra's `runtime.choices` holds it. Now log
+`HydraConfig.get().runtime.choices` under a `hydra_choices` key in both experiments/3d/train.py
+and eval.py, so dataset/augmentations/etc. are visible in wandb. (`model` was already visible
+only because model/*.yaml sets an explicit scalar `model:` key.)
+
+## bench: medverse vs patchset3d compute/memory profile (experiments/3d/bench_arch.py)
+
+Investigated why medverse costs ~190s/epoch + 36GB vs patchset3d 50s + 17GB under
+experiment=1_medverse_benchmark. Added experiments/3d/bench_arch.py: isolates *model*
+compute (no dataloader) at the real runtime shapes (B=1, K=1, 128^3), reproducing
+train_epoch's exact fwd/bwd call paths, with param-by-submodule + torch-profiler op
+breakdown. Ran on loki (RTX 6000 Ada 48GB, .venv_nero torch 2.12+cu130).
+
+Findings (B=1, K=1, 128^3):
+- Params: medverse 71.1M (context_unet 35M / target_decoder 20M / target_encoder 16M)
+  vs patchset3d 4.7M (transformer 4.0M / rest tiny). 15x.
+- fwd+bwd: 185ms vs 63ms (2.9x, matches the 190/50s epoch ratio -> genuine model
+  compute, not dataloader). fwd-only 72 vs 22ms.
+- Op profile (self CUDA): medverse is 3D-conv bound — convolution_backward 34% +
+  conv fwd 14%; plus avoidable overhead: nchwToNhwc layout transpose 11% and
+  aten::copy_/.to() 15% (the Medverse forward repeatedly `.to(device)`s already-on-
+  device tensors, cf. Medverse.py L113-118/133-138). patchset3d: flash-attn 16%,
+  group_norm, conv only 10%.
+- Root cause: medverse runs a native-res 3D U-Net triple (~370 conv3d over 128^3..16^3
+  multiscale); patchset3d downsamples each volume to a 16^3 grid (~21 convs) and does
+  in-context matching as a transformer over 16^3=4096 tokens. Conv cost scales with
+  voxel count (128^3 vs 16^3 = 512x/channel) -> dominant driver. Not primarily
+  inefficiency; a different compute regime.
+- VRAM reconciled at B=4 (both runs used B=4): reserved medverse 38.5GB (~reported 36),
+  patchset3d 18.3GB (~reported 17). Driver is activation memory x batch, NOT
+  cudnn.benchmark (no effect measured) nor eval (medverse predict B=8 only 3GB).
+  Isolated train peak_alloc: medverse 8.2G(B1)/15.3G(B2)/29.5G(B4); patchset3d
+  3.0/5.9/11.7G.
+
+Optimization levers for the medverse runs (time + VRAM):
+- gradient checkpointing on U-Net stages (biggest VRAM lever; ~2-3x less activation mem).
+- channels_last_3d memory format -> removes the nchwToNhwc transpose (~11%).
+- drop redundant `.to(device)` copies in the Medverse fork forward (~15% copy_).
+- torch.compile the medverse net (currently only patchset3d's transformer is compiled).

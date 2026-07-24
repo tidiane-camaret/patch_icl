@@ -369,9 +369,16 @@ def main(cfg: DictConfig) -> None:
     lawa_queue = collections.deque(maxlen=cfg.train.get("lawa_k", 10)) if use_muon else None
 
     wb_on = bool(cfg.wandb.get("project"))
+    # Config-group selections (dataset=, augmentations=, model=, cluster=, experiment=) are
+    # packaged `_global_`, so they merge into data:/paths:/... and leave no key of their own in
+    # cfg — only Hydra's runtime choices record which group was picked. Log them explicitly so
+    # e.g. `dataset` is visible in wandb (cf. the resolved cfg, which omits it).
+    from hydra.core.hydra_config import HydraConfig
+    wb_config = OmegaConf.to_container(cfg, resolve=True)
+    wb_config["hydra_choices"] = dict(HydraConfig.get().runtime.choices)
     run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
                      mode="online" if wb_on else "disabled",
-                     config=OmegaConf.to_container(cfg, resolve=True))
+                     config=wb_config)
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
     out_dir = Path(cfg.train.out_dir) / f"{datetime.date.today():%Y-%m-%d}_{run_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
