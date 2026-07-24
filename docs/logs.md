@@ -3082,3 +3082,90 @@ Optimization levers for the medverse runs (time + VRAM):
 - channels_last_3d memory format -> removes the nchwToNhwc transpose (~11%).
 - drop redundant `.to(device)` copies in the Medverse fork forward (~15% copy_).
 - torch.compile the medverse net (currently only patchset3d's transformer is compiled).
+
+## bench: medverse optimization prototypes (channels_last / ckpt / compile)
+
+Prototyped the medverse levers from the previous entry, applied *externally* (the NFS
+fork is untouched): gradient checkpointing via a non-reentrant `torch.utils.checkpoint`
+wrapper on every conv block of the 3 U-Nets (34 blocks), `channels_last_3d` on conv
+weights, and `torch.compile` on the whole net. Toggles + a variant runner added to
+experiments/3d/bench_arch.py (`--optims -B <n>`; `bench_medverse_variant`). loki RTX 6000 Ada.
+
+Results (fwd+bwd, K=1, 128^3, alloc/reserved GB):
+  B=1  baseline                178.6ms  8.20/9.50
+       channels_last           260.8ms  8.19/9.20   <- HURTS (+46% time)
+       gradient_checkpointing  235.8ms  3.93/5.27   (-52% alloc, +32% time)
+       compile                 161.3ms  8.10/8.85   (-10% time, free)
+       compile+ckpt            196.7ms  5.31/6.19
+  B=4  baseline               1040.8ms 29.54/38.65  (~matches reported 36G)
+       gradient_checkpointing 1279.2ms 13.45/21.41  (-54% alloc, +23% time)
+       compile+ckpt            858.6ms 18.23/24.90  <- WINNER: -17% time AND -38% alloc
+  B=8  gradient_checkpointing 2351.6ms 24.89/32.20  (B=8 now fits in <baseline-B=4 mem)
+
+Takeaways:
+- channels_last_3d is a LOSS here (my profile hypothesis was wrong) — forcing NHWC makes
+  cudnn pick slower kernels and the 6D context reshapes fight the format. Drop it.
+- gradient checkpointing = the memory lever: ~-50% activation mem for +23-32% time; lets
+  B double (B=4->B=8) within the same budget. Verified EXACT: fp32 loss bit-identical to
+  baseline; grad diff (9e-3) sits inside the baseline-vs-baseline conv-nondeterminism band
+  (6.8e-3), i.e. it's cudnn reduction-order noise, not a checkpoint error.
+- torch.compile the whole medverse net compiles cleanly (no fatal graph break) and, at the
+  real B=4, compile+ckpt is strictly better than baseline on BOTH time (-17%) and memory
+  (-38%). Recommended default for the medverse training runs. (compile costs a slow first
+  batch; amortized over an epoch.)
+Not yet wired into training — prototypes live in bench_arch.py; integrating as train.py /
+medverse-adapter flags is the follow-up.
+
+## feat: wire medverse compile + gradient-checkpointing into training
+
+Promoted the two winning prototypes from the bench entry above into the training path as
+config flags. `configs/experiment/3d/model/medverse.yaml` gains a `medverse:` block —
+`grad_checkpoint` (false) and `compile` (false). experiments/3d/train.py applies them after
+weight load (guarded `if not is_patchset`), mirroring the patchset3d compile block.
+Implementation lives in the adapter src/benchmark_models/medverse.py:
+- `enable_gradient_checkpointing()` — monkeypatches each U-Net conv block's `forward` with
+  non-reentrant `torch.utils.checkpoint` IN PLACE (no wrapper submodule), so param names —
+  and thus saved checkpoints — are unchanged; a no-op passthrough when grad is disabled so
+  `predict()`/eval are untouched. Returns #blocks wrapped (34).
+- `compile_net()` — `torch.compile(self.model.net)`; the `_orig_mod.` prefix it adds is
+  stripped by train.py's existing save logic.
+bench_arch.py now calls these adapter methods (drops its local `_Ckpt`) so the benchmark
+exercises shipping code; channels_last stays bench-only (measured a loss).
+
+Verified: (1) checkpointing grads exact — bit-identical fp32 loss, grad diff 9e-3 within the
+baseline-vs-baseline conv-nondeterminism band; param name set unchanged (169). (2) compile+ckpt
+runs together via the monkeypatch path (B=1 192ms / 5.3G, matches the wrapper prototype).
+(3) full save->load roundtrip with BOTH opts on: 172 keys, no `_orig_mod.`/`.mod.` leakage,
+reloads into a fresh eval model + predict() OK. (4) Hydra compose: medverse block defaults
+false, overrides work, patchset3d has no medverse key.
+
+Recommended run: `train.py experiment=1_medverse_benchmark medverse.compile=true
+medverse.grad_checkpoint=true` — at B=4 that's ~858ms/step vs 1041 eager (-17%) and ~18GB
+vs 30GB alloc (-38%).
+
+## Val sample table: `in_train` flag (2026-07-24)
+
+Added an `in_train` boolean column to the val/samples wandb table (experiments/3d).
+`build_sample_table` now takes an optional `train_classes` set and tags each row with
+`case["class"] in train_classes`. train.py resolves `cfg.data.train_classes` once (same
+call as common.py's loader) and passes it in. With the default benchmark/not_benchmark
+split the two class sets are disjoint, so val classes read False — meaningful only once
+train/val overlap. No source guards yet (anchor_synth3d/omnisynth3d val "classes" are
+shapes/tile-ids, so they currently read False across the board).
+
+## 2026-07-24 — thor toolchain fix for torch.compile (broken usr-merge)
+
+`medverse.compile=true` under `.venv_thor` failed with inductor `CppCompileError:
+fatal error: algorithm … nicht gefunden`. Root cause is NOT torch/code: thor (like
+odin) is not usr-merged — `/bin` is a real dir (not a symlink to `/usr/bin`) and
+precedes `/usr/bin` on PATH, so bare `g++`→`/bin/g++` derives install prefix `/` and
+looks for its C++ headers at the nonexistent `/include/c++/9`, silently dropping all
+libstdc++ dirs (C compiles; only C++ headers vanish). `/usr/bin/g++` (prefix `/usr`)
+compiles fine, and torch inductor honors `CXX` (verified `get_cpp_compiler()→/usr/bin/g++`
++ a real `torch.compile` inductor build).
+
+Fix: `experiments/3d/train.py` header now auto-sets `CC=/usr/bin/gcc CXX=/usr/bin/g++`
+when `/bin` is not a symlink and bare gcc/g++ resolve under `/bin/` (no-op on usr-merged
+nodes; skipped if CC/CXX already set). Set before `import torch` so Triton picks it up too.
+So `train.py experiment=1_medverse_benchmark medverse.compile=true` now works on thor with
+no manual export. Memory: feedback-python-env updated with the thor gotcha.

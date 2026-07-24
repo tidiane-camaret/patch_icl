@@ -34,6 +34,19 @@ _cache_root = os.path.join(tempfile.gettempdir(), f"{os.environ.get('USER', 'use
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "inductor"))
 
+# Broken-usr-merge nodes (thor, odin): /bin is a REAL dir (not a symlink to /usr/bin) and
+# comes first on PATH, so bare `gcc`/`g++` resolve to /bin/*, derive prefix `/`, and fail —
+# g++ omits its C++ headers (torch.compile/inductor dies on `#include <algorithm>`), gcc
+# can't find cc1 (Triton dies). Point CC/CXX at the absolute /usr/bin paths (prefix `/usr`)
+# so both work. No-op on usr-merged nodes. Must precede `import torch` (Triton reads CC).
+import shutil as _shutil
+if not os.path.islink("/bin"):
+    for _var, _tool in (("CC", "gcc"), ("CXX", "g++")):
+        _abs = f"/usr/bin/{_tool}"
+        _found = _shutil.which(_tool)
+        if _var not in os.environ and _found and _found.startswith("/bin/") and os.path.exists(_abs):
+            os.environ[_var] = _abs
+
 import hydra
 import torch
 import torch.nn as nn
@@ -294,6 +307,9 @@ def main(cfg: DictConfig) -> None:
     else:
         _, root, is_mri = _source_root(cfg)
         val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
+    # Set of class names the model trains on — fills the val sample table's `in_train` flag.
+    _, _troot, _is_mri = _source_root(cfg)
+    train_classes = set(resolve_classes(cfg.data.train_classes, _troot, is_mri=_is_mri))
     image_size = tuple(cfg.data.image_size)
     print(f"Device: {DEVICE} | model={cfg.get('model','medverse')} | size={image_size} "
           f"| K={cfg.data.context_size} | loss={cfg.train.get('loss','smooth_l1')} "
@@ -334,6 +350,20 @@ def main(cfg: DictConfig) -> None:
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
         print("Compiled net.transformer + Newton–Schulz (dynamic=True); conv encoder runs eager")
+
+    # Medverse perf knobs (medverse.grad_checkpoint / .compile — see model/medverse.yaml,
+    # benchmarked in experiments/3d/bench_arch.py). Applied AFTER weight load so names/keys
+    # match the checkpoint; gradient checkpointing keeps param names, compile adds an
+    # `_orig_mod.` prefix that the save path below already strips. At B=4 both together beat
+    # the eager baseline on time and memory.
+    if not is_patchset:
+        mcfg = cfg.get("medverse", {})
+        if mcfg.get("grad_checkpoint", False):
+            n_ck = model.enable_gradient_checkpointing()
+            print(f"Gradient checkpointing enabled on {n_ck} Medverse U-Net conv blocks")
+        if mcfg.get("compile", False):
+            model.compile_net()
+            print("Compiled the Medverse net (torch.compile); first batch will be slow")
 
     loss_fn = build_loss(cfg)
     # Optimizers (cf. experiments/2d/train.py): patchset3d trains its transformer 2D weight
@@ -418,7 +448,8 @@ def main(cfg: DictConfig) -> None:
                     if vals:
                         log[f"val/{label}@{rd}"] = sum(vals) / len(vals)
             if wb_on:  # per-sample detail table (mirrors experiments/2d train.py's val/samples)
-                log["val/samples"] = build_sample_table(cases, epoch=epoch)
+                log["val/samples"] = build_sample_table(cases, epoch=epoch,
+                                                         train_classes=train_classes)
             if not step_per_batch:  # plateau: step on the val metric
                 scheduler.step(val_dice)
             tqdm.write(f"  [e{epoch}] loss={loss:.4f} train_dice={tr_dice:.4f} "

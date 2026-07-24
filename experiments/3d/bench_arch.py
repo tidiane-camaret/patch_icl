@@ -23,6 +23,20 @@ import torch.nn.functional as F
 DEV = torch.device("cuda")
 
 
+# ---------------------------------------------------------------------------
+# Medverse optimization prototypes. Gradient checkpointing + compile go through the
+# adapter methods (MedverseModel.enable_gradient_checkpointing / compile_net) so this
+# benchmark exercises exactly what train.py ships. channels_last stays bench-only
+# (measured a loss; kept here only to reproduce that result).
+# ---------------------------------------------------------------------------
+
+def apply_channels_last(net):
+    """Store conv weights in channels_last_3d so cudnn uses NHWC kernels natively.
+    Bench-only: measured *slower* here (the 6D context reshapes fight the format)."""
+    net.to(memory_format=torch.channels_last_3d)
+    return net
+
+
 def human(n):
     for u in ["", "K", "M", "B"]:
         if abs(n) < 1000:
@@ -148,6 +162,70 @@ def bench(name, reps=8):
                 peak_f=peak_f, peak_fb=peak_fb, out_shape=out_shape)
 
 
+def bench_medverse_variant(label, opts, B=1, reps=8, compile_net=False):
+    """Build medverse, apply the given optimization opts, and measure fwd+bwd time/peak.
+    opts: subset of {"ckpt", "channels_last"}."""
+    from grid_metrics import target_like  # noqa: F401 (kept for parity)
+    bce = F.binary_cross_entropy_with_logits
+    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+    torch.backends.cudnn.benchmark = True
+    model, net = build_medverse()
+    net.train()
+    n_ck = model.enable_gradient_checkpointing() if "ckpt" in opts else 0
+    chlast = "channels_last" in opts
+    if chlast:
+        apply_channels_last(net)
+    if compile_net:
+        model.compile_net()
+
+    img, ctx_in, ctx_out, lbl = make_inputs(B, 1, 128)
+    if chlast:
+        img = img.to(memory_format=torch.channels_last_3d)
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-4)
+
+    def step():
+        logits = model.train_forward(img, ctx_in, ctx_out)
+        target = lbl.unsqueeze(1)
+        p = torch.sigmoid(logits.float())
+        inter = (p.flatten(1) * target.flatten(1)).sum(1)
+        den = p.flatten(1).sum(1) + target.flatten(1).sum(1)
+        dice = (1 - (2 * inter + 1e-6) / (den + 1e-6)).mean()
+        return bce(logits.float(), target) + dice
+
+    def one():
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = step()
+        loss.backward(); opt.step()
+        return loss.item()
+
+    for _ in range(3):   # warmup (compile + cudnn benchmark)
+        one()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats(); one(); torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    resv = torch.cuda.max_memory_reserved() / 1e9
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(reps):
+        one()
+    torch.cuda.synchronize()
+    ms = 1000 * (time.perf_counter() - t0) / reps
+    print(f"{label:<32} B={B}  {ms:7.1f} ms   alloc {peak:5.2f}G  reserved {resv:5.2f}G"
+          f"  (ckpt {n_ck} blocks)")
+    del model, net; torch.cuda.empty_cache()
+    return dict(label=label, ms=ms, peak=peak, resv=resv)
+
+
+def bench_optims(B=1):
+    print(f"\n{'='*74}\nMEDVERSE OPTIMIZATION VARIANTS (B={B}, K=1, 128^3)\n{'='*74}")
+    bench_medverse_variant("baseline", set(), B=B)
+    bench_medverse_variant("channels_last", {"channels_last"}, B=B)
+    bench_medverse_variant("gradient_checkpointing", {"ckpt"}, B=B)
+    bench_medverse_variant("ckpt+channels_last", {"ckpt", "channels_last"}, B=B)
+    bench_medverse_variant("compile", set(), B=B, compile_net=True)
+    bench_medverse_variant("compile+channels_last", {"channels_last"}, B=B, compile_net=True)
+
+
 def profile_ops(name, rows=15):
     from torch.profiler import profile, ProfilerActivity
     model, net = build_medverse() if name == "medverse" else build_patchset3d()
@@ -174,8 +252,13 @@ def profile_ops(name, rows=15):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--optims", action="store_true", help="benchmark medverse opt variants")
+    ap.add_argument("-B", type=int, default=1, help="batch size for --optims")
     args = ap.parse_args()
     print(f"GPU: {torch.cuda.get_device_name()}  torch {torch.__version__}")
+    if args.optims:
+        bench_optims(B=args.B)
+        sys.exit(0)
     res = [bench("patchset3d"), bench("medverse")]
     print(f"\n{'='*70}\nSUMMARY (B=1, K=1, 128^3)\n{'='*70}")
     print(f"{'model':<12}{'params':>9}{'fwd ms':>10}{'fwd+bwd ms':>12}{'peak fwd':>10}{'peak f+b':>10}")

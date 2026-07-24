@@ -99,22 +99,25 @@ def _sample_detail(meta: dict | None) -> str:
 # The sample-table columns are fixed (medverse is a native-resolution model, so there is
 # no coarse-grid / refine family like 2D's patchset_cnn). One row per eval case, carrying
 # the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
-_SAMPLE_TABLE_COLS = ["epoch", "class", "subject", "dice", "soft_dice", "loss", "time_ms",
-                      "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "detail"]
+_SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "dice", "soft_dice", "loss",
+                      "time_ms", "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "detail"]
 
 
-def build_sample_table(cases: list[dict], epoch: int | None = None):
+def build_sample_table(cases: list[dict], epoch: int | None = None, train_classes=None):
     """Build a wandb.Table of per-case detail from `evaluate_classes` records.
 
     Shared by experiments/3d/eval.py (benchmark) and train.py's val step so both log the
     same schema. `epoch` tags the training epoch (-1 for standalone eval). Cases must be
     the enriched dicts emitted by evaluate_classes (with tgt_size/ctx_occ/detail/... keys).
+    `train_classes` (set of class names seen in training) fills the `in_train` column.
     """
     import wandb
     ep = -1 if epoch is None else int(epoch)
+    train_set = set(train_classes) if train_classes is not None else None
     table = wandb.Table(columns=_SAMPLE_TABLE_COLS)
     for c in cases:
-        table.add_data(ep, c["class"], c["subject"], c["dice"],
+        in_train = c["class"] in train_set if train_set is not None else None
+        table.add_data(ep, c["class"], in_train, c["subject"], c["dice"],
                        c.get("soft_dice", float("nan")), c.get("loss", float("nan")),
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),

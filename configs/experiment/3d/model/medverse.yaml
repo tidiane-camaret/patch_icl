@@ -20,3 +20,11 @@ train:
                                 # random (from scratch) | <path to our finetuned best.pt>
 data:
   max_ds_len_train: 200         # fine-tune sample cap (overrides dataset/totalseg's 2000)
+
+# Training perf knobs (see experiments/3d/bench_arch.py). At B=4 both together beat the
+# eager baseline on time AND memory; applied after weight load in train.py.
+medverse:
+  grad_checkpoint: false        # gradient-checkpoint U-Net conv blocks: ~-50% activation
+                                # memory, ~+25% step time (exact grads). Lets batch double.
+  compile: false                # torch.compile the whole net: fuses norm/elementwise tail
+                                # (~-10% time); slow first batch.
