@@ -41,3 +41,16 @@ def test_sample_points_band_restricts_bg_near_object():
     assert not inside_core.any()                       # band excludes the FG core
     near = ((idx >= 2) & (idx < 14)).all(dim=1)
     assert near.all()                                  # within a 2-voxel shell
+
+
+def test_sample_points_axis_order_is_dhw():
+    S = 16
+    m = torch.zeros(S, S, S)
+    m[4:8, 8:12, 12:16] = 1.0          # distinct extent per axis: d[4,8) h[8,12) w[12,16)
+    coords, labels = sample_points(m, n_fg=40, n_bg=0,
+                                   generator=torch.Generator().manual_seed(0))
+    fg = coords[labels == 1]
+    idx = ((fg + 1) / 2 * (S - 1)).round().long()   # -> voxel indices, (d,h,w)
+    assert ((idx[:, 0] >= 4) & (idx[:, 0] < 8)).all()    # d axis
+    assert ((idx[:, 1] >= 8) & (idx[:, 1] < 12)).all()   # h axis
+    assert ((idx[:, 2] >= 12) & (idx[:, 2] < 16)).all()  # w axis
