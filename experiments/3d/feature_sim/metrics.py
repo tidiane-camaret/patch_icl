@@ -18,7 +18,7 @@ def auroc(scores, labels):
         return float("nan")
     order = scores.argsort()
     ranks = torch.empty_like(scores, dtype=torch.float)
-    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float)
+    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float, device=scores.device)
     # average tied ranks so exact ties score 0.5
     uniq, inv = torch.unique(scores, return_inverse=True)
     mean_rank = torch.zeros_like(uniq, dtype=torch.float).scatter_reduce(
@@ -37,7 +37,7 @@ def average_precision(scores, labels):
     order = scores.argsort(descending=True)
     y = labels[order]
     tp = torch.cumsum(y, 0)
-    precision = tp / torch.arange(1, y.numel() + 1, dtype=torch.float)
+    precision = tp / torch.arange(1, y.numel() + 1, dtype=torch.float, device=y.device)
     return (precision * y).sum().item() / n_pos
 
 
@@ -54,7 +54,7 @@ def soft_auroc(scores, pos_w):
     if P <= 0 or N <= 0:
         return float("nan")
     uniq, inv = torch.unique(scores, return_inverse=True)          # uniq ascending
-    grp_nw = torch.zeros(len(uniq)).scatter_add(0, inv, nw)        # neg weight per score group
+    grp_nw = torch.zeros(len(uniq), device=scores.device).scatter_add(0, inv, nw)  # neg weight per group
     below = torch.cumsum(grp_nw, 0) - grp_nw                        # neg weight of strictly lower scores
     contrib = pw * (below[inv] + 0.5 * grp_nw[inv])                # + half the ties at the same score
     return (contrib.sum() / (P * N)).item()

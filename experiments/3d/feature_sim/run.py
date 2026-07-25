@@ -93,7 +93,7 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
             cf = cf.flatten(2).transpose(1, 2).reshape(-1, cf.shape[1])
             yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
                               adapter.native_res("concat", input_res),
-                              q.cpu(), tl, cf.cpu(), cl, K)
+                              q, tl, cf, cl, K)
             continue
         if mode == "dense":
             tf = adapter.features(image, tier, res)[0]                  # (C,res,res,res)
@@ -117,14 +117,16 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
             cf = torch.cat(cfs, 0); cl = torch.cat(ctx_labels, 0); tf = tf
         yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
                           adapter.native_res(tier, input_res),
-                          tf.cpu(), tl, cf.cpu(), cl, K)
+                          tf, tl, cf, cl, K)
 
 
 def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
                 tf, tl, cf, cl, K):
-    # Metrics run on CPU; features come from the GPU model and labels may be built from
-    # GPU tensors (context_out). Coerce all four to CPU so device provenance never matters.
-    tf, tl, cf, cl = tf.cpu(), tl.cpu(), cf.cpu(), cl.cpu()
+    # Run metrics on the features' device (GPU) — retrieval/margin do large (n_fg x M)
+    # matmuls that are far faster there. Labels may come from CPU (target GT) or GPU
+    # (context_out), so align them to the feature device rather than assuming a common one.
+    dev = tf.device
+    tl, cf, cl = tl.to(dev), cf.to(dev), cl.to(dev)
     proto = prototype_cosine(tf, tl, cf, cl, mode=mode)
     row = {"class": cls, "obj_vox": obj_vox, "real_dice": real_dice,
            "tier": tier, "res": res, "mode": mode, "tier_native_res": tier_native,

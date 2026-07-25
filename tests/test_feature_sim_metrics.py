@@ -31,6 +31,28 @@ def test_auroc_ties():
     assert abs(auroc(s, y) - 0.5) < 1e-6  # all ties -> chance
 
 
+def test_metrics_run_on_cuda_and_match_cpu():
+    # metrics run on the features' device (GPU in production); guard that no helper tensor
+    # is hard-coded to CPU and that GPU results match CPU. No-op on CPU-only nodes.
+    if not torch.cuda.is_available():
+        return
+    tf, tl, cf, cl = _separable()
+    occ = tl.clone()                                    # binary here, but exercise soft path too
+    cpu = (soft_auroc(_p(tf, cf, cl), occ), soft_dice(_p(tf, cf, cl), occ),
+           fg_match_margin(tf, tl, cf, cl), retrieval_at1(tf, tl, cf, cl))
+    d = "cuda"
+    tf, tl, cf, cl, occ = tf.to(d), tl.to(d), cf.to(d), cl.to(d), occ.to(d)
+    gpu = (soft_auroc(_p(tf, cf, cl), occ), soft_dice(_p(tf, cf, cl), occ),
+           fg_match_margin(tf, tl, cf, cl), retrieval_at1(tf, tl, cf, cl))
+    for a, b in zip(cpu, gpu):
+        assert abs(a - b) < 1e-4
+
+
+def _p(tf, cf, cl):
+    from feature_sim.metrics import _prototype_scores
+    return _prototype_scores(tf, cf, cl)
+
+
 def test_soft_auroc_reduces_to_binary():
     # with binary weights, soft_auroc must equal the hard rank-based auroc
     g = torch.Generator().manual_seed(3)

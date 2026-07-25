@@ -3180,3 +3180,21 @@ when `/bin` is not a symlink and bare gcc/g++ resolve under `/bin/` (no-op on us
 nodes; skipped if CC/CXX already set). Set before `import torch` so Triton picks it up too.
 So `train.py experiment=1_medverse_benchmark medverse.compile=true` now works on thor with
 no manual export. Memory: feedback-python-env updated with the thor gotcha.
+
+## Feature-similarity run on real checkpoint (2026-07-25)
+
+Ran experiments/3d/feature_sim/run.py on the trained PatchSet3D (arch.l=2,
+2026-07-25_usual-puddle-174) over totalseg test (experiment=22_totalseg_train_test).
+Fixes surfaced by the real run (node thor, RTX A6000, .venv_thor cu121):
+- Device: metrics run on the features' device (GPU); retrieval/margin do large (n_fg x M)
+  matmuls that are far faster there. metrics.py helper tensors made device-aware.
+- Soft occupancy labels for dense mode (grid_labels threshold=None): at 16^3 a cell pools
+  8^3 voxels, so thin structures never reach the old 0.5 threshold -> dense@16 was ~100%
+  nan AUROC on the model's own operating resolution. Soft labels + soft_auroc/soft_dice
+  match the model's soft-Dice training; nan rate ~0%. Point mode (native res) stays exact 0/1.
+- wandb: logs a per-(task,tier,res) Table + mean auroc/margin/retrieval per (tier,res);
+  project defaults to patch_icl_feature_similarity.
+First observations (n<=4 smoke): dense@16 soft_auroc already high & discriminative
+(thin aorta ~0.92-0.99); point@64 auroc ~0.90-0.99. soft_dice is a min-max-normalized
+relative overlap proxy (cosine maps aren't calibrated); soft_auroc is the scale-free
+separability headline.
