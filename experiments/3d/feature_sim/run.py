@@ -68,7 +68,7 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     cout = item["context_out"].to(DEVICE)         # (1,K,D,H,W)
     gt = item["label"][0]                         # (D,H,W)
     K = cin.shape[1]
-    cls = item.get("label_name", ["?"])[0]
+    cls = item["label_names"][0]
     obj_vox = int((gt > 0).sum().item())
     with torch.no_grad():
         real = model.predict(image, cin, cout)   # cin already (1,K,1,D,H,W) -> (1,D,H,W)
