@@ -51,3 +51,15 @@ def test_transformer_query_shape():
     cout = (torch.rand(2, 2, 16, 16, 16) > 0.5).float()
     q = ad.transformer_query(img, cin, cout)
     assert q.shape == (2, ad.R ** 3, 32)                     # (B, N, e)
+
+
+def test_sample_features_matches_dense_at_voxel():
+    torch.manual_seed(0)
+    ad = PatchSet3DEncoderAdapter(_model())
+    v = torch.randn(1, 1, 16, 16, 16)
+    dense = ad.features(v, "stage:0", res=16)[0]        # (C,16,16,16); stem is stride-1 -> native 16
+    d, h, w = 2, 5, 9                                   # asymmetric voxel: transposed order would differ
+    expected = dense[:, d, h, w]
+    coord = torch.tensor([[d, h, w]], dtype=torch.float) / (16 - 1) * 2 - 1   # (z,y,x) normalized
+    got = ad.sample_features(v, "stage:0", coord.unsqueeze(0))[0, 0]          # (C,)
+    assert torch.allclose(got, expected, atol=1e-4)
