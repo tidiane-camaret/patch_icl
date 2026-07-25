@@ -158,3 +158,25 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
                 h.remove()
         n = self.model.thinking.n
         return [(x[:, s:, 0, :], x[:, n:s, 0, :]) for x, s in outs]
+
+    @torch.no_grad()
+    def transformer_trace(self, image, context_in, context_out):
+        """One forward -> named (target, context) img-token pairs: 'encoder' (the transformer
+        INPUT = encoder image features before any attention) then 'L{i}' after each block, all
+        at res=R on the same token grid. Lets a training run trace how correspondence evolves
+        from the (jointly-trained) encoder through the transformer stack. Free: the forward
+        already runs every block; hooks only capture tensors. Returns [(name, tgt, ctx), ...]."""
+        outs = []
+        hp = self.model.transformer.register_forward_pre_hook(
+            lambda m, a: outs.append(("encoder", a[0], a[1])))     # (x_in, sep_t)
+        hs = [b.register_forward_hook(
+                  lambda m, a, o, i=i: outs.append((f"L{i}", o, a[1])))
+              for i, b in enumerate(self.model.transformer.blocks)]
+        try:
+            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+        finally:
+            hp.remove()
+            for h in hs:
+                h.remove()
+        n = self.model.thinking.n
+        return [(name, x[:, s:, 0, :], x[:, n:s, 0, :]) for name, x, s in outs]

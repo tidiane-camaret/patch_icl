@@ -24,13 +24,15 @@ from data.totalseg_classes import resolve_classes                  # noqa: E402
 from feature_sim.adapters import PatchSet3DEncoderAdapter          # noqa: E402
 from feature_sim.labels import grid_labels, sample_points          # noqa: E402
 from feature_sim.metrics import (                                  # noqa: E402
-    prototype_cosine, fg_match_margin, retrieval_at1)
+    prototype_cosine, fg_match_margin, retrieval_at1, label_transfer)
 
 
 def plan_sweep(tiers, resolutions, budget, R):
     rows, seen = [], set()
     for tier in tiers:
-        if tier == "transformer_q":
+        if tier in ("transformer_q", "transformer_layers"):
+            # Transformer probes live only at the token grid res=R (dense); transformer_layers
+            # fans out to one row per block inside _rows_for_task, so it stays a single plan entry.
             key = (tier, R, "dense")
             if key not in seen:
                 seen.add(key); rows.append({"tier": tier, "res": R, "mode": "dense"})
@@ -96,6 +98,18 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
                               adapter.native_res("concat", input_res),
                               q, tl, cf, cl, K)
             continue
+        if tier == "transformer_layers":
+            # Per-block target<->context correspondence: ONE forward hooks every block and
+            # returns the (target, context) img-token pair after each, both POST-transformer
+            # (clean matched probe, unlike transformer_q). Emit a row per layer, tier "tf:L{i}".
+            tl = grid_labels(gt, adapter.R, threshold=None).flatten()          # soft occupancy
+            cl = torch.stack([grid_labels(cout[0, k], adapter.R, threshold=None).flatten()
+                              for k in range(K)]).flatten()
+            for li, (tq, cq) in enumerate(
+                    adapter.transformer_pair_per_layer(image, cin, cout)):
+                yield _metric_row(cls, obj_vox, real_dice, f"tf:L{li}", res, mode,
+                                  adapter.R, tq[0], tl, cq[0], cl, K)
+            continue
         if mode == "dense":
             tf = adapter.features(image, tier, res)[0]                  # (C,res,res,res)
             tf = tf.flatten(1).transpose(0, 1)                         # (res^3, C)
@@ -129,19 +143,27 @@ def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
     dev = tf.device
     tl, cf, cl = tl.to(dev), cf.to(dev), cl.to(dev)
     proto = prototype_cosine(tf, tl, cf, cl, mode=mode)
+    # Full-volume label-transfer overlap is the segmentation-quality proxy (replaces the
+    # old size-collinear min-max soft_dice); dense only — point pools are 50/50 sampled so
+    # precision would be distorted. Yields transfer_dice/precision/recall from one NN pass.
+    lt = label_transfer(tf, tl, cf, cl) if mode == "dense" else {}
     row = {"class": cls, "obj_vox": obj_vox, "real_dice": real_dice,
            "tier": tier, "res": res, "mode": mode, "tier_native_res": tier_native,
            "K": K, "auroc": proto["auroc"],
-           # None (not "") for the absent metric: dense rows have soft_dice, point rows
-           # have ap. wandb.Table infers a column type from the first row and rejects a
-           # later "" String in a Number column, so use None (an allowed optional) instead.
-           "soft_dice": proto.get("soft_dice"), "ap": proto.get("ap"),
+           # None (not "") for absent metrics: dense rows have transfer_*, point rows have
+           # ap. wandb.Table infers a column type from the first row and rejects a later ""
+           # String in a Number column, so use None (an allowed optional) instead.
+           "ap": proto.get("ap"),
+           "transfer_dice": lt.get("transfer_dice"),
+           "transfer_precision": lt.get("transfer_precision"),
+           "transfer_recall": lt.get("transfer_recall"),
            "margin": fg_match_margin(tf, tl, cf, cl),
            "retrieval_at1": retrieval_at1(tf, tl, cf, cl)}
     return row
 
 
-_AGG_METRICS = ("auroc", "soft_dice", "ap", "margin", "retrieval_at1")
+_AGG_METRICS = ("auroc", "ap", "transfer_dice", "transfer_precision",
+                "transfer_recall", "margin", "retrieval_at1")
 
 
 def _num(x):
@@ -261,11 +283,13 @@ def summarize_by_config(rows):
         for m in _AGG_METRICS:
             row[m + "_mean"] = _mean([r[m] for r in g])
         # metric<->Dice coupling (the actual research signal — means alone hide it)
-        for m in ("auroc", "margin", "retrieval_at1"):
+        for m in ("auroc", "margin", "retrieval_at1", "transfer_dice"):
             row["spearman_" + m] = _spearman(g, m)
         row["pearson_auroc"] = _pearson(*(lambda p: (p["auroc"], p["real_dice"]))(
             _paired(g, "auroc")[0]))
+        # size-partialled Spearman: does the probe predict Dice beyond object size?
         row["partial_spearman_retr"] = _partial_spearman(g, "retrieval_at1")
+        row["partial_spearman_transfer"] = _partial_spearman(g, "transfer_dice")
         out.append(row)
     return list(out[0].keys()), out
 

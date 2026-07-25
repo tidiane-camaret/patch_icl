@@ -256,6 +256,45 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
 
 
 @torch.no_grad()
+def _feature_sim_trace(net, loader, n_tasks):
+    """Per-layer feature-matching trace on a val subsample (patchset3d only): transfer_dice
+    + retrieval_at1 at the transformer INPUT (encoder image features pre-attention, tag
+    'encoder') and after each block ('L{i}'), all at res=R. One hooked forward per task —
+    cheap on a subsample — traces how the jointly-trained encoder and transformer co-evolve.
+
+    Returns a list of per-task records {class, subject, fs_<name>_dice, fs_<name>_retr, ...}
+    keyed so main() can both average them (epoch curves) and merge them into the per-sample
+    val table by (class, subject)."""
+    from feature_sim.adapters import PatchSet3DEncoderAdapter
+    from feature_sim.metrics import label_transfer, retrieval_at1
+    from feature_sim.labels import grid_labels
+    adapter = PatchSet3DEncoderAdapter(net)
+    R, records, seen = adapter.R, [], 0
+    for batch in loader:
+        subjects = batch.get("subjects", [None] * batch["image"].shape[0])
+        names = batch["label_names"]
+        for b in range(batch["image"].shape[0]):
+            if seen >= n_tasks:
+                break
+            image = batch["image"][b:b + 1].to(DEVICE)
+            cin = batch["context_in"][b:b + 1].to(DEVICE)
+            cout = batch["context_out"][b:b + 1].to(DEVICE)
+            K = cin.shape[1]
+            tl = grid_labels(batch["label"][b], R, threshold=None).flatten().to(DEVICE)
+            cl = torch.stack([grid_labels(cout[0, k], R, threshold=None).flatten()
+                              for k in range(K)]).flatten().to(DEVICE)
+            rec = {"class": names[b], "subject": subjects[b]}
+            for name, tf, cf in adapter.transformer_trace(image, cin, cout):
+                rec[f"fs_{name}_dice"] = round(label_transfer(tf[0], tl, cf[0], cl)["transfer_dice"], 4)
+                rec[f"fs_{name}_retr"] = round(retrieval_at1(tf[0], tl, cf[0], cl), 4)
+            records.append(rec)
+            seen += 1
+        if seen >= n_tasks:
+            break
+    return records
+
+
+@torch.no_grad()
 def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     """Mean val Dice via the shared per-class eval loop (uses model.predict).
 
@@ -447,6 +486,26 @@ def main(cfg: DictConfig) -> None:
                     vals = [r[mkey] for r in rows if mkey in r]
                     if vals:
                         log[f"val/{label}@{rd}"] = sum(vals) / len(vals)
+            fs_every = int(cfg.train.get("feature_sim_every", 0) or 0)
+            if is_patchset and fs_every and epoch % fs_every == 0:
+                # Encoder->per-layer correspondence trace (transfer_dice/retrieval at res=R),
+                # on a val subsample; see _feature_sim_trace. Log per-rep means as epoch curves
+                # AND attach the per-task values onto the matching val cases (by class+subject)
+                # so they land as columns in the per-sample table below.
+                records = _feature_sim_trace(net, val_loader,
+                                             int(cfg.train.get("feature_sim_n_tasks", 128)))
+                fs_keys = [k for k in (records[0] if records else {}) if k.startswith("fs_")]
+                for k in fs_keys:  # fs_<rep>_<dice|retr> -> val/<transfer_dice|retrieval>/<rep>
+                    vals = [r[k] for r in records if not math.isnan(r.get(k, float("nan")))]
+                    rep, metric = k[3:].rsplit("_", 1)
+                    label = "transfer_dice" if metric == "dice" else "retrieval"
+                    if vals:
+                        log[f"val/{label}/{rep}"] = sum(vals) / len(vals)
+                by_id = {(r["class"], r["subject"]): r for r in records}
+                for c in cases:  # merge per-sample fs_ values onto the matching case
+                    r = by_id.get((c["class"], c.get("subject")))
+                    if r:
+                        c.update({k: v for k, v in r.items() if k.startswith("fs_")})
             if wb_on:  # per-sample detail table (mirrors experiments/2d train.py's val/samples)
                 log["val/samples"] = build_sample_table(cases, epoch=epoch,
                                                          train_classes=train_classes)

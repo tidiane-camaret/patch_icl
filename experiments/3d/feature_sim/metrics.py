@@ -60,22 +60,6 @@ def soft_auroc(scores, pos_w):
     return (contrib.sum() / (P * N)).item()
 
 
-def soft_dice(scores, soft_labels, eps=1e-8):
-    """Soft-Dice between the cosine score map and the occupancy fraction `soft_labels`.
-
-    Scores are per-map min-max normalized to [0,1] first: raw cosine sits near a ~0.5
-    baseline for every cell, which swamps the sparse occupancy of thin structures, so a
-    fixed [-1,1]->[0,1] map yields a near-zero, uninformative Dice. Min-max makes it a
-    relative overlap comparable across tiers/resolutions (not an absolute probability, and
-    not directly comparable to the model's real Dice). Never nan when the object is present.
-    soft_auroc is the scale-free separability headline; this is the segmentation-quality proxy."""
-    lo, hi = scores.min(), scores.max()
-    s = (scores - lo) / (hi - lo + eps)
-    g = soft_labels.float().clamp(0, 1)
-    inter = (s * g).sum()
-    return (2 * inter / (s.sum() + g.sum() + eps)).item()
-
-
 def _prototype_scores(target_feats, ctx_feats, ctx_w):
     """Occupancy-weighted context prototype (weights = ctx occupancy fraction, clamped >=0);
     reduces to the FG-mean prototype when ctx_w is binary. Returns per-target-cell cosine."""
@@ -86,13 +70,13 @@ def _prototype_scores(target_feats, ctx_feats, ctx_w):
 
 
 def prototype_cosine(target_feats, target_labels, ctx_feats, ctx_labels, mode="dense"):
-    """Dense: soft labels (occupancy fraction) -> {soft_auroc, soft_dice}. Point (native
-    res, exact 0/1 voxels): {binary auroc, average precision}. `auroc` key holds the soft
-    variant in dense mode, the hard one in point mode."""
+    """Dense: soft labels (occupancy fraction) -> {soft_auroc}. Point (native res, exact
+    0/1 voxels): {binary auroc, average precision}. `auroc` key holds the soft variant in
+    dense mode, the hard one in point mode. Segmentation quality is measured by
+    `label_transfer` (dense), not by a prototype-score Dice."""
     scores = _prototype_scores(target_feats, ctx_feats, ctx_labels)
     if mode == "dense":
-        return {"auroc": soft_auroc(scores, target_labels),
-                "soft_dice": soft_dice(scores, target_labels)}
+        return {"auroc": soft_auroc(scores, target_labels)}
     if mode == "point":
         return {"auroc": auroc(scores, target_labels),
                 "ap": average_precision(scores, target_labels)}
@@ -117,3 +101,40 @@ def retrieval_at1(target_feats, target_labels, ctx_feats, ctx_labels):
     cf = l2norm(ctx_feats)
     nn = (tf @ cf.T).argmax(1)
     return (ctx_labels[nn] > 0).float().mean().item()
+
+
+def label_transfer(target_feats, target_labels, ctx_feats, ctx_labels,
+                   soft=False, tau=0.1, chunk=2048, eps=1e-8):
+    """Segment the target by feature matching, then score the mask against GT.
+
+    Each target cell copies the (occupancy) label of its nearest context cell — 1-NN
+    label transfer; `soft=True` uses a softmax(cos/tau)-weighted vote of all context
+    labels instead. Threshold-free: the prediction is a neighbour's label, never a
+    cutoff, and GT stays a soft occupancy fraction — so nothing depends on cell size.
+    Overlap is scored over the WHOLE volume, so a background cell that matches a FG
+    context cell counts as a false positive.
+
+    Returns {transfer_dice, transfer_precision, transfer_recall}. `recall` is the soft
+    analogue of retrieval_at1 (of the object's occupancy, how much the transfer labels
+    FG); `precision`/`dice` add the false-positive term retrieval_at1 omits — where
+    instance ambiguity (ribs, vertebrae: right class, wrong instance) shows up. Unlike
+    the old min-max soft_dice, both masks are real overlaps, so it does not collapse to
+    object size. nan if the target has no foreground. Runs on the feature device; the
+    (chunk x M) cosine block bounds memory for dense full-volume matching."""
+    g = target_labels.float().clamp(0, 1)
+    if g.sum() <= 0:
+        return {"transfer_dice": float("nan"), "transfer_precision": float("nan"),
+                "transfer_recall": float("nan")}
+    tn, cn = l2norm(target_feats), l2norm(ctx_feats)
+    cl = ctx_labels.float().clamp(0, 1)
+    pred = target_feats.new_zeros(tn.shape[0])
+    for s in range(0, tn.shape[0], chunk):
+        sim = tn[s:s + chunk] @ cn.T                       # (b, M) cosine to every ctx cell
+        if soft:
+            pred[s:s + chunk] = torch.softmax(sim / tau, dim=1) @ cl
+        else:
+            pred[s:s + chunk] = cl[sim.argmax(1)]          # copy nearest ctx cell's occupancy
+    inter = (pred * g).sum()
+    return {"transfer_dice": (2 * inter / (pred.sum() + g.sum() + eps)).item(),
+            "transfer_precision": (inter / (pred.sum() + eps)).item(),
+            "transfer_recall": (inter / (g.sum() + eps)).item()}

@@ -114,7 +114,10 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
     import wandb
     ep = -1 if epoch is None else int(epoch)
     train_set = set(train_classes) if train_classes is not None else None
-    table = wandb.Table(columns=_SAMPLE_TABLE_COLS)
+    # Optional per-layer feature-sim columns (train.py attaches fs_<rep>_<dice|retr> onto a
+    # subsample of cases); absent for standalone eval, so the schema stays backward-compatible.
+    fs_cols = sorted({k for c in cases for k in c if k.startswith("fs_")})
+    table = wandb.Table(columns=_SAMPLE_TABLE_COLS + fs_cols)
     for c in cases:
         in_train = c["class"] in train_set if train_set is not None else None
         table.add_data(ep, c["class"], in_train, c["subject"], c["dice"],
@@ -122,7 +125,8 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
                        c.get("ctx_size", float("nan")), c.get("ctx_occ", float("nan")),
-                       c.get("detail", ""))
+                       c.get("detail", ""),
+                       *[c.get(k, float("nan")) for k in fs_cols])
     return table
 
 
