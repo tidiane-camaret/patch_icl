@@ -49,6 +49,10 @@ def _load_patchset(cfg):
         cfg.model = "patchset3d"
         if ckpt.get("arch") is not None:
             cfg.arch = OmegaConf.create(ckpt["arch"])
+        elif "arch" not in cfg:
+            raise ValueError(
+                "checkpoint has no stored arch (older run); re-supply the training "
+                "arch, e.g. +model=patchset3d arch.l=2")
     model, _ = build_model(cfg)
     model = model.to(DEVICE)
     sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
@@ -80,8 +84,10 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
             tl = grid_labels(gt, adapter.R).flatten()
             cl = torch.stack([grid_labels(cout[0, k], adapter.R).flatten()
                               for k in range(K)]).flatten()
-            # context query reps aren't produced by the hook; use encoder concat@R for ctx
-            cf = adapter.features(ctx_imgs.unsqueeze(1), "concat", adapter.R)
+            # context side uses img_embed tier (concat→e projection) so its channel dim
+            # matches the transformer query rep e; note this is an approximate ceiling
+            # reference (post-transformer target vs pre-transformer context embeddings)
+            cf = adapter.features(ctx_imgs.unsqueeze(1), "img_embed", adapter.R)
             cf = cf.flatten(2).transpose(1, 2).reshape(-1, cf.shape[1])
             yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
                               adapter.native_res("concat", input_res),
@@ -99,17 +105,16 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
             tcoords, tl = sample_points(gt, fs.n_fg, fs.n_bg,
                                         band=fs.get("band"), generator=gen)
             tf = adapter.sample_features(image, tier, tcoords.to(DEVICE).unsqueeze(0))[0]
-            cfs, cls = [], []
+            cfs, ctx_labels = [], []
             for k in range(K):
                 cc, ll = sample_points(cout[0, k].cpu(), fs.n_fg, fs.n_bg,
                                        band=fs.get("band"), generator=gen)
                 cfs.append(adapter.sample_features(
                     ctx_imgs[k][None, None], tier, cc.to(DEVICE).unsqueeze(0))[0])
-                cls.append(ll)
-            cf = torch.cat(cfs, 0); cl = torch.cat(cls, 0); tf = tf
+                ctx_labels.append(ll)
+            cf = torch.cat(cfs, 0); cl = torch.cat(ctx_labels, 0); tf = tf
         yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
-                          adapter.native_res("concat" if tier == "transformer_q" else tier,
-                                              input_res),
+                          adapter.native_res(tier, input_res),
                           tf.cpu(), tl, cf.cpu(), cl, K)
 
 
@@ -130,6 +135,8 @@ def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.eval.seed)
     _, root, is_mri = _source_root(cfg)
+    if not cfg.eval.get("checkpoint"):
+        raise ValueError("eval.checkpoint is required (path to a trained PatchSet3D best.pt)")
     val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
     loader = make_eval_loader(cfg, val_classes, split=cfg.eval.split)
     model = _load_patchset(cfg)
