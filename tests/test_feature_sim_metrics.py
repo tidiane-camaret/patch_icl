@@ -26,6 +26,11 @@ def test_auroc_perfect_and_chance():
     assert abs(auroc(s, 1 - y) - 0.0) < 1e-6
 
 
+def test_auroc_ties():
+    s = torch.tensor([1.0, 1.0, 0.0, 0.0]); y = torch.tensor([1., 0., 1., 0.])
+    assert abs(auroc(s, y) - 0.5) < 1e-6  # all ties -> chance
+
+
 def test_average_precision_perfect():
     s = torch.tensor([0.9, 0.8, 0.2, 0.1]); y = torch.tensor([1., 1., 0., 0.])
     assert abs(average_precision(s, y) - 1.0) < 1e-6
