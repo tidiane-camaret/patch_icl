@@ -116,3 +116,45 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         finally:
             h.remove()
         return captured["q"]
+
+    @torch.no_grad()
+    def transformer_pair(self, image, context_in, context_out):
+        """Post-transformer img-column tokens for BOTH target and context, in the same
+        space e (res=R). Unlike transformer_query (target post- vs context PRE-transformer,
+        a mismatched probe), this reads the context tokens the transformer actually produced,
+        so target<->context correspondence is measured cleanly on the post-transformer rep.
+
+        Returns (target (B,N,e), context (B,K*N,e)). Sequence after ThinkingRows is
+        [think(n), context(K*N), target(N)] with sep_t = K*N + n; column 0 is the img token."""
+        cap = {}
+
+        def hook(mod, args, output):
+            cap["x"], cap["sep_t"] = output, args[1]       # transformer(x, sep_t, ...)
+
+        h = self.model.transformer.register_forward_hook(hook)
+        try:
+            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+        finally:
+            h.remove()
+        x, sep_t = cap["x"], cap["sep_t"]
+        n = self.model.thinking.n
+        return x[:, sep_t:, 0, :], x[:, n:sep_t, 0, :]
+
+    @torch.no_grad()
+    def transformer_pair_per_layer(self, image, context_in, context_out):
+        """Like transformer_pair but returns the (target, context) img-token pair after
+        EACH transformer block, so correspondence can be traced layer by layer. Free: the
+        forward already runs every block; the hooks only capture its output tensor.
+
+        Token layout + sep_t are invariant across blocks, so the same slicing applies at
+        every depth. Returns a list of (target (B,N,e), context (B,K*N,e)), one per block."""
+        outs = []
+        hs = [b.register_forward_hook(lambda m, a, o: outs.append((o, a[1])))
+              for b in self.model.transformer.blocks]
+        try:
+            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+        finally:
+            for h in hs:
+                h.remove()
+        n = self.model.thinking.n
+        return [(x[:, s:, 0, :], x[:, n:s, 0, :]) for x, s in outs]

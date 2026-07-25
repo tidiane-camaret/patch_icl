@@ -48,4 +48,5 @@ def test_rows_for_task_reads_batch_keys_and_shapes():
     assert all(r["class"] == "liver" for r in rows)          # "?" would mean the wrong batch key
     assert rows[0]["mode"] == "dense" and rows[1]["mode"] == "point"
     assert all("auroc" in r and "margin" in r and "retrieval_at1" in r for r in rows)
-    assert rows[0]["ap"] == "" and rows[1]["soft_dice"] == ""  # mode-specific columns empty
+    # mode-specific columns are None (not "") so wandb.Table types them as optional Number
+    assert rows[0]["ap"] is None and rows[1]["soft_dice"] is None

@@ -6,6 +6,7 @@ eval loader, and write a tidy per-(task,tier,res) CSV of matching metrics + real
 """
 import collections
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -131,10 +132,142 @@ def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
     row = {"class": cls, "obj_vox": obj_vox, "real_dice": real_dice,
            "tier": tier, "res": res, "mode": mode, "tier_native_res": tier_native,
            "K": K, "auroc": proto["auroc"],
-           "soft_dice": proto.get("soft_dice", ""), "ap": proto.get("ap", ""),
+           # None (not "") for the absent metric: dense rows have soft_dice, point rows
+           # have ap. wandb.Table infers a column type from the first row and rejects a
+           # later "" String in a Number column, so use None (an allowed optional) instead.
+           "soft_dice": proto.get("soft_dice"), "ap": proto.get("ap"),
            "margin": fg_match_margin(tf, tl, cf, cl),
            "retrieval_at1": retrieval_at1(tf, tl, cf, cl)}
     return row
+
+
+_AGG_METRICS = ("auroc", "soft_dice", "ap", "margin", "retrieval_at1")
+
+
+def _num(x):
+    """Coerce a cell to float, mapping "", None and nan to None (dropped from means)."""
+    if x is None or x == "":
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
+
+
+def _mean(vals):
+    vals = [v for v in (_num(x) for x in vals) if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def aggregate_by_class(rows):
+    """Collapse the per-task table to per-(tier,res,mode,class) means for wandb.
+
+    Each config sees ~one row per subject for a class; this averages those tasks (dropping
+    None/nan) into a single row, cutting the 130k full table to ~n_config x n_class rows.
+    Returns (fields, agg_rows) sorted by (tier, res, class)."""
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[(r["tier"], r["res"], r["mode"], r["tier_native_res"], r["class"])].append(r)
+    out = []
+    for (tier, res, mode, native, cls) in sorted(groups, key=lambda k: (k[0], int(k[1]), k[4])):
+        g = groups[(tier, res, mode, native, cls)]
+        row = {"tier": tier, "res": res, "mode": mode, "tier_native_res": native,
+               "class": cls, "n": len(g),
+               "obj_vox_mean": _mean([r["obj_vox"] for r in g]),
+               "real_dice_mean": _mean([r["real_dice"] for r in g])}
+        for m in _AGG_METRICS:
+            row[m + "_mean"] = _mean([r[m] for r in g])
+        out.append(row)
+    return list(out[0].keys()), out
+
+
+def _avg_rank(a):
+    """Average (tie-corrected) ranks of a 1-D list — the basis for Spearman."""
+    idx = sorted(range(len(a)), key=lambda i: a[i])
+    ranks = [0.0] * len(a)
+    i = 0
+    while i < len(a):
+        j = i
+        while j + 1 < len(a) and a[idx[j + 1]] == a[idx[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[idx[k]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
+def _pearson(x, y):
+    """Pearson r on paired lists (already NaN-free). None if degenerate."""
+    n = len(x)
+    if n < 3:
+        return None
+    mx, my = sum(x) / n, sum(y) / n
+    sxy = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+    sxx = sum((xi - mx) ** 2 for xi in x)
+    syy = sum((yi - my) ** 2 for yi in y)
+    d = (sxx * syy) ** 0.5
+    return sxy / d if d > 0 else None
+
+
+def _paired(g, col, ref="real_dice", extra=None):
+    """Rows of g where col, ref (and each `extra` col) are all numeric; returns column lists."""
+    cols = [col, ref] + list(extra or [])
+    keep = [r for r in g if all(_num(r[c]) is not None for c in cols)]
+    return {c: [_num(r[c]) for r in keep] for c in cols}, len(keep)
+
+
+def _spearman(g, col, ref="real_dice"):
+    p, n = _paired(g, col, ref)
+    if n < 3:
+        return None
+    return _pearson(_avg_rank(p[col]), _avg_rank(p[ref]))
+
+
+def _partial_spearman(g, col, ctrl="obj_vox", ref="real_dice"):
+    """Spearman(col, ref | ctrl): Pearson of rank-residuals after regressing out rank(ctrl).
+    Confirms the probe predicts Dice beyond the object-size confound."""
+    p, n = _paired(g, col, ref, extra=[ctrl])
+    if n < 4:
+        return None
+    rc, rr, rz = _avg_rank(p[col]), _avg_rank(p[ref]), _avg_rank(p[ctrl])
+    mz = sum(rz) / n
+    szz = sum((z - mz) ** 2 for z in rz)
+    if szz == 0:
+        return None
+
+    def resid(v):
+        mv = sum(v) / n
+        b = sum((vi - mv) * (zi - mz) for vi, zi in zip(v, rz)) / szz
+        a = mv - b * mz
+        return [vi - (a + b * zi) for vi, zi in zip(v, rz)]
+
+    return _pearson(resid(rc), resid(rr))
+
+
+def summarize_by_config(rows):
+    """Collapse to one row per (tier,res,mode): metric means + the metric<->Dice couplings
+    the study rests on (Spearman with real_dice, plus size-partialled Spearman for
+    retrieval_at1). ~21 rows — the headline table for choosing a stage/resolution."""
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[(r["tier"], r["res"], r["mode"], r["tier_native_res"])].append(r)
+    out = []
+    for (tier, res, mode, native) in sorted(groups, key=lambda k: (k[0], int(k[1]))):
+        g = groups[(tier, res, mode, native)]
+        row = {"tier": tier, "res": res, "mode": mode, "tier_native_res": native,
+               "n": len(g), "obj_vox_mean": _mean([r["obj_vox"] for r in g]),
+               "real_dice_mean": _mean([r["real_dice"] for r in g])}
+        for m in _AGG_METRICS:
+            row[m + "_mean"] = _mean([r[m] for r in g])
+        # metric<->Dice coupling (the actual research signal — means alone hide it)
+        for m in ("auroc", "margin", "retrieval_at1"):
+            row["spearman_" + m] = _spearman(g, m)
+        row["pearson_auroc"] = _pearson(*(lambda p: (p["auroc"], p["real_dice"]))(
+            _paired(g, "auroc")[0]))
+        row["partial_spearman_retr"] = _partial_spearman(g, "retrieval_at1")
+        out.append(row)
+    return list(out[0].keys()), out
 
 
 @hydra.main(config_path="../../../configs/experiment/3d",
@@ -182,15 +315,23 @@ def main(cfg: DictConfig) -> None:
     print(f"Done. {n} rows -> {csv_path}")
 
     if wb_on and all_rows:
-        # Full per-(task,tier,res) table plus mean auroc/margin/retrieval per (tier,res).
-        wandb.log({"feature_sim/table":
-                   wandb.Table(columns=fields, data=[[r[c] for c in fields] for r in all_rows])})
+        # Per-(tier,res,mode,class) aggregated table (the full 130k per-task table is far
+        # too large for wandb; the raw CSV above is the source of truth). Plus a scalar
+        # mean per (tier,res) for the run-overview panels.
+        afields, arows = aggregate_by_class(all_rows)
+        wandb.log({"feature_sim/by_class":
+                   wandb.Table(columns=afields, data=[[r[c] for c in afields] for r in arows])})
+        # Config-summary (~21 rows): metric means + metric<->Dice couplings (the headline).
+        sfields, srows = summarize_by_config(all_rows)
+        wandb.log({"feature_sim/by_config":
+                   wandb.Table(columns=sfields, data=[[r[c] for c in sfields] for r in srows])})
         agg = collections.defaultdict(lambda: collections.defaultdict(list))
         for r in all_rows:
             key = f"{r['tier']}@{r['res']}"
             for m in ("auroc", "margin", "retrieval_at1"):
-                if r[m] != "":
-                    agg[key][m].append(float(r[m]))
+                v = _num(r[m])
+                if v is not None:
+                    agg[key][m].append(v)
         summary = {f"feature_sim/{m}/{key}": sum(v) / len(v)
                    for key, ms in agg.items() for m, v in ms.items()}
         wandb.log(summary)

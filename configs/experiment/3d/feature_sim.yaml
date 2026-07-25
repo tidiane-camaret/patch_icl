@@ -2,7 +2,7 @@
 # Feature-similarity study entrypoint (experiments/3d/feature_sim/run.py). Reuses the
 # eval loader/checkpoint surface (eval.*) and adds a feature_sim.* sweep block.
 #   python experiments/3d/feature_sim/run.py eval.model=patchset3d \
-#       eval.checkpoint=results/checkpoints/<run>/best.pt eval.split=val
+#       eval.checkpoint=results/checkpoints/<run>/best.pt eval.split=test
 defaults:
   - cluster: nfs
   - augmentations: multiverseg
@@ -14,9 +14,9 @@ hydra:
     - file://${oc.env:PWD}/configs
 eval:
   model: patchset3d
-  split: val
-  n_subjects: 25
-  batch_size: 4
+  split: test
+  n_subjects: null
+  batch_size: 16
   workers: 8
   seed: 0
   out_dir: ${paths.results}/3d_feature_sim
