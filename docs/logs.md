@@ -1,5 +1,16 @@
 # Change log
 
+## Encoder feature-similarity study (2026-07-25)
+
+Added `experiments/3d/feature_sim/` — transformer-free target<->context matching metrics
+(prototype cosine -> AUROC/soft-Dice or AP; FG-match margin; top-1 retrieval), a
+PatchSet3D encoder adapter (per-stage / concat / img_embed / transformer_q tiers, dense
+`R'^3` grids + native-res point sampling), and a Hydra driver (`run.py`) that sweeps
+(tier x resolution) over the shared eval loader and writes a tidy `feature_sim.csv` with
+the model's real Dice per task. Spec:
+docs/superpowers/specs/2026-07-25-patchset3d-encoder-feature-similarity-design.md.
+SAM/DINO adapters and Dice-correlation analysis are phase 2.
+
 ## 3d train: unified `train.checkpoint` weight-source knob
 
 Collapsed the three medverse weight-source knobs (`train.random_init`,

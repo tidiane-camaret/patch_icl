@@ -1,0 +1,33 @@
+# @package _global_
+# Feature-similarity study entrypoint (experiments/3d/feature_sim/run.py). Reuses the
+# eval loader/checkpoint surface (eval.*) and adds a feature_sim.* sweep block.
+#   python experiments/3d/feature_sim/run.py eval.model=patchset3d \
+#       eval.checkpoint=results/checkpoints/<run>/best.pt eval.split=val
+defaults:
+  - cluster: nfs
+  - augmentations: multiverseg
+  - dataset: totalseg
+  - _self_
+  - optional experiment:
+hydra:
+  searchpath:
+    - file://${oc.env:PWD}/configs
+eval:
+  model: patchset3d
+  split: val
+  n_subjects: 25
+  batch_size: 4
+  workers: 8
+  seed: 0
+  out_dir: ${paths.results}/3d_feature_sim
+  checkpoint: null            # REQUIRED: trained PatchSet3D best.pt
+feature_sim:
+  tiers: [stage:0, stage:1, stage:2, concat, img_embed, transformer_q]
+  resolutions: [16, 32, 48, 64]     # >48^3 auto-switches to point mode
+  budget: 110592                    # 48^3; res^3 above this uses point sampling
+  n_fg: 512
+  n_bg: 512
+  band: null                        # null = BG anywhere; int = dilated shell (voxels)
+wandb:
+  project: null
+  name: null
