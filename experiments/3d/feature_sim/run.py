@@ -4,12 +4,14 @@ eval loader, and write a tidy per-(task,tier,res) CSV of matching metrics + real
     python experiments/3d/feature_sim/run.py eval.checkpoint=results/.../best.pt \
         eval.model=patchset3d
 """
+import collections
 import csv
 import sys
 from pathlib import Path
 
 import hydra
 import torch
+import wandb
 from omegaconf import DictConfig, OmegaConf
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -120,6 +122,9 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
 
 def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
                 tf, tl, cf, cl, K):
+    # Metrics run on CPU; features come from the GPU model and labels may be built from
+    # GPU tensors (context_out). Coerce all four to CPU so device provenance never matters.
+    tf, tl, cf, cl = tf.cpu(), tl.cpu(), cf.cpu(), cl.cpu()
     proto = prototype_cosine(tf, tl, cf, cl, mode=mode)
     row = {"class": cls, "obj_vox": obj_vox, "real_dice": real_dice,
            "tier": tier, "res": res, "mode": mode, "tier_native_res": tier_native,
@@ -147,9 +152,15 @@ def main(cfg: DictConfig) -> None:
                       int(cfg.feature_sim.budget), adapter.R)
     gen = torch.Generator().manual_seed(cfg.eval.seed)
 
+    # W&B: online when a project is configured, disabled otherwise (CSV still written).
+    wb_on = bool(cfg.wandb.get("project"))
+    wandb.init(project=cfg.wandb.get("project"), name=cfg.wandb.get("name"),
+               mode="online" if wb_on else "disabled",
+               config=OmegaConf.to_container(cfg, resolve=True))
+
     out_dir = Path(cfg.eval.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "feature_sim.csv"
-    n = 0
+    all_rows, fields, n = [], None, 0
     with open(csv_path, "w", newline="") as fh:
         writer = None
         for batch in loader:
@@ -160,12 +171,28 @@ def main(cfg: DictConfig) -> None:
                 for row in _rows_for_task(adapter, model, item, cfg, plan,
                                           input_res, gen):
                     if writer is None:
-                        writer = csv.DictWriter(fh, fieldnames=list(row.keys()))
+                        fields = list(row.keys())
+                        writer = csv.DictWriter(fh, fieldnames=fields)
                         writer.writeheader()
-                    writer.writerow(row); n += 1
+                    writer.writerow(row); all_rows.append(row); n += 1
             if n and n % 200 == 0:
                 print(f"  wrote {n} rows...")
     print(f"Done. {n} rows -> {csv_path}")
+
+    if wb_on and all_rows:
+        # Full per-(task,tier,res) table plus mean auroc/margin/retrieval per (tier,res).
+        wandb.log({"feature_sim/table":
+                   wandb.Table(columns=fields, data=[[r[c] for c in fields] for r in all_rows])})
+        agg = collections.defaultdict(lambda: collections.defaultdict(list))
+        for r in all_rows:
+            key = f"{r['tier']}@{r['res']}"
+            for m in ("auroc", "margin", "retrieval_at1"):
+                if r[m] != "":
+                    agg[key][m].append(float(r[m]))
+        summary = {f"feature_sim/{m}/{key}": sum(v) / len(v)
+                   for key, ms in agg.items() for m, v in ms.items()}
+        wandb.log(summary)
+    wandb.finish()
 
 
 if __name__ == "__main__":

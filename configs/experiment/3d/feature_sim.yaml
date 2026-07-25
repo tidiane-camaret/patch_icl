@@ -29,5 +29,5 @@ feature_sim:
   n_bg: 512
   band: null                        # null = BG anywhere; int = dilated shell (voxels)
 wandb:
-  project: null
+  project: patch_icl_feature_similarity   # null to disable (CSV still written)
   name: null

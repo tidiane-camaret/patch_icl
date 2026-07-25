@@ -22,11 +22,14 @@ def test_rows_for_task_reads_batch_keys_and_shapes():
     from src.models.patchset3d import PatchSet3D
     from feature_sim.adapters import PatchSet3DEncoderAdapter
     from feature_sim.run import _rows_for_task
+    from common import DEVICE
 
     torch.manual_seed(0)
     S, K = 16, 2
+    # Model must live on DEVICE: _rows_for_task moves inputs to DEVICE (as _load_patchset
+    # moves the model in production), so a CPU model would device-mismatch on a GPU node.
     model = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
-                       thinking_rows=2, fourier_bands=4)
+                       thinking_rows=2, fourier_bands=4).to(DEVICE)
     adapter = PatchSet3DEncoderAdapter(model)
     gt = torch.zeros(1, S, S, S); gt[0, 4:12, 4:12, 4:12] = 1.0
     item = {
