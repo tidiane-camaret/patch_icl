@@ -7,12 +7,18 @@ import torch.nn.functional as F
 from src.models.patchset3d import _down_to
 
 
-def grid_labels(mask, res):
+def grid_labels(mask, res, threshold=0.5):
+    """Downsample `mask` (D,H,W) or (1,D,H,W) to an occupancy grid at res^3.
+
+    threshold=None returns the raw occupancy FRACTION in [0,1] (soft label, matching the
+    model's soft-Dice target); a float returns the binary `occupancy >= threshold` grid.
+    Coarse cells pool many voxels, so thin structures rarely reach 0.5 — use the soft
+    fraction for dense metrics so they don't collapse to an all-background (nan) target."""
     m = mask.float()
     if m.dim() == 3:
         m = m.unsqueeze(0)                    # (1,D,H,W)
-    occ = _down_to(m.unsqueeze(0), res)       # (1,1,res,res,res)
-    return (occ >= 0.5).float().squeeze(0).squeeze(0)
+    occ = _down_to(m.unsqueeze(0), res).squeeze(0).squeeze(0)   # (res,res,res) fraction
+    return occ if threshold is None else (occ >= threshold).float()
 
 
 def _to_norm_coords(idx, shape):

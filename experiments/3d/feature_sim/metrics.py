@@ -41,48 +41,79 @@ def average_precision(scores, labels):
     return (precision * y).sum().item() / n_pos
 
 
-def _best_soft_dice(scores, labels):
-    """Max Dice over thresholds at each unique score (scores expected in a bounded range)."""
-    labels = labels.float()
-    thr = torch.unique(scores)
-    best = 0.0
-    for t in thr:
-        pred = (scores >= t).float()
-        inter = (pred * labels).sum().item()
-        den = pred.sum().item() + labels.sum().item()
-        d = (2 * inter) / den if den > 0 else 0.0
-        best = max(best, d)
-    return best
+def soft_auroc(scores, pos_w):
+    """Probabilistic AUC with soft positive weights `pos_w` in [0,1] (neg weight = 1-pos_w):
+    P(score of a pos-weighted draw > score of a neg-weighted draw), ties counted 0.5.
+    Reduces exactly to `auroc` when pos_w is binary. O(n log n) via score-grouped cumsum.
+
+    Matches the model's soft-Dice training, where the target is an occupancy fraction per
+    cell rather than a hard 0/1 label."""
+    pw = pos_w.float().clamp(0, 1)
+    nw = 1.0 - pw
+    P, N = pw.sum(), nw.sum()
+    if P <= 0 or N <= 0:
+        return float("nan")
+    uniq, inv = torch.unique(scores, return_inverse=True)          # uniq ascending
+    grp_nw = torch.zeros(len(uniq)).scatter_add(0, inv, nw)        # neg weight per score group
+    below = torch.cumsum(grp_nw, 0) - grp_nw                        # neg weight of strictly lower scores
+    contrib = pw * (below[inv] + 0.5 * grp_nw[inv])                # + half the ties at the same score
+    return (contrib.sum() / (P * N)).item()
 
 
-def _prototype_scores(target_feats, ctx_feats, ctx_labels):
-    proto = l2norm(l2norm(ctx_feats)[ctx_labels == 1].mean(0), dim=0)
+def soft_dice(scores, soft_labels, eps=1e-8):
+    """Soft-Dice between the cosine score map and the occupancy fraction `soft_labels`.
+
+    Scores are per-map min-max normalized to [0,1] first: raw cosine sits near a ~0.5
+    baseline for every cell, which swamps the sparse occupancy of thin structures, so a
+    fixed [-1,1]->[0,1] map yields a near-zero, uninformative Dice. Min-max makes it a
+    relative overlap comparable across tiers/resolutions (not an absolute probability, and
+    not directly comparable to the model's real Dice). Never nan when the object is present.
+    soft_auroc is the scale-free separability headline; this is the segmentation-quality proxy."""
+    lo, hi = scores.min(), scores.max()
+    s = (scores - lo) / (hi - lo + eps)
+    g = soft_labels.float().clamp(0, 1)
+    inter = (s * g).sum()
+    return (2 * inter / (s.sum() + g.sum() + eps)).item()
+
+
+def _prototype_scores(target_feats, ctx_feats, ctx_w):
+    """Occupancy-weighted context prototype (weights = ctx occupancy fraction, clamped >=0);
+    reduces to the FG-mean prototype when ctx_w is binary. Returns per-target-cell cosine."""
+    n = l2norm(ctx_feats)
+    w = ctx_w.float().clamp(min=0)
+    proto = l2norm((n * w.unsqueeze(1)).sum(0) / (w.sum() + 1e-8), dim=0)
     return l2norm(target_feats) @ proto
 
 
 def prototype_cosine(target_feats, target_labels, ctx_feats, ctx_labels, mode="dense"):
+    """Dense: soft labels (occupancy fraction) -> {soft_auroc, soft_dice}. Point (native
+    res, exact 0/1 voxels): {binary auroc, average precision}. `auroc` key holds the soft
+    variant in dense mode, the hard one in point mode."""
     scores = _prototype_scores(target_feats, ctx_feats, ctx_labels)
-    out = {"auroc": auroc(scores, target_labels)}
     if mode == "dense":
-        out["soft_dice"] = _best_soft_dice(scores, target_labels)
-    elif mode == "point":
-        out["ap"] = average_precision(scores, target_labels)
-    else:
-        raise ValueError(f"mode must be 'dense' or 'point', got {mode!r}")
-    return out
+        return {"auroc": soft_auroc(scores, target_labels),
+                "soft_dice": soft_dice(scores, target_labels)}
+    if mode == "point":
+        return {"auroc": auroc(scores, target_labels),
+                "ap": average_precision(scores, target_labels)}
+    raise ValueError(f"mode must be 'dense' or 'point', got {mode!r}")
 
 
 def fg_match_margin(target_feats, target_labels, ctx_feats, ctx_labels):
-    tf = l2norm(target_feats)[target_labels == 1]
+    """Mean cosine of target-FG cells to context-FG minus to context-BG. FG membership is
+    `label > 0` (any occupancy), so it is non-degenerate for soft (fractional) labels and
+    identical to `== 1` for binary labels. nan if the target has no FG cell."""
+    tf = l2norm(target_feats)[target_labels > 0]
     cf = l2norm(ctx_feats)
     sims = tf @ cf.T                                   # (n_tfg, M)
-    fg = sims[:, ctx_labels == 1].mean(1)
+    fg = sims[:, ctx_labels > 0].mean(1)
     bg = sims[:, ctx_labels == 0].mean(1)
     return (fg - bg).mean().item()
 
 
 def retrieval_at1(target_feats, target_labels, ctx_feats, ctx_labels):
-    tf = l2norm(target_feats)[target_labels == 1]
+    """Fraction of target-FG cells whose nearest context cell is also FG (`label > 0`)."""
+    tf = l2norm(target_feats)[target_labels > 0]
     cf = l2norm(ctx_feats)
     nn = (tf @ cf.T).argmax(1)
-    return (ctx_labels[nn] == 1).float().mean().item()
+    return (ctx_labels[nn] > 0).float().mean().item()

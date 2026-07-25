@@ -2,7 +2,7 @@
 import sys; sys.path.insert(0, "."); sys.path.insert(0, "experiments/3d")
 import torch
 from feature_sim.metrics import (
-    l2norm, auroc, average_precision,
+    l2norm, auroc, average_precision, soft_auroc, soft_dice,
     prototype_cosine, fg_match_margin, retrieval_at1)
 
 
@@ -29,6 +29,55 @@ def test_auroc_perfect_and_chance():
 def test_auroc_ties():
     s = torch.tensor([1.0, 1.0, 0.0, 0.0]); y = torch.tensor([1., 0., 1., 0.])
     assert abs(auroc(s, y) - 0.5) < 1e-6  # all ties -> chance
+
+
+def test_soft_auroc_reduces_to_binary():
+    # with binary weights, soft_auroc must equal the hard rank-based auroc
+    g = torch.Generator().manual_seed(3)
+    s = torch.randn(200, generator=g)
+    y = (torch.rand(200, generator=g) > 0.5).float()
+    assert abs(soft_auroc(s, y) - auroc(s, y)) < 1e-5
+    # perfect and tie cases too
+    sp = torch.tensor([0.9, 0.8, 0.2, 0.1]); yp = torch.tensor([1., 1., 0., 0.])
+    assert abs(soft_auroc(sp, yp) - 1.0) < 1e-6
+    st = torch.tensor([1.0, 1.0, 0.0, 0.0]); yt = torch.tensor([1., 0., 1., 0.])
+    assert abs(soft_auroc(st, yt) - 0.5) < 1e-6
+
+
+def test_soft_auroc_fractional_ranks_by_occupancy():
+    # higher scores carry higher occupancy weight -> soft_auroc > 0.5
+    s = torch.tensor([0.9, 0.7, 0.3, 0.1]); occ = torch.tensor([0.9, 0.6, 0.2, 0.05])
+    assert soft_auroc(s, occ) > 0.5
+    assert soft_auroc(-s, occ) < 0.5          # reversed scores -> below chance
+    # all-foreground (P>0,N=0) is undefined
+    import math
+    assert math.isnan(soft_auroc(s, torch.ones(4)))
+
+
+def test_soft_dice_matches_occupancy():
+    # a score map aligned with occupancy beats a reversed one; soft-Dice of a graded map
+    # against itself is Σg²/Σg (~0.74 here), not 1 — that is inherent to soft-Dice.
+    occ = torch.tensor([0.9, 0.6, 0.1, 0.0])
+    scores = occ * 2 - 1                       # invert the [-1,1]->[0,1] mapping
+    matched = soft_dice(scores, occ)
+    assert matched > soft_dice(-scores, occ)
+    assert matched > 0.7
+    # never nan when the object is present, even if scores are flat
+    flat = soft_dice(torch.zeros(4), occ)
+    assert flat == flat                        # not nan
+
+
+def test_prototype_cosine_soft_labels_dense():
+    # graded target occupancy that tracks the FG direction -> sensible soft metrics
+    g = torch.Generator().manual_seed(7)
+    c = 8
+    tf = 0.2 * torch.randn(80, c, generator=g); tf[:40, 0] += 5.0     # first 40 near +e0
+    occ = torch.cat([torch.linspace(0.4, 1.0, 40), torch.zeros(40)])  # soft FG, hard BG
+    cf = 0.2 * torch.randn(80, c, generator=g); cf[:40, 0] += 5.0
+    cocc = torch.cat([torch.ones(40), torch.zeros(40)])
+    out = prototype_cosine(tf, occ, cf, cocc, mode="dense")
+    assert set(out) == {"auroc", "soft_dice"}
+    assert out["auroc"] > 0.85 and out["soft_dice"] > 0.6
 
 
 def test_average_precision_perfect():

@@ -83,8 +83,8 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
         tier, res, mode = p["tier"], p["res"], p["mode"]
         if tier == "transformer_q":
             q = adapter.transformer_query(image, cin, cout)[0]          # (N,e)
-            tl = grid_labels(gt, adapter.R).flatten()
-            cl = torch.stack([grid_labels(cout[0, k], adapter.R).flatten()
+            tl = grid_labels(gt, adapter.R, threshold=None).flatten()   # soft occupancy
+            cl = torch.stack([grid_labels(cout[0, k], adapter.R, threshold=None).flatten()
                               for k in range(K)]).flatten()
             # context side uses img_embed tier (concat→e projection) so its channel dim
             # matches the transformer query rep e; note this is an approximate ceiling
@@ -98,10 +98,10 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
         if mode == "dense":
             tf = adapter.features(image, tier, res)[0]                  # (C,res,res,res)
             tf = tf.flatten(1).transpose(0, 1)                         # (res^3, C)
-            tl = grid_labels(gt, res).flatten()
+            tl = grid_labels(gt, res, threshold=None).flatten()        # soft occupancy fraction
             cvol = adapter.features(ctx_imgs.unsqueeze(1), tier, res)  # (K,C,res^3...)
             cf = cvol.flatten(2).transpose(1, 2).reshape(-1, cvol.shape[1])
-            cl = torch.stack([grid_labels(cout[0, k], res).flatten()
+            cl = torch.stack([grid_labels(cout[0, k], res, threshold=None).flatten()
                               for k in range(K)]).flatten()
         else:
             tcoords, tl = sample_points(gt, fs.n_fg, fs.n_bg,
