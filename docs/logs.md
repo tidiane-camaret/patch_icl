@@ -3198,3 +3198,5 @@ First observations (n<=4 smoke): dense@16 soft_auroc already high & discriminati
 (thin aorta ~0.92-0.99); point@64 auroc ~0.90-0.99. soft_dice is a min-max-normalized
 relative overlap proxy (cosine maps aren't calibrated); soft_auroc is the scale-free
 separability headline.
+
+- 2026-07-26: Added `experiments/3d/encoder_bench/` — compute/latency scaling benchmark for 3D encoders (7 zoo + Primus/SegMamba compute-only stand-ins). Sweeps encoder × input_size at best-optimized config (torch.compile/bf16/SDPA), writes CSV + log-y scaling-curve PNGs. Real full-depth architectures; sizes an encoder can't process yield honest `error:*`/skip rows. NOTE: SegMamba uses an O(L) pure-Python reference scan unless `mamba_ssm` is installed (absent on thor) — its latency at ≥64³ is not representative; install mamba_ssm for meaningful Mamba numbers. Run: `.venv_thor/bin/python experiments/3d/encoder_bench/run.py`.
