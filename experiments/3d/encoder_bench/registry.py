@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from src.models.patchset3d import ConvEncoder3D
 from src.models.encoders import ResEncEncoder
-from encoder_bench.encoders_standin import PrimusStandin
+from encoder_bench.encoders_standin import PrimusStandin, SegMambaStandin
 
 
 @dataclass
@@ -54,4 +54,9 @@ register(EncoderSpec(
     name="primus", family="transformer", call="single", size_multiple=8,
     factory=lambda: PrimusStandin(img_size=64, patch=8, embed_dim=384, depth=12, heads=6),
     opt_profile={"autocast": "bf16", "compile": "max-autotune"},
+))
+register(EncoderSpec(
+    name="segmamba", family="mamba", call="single", size_multiple=8,
+    factory=lambda: SegMambaStandin(dims=(32, 64, 128, 256)),
+    opt_profile={"autocast": "bf16", "channels_last": True},
 ))

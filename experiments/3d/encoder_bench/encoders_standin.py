@@ -3,8 +3,6 @@
 Primus: high-res-token pure-ViT (arxiv 2503.01835). SegMamba: CNN-stem + SSM blocks
 (arxiv 2401.13560). Faithful block structure/dims for FLOPs/latency/VRAM; NOT for Dice.
 """
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,3 +47,69 @@ class PrimusStandin(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         return self.norm(x)
+
+
+def _ref_scan(u, delta, A, B, C):
+    """Pure-PyTorch fallback selective scan. u,delta:(b,d,l) A:(d,n) B,C:(b,n,l)."""
+    b, d, l = u.shape
+    n = A.shape[1]
+    dA = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))  # (b,d,l,n)
+    dB = delta.unsqueeze(-1) * B.transpose(1, 2).unsqueeze(1)  # (b,d,l,n)
+    x = torch.zeros(b, d, n, device=u.device, dtype=u.dtype)
+    ys = []
+    for t in range(l):
+        x = dA[:, :, t] * x + dB[:, :, t] * u[:, :, t].unsqueeze(-1)   # (b,d,n)
+        ys.append(torch.einsum("bdn,bn->bd", x, C[:, :, t]))          # (b,d)
+    return torch.stack(ys, dim=-1)                                    # (b,d,l)
+
+
+class _SSM3D(nn.Module):
+    """Minimal selective-SSM over a flattened 3D volume (single scan orientation)."""
+    def __init__(self, dim, d_state=16):
+        super().__init__()
+        self.dim, self.n = dim, d_state
+        self.in_proj = nn.Linear(dim, dim)
+        self.dt = nn.Linear(dim, dim)
+        self.A = nn.Parameter(-torch.rand(dim, d_state))
+        self.B = nn.Linear(dim, d_state); self.C = nn.Linear(dim, d_state)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, x):                                      # x: (B,dim,D,H,W)
+        B_, dim, D, H, W = x.shape
+        seq = x.flatten(2).transpose(1, 2)                    # (B,L,dim)
+        u = F.silu(self.in_proj(seq))
+        delta = F.softplus(self.dt(seq)).transpose(1, 2)      # (B,dim,L)
+        Bm, Cm = self.B(seq).transpose(1, 2), self.C(seq).transpose(1, 2)  # (B,n,L)
+        y = _selective_scan(u.transpose(1, 2), delta, self.A, Bm, Cm)      # (B,dim,L)
+        y = self.out(y.transpose(1, 2))                        # (B,L,dim)
+        return y.transpose(1, 2).reshape(B_, dim, D, H, W)
+
+
+def _selective_scan(u, delta, A, B, C):
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+        return selective_scan_fn(u.contiguous(), delta.contiguous(),
+                                 A.contiguous(), B.contiguous(), C.contiguous(),
+                                 None, None, None, False)
+    except Exception:
+        return _ref_scan(u, delta, A, B, C)
+
+
+class SegMambaStandin(nn.Module):
+    def __init__(self, in_ch=1, dims=(32, 64, 128, 256), d_state=16):
+        super().__init__()
+        def cbr(ci, co, s):
+            return nn.Sequential(nn.Conv3d(ci, co, 3, stride=s, padding=1),
+                                 nn.InstanceNorm3d(co), nn.SiLU())
+        self.stem = cbr(in_ch, dims[0], 1)
+        self.stages = nn.ModuleList()
+        self.ssms = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            self.stages.append(cbr(dims[i], dims[i + 1], 2))
+            self.ssms.append(_SSM3D(dims[i + 1], d_state))
+
+    def forward(self, x):
+        x = self.stem(x)
+        for stage, ssm in zip(self.stages, self.ssms):
+            x = stage(x); x = x + ssm(x)
+        return x

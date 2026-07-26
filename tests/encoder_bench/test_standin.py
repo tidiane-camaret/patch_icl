@@ -15,3 +15,13 @@ def test_primus_registered():
     assert "primus" in R.list_encoders()
     assert R.REGISTRY["primus"].family == "transformer"
     assert R.REGISTRY["primus"].size_multiple == 8
+
+
+def test_segmamba_forward_and_registered():
+    from encoder_bench.encoders_standin import SegMambaStandin
+    m = SegMambaStandin(dims=(8, 16, 32, 64)).eval()
+    y = m(torch.zeros(1, 1, 32, 32, 32))
+    assert y.shape[0] == 1 and y.shape[1] == 64            # bottleneck channels
+    assert y.shape[-1] == 32 // 8                          # 3 stride-2 stages
+    assert "segmamba" in R.list_encoders()
+    assert R.REGISTRY["segmamba"].family == "mamba"
