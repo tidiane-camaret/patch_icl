@@ -23,4 +23,6 @@ def test_plot_curves_creates_png(tmp_path):
              "train_vram_mb": None, "gflops": 8.0, "throughput_vol_s": 1.0,
              "params": 10, "status": "ok"}]
     pngs = RUN.plot_curves(rows, tmp_path)
-    assert any(p.exists() for p in pngs)
+    assert len(pngs) == 2                                  # fwd_bwd_ms + gflops; vram dropped (all None)
+    assert not (tmp_path / "scaling_train_vram_mb.png").exists()
+    assert all(p.exists() for p in pngs)

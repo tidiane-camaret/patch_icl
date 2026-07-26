@@ -31,8 +31,11 @@ def sweep(encoders, input_sizes, device, out_dir, n_warmup=3, n_timed=10):
             try:
                 mod, ctx = apply_optimization(spec.factory(), spec.opt_profile, device)
             except Exception as e:                      # ckpt/dep missing -> log + skip
-                r = profile_point(spec, size, device, module=torch.nn.Identity())
-                r["status"] = f"unavailable:{type(e).__name__}"; rows.append(r); continue
+                print(f"  WARN {name}@{size} unavailable: {e}", file=sys.stderr)
+                r = {k: None for k in _FIELDS}
+                r.update(encoder=name, family=spec.family, input_size=size,
+                         status=f"unavailable:{type(e).__name__}")
+                rows.append(r); continue
             with ctx:
                 rows.append(profile_point(spec, size, device, module=mod,
                                           n_warmup=n_warmup, n_timed=n_timed))
