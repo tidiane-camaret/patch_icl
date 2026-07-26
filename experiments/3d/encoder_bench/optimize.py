@@ -20,7 +20,7 @@ def apply_optimization(module, opt_profile: dict, device):
         module = module.to(memory_format=torch.channels_last_3d)
     ctx = contextlib.nullcontext()
     if device.type == "cuda" and opt_profile.get("autocast") == "bf16":
-        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     if device.type == "cuda" and opt_profile.get("compile"):
         set_compiler_env()
         try:

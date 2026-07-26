@@ -8,6 +8,7 @@ def test_apply_optimization_cpu_noop_compile():
     spec = R.REGISTRY["conv_encoder3d"]
     mod = spec.factory()
     out_mod, ctx = O.apply_optimization(mod, spec.opt_profile, torch.device("cpu"))
+    assert isinstance(ctx, contextlib.nullcontext)
     assert isinstance(out_mod, torch.nn.Module)
     # on CPU autocast/compile are disabled -> ctx is a nullcontext
     with ctx:
