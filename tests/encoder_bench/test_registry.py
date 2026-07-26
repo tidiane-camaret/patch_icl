@@ -39,6 +39,5 @@ def test_weightsfree_zoo_factory_builds():
     """STU-Net-B full depth: 64³ -> 2³ bottleneck (stride-32), no checkpoint needed."""
     spec = R.REGISTRY["stunet"]
     mod = spec.factory().eval()
-    import torch
     out = mod(*R.make_inputs(spec, torch.zeros(1, 1, 64, 64, 64)))
     assert out is not None

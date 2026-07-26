@@ -1,4 +1,5 @@
 """Encoder registry: name -> build recipe + uniform call convention for the bench."""
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -62,8 +63,6 @@ register(EncoderSpec(
 ))
 
 # --- pretrained zoo encoders (weights-off + gated) ---------------------------
-
-import os  # noqa: E402
 
 _OPT_CNN = {"autocast": "bf16", "channels_last": True, "compile": "reduce-overhead"}
 
