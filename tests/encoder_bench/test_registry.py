@@ -24,3 +24,21 @@ def test_factories_build_and_run_tiny():
         # accept a tensor or a list/tuple of tensors
         t = out[0] if isinstance(out, (list, tuple)) else out
         assert torch.is_tensor(t)
+
+
+def test_zoo_encoders_registered():
+    names = set(R.list_encoders())
+    assert {"stunet", "vocomni_swin", "vocomni_nnunet",
+            "nninteractive", "threedino"} <= names
+    assert R.REGISTRY["nninteractive"].requires_ckpt
+    assert R.REGISTRY["threedino"].requires_ckpt
+    assert R.REGISTRY["vocomni_swin"].size_multiple == 32
+
+
+def test_weightsfree_zoo_factory_builds():
+    # stunet builds with no checkpoint (pretrained=None); tiny forward on CPU
+    spec = R.REGISTRY["stunet"]
+    mod = spec.factory().eval()
+    import torch
+    out = mod(*R.make_inputs(spec, torch.zeros(1, 1, 32, 32, 32)))
+    assert out is not None

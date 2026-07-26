@@ -60,3 +60,61 @@ register(EncoderSpec(
     factory=lambda: SegMambaStandin(dims=(32, 64, 128, 256)),
     opt_profile={"autocast": "bf16", "channels_last": True},
 ))
+
+# --- pretrained zoo encoders (weights-off + gated) ---------------------------
+
+import os  # noqa: E402
+
+_OPT_CNN = {"autocast": "bf16", "channels_last": True, "compile": "reduce-overhead"}
+
+
+def _stunet():
+    """Build STU-Net-Base encoder (4 stages) with no pretrained weights.
+
+    num_stages=4 → 8× downsampling, compatible with 32³ test inputs.
+    Default 6 stages would reduce 32³ to 1³, hitting InstanceNorm's spatial
+    size constraint.
+    """
+    from src.models.encoders.stunet import STUNetEncoder
+    return STUNetEncoder(in_channels=1, variant="base", pretrained=None, num_stages=4)
+
+
+def _vocomni_swin():
+    """Build VoComni SwinUNETR encoder with no checkpoint (random weights)."""
+    from src.models.encoders.vocomni import VoComniEncoder
+    return VoComniEncoder(ckpt_path=None, feature_size=48)
+
+
+def _vocomni_nnunet():
+    """Build VoComni NNUNet encoder with no checkpoint (random weights)."""
+    from src.models.encoders.vocomni_nnunet import VoComniNNUNetEncoder
+    return VoComniNNUNetEncoder(ckpt_path=None, freeze_encoder=False, compile_model=False)
+
+
+def _nninteractive():
+    """Build NNInteractive encoder; raises if NNINT_CKPT env var is unset."""
+    from src.models.encoders.nninteractive import NNInteractiveEncoder
+    ckpt = os.environ.get("NNINT_CKPT")
+    if not ckpt:
+        raise FileNotFoundError("NNINT_CKPT not set")
+    return NNInteractiveEncoder(ckpt_dir=ckpt, num_stages=6, device="cpu")
+
+
+def _threedino():
+    """Build ThreeDINO encoder; raises if THREEDINO_CKPT env var is unset."""
+    from src.models.encoders.threedino import ThreeDINOEncoder
+    ckpt = os.environ.get("THREEDINO_CKPT")
+    if not ckpt:
+        raise FileNotFoundError("THREEDINO_CKPT not set")
+    return ThreeDINOEncoder(ckpt_path=ckpt)
+
+
+register(EncoderSpec("stunet", "cnn", _stunet, call="img_mask", opt_profile=_OPT_CNN))
+register(EncoderSpec("vocomni_swin", "transformer", _vocomni_swin, call="single",
+                     size_multiple=32, opt_profile={"autocast": "bf16"}))
+register(EncoderSpec("vocomni_nnunet", "cnn", _vocomni_nnunet, call="img_mask",
+                     size_multiple=32, opt_profile=_OPT_CNN))
+register(EncoderSpec("nninteractive", "cnn", _nninteractive, call="img_mask",
+                     requires_ckpt=True, opt_profile=_OPT_CNN))
+register(EncoderSpec("threedino", "transformer", _threedino, call="single",
+                     size_multiple=16, requires_ckpt=True, opt_profile={"autocast": "bf16"}))
