@@ -45,7 +45,7 @@ def _time_fwd_bwd(module, inputs, device, n_warmup, n_timed) -> float:
         one(); _sync(device)
         times.append((time.perf_counter() - t0) * 1e3)
     times.sort()
-    return times[len(times) // 2]
+    return times[(len(times) - 1) // 2]
 
 
 def _peak_vram_mb(device) -> float | None:
@@ -58,7 +58,7 @@ def _throughput(module, spec, input_size, device) -> float | None:
     """Largest batch that fits (exponential search) -> volumes/sec, fwd-only no_grad."""
     if device.type != "cuda":
         with torch.no_grad():
-            x = torch.zeros(1, spec.in_ch, input_size, input_size, input_size)
+            x = torch.zeros(1, spec.in_ch, input_size, input_size, input_size, device=device)
             t0 = time.perf_counter(); module(*make_inputs(spec, x)); dt = time.perf_counter() - t0
         return 1.0 / dt if dt > 0 else None
     best_b, bs = None, 1

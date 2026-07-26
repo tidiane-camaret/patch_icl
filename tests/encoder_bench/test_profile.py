@@ -1,4 +1,3 @@
-import math
 import torch
 from encoder_bench import registry as R
 from encoder_bench import profile as P
