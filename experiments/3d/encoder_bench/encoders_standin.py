@@ -88,10 +88,15 @@ class _SSM3D(nn.Module):
 def _selective_scan(u, delta, A, B, C):
     try:
         from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    except Exception:
+        return _ref_scan(u, delta, A, B, C)          # kernel absent: expected fallback
+    try:
         return selective_scan_fn(u.contiguous(), delta.contiguous(),
                                  A.contiguous(), B.contiguous(), C.contiguous(),
                                  None, None, None, False)
-    except Exception:
+    except Exception as e:                            # kernel present but failed: surface it
+        import warnings
+        warnings.warn(f"mamba_ssm selective_scan_fn failed ({e}); using slow reference scan")
         return _ref_scan(u, delta, A, B, C)
 
 

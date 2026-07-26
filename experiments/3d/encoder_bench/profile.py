@@ -1,5 +1,7 @@
 """Device-aware measurement of one (encoder, input_size) point."""
+import sys
 import time
+import traceback
 
 import torch
 
@@ -35,8 +37,9 @@ def _time_fwd_bwd(module, inputs, device, n_warmup, n_timed) -> float:
         for p in module.parameters():
             p.grad = None
         out = module(*inputs)
-        t = out[0] if isinstance(out, (list, tuple)) else out
-        t.float().sum().backward()
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        loss = sum(o.float().sum() for o in outs)
+        loss.backward()
     for _ in range(n_warmup):
         one(); _sync(device)
     times = []
@@ -108,6 +111,8 @@ def profile_point(spec: EncoderSpec, input_size: int, device, module=None,
         if device.type == "cuda":
             torch.cuda.empty_cache()
     except Exception as e:
+        print(f"  WARN profile error {spec.name}@{input_size}: {e}", file=sys.stderr)
+        traceback.print_exc()
         row["status"] = f"error:{type(e).__name__}"
         if device.type == "cuda":
             torch.cuda.empty_cache()

@@ -37,7 +37,9 @@ def list_encoders() -> list[str]:
 def make_inputs(spec: EncoderSpec, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
     if spec.call == "img_mask":
         return (x, torch.zeros_like(x))
-    return (x,)
+    if spec.call == "single":
+        return (x,)
+    raise ValueError(f"unknown call convention: {spec.call!r}")
 
 
 # --- trivial, weights-free encoders ---------------------------------------
