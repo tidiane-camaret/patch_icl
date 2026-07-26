@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from encoder_bench import registry as R
-from encoder_bench import profile as P
+from encoder_bench import profiling as P
 
 
 class _BoomModule(nn.Module):

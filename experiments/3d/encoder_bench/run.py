@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "experiments" / "3d"))
 
 from encoder_bench import registry as R                     # noqa: E402
-from encoder_bench.profile import profile_point             # noqa: E402
+from encoder_bench.profiling import profile_point           # noqa: E402
 from encoder_bench.optimize import apply_optimization       # noqa: E402
 
 _FIELDS = ["encoder", "family", "input_size", "params", "gflops",

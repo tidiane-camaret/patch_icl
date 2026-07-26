@@ -91,9 +91,13 @@ def _selective_scan(u, delta, A, B, C):
     except Exception:
         return _ref_scan(u, delta, A, B, C)          # kernel absent: expected fallback
     try:
-        return selective_scan_fn(u.contiguous(), delta.contiguous(),
-                                 A.contiguous(), B.contiguous(), C.contiguous(),
-                                 None, None, None, False)
+        # The CUDA kernel isn't autocast-aware: it requires u/delta/B/C to share one
+        # floating dtype and A to be fp32. Under bf16 autocast the inputs arrive mixed,
+        # so coerce them here (a no-op outside autocast).
+        dt = u.dtype
+        return selective_scan_fn(u.contiguous(), delta.to(dt).contiguous(),
+                                 A.float().contiguous(), B.to(dt).contiguous(),
+                                 C.to(dt).contiguous(), None, None, None, False)
     except Exception as e:                            # kernel present but failed: surface it
         import warnings
         warnings.warn(f"mamba_ssm selective_scan_fn failed ({e}); using slow reference scan")
