@@ -69,14 +69,14 @@ _OPT_CNN = {"autocast": "bf16", "channels_last": True, "compile": "reduce-overhe
 
 
 def _stunet():
-    """Build STU-Net-Base encoder (4 stages) with no pretrained weights.
+    """Build STU-Net-Base encoder (full depth) with no pretrained weights.
 
-    num_stages=4 → 8× downsampling, compatible with 32³ test inputs.
-    Default 6 stages would reduce 32³ to 1³, hitting InstanceNorm's spatial
-    size constraint.
+    Full-depth STU-Net-B has stride-32 total; inputs must be divisible by 32.
+    Inputs too small (e.g. 32³ → 1³ bottleneck) will hit InstanceNorm errors
+    and are recorded as honest error rows by the profiler.
     """
     from src.models.encoders.stunet import STUNetEncoder
-    return STUNetEncoder(in_channels=1, variant="base", pretrained=None, num_stages=4)
+    return STUNetEncoder(in_channels=1, variant="base", pretrained=None)
 
 
 def _vocomni_swin():
@@ -109,7 +109,8 @@ def _threedino():
     return ThreeDINOEncoder(ckpt_path=ckpt)
 
 
-register(EncoderSpec("stunet", "cnn", _stunet, call="img_mask", opt_profile=_OPT_CNN))
+register(EncoderSpec("stunet", "cnn", _stunet, call="img_mask",
+                     size_multiple=32, opt_profile=_OPT_CNN))
 register(EncoderSpec("vocomni_swin", "transformer", _vocomni_swin, call="single",
                      size_multiple=32, opt_profile={"autocast": "bf16"}))
 register(EncoderSpec("vocomni_nnunet", "cnn", _vocomni_nnunet, call="img_mask",

@@ -107,4 +107,8 @@ def profile_point(spec: EncoderSpec, input_size: int, device, module=None,
         row["status"] = "oom"
         if device.type == "cuda":
             torch.cuda.empty_cache()
+    except Exception as e:
+        row["status"] = f"error:{type(e).__name__}"
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     return row

@@ -1,6 +1,26 @@
 import torch
+import torch.nn as nn
 from encoder_bench import registry as R
 from encoder_bench import profile as P
+
+
+class _BoomModule(nn.Module):
+    """Minimal module whose forward always raises RuntimeError."""
+
+    def forward(self, x):
+        raise RuntimeError("boom")
+
+
+def test_profile_point_error_path():
+    """Graceful error row when forward raises a non-OOM exception."""
+    spec = R.EncoderSpec(
+        name="boom", family="cnn",
+        factory=_BoomModule, call="single",
+    )
+    row = P.profile_point(spec, input_size=16, device=torch.device("cpu"),
+                          n_warmup=1, n_timed=2)
+    assert row["status"] == "error:RuntimeError"
+    assert row["fwd_bwd_ms"] is None
 
 
 def test_profile_point_cpu_conv():
