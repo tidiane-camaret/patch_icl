@@ -1,5 +1,5 @@
 """Encoder registry: name -> build recipe + uniform call convention for the bench."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -18,7 +18,7 @@ class EncoderSpec:
     in_ch: int = 1
     size_multiple: int = 1            # input D=H=W must be divisible by this
     requires_ckpt: bool = False
-    opt_profile: dict = field(default_factory=dict)
+    opt_profile: dict | None = None
 
 
 REGISTRY: dict[str, EncoderSpec] = {}
