@@ -147,6 +147,7 @@ def build_dataset(cfg, split: str):
         p_synth=(d.p_synth if is_train else 0.0),
         class_balanced=d.class_balanced,
         use_crop=d.use_crop,
+        crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
         random_coloring=d.get("random_coloring", False),
         num_labels_per_sample=d.get("num_labels_per_sample", 1),
         n_synth_merge_min=d.get("n_synth_merge_min", 1),
@@ -220,6 +221,7 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
         p_synth=0.0,
         class_balanced=False,
         use_crop=d.use_crop,
+        crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
         # Deterministic per-item context shuffle + crop jitter (reproducible across
         # models/workers/order); see TotalSegInContextDataset.eval_seed.
         eval_seed=int(e.get("seed", 0)),

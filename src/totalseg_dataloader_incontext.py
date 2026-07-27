@@ -207,6 +207,7 @@ class TotalSegInContextDataset(Dataset):
         class_balanced: bool = False,
         use_crop: bool = False,
         crop_jitter: Optional[int] = None,
+        crop_spacing_mm: float = 1.5,
         random_coloring: bool = False,
         num_labels_per_sample: int = 1,
         n_synth_merge_min: int = 1,
@@ -242,6 +243,9 @@ class TotalSegInContextDataset(Dataset):
         self.crop_jitter = crop_jitter if crop_jitter is not None else (
             image_size[0] // 4 if image_size is not None else 0
         )
+        # Output mm/voxel of use_crop=True crops: crop covers T*crop_spacing_mm and is
+        # resampled to T³. Default 1.5 (native CT). Set 2.0 to match CoLiPri's 2mm training.
+        self.crop_spacing_mm = crop_spacing_mm
         self.hu_jitter = (
             getattr(aug_cfg.intensity, "hu_jitter", 0)
             if aug_cfg is not None and aug_cfg.enabled
@@ -889,7 +893,7 @@ class TotalSegInContextDataset(Dataset):
         # Using a fixed extent gives identical effective spacing (1.5mm/voxel) across
         # all subjects and modalities after the crop is resampled to T³.
         sp = self._get_spacing(subj).tolist()   # native mm/voxel (3,)
-        phys_ref = T * 1.5
+        phys_ref = T * self.crop_spacing_mm
         crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
                       for spi, dim in zip(sp, (D, H, W))]
 
@@ -939,7 +943,7 @@ class TotalSegInContextDataset(Dataset):
         cd, ch, cw = center if center is not None else (D // 2, H // 2, W // 2)
 
         sp = self._get_spacing(subj).tolist()
-        phys_ref = T * 1.5
+        phys_ref = T * self.crop_spacing_mm
         crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
                       for spi, dim in zip(sp, (D, H, W))]
 
