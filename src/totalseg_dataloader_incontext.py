@@ -33,6 +33,7 @@ import random
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -49,6 +50,28 @@ from src.totalseg_dataset import (
     _resize_volume,
 )
 from src.augmentations import apply_task_aug, apply_intensity_aug, apply_synth_aug
+
+
+def _to_ns(obj):
+    """Recursively convert a DictConfig/dict aug config to nested SimpleNamespace.
+
+    Per-item augmentation reads dozens of cfg fields; omegaconf's __getattr__ (validation
+    + interpolation resolution) cost ~30% of __getitem__ wall time in the DataLoader hot
+    path. Converting once at dataset init makes those plain-Python attribute lookups.
+    Lists stay lists (indexing/unpacking preserved); leaves pass through. getattr(ns, k,
+    default) still works for the optional fields the aug fns probe.
+    """
+    try:
+        from omegaconf import OmegaConf, DictConfig, ListConfig
+        if isinstance(obj, (DictConfig, ListConfig)):
+            obj = OmegaConf.to_container(obj, resolve=True)
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return SimpleNamespace(**{k: _to_ns(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_to_ns(v) for v in obj]
+    return obj
 
 # Inverse map: orig label index → class name (covers all 117 classes)
 _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
@@ -185,6 +208,10 @@ class TotalSegInContextDataset(Dataset):
             if image_size is not None else None
         )
         self.context_size = context_size
+        # Convert omegaconf -> plain nested namespace ONCE (per-item aug reads many fields;
+        # omegaconf __getattr__ is ~30% of __getitem__ in the hot path). See _to_ns.
+        if aug_cfg is not None:
+            aug_cfg = _to_ns(aug_cfg)
         self.aug_cfg = aug_cfg  # None → no augmentation
         self.synth_method = synth_method
         self.p_synth = p_synth
