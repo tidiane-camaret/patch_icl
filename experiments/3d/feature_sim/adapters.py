@@ -3,13 +3,17 @@
 
 EncoderAdapter maps volumes -> per-cell feature grids at an arbitrary resolution
 (dense) or trilinearly-sampled point features (native res). PatchSet3DEncoderAdapter
-wraps a loaded PatchSet3D. Future SAM/DINO adapters implement the same interface."""
+wraps a loaded PatchSet3D; PrimusEncoderAdapter wraps a frozen nnUNet Primus ViT
+(weights-pluggable — e.g. a CoLiPri backbone). Future SAM/DINO adapters implement the
+same interface."""
 from abc import ABC, abstractmethod
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.patchset3d import _down_to
+from src.totalseg_dataset import CT_MEAN, CT_STD
 
 
 class EncoderAdapter(ABC):
@@ -105,6 +109,20 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
             s = self.model.img_embed(s)
         return s
 
+    def cost_target(self, input_res):
+        """(module, example_inputs) for the encode-cost probe: the encoder stem+stages
+        forward on one 1-channel volume at the study input res — the exact path
+        features() drives, so cost compares like-for-like against other encoders."""
+        adapter = self
+        dev = next(self.enc.parameters()).device
+
+        class _EncodeFwd(nn.Module):
+            def forward(self, x):
+                return adapter._stage_feats(x)
+
+        x = torch.zeros(1, 1, input_res, input_res, input_res, device=dev)
+        return _EncodeFwd().to(dev), (x,)
+
     @torch.no_grad()
     def transformer_query(self, image, context_in, context_out):
         """Post-transformer query rep (B,N,e) via a decoder-input hook (res=R only)."""
@@ -180,3 +198,122 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
                 h.remove()
         n = self.model.thinking.n
         return [(name, x[:, s:, 0, :], x[:, n:s, 0, :]) for name, x, s in outs]
+
+
+# ---------------------------------------------------------------------------
+# Generic frozen Primus (nnUNet ViT) adapter — weights-pluggable.
+# CoLiPri's vision tower IS a stock nnUNet Primus, so its backbone weights load
+# here directly; weights=None gives an architecture-only (random-init) floor.
+# ---------------------------------------------------------------------------
+
+
+class PrimusEncoderAdapter(EncoderAdapter):
+    """Frozen nnUNet Primus ViT as a feature source for the similarity study.
+
+    Only the ViT encoder (`down_projection` -> `eva`) is run; the Primus segmentation
+    decoder (`up_projection`) is skipped. Dense features are the eva token grid
+    (B, embed_dim, g, g, g) at native token res g = input_shape // patch. Every input
+    volume is resampled to `input_shape` so the token grid is fixed (sidesteps rope
+    variable-size concerns and matches the pretraining input size).
+
+    preproc (optional): {"clip_min","clip_max","mean","std"} to map the loader's
+    z-scored HU back to raw HU and re-normalise the way the pretrained encoder expects.
+    None -> feed the loader's z-scored input unchanged (fine for the random-init floor).
+    """
+
+    def __init__(self, weights_path=None, primus_kwargs=None, preproc=None,
+                 device="cuda"):
+        from dynamic_network_architectures.architectures.primus import Primus
+        kw = dict(primus_kwargs or {})
+        self.input_shape = tuple(kw["input_shape"])
+        self.patch = tuple(kw["patch_embed_size"])
+        assert all(s % p == 0 for s, p in zip(self.input_shape, self.patch)), \
+            f"input_shape {self.input_shape} not divisible by patch {self.patch}"
+        self.primus = Primus(**kw).to(device).eval()
+        for p in self.primus.parameters():
+            p.requires_grad_(False)
+        if weights_path is not None:
+            sd = torch.load(weights_path, map_location=device)
+            sd = sd.get("model", sd) if isinstance(sd, dict) else sd
+            missing, unexpected = self.primus.load_state_dict(sd, strict=False)
+            if missing or unexpected:
+                print(f"[primus] load_state_dict: {len(missing)} missing, "
+                      f"{len(unexpected)} unexpected keys")
+        self.preproc = preproc
+        self.device = device
+        self._embed_dim = self.primus.embed_dim
+        self._g = self.input_shape[-1] // self.patch[-1]
+
+    # -- interface ---------------------------------------------------------
+    @property
+    def R(self):
+        return self._g                              # native token grid res
+
+    def tiers(self):
+        return ["backbone"]
+
+    def native_res(self, tier, input_res):
+        return self._g                              # fixed: inputs resampled to input_shape
+
+    # -- preprocessing + encode -------------------------------------------
+    def _preprocess(self, volumes):
+        """(B,1,D,H,W) loader z-scored HU -> resampled, encoder-normalised (B,1,*input_shape)."""
+        v = volumes.float()
+        if self.preproc is not None:
+            hu = v * CT_STD + CT_MEAN               # undo loader z-score -> ~HU
+            hu = hu.clamp(self.preproc["clip_min"], self.preproc["clip_max"])
+            v = (hu - self.preproc["mean"]) / self.preproc["std"]
+        if tuple(v.shape[-3:]) != self.input_shape:
+            v = F.interpolate(v, size=self.input_shape, mode="trilinear",
+                              align_corners=False)
+        return v
+
+    def _encode(self, x):
+        """Run the Primus ViT encoder only -> (B, embed_dim, g, g, g). x already preprocessed."""
+        p = self.primus
+        x = p.down_projection(x)                    # (B,C,W,H,D)
+        B, C, W, H, D = x.shape
+        x = x.flatten(2).transpose(1, 2)            # (B,N,C)
+        if p.register_tokens is not None:
+            x = torch.cat([p.register_tokens.expand(B, -1, -1), x], dim=1)
+        x, keep = p.eva(x)                           # keep is None when patch_drop_rate=0
+        assert keep is None, "patch dropping must be off for dense features"
+        if p.register_tokens is not None:
+            x = x[:, p.register_tokens.shape[1]:]
+        return x.transpose(1, 2).reshape(B, self._embed_dim, W, H, D)
+
+    def _autocast(self):
+        return torch.autocast("cuda", dtype=torch.bfloat16) if self.device == "cuda" \
+            else torch.autocast("cpu", dtype=torch.bfloat16)
+
+    @torch.no_grad()
+    def features(self, volumes, tier, res):
+        assert tier == "backbone", f"unknown tier {tier!r}"
+        x = self._preprocess(volumes.to(self.device))
+        with self._autocast():
+            f = self._encode(x)
+        return _down_to(f.float(), res)             # (B, embed_dim, res, res, res)
+
+    @torch.no_grad()
+    def sample_features(self, volumes, tier, coords):
+        """coords (B,N,3) normalized in (z,y,x) order -> (B,N,C)."""
+        assert tier == "backbone", f"unknown tier {tier!r}"
+        x = self._preprocess(volumes.to(self.device))
+        with self._autocast():
+            f = self._encode(x).float()
+        xyz = coords.to(self.device).flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)
+        s = F.grid_sample(f, xyz, mode="bilinear", align_corners=True)   # (B,C,N,1,1)
+        return s.squeeze(-1).squeeze(-1).transpose(1, 2)                 # (B,N,C)
+
+    # -- cost probe hook ---------------------------------------------------
+    def cost_target(self, input_res):
+        """(module, example_inputs) for the encode-cost probe: the ViT encoder forward
+        on one preprocessed volume at input_shape (native token grid)."""
+        adapter = self
+
+        class _EncodeFwd(nn.Module):
+            def forward(self, x):
+                return adapter._encode(x)
+
+        x = torch.zeros(1, 1, *self.input_shape, device=self.device)
+        return _EncodeFwd().to(self.device), (x,)

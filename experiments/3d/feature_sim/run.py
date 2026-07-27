@@ -21,7 +21,9 @@ sys.path.insert(0, str(ROOT / "experiments" / "3d"))      # common / eval / eval
 
 from common import DEVICE, make_eval_loader, _source_root          # noqa: E402
 from data.totalseg_classes import resolve_classes                  # noqa: E402
-from feature_sim.adapters import PatchSet3DEncoderAdapter          # noqa: E402
+from feature_sim.adapters import (                                 # noqa: E402
+    PatchSet3DEncoderAdapter, PrimusEncoderAdapter)
+from feature_sim.cost import measure_encode_cost                   # noqa: E402
 from feature_sim.labels import grid_labels, sample_points          # noqa: E402
 from feature_sim.metrics import (                                  # noqa: E402
     prototype_cosine, fg_match_margin, retrieval_at1, label_transfer)
@@ -65,6 +67,41 @@ def _load_patchset(cfg):
     return model.eval()
 
 
+def _primus_spec(cfg):
+    """Resolve (weights, primus_kwargs, preproc) for a Primus adapter from either an
+    extraction sidecar (eval.primus_sidecar) or inline config (eval.primus_kwargs)."""
+    import json
+    sidecar = cfg.eval.get("primus_sidecar")
+    if sidecar:
+        meta = json.load(open(sidecar))
+        pk, preproc = meta["primus_kwargs"], meta.get("preproc")
+        weights = cfg.eval.get("weights") or meta.get("weights")
+    else:
+        if not cfg.eval.get("primus_kwargs"):
+            raise ValueError("model=primus needs eval.primus_sidecar or eval.primus_kwargs")
+        pk = OmegaConf.to_container(cfg.eval.primus_kwargs, resolve=True)
+        preproc = (OmegaConf.to_container(cfg.eval.preproc, resolve=True)
+                   if cfg.eval.get("preproc") else None)
+        weights = cfg.eval.get("weights")
+    return weights, pk, preproc
+
+
+def build_adapter(cfg):
+    """Dispatch on cfg.eval.model -> (adapter, model_or_none).
+
+    model_or_none is the PatchSet3D used for real_dice (a segmenter); None for a generic
+    frozen encoder (Primus/CoLiPri), whose study reports intrinsic metrics only."""
+    which = cfg.eval.model
+    if which == "patchset3d":
+        m = _load_patchset(cfg)
+        return PatchSet3DEncoderAdapter(m), m
+    if which == "primus":
+        weights, pk, preproc = _primus_spec(cfg)
+        return PrimusEncoderAdapter(weights_path=weights, primus_kwargs=pk,
+                                    preproc=preproc, device=DEVICE.type), None
+    raise ValueError(f"unknown eval.model {which!r} (expected patchset3d | primus)")
+
+
 def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     """One task (single batch index already unbatched to B=1 tensors). Yields dict rows."""
     fs = cfg.feature_sim
@@ -75,11 +112,16 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     K = cin.shape[1]
     cls = item["label_names"][0]
     obj_vox = int((gt > 0).sum().item())
-    with torch.no_grad():
-        real = model.predict(image, cin, cout)   # cin already (1,K,1,D,H,W) -> (1,D,H,W)
-    inter = (real[0] * (gt.to(DEVICE) > 0)).sum().item()
-    den = real[0].sum().item() + (gt > 0).sum().item()
-    real_dice = (2 * inter) / den if den > 0 else 0.0
+    # real_dice needs a trained segmenter; a generic frozen encoder (model is None)
+    # reports intrinsic metrics only -> real_dice stays None (coupling analyses drop it).
+    if model is not None:
+        with torch.no_grad():
+            real = model.predict(image, cin, cout)   # cin (1,K,1,D,H,W) -> (1,D,H,W)
+        inter = (real[0] * (gt.to(DEVICE) > 0)).sum().item()
+        den = real[0].sum().item() + (gt > 0).sum().item()
+        real_dice = (2 * inter) / den if den > 0 else 0.0
+    else:
+        real_dice = None
 
     ctx_imgs = cin[0].squeeze(1)                  # (K,D,H,W)
     for p in plan:
@@ -299,17 +341,27 @@ def summarize_by_config(rows):
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.eval.seed)
     _, root, is_mri = _source_root(cfg)
-    if not cfg.eval.get("checkpoint"):
+    if cfg.eval.model == "patchset3d" and not cfg.eval.get("checkpoint"):
         raise ValueError("eval.checkpoint is required (path to a trained PatchSet3D best.pt)")
     val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
     loader = make_eval_loader(cfg, val_classes, split=cfg.eval.split)
-    model = _load_patchset(cfg)
-    adapter = PatchSet3DEncoderAdapter(model)
+    adapter, model = build_adapter(cfg)
     input_res = int(cfg.data.image_size[-1])
     tiers = list(cfg.feature_sim.tiers)
+    # Transformer probes are PatchSet3D-only; drop them for a generic encoder.
+    tf_tiers = {"transformer_q", "transformer_layers"}
+    if not hasattr(adapter, "transformer_pair_per_layer"):
+        dropped = [t for t in tiers if t in tf_tiers]
+        if dropped:
+            print(f"  adapter has no transformer probes; dropping tiers {dropped}")
+        tiers = [t for t in tiers if t not in tf_tiers]
     plan = plan_sweep(tiers, list(cfg.feature_sim.resolutions),
                       int(cfg.feature_sim.budget), adapter.R)
     gen = torch.Generator().manual_seed(cfg.eval.seed)
+
+    # Image-encoding cost (frozen forward): FLOPs / peak VRAM / it-s, once per run.
+    cost = measure_encode_cost(adapter, input_res, DEVICE)
+    print(f"  encode cost @ {input_res}^3: {cost}")
 
     # W&B: online when a project is configured, disabled otherwise (CSV still written).
     wb_on = bool(cfg.wandb.get("project"))
@@ -318,6 +370,9 @@ def main(cfg: DictConfig) -> None:
                config=OmegaConf.to_container(cfg, resolve=True))
 
     out_dir = Path(cfg.eval.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    cost_row = {"encoder": cfg.eval.model, "input_res": input_res, **cost}
+    with open(out_dir / "encode_cost.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(cost_row)); w.writeheader(); w.writerow(cost_row)
     csv_path = out_dir / "feature_sim.csv"
     all_rows, fields, n = [], None, 0
     with open(csv_path, "w", newline="") as fh:
@@ -338,6 +393,8 @@ def main(cfg: DictConfig) -> None:
                 print(f"  wrote {n} rows...")
     print(f"Done. {n} rows -> {csv_path}")
 
+    if wb_on:
+        wandb.log({f"encode_cost/{k}": v for k, v in cost.items() if v is not None})
     if wb_on and all_rows:
         # Per-(tier,res,mode,class) aggregated table (the full 130k per-task table is far
         # too large for wandb; the raw CSV above is the source of truth). Plus a scalar
