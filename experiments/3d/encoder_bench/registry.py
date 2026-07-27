@@ -81,9 +81,15 @@ def _stunet():
 
 
 def _vocomni_swin():
-    """Build VoComni SwinUNETR encoder with no checkpoint (random weights)."""
+    """Build VoComni SwinUNETR encoder with no checkpoint (random weights).
+
+    compile_model=False: the wrapper self-compiles by default, but that internal
+    torch.compile bypasses the harness's set_compiler_env() (broken bare-g++ -> can't
+    find <algorithm>). Let apply_optimization own optimization, like every other encoder.
+    """
     from src.models.encoders.vocomni import VoComniEncoder
-    return VoComniEncoder(ckpt_path=None, feature_size=48)
+    return VoComniEncoder(ckpt_path=None, feature_size=48, compile_model=False,
+                          freeze_encoder=False)
 
 
 def _vocomni_nnunet():
@@ -92,22 +98,33 @@ def _vocomni_nnunet():
     return VoComniNNUNetEncoder(ckpt_path=None, freeze_encoder=False, compile_model=False)
 
 
+# Default checkpoint locations on thor (override via NNINT_CKPT / THREEDINO_CKPT env vars).
+_NNINT_CKPT_DEFAULT = "/home/dpxuser/model_checkpoints/nnint/nnInteractive_v1.0"
+_THREEDINO_CKPT_DEFAULT = "/home/dpxuser/model_checkpoints/3DINO/3dino_vit_weights.pth"
+
+
 def _nninteractive():
-    """Build NNInteractive encoder; raises if NNINT_CKPT env var is unset."""
+    """Build NNInteractive encoder (default ckpt on thor; override via NNINT_CKPT)."""
     from src.models.encoders.nninteractive import NNInteractiveEncoder
-    ckpt = os.environ.get("NNINT_CKPT")
+    ckpt = os.environ.get("NNINT_CKPT", _NNINT_CKPT_DEFAULT)
     if not ckpt:
         raise FileNotFoundError("NNINT_CKPT not set")
-    return NNInteractiveEncoder(ckpt_dir=ckpt, num_stages=6, device="cpu")
+    # freeze_encoder=False so the fwd+bwd timing has a real backward graph (matches
+    # the other trainable zoo factories); the bench measures training compute, not a
+    # frozen-feature use case.
+    return NNInteractiveEncoder(ckpt_dir=ckpt, num_stages=6,
+                                freeze_encoder=False, device="cpu")
 
 
 def _threedino():
-    """Build ThreeDINO encoder; raises if THREEDINO_CKPT env var is unset."""
+    """Build ThreeDINO encoder (default ckpt on thor; override via THREEDINO_CKPT)."""
     from src.models.encoders.threedino import ThreeDINOEncoder
-    ckpt = os.environ.get("THREEDINO_CKPT")
+    ckpt = os.environ.get("THREEDINO_CKPT", _THREEDINO_CKPT_DEFAULT)
     if not ckpt:
         raise FileNotFoundError("THREEDINO_CKPT not set")
-    return ThreeDINOEncoder(ckpt_path=ckpt)
+    # freeze_encoder=False so fwd+bwd timing has a real backward graph (same reason as
+    # nninteractive): the bench measures training compute, not frozen-feature extraction.
+    return ThreeDINOEncoder(ckpt_path=ckpt, freeze_encoder=False)
 
 
 register(EncoderSpec("stunet", "cnn", _stunet, call="img_mask",

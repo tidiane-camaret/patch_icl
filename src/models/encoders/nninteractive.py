@@ -83,11 +83,12 @@ def _load_encoder(ckpt_dir: str | Path, device: str = "cpu") -> nn.Module:
     plans_mgr  = PlansManager(plans)
     config_mgr = plans_mgr.get_configuration("3d_fullres_ps192")
 
-    # num_input_channels=1 (CT image); the stub adds +7 interaction channels internally.
-    # num_output_channels=2 (BG + FG).
+    # num_input_channels=8: 1 CT image + 7 interaction slots. The stub does NOT add the
+    # interaction channels itself (it passes num_input_channels straight through), so the
+    # pretrained stem is 8-channel and must be built as such. num_output_channels=2 (BG+FG).
     network = nnInteractiveTrainer_stub.build_network_architecture(
         plans_mgr, config_mgr,
-        num_input_channels=1, num_output_channels=2,
+        num_input_channels=8, num_output_channels=2,
         enable_deep_supervision=False,
     )
     network.load_state_dict(ckpt["network_weights"])

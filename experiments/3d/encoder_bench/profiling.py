@@ -17,6 +17,9 @@ def count_gflops(module, inputs) -> float | None:
         from fvcore.nn import FlopCountAnalysis
     except Exception:
         return None
+    # fvcore's tracer can't trace a torch.compile OptimizedModule -> unwrap to the eager
+    # module (shared weights, identical FLOPs) so compiled encoders still get a FLOP count.
+    module = getattr(module, "_orig_mod", module)
     try:
         flops = FlopCountAnalysis(module, inputs)
         flops.unsupported_ops_warnings(False)
