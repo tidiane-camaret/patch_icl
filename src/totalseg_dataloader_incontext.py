@@ -73,6 +73,19 @@ def _to_ns(obj):
         return [_to_ns(v) for v in obj]
     return obj
 
+
+def _lazy_shuffle(rng, x):
+    """Yield the elements of list `x` in uniformly-random order, doing only O(k) RNG
+    work to produce the first k (forward Fisher-Yates). Consuming all of it is a full
+    permutation; stopping early (the common case: take context_size of ~1000 candidates)
+    avoids the O(len(x)) cost of rng.shuffle. Mutates `x` in place (caller passes a
+    throwaway list). `rng` is `random` or a seeded random.Random (eval determinism kept)."""
+    n = len(x)
+    for i in range(n):
+        j = rng.randrange(i, n)
+        x[i], x[j] = x[j], x[i]
+        yield x[i]
+
 # Inverse map: orig label index → class name (covers all 117 classes)
 _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
 
@@ -788,10 +801,14 @@ class TotalSegInContextDataset(Dataset):
             load_ctx = lambda s: self._load(s, cls)
 
         # --- Context sampling ----------------------------------------------
-        self._cur_rng.shuffle(candidates)
+        # Draw candidates in uniformly-random order but lazily: shuffling the whole
+        # pool (often ~all subjects with the class) just to take context_size of them
+        # was the top per-item RNG cost. _lazy_shuffle does O(consumed) work while still
+        # able to walk every candidate if context loads fail. (Distribution identical to
+        # shuffle-then-take; the exact per-seed picks differ from the old full-shuffle.)
         context_in:  list[torch.Tensor] = []
         context_out: list[torch.Tensor] = []
-        for ctx_subj in candidates:
+        for ctx_subj in _lazy_shuffle(self._cur_rng, candidates):
             if len(context_in) >= self.context_size:
                 break
             try:
