@@ -1,5 +1,27 @@
 # Change log
 
+## Frozen CoLiPri encoder training path (2026-07-28)
+
+Validated end-to-end frozen-CoLiPri-encoder training via `model=patchset3d_colipri`
+(smoke + unit test + regression, all pass). Key facts:
+
+- **Config:** `experiments/3d/train.py model=patchset3d_colipri data.image_size=[192,192,192]
+  data.use_crop=true` — `arch.encoder=primus`, `arch.encoder_frozen=true`,
+  `arch.primus_sidecar=results/checkpoints/primus_colipri.json`, `arch.resolution=24`.
+- **Run at 1.5mm crop** (default `data.crop_spacing_mm=1.5`; 192 vox × 1.5mm = 288mm FOV,
+  24³ ViT tokens = 12mm/token). Use `crop_spacing_mm=2.0` to match CoLiPri's native 2mm
+  training resolution.
+- **Frozen head-only training:** encoder weights frozen (`requires_grad=False`),
+  trainable params = **4.7M** (img/mask embed + pos + transformer + decoder; full CoLiPri
+  ~300M frozen). Optimizer auto-excludes frozen params via `requires_grad`.
+- **Step cost ≈ CoLiPri forward × (K+1) volumes** (K contexts + 1 target) per training step
+  at `arch.compile=false`; expected ~0.39 vol/s × 2 vol/step ≈ 5s/step @192³. With compile
+  on (`arch.compile=true`, the config default) expect a modest speedup on the head forward.
+- Smoke: `[PrimusEncoder] loaded weights: 10 missing (up_projection decoder, unused), 0
+  unexpected`; train bar advances, loss finite, run completes. Frozen-grad unit test:
+  `encoder got grad: False | head got grad: True | trainable 4.7M`. Conv regression:
+  ConvEncoder3D path unchanged (no PrimusEncoder message, 4.7M trainable, completes).
+
 ## Encoder feature-similarity study (2026-07-25)
 
 Added `experiments/3d/feature_sim/` — transformer-free target<->context matching metrics
