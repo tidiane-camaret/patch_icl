@@ -430,7 +430,7 @@ def main(cfg: DictConfig) -> None:
         print(f"Muon on {len(muon_params)} transformer matrices + AdamW on {len(adam_params)} "
               f"other tensors, LAWA k={cfg.train.get('lawa_k', 10)}")
     else:
-        optimizer = build_optimizer(cfg, net.parameters())
+        optimizer = build_optimizer(cfg, (p for p in net.parameters() if p.requires_grad))
         optimizers = [optimizer]
     steps = max(1, len(loader))
     scheduler, step_per_batch = build_scheduler(cfg, optimizer, cfg.train.epochs * steps, steps)

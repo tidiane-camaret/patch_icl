@@ -22,7 +22,8 @@ class PrimusEncoder(nn.Module):
     def __init__(self, sidecar_path, resolution, frozen=True, device="cuda"):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
-        meta = json.load(open(sidecar_path))
+        with open(sidecar_path) as f:
+            meta = json.load(f)
         kw = dict(meta["primus_kwargs"])
         self.input_shape = tuple(kw["input_shape"])
         self.preproc = meta.get("preproc")
@@ -32,7 +33,7 @@ class PrimusEncoder(nn.Module):
         self.primus = Primus(**kw)
         weights = meta.get("weights")
         if weights:
-            sd = torch.load(weights, map_location="cpu")
+            sd = torch.load(weights, map_location="cpu", weights_only=False)
             sd = sd.get("model", sd) if isinstance(sd, dict) else sd
             missing, unexpected = self.primus.load_state_dict(sd, strict=False)
             print(f"[PrimusEncoder] loaded weights: {len(missing)} missing "
