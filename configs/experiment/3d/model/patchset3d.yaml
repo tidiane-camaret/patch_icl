@@ -10,6 +10,9 @@
 model: patchset3d
 
 arch:
+  encoder: conv                # conv (ConvEncoder3D, trainable) | primus (frozen CoLiPri ViT)
+  encoder_frozen: true         # only used when encoder=primus
+  primus_sidecar: null         # required when encoder=primus: results/checkpoints/primus_colipri.json
   resolution: 16               # token grid R (prediction at R³, tiled to (R·d)³)
   enc_dims: [32, 32, 32, 32]   # 3D per-stage widths; stem + 3 stride-2 stages (len=log2(128/16)+1)
   e: 256
