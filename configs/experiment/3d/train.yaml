@@ -21,7 +21,14 @@ train:
   seed: 42
   eval_every: 1
   grad_clip: 1.0
-  checkpoint: null              # resume/warm-start fine-tuned weights
+  # Per-layer feature-matching trace at eval (patchset3d only): logs val/transfer_dice/{encoder,L0..}
+  # + val/retrieval/* at res=R, tracing encoder(pre-attention)->transformer co-evolution. One hooked
+  # forward per task over feature_sim_n_tasks val tasks. 0 = off; e.g. 5 = every 5 epochs.
+  feature_sim_every: 0
+  feature_sim_n_tasks: 128
+  # train.checkpoint is the weight-source knob; its default is per-model (set in
+  # model/*.yaml so it survives composition). medverse: orig_weights | random | <path>.
+  # patchset3d: null=fresh | <path>=resume.
   out_dir: ${paths.results}/3d_train
 eval:                           # per-class validation during training
   split: val

@@ -1,0 +1,34 @@
+# @package _global_
+# anchor_synth3d: synthetic objects drawn at a position defined by a barycentric
+# combination of 4 landmark anchor organs, on real TotalSegmentator CT backgrounds.
+# Composed as `dataset=anchor_synth3d`. Rides the pre-resized fast path (ct_/label_ npy).
+data:
+  source: anchor_synth3d
+  image_size: [128, 128, 128]
+  context_size: 1
+
+anchor_synth:
+  object_source: blob        # blob (analytic) | organ (not implemented in v1)
+  shape: mix                 # blob | elongated | tubular | mix (mix samples all three)
+  n_objects: 1               # objects (labels) per task; position is barycentric over n_anchors landmarks
+  anchor_classes: []         # allowed anchor POOL: [] = all; or a list / "benchmark" / "not_benchmark"
+  n_anchors: 4               # landmark organs defining the barycentric frame
+  extrapolation: 0.3         # affine expansion around barycenter (0 = strictly inside hull)
+  weight_concentration: 1.0  # Dirichlet alpha for base weights (1 = uniform simplex)
+  max_select_tries: 20       # retries to find a co-occurring anchor set
+  object_size_frac_min: 0.3  # object side ~ U[min,max] * L (L = mean pairwise anchor dist)
+  object_size_frac_max: 0.8
+  object_size_min_vox: 6     # absolute voxel floor (guards empty/degenerate renders)
+  scale_jitter: 0.15         # per-scene multiplicative size jitter (K+1 consistency)
+  rotate_jitter: 12.0        # per-scene small rotation (deg)
+  contrast_delta: 0.15       # |object - local background| intensity (blends in)
+  edge_blur: 0.08            # soft-edge width (fraction of object radius)
+  # --- shape complexity ---
+  boundary_complexity: 0.3   # >0 = scipy SDF-noise roughening (heavier; hardens edges,
+                             #      fragments thin elongated/tubular shapes)
+  harmonic_amp: 0.5          # ellipsoid angular-bump amplitude (mild 3D lumpiness)
+  n_harmonics: 6             # number of angular bumps
+  eccentricity: 4.0          # elongation of the `elongated` shape
+  eval_subjects_per_task: 4
+  eval_seed_namespace: 0
+  epoch_length: 10000

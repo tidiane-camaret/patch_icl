@@ -34,6 +34,19 @@ _cache_root = os.path.join(tempfile.gettempdir(), f"{os.environ.get('USER', 'use
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "inductor"))
 
+# Broken-usr-merge nodes (thor, odin): /bin is a REAL dir (not a symlink to /usr/bin) and
+# comes first on PATH, so bare `gcc`/`g++` resolve to /bin/*, derive prefix `/`, and fail —
+# g++ omits its C++ headers (torch.compile/inductor dies on `#include <algorithm>`), gcc
+# can't find cc1 (Triton dies). Point CC/CXX at the absolute /usr/bin paths (prefix `/usr`)
+# so both work. No-op on usr-merged nodes. Must precede `import torch` (Triton reads CC).
+import shutil as _shutil
+if not os.path.islink("/bin"):
+    for _var, _tool in (("CC", "gcc"), ("CXX", "g++")):
+        _abs = f"/usr/bin/{_tool}"
+        _found = _shutil.which(_tool)
+        if _var not in os.environ and _found and _found.startswith("/bin/") and os.path.exists(_abs):
+            os.environ[_var] = _abs
+
 import hydra
 import torch
 import torch.nn as nn
@@ -156,9 +169,11 @@ def build_model(cfg: DictConfig):
     if name == "medverse":
         from src.benchmark_models.medverse import MedverseModel
         mk = {"sw_roi_size": tuple(cfg.data.image_size)}  # val predict = single ROI
-        if cfg.train.get("base_ckpt"):
-            mk["ckpt_path"] = cfg.train.base_ckpt
-        if cfg.train.get("random_init"):
+        # Weight source is driven entirely by train.checkpoint (see main()'s loader):
+        #   "orig_weights" -> released Medverse.ckpt, "random" -> from scratch,
+        #   <path> -> our finetuned best.pt (built with released weights here, then
+        #   overridden by load_finetuned in main()).
+        if cfg.train.get("checkpoint") == "random":
             mk["random_init"] = True  # train from scratch (ignores pretrained weights)
         return MedverseModel(device=DEVICE, **mk), name
     if name == "patchset3d":
@@ -241,6 +256,45 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
 
 
 @torch.no_grad()
+def _feature_sim_trace(net, loader, n_tasks):
+    """Per-layer feature-matching trace on a val subsample (patchset3d only): transfer_dice
+    + retrieval_at1 at the transformer INPUT (encoder image features pre-attention, tag
+    'encoder') and after each block ('L{i}'), all at res=R. One hooked forward per task —
+    cheap on a subsample — traces how the jointly-trained encoder and transformer co-evolve.
+
+    Returns a list of per-task records {class, subject, fs_<name>_dice, fs_<name>_retr, ...}
+    keyed so main() can both average them (epoch curves) and merge them into the per-sample
+    val table by (class, subject)."""
+    from feature_sim.adapters import PatchSet3DEncoderAdapter
+    from feature_sim.metrics import label_transfer, retrieval_at1
+    from feature_sim.labels import grid_labels
+    adapter = PatchSet3DEncoderAdapter(net)
+    R, records, seen = adapter.R, [], 0
+    for batch in loader:
+        subjects = batch.get("subjects", [None] * batch["image"].shape[0])
+        names = batch["label_names"]
+        for b in range(batch["image"].shape[0]):
+            if seen >= n_tasks:
+                break
+            image = batch["image"][b:b + 1].to(DEVICE)
+            cin = batch["context_in"][b:b + 1].to(DEVICE)
+            cout = batch["context_out"][b:b + 1].to(DEVICE)
+            K = cin.shape[1]
+            tl = grid_labels(batch["label"][b], R, threshold=None).flatten().to(DEVICE)
+            cl = torch.stack([grid_labels(cout[0, k], R, threshold=None).flatten()
+                              for k in range(K)]).flatten().to(DEVICE)
+            rec = {"class": names[b], "subject": subjects[b]}
+            for name, tf, cf in adapter.transformer_trace(image, cin, cout):
+                rec[f"fs_{name}_dice"] = round(label_transfer(tf[0], tl, cf[0], cl)["transfer_dice"], 4)
+                rec[f"fs_{name}_retr"] = round(retrieval_at1(tf[0], tl, cf[0], cl), 4)
+            records.append(rec)
+            seen += 1
+        if seen >= n_tasks:
+            break
+    return records
+
+
+@torch.no_grad()
 def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     """Mean val Dice via the shared per-class eval loop (uses model.predict).
 
@@ -273,7 +327,11 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
-    if cfg.data.get("source", "totalseg") == "omnisynth3d":
+    if cfg.data.get("source") == "anchor_synth3d":
+        # anchor_synth3d groups val by object shape (each item's label_name = its shape).
+        from common import anchor_shapes
+        val_classes = anchor_shapes(cfg)
+    elif cfg.data.get("source", "totalseg") == "omnisynth3d":
         # omniSynth3D val classes come from the tile-cache pool (the label_names the
         # dataset emits), not label_stats.csv — mirrors eval.py's resolution.
         from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
@@ -288,6 +346,9 @@ def main(cfg: DictConfig) -> None:
     else:
         _, root, is_mri = _source_root(cfg)
         val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
+    # Set of class names the model trains on — fills the val sample table's `in_train` flag.
+    _, _troot, _is_mri = _source_root(cfg)
+    train_classes = set(resolve_classes(cfg.data.train_classes, _troot, is_mri=_is_mri))
     image_size = tuple(cfg.data.image_size)
     print(f"Device: {DEVICE} | model={cfg.get('model','medverse')} | size={image_size} "
           f"| K={cfg.data.context_size} | loss={cfg.train.get('loss','smooth_l1')} "
@@ -303,15 +364,19 @@ def main(cfg: DictConfig) -> None:
         net.to(DEVICE)
     print(f"Trainable params: {sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6:.1f}M")
 
-    if cfg.train.get("checkpoint"):
-        ckpt = torch.load(cfg.train.checkpoint, map_location=DEVICE, weights_only=False)
+    # train.checkpoint is the single weight-source knob. Sentinels ("orig_weights",
+    # "random") are handled at model construction (build_model); only an actual path
+    # loads weights here — our finetuned best.pt for medverse, a raw resume for patchset3d.
+    checkpoint = cfg.train.get("checkpoint")
+    if checkpoint and checkpoint not in ("orig_weights", "random"):
+        ckpt = torch.load(checkpoint, map_location=DEVICE, weights_only=False)
         sd = ckpt["model"] if "model" in ckpt else ckpt
         if is_patchset:
             # Strip the `_orig_mod.` prefix torch.compile may have left on saved keys.
             net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in sd.items()})
         else:
             model.load_finetuned(sd)
-        print(f"Resumed weights from {cfg.train.checkpoint}")
+        print(f"Resumed weights from {checkpoint}")
 
     # Compile only the transformer submodule (like experiments/2d/train.py): it is pure
     # tensor ops so it graph-compiles cleanly, whereas the conv encoder's adaptive_avg_pool3d
@@ -324,6 +389,20 @@ def main(cfg: DictConfig) -> None:
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
         print("Compiled net.transformer + Newton–Schulz (dynamic=True); conv encoder runs eager")
+
+    # Medverse perf knobs (medverse.grad_checkpoint / .compile — see model/medverse.yaml,
+    # benchmarked in experiments/3d/bench_arch.py). Applied AFTER weight load so names/keys
+    # match the checkpoint; gradient checkpointing keeps param names, compile adds an
+    # `_orig_mod.` prefix that the save path below already strips. At B=4 both together beat
+    # the eager baseline on time and memory.
+    if not is_patchset:
+        mcfg = cfg.get("medverse", {})
+        if mcfg.get("grad_checkpoint", False):
+            n_ck = model.enable_gradient_checkpointing()
+            print(f"Gradient checkpointing enabled on {n_ck} Medverse U-Net conv blocks")
+        if mcfg.get("compile", False):
+            model.compile_net()
+            print("Compiled the Medverse net (torch.compile); first batch will be slow")
 
     loss_fn = build_loss(cfg)
     # Optimizers (cf. experiments/2d/train.py): patchset3d trains its transformer 2D weight
@@ -359,9 +438,16 @@ def main(cfg: DictConfig) -> None:
     lawa_queue = collections.deque(maxlen=cfg.train.get("lawa_k", 10)) if use_muon else None
 
     wb_on = bool(cfg.wandb.get("project"))
+    # Config-group selections (dataset=, augmentations=, model=, cluster=, experiment=) are
+    # packaged `_global_`, so they merge into data:/paths:/... and leave no key of their own in
+    # cfg — only Hydra's runtime choices record which group was picked. Log them explicitly so
+    # e.g. `dataset` is visible in wandb (cf. the resolved cfg, which omits it).
+    from hydra.core.hydra_config import HydraConfig
+    wb_config = OmegaConf.to_container(cfg, resolve=True)
+    wb_config["hydra_choices"] = dict(HydraConfig.get().runtime.choices)
     run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
                      mode="online" if wb_on else "disabled",
-                     config=OmegaConf.to_container(cfg, resolve=True))
+                     config=wb_config)
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
     out_dir = Path(cfg.train.out_dir) / f"{datetime.date.today():%Y-%m-%d}_{run_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -400,8 +486,29 @@ def main(cfg: DictConfig) -> None:
                     vals = [r[mkey] for r in rows if mkey in r]
                     if vals:
                         log[f"val/{label}@{rd}"] = sum(vals) / len(vals)
+            fs_every = int(cfg.train.get("feature_sim_every", 0) or 0)
+            if is_patchset and fs_every and epoch % fs_every == 0:
+                # Encoder->per-layer correspondence trace (transfer_dice/retrieval at res=R),
+                # on a val subsample; see _feature_sim_trace. Log per-rep means as epoch curves
+                # AND attach the per-task values onto the matching val cases (by class+subject)
+                # so they land as columns in the per-sample table below.
+                records = _feature_sim_trace(net, val_loader,
+                                             int(cfg.train.get("feature_sim_n_tasks", 128)))
+                fs_keys = [k for k in (records[0] if records else {}) if k.startswith("fs_")]
+                for k in fs_keys:  # fs_<rep>_<dice|retr> -> val/<transfer_dice|retrieval>/<rep>
+                    vals = [r[k] for r in records if not math.isnan(r.get(k, float("nan")))]
+                    rep, metric = k[3:].rsplit("_", 1)
+                    label = "transfer_dice" if metric == "dice" else "retrieval"
+                    if vals:
+                        log[f"val/{label}/{rep}"] = sum(vals) / len(vals)
+                by_id = {(r["class"], r["subject"]): r for r in records}
+                for c in cases:  # merge per-sample fs_ values onto the matching case
+                    r = by_id.get((c["class"], c.get("subject")))
+                    if r:
+                        c.update({k: v for k, v in r.items() if k.startswith("fs_")})
             if wb_on:  # per-sample detail table (mirrors experiments/2d train.py's val/samples)
-                log["val/samples"] = build_sample_table(cases, epoch=epoch)
+                log["val/samples"] = build_sample_table(cases, epoch=epoch,
+                                                         train_classes=train_classes)
             if not step_per_batch:  # plateau: step on the val metric
                 scheduler.step(val_dice)
             tqdm.write(f"  [e{epoch}] loss={loss:.4f} train_dice={tr_dice:.4f} "
@@ -417,6 +524,10 @@ def main(cfg: DictConfig) -> None:
                     "image_size": list(image_size), "context_size": cfg.data.context_size,
                     "best_val_dice": best, "epoch": epoch,
                     "data": OmegaConf.to_container(cfg.data, resolve=True),
+                    # arch (patchset3d only): lets eval.py rebuild the exact architecture
+                    # from the checkpoint instead of re-supplying arch.* overrides.
+                    "arch": (OmegaConf.to_container(cfg.arch, resolve=True)
+                             if "arch" in cfg else None),
                 }, ckpt_path)
                 log["val/best_dice"] = best
             if saved is not None:   # restore raw training weights after LAWA-averaged eval

@@ -42,3 +42,4 @@ train:
   muon_momentum: 0.96
   muon_wd: 0.1
   lawa_k: 10                   # LAWA checkpoint-averaging buffer size
+  checkpoint: null             # null = fresh init | <path> = resume from a saved best.pt

@@ -1,5 +1,90 @@
 # Change log
 
+## Encoder feature-similarity study (2026-07-25)
+
+Added `experiments/3d/feature_sim/` — transformer-free target<->context matching metrics
+(prototype cosine -> AUROC/soft-Dice or AP; FG-match margin; top-1 retrieval), a
+PatchSet3D encoder adapter (per-stage / concat / img_embed / transformer_q tiers, dense
+`R'^3` grids + native-res point sampling), and a Hydra driver (`run.py`) that sweeps
+(tier x resolution) over the shared eval loader and writes a tidy `feature_sim.csv` with
+the model's real Dice per task. Spec:
+docs/superpowers/specs/2026-07-25-patchset3d-encoder-feature-similarity-design.md.
+SAM/DINO adapters and Dice-correlation analysis are phase 2.
+
+## 3d train: unified `train.checkpoint` weight-source knob
+
+Collapsed the three medverse weight-source knobs (`train.random_init`,
+`train.base_ckpt`, and the path-resume role of `train.checkpoint`) into a single
+`train.checkpoint` accepting: `orig_weights` (fine-tune from the released
+`Medverse.ckpt`, now the medverse default), `random` (train from scratch), or a
+`<path>` to our finetuned `best.pt` (warm-start via `load_finetuned`). `build_model`
+now only special-cases `checkpoint == "random"`; `main()` loads weights only for an
+actual path (sentinels are handled at construction). Patchset3d is unchanged
+(`null`=fresh / `<path>`=resume). Dropped `base_ckpt` (was `null` everywhere;
+`MEDVERSE_CKPT` remains a module constant). `MedverseModel`'s constructor API
+(`random_init`/`ckpt_path`) is untouched. Design:
+docs/superpowers/specs/2026-07-23-unified-train-checkpoint-design.md.
+
+## anchor_synth3d: barycentric multi-anchor positioning + frame-relative size
+
+Replaced the single-anchor offset placement (position `= centroid + offset·extent`,
+size `= frac·image`) with an affine-invariant scheme over **4 landmark organs**.
+Per item (subject-first): pick a target subject, choose 4 co-occurring anchor
+classes present in it (contexts drawn from their co-occurrence set, target
+excluded), draw shared **barycentric weights** (`Σwᵢ=1`, mildly affine via
+`extrapolation=0.3`) and a shared `size_frac`. Position `= Σ wᵢ·centroidᵢ`; object
+side `= size_frac · L` where `L` = mean pairwise centroid distance (orientation-
+invariant frame length). Because the weights and `size_frac` are shared across the
+K+1 scenes while `centroids`/`L` are per-subject, both the anatomical position and
+the apparent size (fraction of the anatomy) are consistent across target and
+contexts — fixing the orientation-dependent `extent` and the FOV-dependent absolute
+size. Anchors are landmarks only; label = the drawn object. Validation groups by
+object **shape** (`label_name`; `anchor_shapes(cfg)`). New geometry helpers in
+`draw.py` (`affine_weights`, `frame_length`, `barycentric_center`); `offset_to_center`
+removed. New knobs: `n_anchors`, `extrapolation`, `weight_concentration`,
+`max_select_tries`, `object_size_frac_min/max`, `object_size_min_vox` (replace
+`offset_range`/`object_size_min`/`object_size_max_frac`). Design + plan:
+docs/superpowers/specs/2026-07-22-anchor-synth3d-barycentric-positioning-design.md,
+docs/superpowers/plans/2026-07-23-anchor-synth3d-barycentric-positioning.md.
+Verification (val, real data): overall zero-rate **0.9%** (was ~11%); per-shape
+occupancy median blob≈1810, elongated≈780, tubular≈150 vox @128³. Apparent size is
+consistent by construction; residual within-task voxel-size CV≈0.14 is dominated by
+the intentional `scale_jitter` (±15%) — lower `scale_jitter` for tighter consistency.
+
+## anchor_synth3d: decouple object size from the anchor
+
+Object size was tied to the anchor (`size = scale_frac * mean(anchor extent)`), so
+small anchors (thin vessels, small glands) forced `size≈3` and produced empty /
+near-empty labels. Root-caused via an occupancy probe: 13% of train targets (6% val,
+no aug) had zero occupancy — from tubular shapes rendering below the `alpha>0.5`
+label threshold at small sizes, plus the new nearest-interp aug erasing sub-~50-voxel
+objects. Fix: the anchor now sets **position only**; object side is drawn
+independently `~U[object_size_min, object_size_max_frac·min(image_size)]` (default
+**20–51 vox** at 128³), shared across the K+1 scenes with per-scene `scale_jitter`.
+Removed `scale_frac`. Config knobs `object_size_min` / `object_size_max_frac` replace
+it (common.py, dataset3d.py, yaml, tests, plot/analyze captions updated). Also made
+`build_dataset` read `cfg.get("augmentations")` so minimal cfgs (wiring test) don't
+require the key. The resolved per-object shape (from `mix`) is recorded in the spec
+and item `meta["shapes"]` for per-shape analysis. Zero-rate went 13.0→0.4% (train),
+6.1→0.7% (val). Per-shape occupancy (median vox @128³): blob ~6000, elongated ~2500,
+tubular ~360 — tubes stay much smaller (thin caliber), so raise tube radius if more
+balance is wanted.
+
+## anchor_synth3d: apply the multiverseg augmentations
+
+`AnchorSynth3DICLDataset` fully overrides `__getitem__`, so the parent's aug hook
+never ran and `build_dataset` never passed `aug_cfg` for `anchor_synth3d` — the
+`augmentations: multiverseg` config was loaded but dead. Wired it through:
+`build_dataset` now forwards `aug_cfg=(cfg.augmentations if is_train else None)`,
+and the dataset applies shared geometric task aug over the K+1 scenes + independent
+per-volume intensity aug (mirroring the real-data path; mask nearest-interp keeps
+the int64 object ids). val/test remain un-augmented. Built-in per-scene
+scale/rotation jitter is unchanged. Verified: aug wired on train (None on val), and
+on a fixed deterministic scene the aug'd image/mask differ from the un-augmented one.
+`plot_dataset_items.py` builds through `build_dataset`, so `--split train` now shows
+augmented anchor_synth3d items; its caption gains a `+ aug` tag (was mislabelled "no
+task-aug").
+
 ## PatchSet3D: profile a train step + avg_pool3d resample optimization
 - Profiled one fwd+bwd step (B=1, K=1, 128³, R=16, full_attn, compiled transformer) on an
   A6000. GPU is already saturated (100% SM, ~memory-bandwidth bound). Breakdown of CUDA time:
@@ -2864,3 +2949,254 @@ must be retrained/resaved to be eval-loadable (`train.checkpoint` warm-start, 20
     Triton cache (`GLIBC_2.34 not found` from a cuda_utils.so built on a newer-GLIBC node).
 - `configs/experiment/3d/model/patchset3d.yaml`: added `arch.compile: true` and
   `train.{muon, muon_lr_scale, muon_momentum, muon_wd, lawa_k}`.
+
+## anchor_synth3d dataset
+
+Added `data.source=anchor_synth3d` (`dataset=anchor_synth3d`): pulls K+1 real CT
+scans that share an anchor organ and draws a synthetic blob at a consistent
+anchor-relative position (offset normalized to anchor extent, small per-scene
+scale/rotation jitter, contrast blended to local background). Anchor is a
+landmark only — the label is the drawn object(s). New package
+`src/datasets/anchor_synth/` (analytic shapes + placement); subclasses
+`TotalSegInContextDataset` for the scan cache + fast-path loading. v1 = blob
+objects only; organ objects and multi-anchor deferred. Spec:
+docs/superpowers/specs/2026-07-22-anchor-synth3d-design.md.
+
+## patchset3d eval support
+
+`experiments/3d/eval.py` can now evaluate a `model=patchset3d` checkpoint. Added
+a `patchset3d` branch to `_build_model` that reuses `train.build_model` to
+instantiate `PatchSet3D` (used directly as the eval model — it provides the
+`.predict` the shared eval loop needs) and loads the checkpoint's `model` state
+dict (`_orig_mod.` stripped). Architecture is rebuilt from the checkpoint's new
+`arch` field; `train.py` now stores `arch` (patchset3d only) alongside the state
+dict so eval no longer needs the `arch.*` overrides re-supplied. Older
+checkpoints without stored arch still work by passing `+model=patchset3d arch.l=...`.
+
+    python experiments/3d/eval.py eval.model=patchset3d \
+        eval.checkpoint=results/checkpoints/3d/<DATE>_<run>/best.pt \
+        dataset=omnisynth3d eval.split=val
+
+## 3D eval reproducibility fix (per-item RNG)
+
+`experiments/3d/eval.py` on the totalseg source was not reproducible across models:
+context selection (`random.shuffle(candidates)`) and organ-crop jitter
+(`random.randint`, crop_jitter=32, use_crop=true) drew from the process-global
+`random`. With `workers>0`, each worker's `random` is seeded by PyTorch as
+`base_seed + worker_id`, and `base_seed` comes from the main-process torch RNG at
+loader-spawn time — which is perturbed *differently by each model's construction*
+(PatchSet3D random init vs medverse pretrained load). Result: two runs saw
+different context (98.4% of samples) and different crops (50.3%), so paired
+medverse-vs-patchset comparisons were not on identical inputs.
+
+Fix: `TotalSegInContextDataset` gains `eval_seed`. When set, `__getitem__` seeds a
+per-item `random.Random(hash((eval_seed, idx)))` (`self._cur_rng`) and routes the
+context shuffle, pad-resample, multi-label extra-class shuffle, and crop jitter
+(`_load_crop`/`_load_crop_multi`) through it — fully reproducible regardless of
+worker count, iteration order, or model. `eval_seed=None` (training) keeps the
+global `random`, so training stochasticity is unchanged. `make_eval_loader` passes
+`eval_seed=cfg.eval.seed` (default 0), covering both the eval entrypoint and
+train-time per-class validation.
+
+## nb 20 (medverse vs patchset3d): all-TotalSeg-class support + per-class dice plot
+
+The new eval runs cover all TotalSegmentator labels (not the earlier 47-class
+subset), which broke `results/experiments/20_medverse_patchset3d_comp.py`:
+- The shape-taxonomy assert crashed with `'tuple' object has no attribute 'isna'`
+  (`D.shape` is the DataFrame `(rows, cols)` tuple, not the `shape` column). Fixed
+  the reference, then replaced the hard assert with a catch-all: unmapped classes
+  now fall into a new `"other"` shape family (added to `SHAPE_ORDER`) and are
+  printed, instead of failing.
+- Removed hardcoded `/47` class counts in cells 0b and 1 — derived from `len(...)`.
+- Added cell 1b (per-class dice analysis + plot): per-class mean dice for every
+  run; for a 2-run pair, a run-vs-run scatter coloured by shape (y=x reference)
+  plus a diverging bar of the largest per-class gaps; for >2 runs, per-class dice
+  sorted with one line per run. Generalises to any RUNS set.
+
+## nb 20: data-driven morphology taxonomy (clustered, auto-labelled)
+
+Replaced the hand-mapped 4-family SHAPE dict (compact/tubular/elongated/bone) with a
+data-driven taxonomy clustered from real-mask geometry. Two reusable helpers added to
+`results/experiments/totalseg_geometry_extract.py`:
+- `load_or_build_geometry(pairs, cache, ...)` — cache-or-rebuild per-(subject,class)
+  geometry; now shared by nb 20 cells 0 and 4 (single cache, no NFS double-read).
+- `shape_families(geom, k=10)` — Ward clustering (scipy, numpy-standardised, no sklearn)
+  on scale-invariant shape descriptors + thickness + fragmentation. Auto-labels each
+  cluster `{thick|mid|thin}_{blob|tube|sheet}` (+ `frag` for multi-component): thickness
+  tercile from surf/vol (primary axis, = the medverse<->patchset dice driver); the shape
+  tag is the Westin coord (linearity/planarity/sphericity) the cluster stands out on vs
+  other clusters (z-score argmax, so it isn't swamped by linearity being globally largest).
+
+Cell 0 now sets N_SHAPE=10 and derives SHAPE/SHAPE_ORDER at runtime; classes with no
+non-empty mask fall back to 'other'. Key finding: geometry does NOT support "bone" as a
+morphology family — bones scatter by actual shape (femur/humerus->thick blob, ribs->thin
+tube, vertebrae->mid sheet, flat bones->mid). k=10 has the best silhouette (0.331) in 8-13
+with no singletons; example families: thick_blob1 = liver/heart/brain/lungs/spleen/bladder,
+thin_tube* = ribs + arteries, mid_sheet = vertebrae.
+
+## nb 21: reusable single 3D training-run val breakdown (21_totalseg_seeds3d.py)
+
+New marimo notebook for the FINAL-epoch val/samples breakdown of one patch_icl_3d_exps run
+(default RUN = d7fk2k9h, patchset3d + seeds3d synth). General/uncluttered: RUN is the only
+knob (N_SHAPE tunes family granularity); class list + shape families are derived from the
+logged data, nothing hardcoded. Aggregate learning curves deliberately omitted (live in W&B).
+Reuses totalseg_geometry_extract.{load_or_build_geometry, shape_families} for morphology (same
+taxonomy as nb 20; here clustered on the evaluated pairs). Caches samples, config+summary, and
+geometry under artifacts/21_<id>_*.{csv,json}. Cells: (0) fetch+cache+cluster+header; (1)
+per-class val dice ranked bar coloured by shape family (+table); (2) per-shape family breakdown
+(macro/micro dice, complete-miss rate, median thickness); (3) per-sample dice vs geometry
+drivers (thickness, volume, target/context occupancy). Finding for d7fk2k9h: dice falls
+monotonically with thinness — thick_blob1 macro≈0.20 (miss 39%) → thin_tube≈0.005 (miss 87%);
+macro val/dice≈0.083, 11/47 classes complete-miss.
+
+## fix: log Hydra group choices to wandb (3D train/eval)
+
+`dataset=`, `augmentations=`, `model=`, `cluster=`, `experiment=` config files are all
+`# @package _global_`, so a group selection merges into `data:`/`paths:`/... and leaves no
+key of its own in the composed cfg. wandb logs `OmegaConf.to_container(cfg)`, so the *choice*
+(e.g. which dataset) was never recorded — only Hydra's `runtime.choices` holds it. Now log
+`HydraConfig.get().runtime.choices` under a `hydra_choices` key in both experiments/3d/train.py
+and eval.py, so dataset/augmentations/etc. are visible in wandb. (`model` was already visible
+only because model/*.yaml sets an explicit scalar `model:` key.)
+
+## bench: medverse vs patchset3d compute/memory profile (experiments/3d/bench_arch.py)
+
+Investigated why medverse costs ~190s/epoch + 36GB vs patchset3d 50s + 17GB under
+experiment=1_medverse_benchmark. Added experiments/3d/bench_arch.py: isolates *model*
+compute (no dataloader) at the real runtime shapes (B=1, K=1, 128^3), reproducing
+train_epoch's exact fwd/bwd call paths, with param-by-submodule + torch-profiler op
+breakdown. Ran on loki (RTX 6000 Ada 48GB, .venv_nero torch 2.12+cu130).
+
+Findings (B=1, K=1, 128^3):
+- Params: medverse 71.1M (context_unet 35M / target_decoder 20M / target_encoder 16M)
+  vs patchset3d 4.7M (transformer 4.0M / rest tiny). 15x.
+- fwd+bwd: 185ms vs 63ms (2.9x, matches the 190/50s epoch ratio -> genuine model
+  compute, not dataloader). fwd-only 72 vs 22ms.
+- Op profile (self CUDA): medverse is 3D-conv bound — convolution_backward 34% +
+  conv fwd 14%; plus avoidable overhead: nchwToNhwc layout transpose 11% and
+  aten::copy_/.to() 15% (the Medverse forward repeatedly `.to(device)`s already-on-
+  device tensors, cf. Medverse.py L113-118/133-138). patchset3d: flash-attn 16%,
+  group_norm, conv only 10%.
+- Root cause: medverse runs a native-res 3D U-Net triple (~370 conv3d over 128^3..16^3
+  multiscale); patchset3d downsamples each volume to a 16^3 grid (~21 convs) and does
+  in-context matching as a transformer over 16^3=4096 tokens. Conv cost scales with
+  voxel count (128^3 vs 16^3 = 512x/channel) -> dominant driver. Not primarily
+  inefficiency; a different compute regime.
+- VRAM reconciled at B=4 (both runs used B=4): reserved medverse 38.5GB (~reported 36),
+  patchset3d 18.3GB (~reported 17). Driver is activation memory x batch, NOT
+  cudnn.benchmark (no effect measured) nor eval (medverse predict B=8 only 3GB).
+  Isolated train peak_alloc: medverse 8.2G(B1)/15.3G(B2)/29.5G(B4); patchset3d
+  3.0/5.9/11.7G.
+
+Optimization levers for the medverse runs (time + VRAM):
+- gradient checkpointing on U-Net stages (biggest VRAM lever; ~2-3x less activation mem).
+- channels_last_3d memory format -> removes the nchwToNhwc transpose (~11%).
+- drop redundant `.to(device)` copies in the Medverse fork forward (~15% copy_).
+- torch.compile the medverse net (currently only patchset3d's transformer is compiled).
+
+## bench: medverse optimization prototypes (channels_last / ckpt / compile)
+
+Prototyped the medverse levers from the previous entry, applied *externally* (the NFS
+fork is untouched): gradient checkpointing via a non-reentrant `torch.utils.checkpoint`
+wrapper on every conv block of the 3 U-Nets (34 blocks), `channels_last_3d` on conv
+weights, and `torch.compile` on the whole net. Toggles + a variant runner added to
+experiments/3d/bench_arch.py (`--optims -B <n>`; `bench_medverse_variant`). loki RTX 6000 Ada.
+
+Results (fwd+bwd, K=1, 128^3, alloc/reserved GB):
+  B=1  baseline                178.6ms  8.20/9.50
+       channels_last           260.8ms  8.19/9.20   <- HURTS (+46% time)
+       gradient_checkpointing  235.8ms  3.93/5.27   (-52% alloc, +32% time)
+       compile                 161.3ms  8.10/8.85   (-10% time, free)
+       compile+ckpt            196.7ms  5.31/6.19
+  B=4  baseline               1040.8ms 29.54/38.65  (~matches reported 36G)
+       gradient_checkpointing 1279.2ms 13.45/21.41  (-54% alloc, +23% time)
+       compile+ckpt            858.6ms 18.23/24.90  <- WINNER: -17% time AND -38% alloc
+  B=8  gradient_checkpointing 2351.6ms 24.89/32.20  (B=8 now fits in <baseline-B=4 mem)
+
+Takeaways:
+- channels_last_3d is a LOSS here (my profile hypothesis was wrong) — forcing NHWC makes
+  cudnn pick slower kernels and the 6D context reshapes fight the format. Drop it.
+- gradient checkpointing = the memory lever: ~-50% activation mem for +23-32% time; lets
+  B double (B=4->B=8) within the same budget. Verified EXACT: fp32 loss bit-identical to
+  baseline; grad diff (9e-3) sits inside the baseline-vs-baseline conv-nondeterminism band
+  (6.8e-3), i.e. it's cudnn reduction-order noise, not a checkpoint error.
+- torch.compile the whole medverse net compiles cleanly (no fatal graph break) and, at the
+  real B=4, compile+ckpt is strictly better than baseline on BOTH time (-17%) and memory
+  (-38%). Recommended default for the medverse training runs. (compile costs a slow first
+  batch; amortized over an epoch.)
+Not yet wired into training — prototypes live in bench_arch.py; integrating as train.py /
+medverse-adapter flags is the follow-up.
+
+## feat: wire medverse compile + gradient-checkpointing into training
+
+Promoted the two winning prototypes from the bench entry above into the training path as
+config flags. `configs/experiment/3d/model/medverse.yaml` gains a `medverse:` block —
+`grad_checkpoint` (false) and `compile` (false). experiments/3d/train.py applies them after
+weight load (guarded `if not is_patchset`), mirroring the patchset3d compile block.
+Implementation lives in the adapter src/benchmark_models/medverse.py:
+- `enable_gradient_checkpointing()` — monkeypatches each U-Net conv block's `forward` with
+  non-reentrant `torch.utils.checkpoint` IN PLACE (no wrapper submodule), so param names —
+  and thus saved checkpoints — are unchanged; a no-op passthrough when grad is disabled so
+  `predict()`/eval are untouched. Returns #blocks wrapped (34).
+- `compile_net()` — `torch.compile(self.model.net)`; the `_orig_mod.` prefix it adds is
+  stripped by train.py's existing save logic.
+bench_arch.py now calls these adapter methods (drops its local `_Ckpt`) so the benchmark
+exercises shipping code; channels_last stays bench-only (measured a loss).
+
+Verified: (1) checkpointing grads exact — bit-identical fp32 loss, grad diff 9e-3 within the
+baseline-vs-baseline conv-nondeterminism band; param name set unchanged (169). (2) compile+ckpt
+runs together via the monkeypatch path (B=1 192ms / 5.3G, matches the wrapper prototype).
+(3) full save->load roundtrip with BOTH opts on: 172 keys, no `_orig_mod.`/`.mod.` leakage,
+reloads into a fresh eval model + predict() OK. (4) Hydra compose: medverse block defaults
+false, overrides work, patchset3d has no medverse key.
+
+Recommended run: `train.py experiment=1_medverse_benchmark medverse.compile=true
+medverse.grad_checkpoint=true` — at B=4 that's ~858ms/step vs 1041 eager (-17%) and ~18GB
+vs 30GB alloc (-38%).
+
+## Val sample table: `in_train` flag (2026-07-24)
+
+Added an `in_train` boolean column to the val/samples wandb table (experiments/3d).
+`build_sample_table` now takes an optional `train_classes` set and tags each row with
+`case["class"] in train_classes`. train.py resolves `cfg.data.train_classes` once (same
+call as common.py's loader) and passes it in. With the default benchmark/not_benchmark
+split the two class sets are disjoint, so val classes read False — meaningful only once
+train/val overlap. No source guards yet (anchor_synth3d/omnisynth3d val "classes" are
+shapes/tile-ids, so they currently read False across the board).
+
+## 2026-07-24 — thor toolchain fix for torch.compile (broken usr-merge)
+
+`medverse.compile=true` under `.venv_thor` failed with inductor `CppCompileError:
+fatal error: algorithm … nicht gefunden`. Root cause is NOT torch/code: thor (like
+odin) is not usr-merged — `/bin` is a real dir (not a symlink to `/usr/bin`) and
+precedes `/usr/bin` on PATH, so bare `g++`→`/bin/g++` derives install prefix `/` and
+looks for its C++ headers at the nonexistent `/include/c++/9`, silently dropping all
+libstdc++ dirs (C compiles; only C++ headers vanish). `/usr/bin/g++` (prefix `/usr`)
+compiles fine, and torch inductor honors `CXX` (verified `get_cpp_compiler()→/usr/bin/g++`
++ a real `torch.compile` inductor build).
+
+Fix: `experiments/3d/train.py` header now auto-sets `CC=/usr/bin/gcc CXX=/usr/bin/g++`
+when `/bin` is not a symlink and bare gcc/g++ resolve under `/bin/` (no-op on usr-merged
+nodes; skipped if CC/CXX already set). Set before `import torch` so Triton picks it up too.
+So `train.py experiment=1_medverse_benchmark medverse.compile=true` now works on thor with
+no manual export. Memory: feedback-python-env updated with the thor gotcha.
+
+## Feature-similarity run on real checkpoint (2026-07-25)
+
+Ran experiments/3d/feature_sim/run.py on the trained PatchSet3D (arch.l=2,
+2026-07-25_usual-puddle-174) over totalseg test (experiment=22_totalseg_train_test).
+Fixes surfaced by the real run (node thor, RTX A6000, .venv_thor cu121):
+- Device: metrics run on the features' device (GPU); retrieval/margin do large (n_fg x M)
+  matmuls that are far faster there. metrics.py helper tensors made device-aware.
+- Soft occupancy labels for dense mode (grid_labels threshold=None): at 16^3 a cell pools
+  8^3 voxels, so thin structures never reach the old 0.5 threshold -> dense@16 was ~100%
+  nan AUROC on the model's own operating resolution. Soft labels + soft_auroc/soft_dice
+  match the model's soft-Dice training; nan rate ~0%. Point mode (native res) stays exact 0/1.
+- wandb: logs a per-(task,tier,res) Table + mean auroc/margin/retrieval per (tier,res);
+  project defaults to patch_icl_feature_similarity.
+First observations (n<=4 smoke): dense@16 soft_auroc already high & discriminative
+(thin aorta ~0.92-0.99); point@64 auroc ~0.90-0.99. soft_dice is a min-max-normalized
+relative overlap proxy (cosine maps aren't calibrated); soft_auroc is the scale-free
+separability headline.
+
+- 2026-07-26: Added `experiments/3d/encoder_bench/` — compute/latency scaling benchmark for 3D encoders (7 zoo + Primus/SegMamba compute-only stand-ins). Sweeps encoder × input_size at best-optimized config (torch.compile/bf16/SDPA), writes CSV + log-y scaling-curve PNGs. Real full-depth architectures; sizes an encoder can't process yield honest `error:*`/skip rows. NOTE: SegMamba uses an O(L) pure-Python reference scan unless `mamba_ssm` is installed (absent on thor) — its latency at ≥64³ is not representative; install mamba_ssm for meaningful Mamba numbers. Run: `.venv_thor/bin/python experiments/3d/encoder_bench/run.py`.

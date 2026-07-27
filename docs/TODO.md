@@ -1,5 +1,37 @@
 # TODO
 
+## anchor_synth3d — follow-ups (from blend analysis, 2026-07-22)
+
+Spec/plan: `docs/superpowers/specs/2026-07-22-anchor-synth3d-design.md`,
+`docs/superpowers/plans/2026-07-22-anchor-synth3d.md`. Analysis tool:
+`experiments/3d/analyze_object_blend.py` (per-object local separability: Cohen's d +
+direction-agnostic intensity AUC obj-vs-shell).
+
+**Context.** CT is z-normalized (intensity range ≈ [-1.7, 3.4]), so `contrast_delta`
+is in **std units**. Δ sweep at scale_frac=0.4, offset_range=0.6:
+`0.05 → med local_auc 0.61 (82% blended)`, `0.15 → 0.70 (52% blended, 15% too-easy)`,
+`0.30 → 0.735 (38% blended, 30% too-easy)`. Default 0.15 is a good sweet spot.
+Two weaknesses are placement-driven, not contrast-driven:
+
+### Contrast relative to local std
+Set `Δ = k · shell_std` instead of a fixed value, so blending is consistent across
+regions and the "too-easy" tail (objects in uniform regions) shrinks. Caveat: in air
+(std≈0) the object goes invisible — floor the effective Δ or combine with the
+in-body constraint below.
+
+### Constrain placement to inside the body
+The too-easy tail is mostly objects pushed into **air / outside the body** by
+`offset_range`, where any Δ is trivially separable. Reject candidate centers whose
+local intensity ≈ air (below a background threshold), or clamp the offset to keep the
+object within the body mask, before compositing.
+
+### Minimum object-size floor
+`scale_frac · mean(anchor_extent)` yields 1-voxel objects on thin/small anchors
+(`obj_voxels` p10 ≈ 1). Add a minimum object size (voxels) so targets are never
+degenerate.
+
+---
+
 ## Label injection — notes from TabPFN comparison
 
 ### Current mechanism (patch_icl)

@@ -69,12 +69,17 @@ def _best_slice(img: torch.Tensor, mask: torch.Tensor):
     return img[z].numpy(), mask[z].numpy()
 
 
+def _raw_rgb(img_slice: np.ndarray) -> np.ndarray:
+    """Min-max normalise a 2-D slice to a [0,1] greyscale RGB image (no overlay)."""
+    lo, hi = img_slice.min(), img_slice.max()
+    img_n  = (img_slice - lo) / (hi - lo + 1e-8)
+    return np.stack([img_n] * 3, axis=-1)
+
+
 def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray,
              colours: dict[int, list[float]], alpha: float = 0.5) -> np.ndarray:
     """Blend a 2-D float image with a per-label colour overlay."""
-    lo, hi = img_slice.min(), img_slice.max()
-    img_n  = (img_slice - lo) / (hi - lo + 1e-8)
-    rgb    = np.stack([img_n] * 3, axis=-1)
+    rgb = _raw_rgb(img_slice)
     for lid, col in colours.items():
         fg = mask_slice == lid
         if fg.any():
@@ -89,8 +94,11 @@ def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray,
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--split",     default="train", choices=["train", "val", "test"])
-    parser.add_argument("--n_samples", type=int, default=4)
+    parser.add_argument("--n_samples", type=int, default=12)
     parser.add_argument("--out",       default="results/3d/dataset_items.png")
+    parser.add_argument("--separate_overlay", action="store_true",
+                        help="render each volume as a raw-scan column plus a separate "
+                             "mask-overlay column (to judge how much the object blends).")
     parser.add_argument("-h", "--help", action="store_true")
     args, hydra_overrides = parser.parse_known_args()
 
@@ -112,29 +120,41 @@ def main():
     batch = next(iter(loader))
     has_palette = "label_palette" in batch
 
-    # Layout: one column per volume (target + K contexts)
-    n_cols = 1 + K
-    col_w  = 2.4
+    # Layout: one column per volume (target + K contexts), or — with
+    # --separate_overlay — two columns per volume (raw scan, then mask overlay).
+    sep       = args.separate_overlay
+    per_vol   = 2 if sep else 1
+    vol_names = ["target"] + [f"ctx {k+1}" for k in range(K)]
+    n_cols    = per_vol * (1 + K)
+    col_w     = 2.4
     fig, axes = plt.subplots(N, n_cols, figsize=(col_w * n_cols, col_w * N),
                              squeeze=False)
 
-    for col, title in enumerate(["target"] + [f"ctx {k+1}" for k in range(K)]):
-        axes[0, col].set_title(title, fontsize=9, pad=4)
+    for v, name in enumerate(vol_names):
+        if sep:
+            axes[0, 2 * v].set_title(name, fontsize=9, pad=4)
+            axes[0, 2 * v + 1].set_title(f"{name} · seg", fontsize=9, pad=4)
+        else:
+            axes[0, v].set_title(name, fontsize=9, pad=4)
 
     for row in range(N):
         palette = batch["label_palette"][row].numpy() if has_palette else None
         colours = _label_colours(num_labels, palette)
 
-        img_sl, mask_sl = _best_slice(batch["image"][row], batch["label"][row])
-        axes[row, 0].imshow(_overlay(img_sl, mask_sl, colours))
+        vols = [(batch["image"][row], batch["label"][row])]
+        vols += [(batch["context_in"][row, k], batch["context_out"][row, k])
+                 for k in range(K)]
+
+        for v, (im, mk) in enumerate(vols):
+            img_sl, mask_sl = _best_slice(im, mk)
+            if sep:
+                axes[row, 2 * v].imshow(_raw_rgb(img_sl))               # scan only
+                axes[row, 2 * v + 1].imshow(_overlay(img_sl, mask_sl, colours))
+            else:
+                axes[row, v].imshow(_overlay(img_sl, mask_sl, colours))
+
         axes[row, 0].set_ylabel(f"{batch['subjects'][row]}\n{batch['label_names'][row]}",
                                 fontsize=7, rotation=0, labelpad=90, va="center")
-
-        for k in range(K):
-            img_sl, mask_sl = _best_slice(
-                batch["context_in"][row, k], batch["context_out"][row, k]
-            )
-            axes[row, 1 + k].imshow(_overlay(img_sl, mask_sl, colours))
 
     for ax in axes.flat:
         ax.set_xticks([]); ax.set_yticks([])
@@ -146,6 +166,17 @@ def main():
         s3 = cfg.synth3d
         extra = (f"  |  n_obj={s3.n_objects}  k={s3.k_min}-{s3.k_max}"
                  f"  mode={s3.target_mode}  bg={s3.background}")
+    elif source == "anchor_synth3d":
+        # anchor_synth3d draws synthetic objects at anchor-relative positions on real CT;
+        # scene knobs live in cfg.anchor_synth. On the train split build_dataset also
+        # forwards the multiverseg task+intensity aug (like the totalseg path), so the
+        # plotted items are augmented there.
+        a = cfg.anchor_synth
+        aug_on  = args.split == "train" and cfg.augmentations.enabled
+        aug_tag = " + aug" if aug_on else ""
+        extra = (f"  |  obj={a.object_source}/{a.shape}  n_obj={a.n_objects}"
+                 f"  anchors={a.n_anchors}  size_frac={a.object_size_frac_min}-"
+                 f"{a.object_size_frac_max}  Δ={a.contrast_delta}{aug_tag}")
     else:
         aug_on    = args.split == "train" and cfg.augmentations.enabled
         synth_on  = args.split == "train" and bool(cfg.data.synth_method)

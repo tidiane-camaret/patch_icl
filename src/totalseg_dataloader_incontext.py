@@ -175,6 +175,7 @@ class TotalSegInContextDataset(Dataset):
         num_labels_per_sample: int = 1,
         n_synth_merge_min: int = 1,
         n_synth_merge_max: int = 1,
+        eval_seed: Optional[int] = None,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -188,6 +189,13 @@ class TotalSegInContextDataset(Dataset):
         self.synth_method = synth_method
         self.p_synth = p_synth
         self.class_balanced = class_balanced
+        # Deterministic eval: when set, __getitem__ draws context shuffling + crop
+        # jitter from a per-item RNG seeded by (eval_seed, idx) instead of the global
+        # `random`, so results are reproducible regardless of worker count, iteration
+        # order, or the torch-RNG state left by model construction. None → training
+        # behaviour (global `random`, freely stochastic).
+        self.eval_seed = eval_seed
+        self._cur_rng = random   # per-item Random in __getitem__ when eval_seed is set
         self.use_crop = use_crop
         self.random_coloring = random_coloring
         self.num_labels_per_sample = num_labels_per_sample
@@ -710,6 +718,12 @@ class TotalSegInContextDataset(Dataset):
         return item
 
     def __getitem__(self, idx: int) -> dict:
+        # Deterministic eval draws every per-item random choice (context shuffle, crop
+        # jitter) from a Random seeded by (eval_seed, idx); training keeps the global
+        # `random` module. `_load`/`_load_crop` read self._cur_rng, so this covers the
+        # crop jitter too. hash() over a tuple of ints is stable across processes.
+        self._cur_rng = (random.Random(hash((self.eval_seed, idx)))
+                         if self.eval_seed is not None else random)
         if self._synth_subjects and random.random() < self.p_synth:
             return self._get_synth_item()
 
@@ -726,7 +740,7 @@ class TotalSegInContextDataset(Dataset):
             subj_classes = [c for c in self.active_classes
                             if subj in self.label_to_subjects[c]]
             extra = [c for c in subj_classes if c != primary_cls]
-            random.shuffle(extra)
+            self._cur_rng.shuffle(extra)
             selected = [primary_cls] + extra[:self.num_labels_per_sample - 1]
             label_name = primary_cls
 
@@ -747,7 +761,7 @@ class TotalSegInContextDataset(Dataset):
             load_ctx = lambda s: self._load(s, cls)
 
         # --- Context sampling ----------------------------------------------
-        random.shuffle(candidates)
+        self._cur_rng.shuffle(candidates)
         context_in:  list[torch.Tensor] = []
         context_out: list[torch.Tensor] = []
         for ctx_subj in candidates:
@@ -771,7 +785,7 @@ class TotalSegInContextDataset(Dataset):
             context_in.append(image_t.clone())
             context_out.append(label_t.clone())
         while len(context_in) < self.context_size:
-            i = random.randrange(len(context_in))
+            i = self._cur_rng.randrange(len(context_in))
             context_in.append(context_in[i].clone())
             context_out.append(context_out[i].clone())
 
@@ -841,7 +855,7 @@ class TotalSegInContextDataset(Dataset):
             ideal = c - cs // 2
             lo = max(0, ideal - j)
             hi = max(lo, min(max(0, s - cs), ideal + j))
-            starts.append(random.randint(lo, hi))
+            starts.append(self._cur_rng.randint(lo, hi))
         d0, h0, w0 = starts
 
         ct_mm = np.load(subj_dir / "ct.npy", mmap_mode="r")
@@ -891,7 +905,7 @@ class TotalSegInContextDataset(Dataset):
             ideal = c - cs // 2
             lo = max(0, ideal - j)
             hi = max(lo, min(max(0, s - cs), ideal + j))
-            starts.append(random.randint(lo, hi))
+            starts.append(self._cur_rng.randint(lo, hi))
         d0, h0, w0 = starts
 
         ct_mm   = np.load(subj_dir / "ct.npy", mmap_mode="r")
