@@ -73,21 +73,27 @@ def bench(size, workers, n_warmup, n_timed, use_crop=None):
             "items_s": seen / dt, "ms_item": 1e3 * dt / seen, "batch_mb": last_mb}
 
 
-def profile(size, use_crop, n_items):
-    """cProfile the dataset __getitem__ in-process (workers=0) to attribute time."""
+def profile(size, use_crop, n_items, split="train"):
+    """cProfile the dataset __getitem__ in-process (workers=0) to attribute time.
+
+    split=test mirrors the feature_sim/eval path (no aug, deterministic) — use it to
+    profile the exact loading CoLiPri eval drives."""
     import cProfile
     import pstats
     from common import build_dataset
     cfg = _cfg(size, 0, use_crop)
-    ds = build_dataset(cfg, "train")
+    ds = build_dataset(cfg, split)
     idxs = [i % len(ds) for i in range(n_items + 2)]
     for i in idxs[:2]:
         ds[i]                                   # warm caches
+    t0 = time.perf_counter()
     pr = cProfile.Profile(); pr.enable()
     for i in idxs[2:]:
         ds[i]
     pr.disable()
-    print(f"\n=== cProfile use_crop={use_crop} size={size} ({n_items} items) ===")
+    dt = time.perf_counter() - t0
+    print(f"\n=== cProfile split={split} use_crop={use_crop} size={size} "
+          f"({n_items} items, {1e3*dt/n_items:.0f} ms/item single-thread) ===")
     pstats.Stats(pr).sort_stats("cumulative").print_stats(14)
 
 
@@ -101,11 +107,13 @@ def main():
     ap.add_argument("--n_timed", type=int, default=60)
     ap.add_argument("--profile", nargs=2, metavar=("SIZE", "USE_CROP"), default=None,
                     help="cProfile a single (size, use_crop) config in-process and exit")
+    ap.add_argument("--split", default="train", choices=["train", "val", "test"],
+                    help="dataset split for --profile (test = feature_sim/eval path)")
     args = ap.parse_args()
 
     if args.profile:
         s = int(args.profile[0]); uc = args.profile[1].lower() == "true"
-        profile(s, uc, args.n_timed)
+        profile(s, uc, args.n_timed, args.split)
         return
 
     def _uc(v):
