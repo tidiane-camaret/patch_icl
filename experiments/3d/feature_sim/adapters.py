@@ -243,6 +243,12 @@ class PrimusEncoderAdapter(EncoderAdapter):
         self.device = device
         self._embed_dim = self.primus.embed_dim
         self._g = self.input_shape[-1] // self.patch[-1]
+        # Native-encode cache: the study re-requests the SAME volume at several resolutions
+        # (features() encodes to the native grid then _down_to(res)), so cache the native
+        # forward and reuse it across resolutions — halves encodes when sweeping 2 res.
+        # Keyed by (storage ptr, shape); reset_cache() must be called per task since a later
+        # task's tensor can reuse freed storage (same ptr, different data).
+        self._native_cache = {}
 
     # -- interface ---------------------------------------------------------
     @property
@@ -286,21 +292,34 @@ class PrimusEncoderAdapter(EncoderAdapter):
         return torch.autocast("cuda", dtype=torch.bfloat16) if self.device == "cuda" \
             else torch.autocast("cpu", dtype=torch.bfloat16)
 
+    def reset_cache(self):
+        """Drop cached native encodes. Call once per task (input tensors change)."""
+        self._native_cache.clear()
+
+    @torch.no_grad()
+    def _encode_native(self, volumes):
+        """Preprocess + ViT encode to the native grid (B, embed_dim, g, g, g), cached by
+        (storage ptr, shape) so repeated calls on the same volume (different res) hit once."""
+        key = (volumes.untyped_storage().data_ptr(), tuple(volumes.shape))
+        cached = self._native_cache.get(key)
+        if cached is not None:
+            return cached
+        x = self._preprocess(volumes.to(self.device))
+        with self._autocast():
+            f = self._encode(x).float()
+        self._native_cache[key] = f
+        return f
+
     @torch.no_grad()
     def features(self, volumes, tier, res):
         assert tier == "backbone", f"unknown tier {tier!r}"
-        x = self._preprocess(volumes.to(self.device))
-        with self._autocast():
-            f = self._encode(x)
-        return _down_to(f.float(), res)             # (B, embed_dim, res, res, res)
+        return _down_to(self._encode_native(volumes), res)   # (B, embed_dim, res, res, res)
 
     @torch.no_grad()
     def sample_features(self, volumes, tier, coords):
         """coords (B,N,3) normalized in (z,y,x) order -> (B,N,C)."""
         assert tier == "backbone", f"unknown tier {tier!r}"
-        x = self._preprocess(volumes.to(self.device))
-        with self._autocast():
-            f = self._encode(x).float()
+        f = self._encode_native(volumes)
         xyz = coords.to(self.device).flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)
         s = F.grid_sample(f, xyz, mode="bilinear", align_corners=True)   # (B,C,N,1,1)
         return s.squeeze(-1).squeeze(-1).transpose(1, 2)                 # (B,N,C)

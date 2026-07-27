@@ -105,6 +105,10 @@ def build_adapter(cfg):
 def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     """One task (single batch index already unbatched to B=1 tensors). Yields dict rows."""
     fs = cfg.feature_sim
+    # Frozen-encoder adapters may cache native encodes across resolutions within a task;
+    # reset per task since new items reuse tensor storage (cache is keyed by storage ptr).
+    if hasattr(adapter, "reset_cache"):
+        adapter.reset_cache()
     image = item["image"].to(DEVICE)              # (1,1,D,H,W)
     cin = item["context_in"].to(DEVICE)           # (1,K,1,D,H,W)
     cout = item["context_out"].to(DEVICE)         # (1,K,D,H,W)
@@ -375,9 +379,11 @@ def main(cfg: DictConfig) -> None:
         w = csv.DictWriter(fh, fieldnames=list(cost_row)); w.writeheader(); w.writerow(cost_row)
     csv_path = out_dir / "feature_sim.csv"
     all_rows, fields, n = [], None, 0
+    from tqdm import tqdm
+    pbar = tqdm(loader, desc=f"feature_sim {cfg.eval.model}", unit="batch")
     with open(csv_path, "w", newline="") as fh:
         writer = None
-        for batch in loader:
+        for batch in pbar:
             B = batch["image"].shape[0]
             for b in range(B):
                 item = {k: (v[b:b + 1] if torch.is_tensor(v) else [v[b]])
@@ -389,8 +395,7 @@ def main(cfg: DictConfig) -> None:
                         writer = csv.DictWriter(fh, fieldnames=fields)
                         writer.writeheader()
                     writer.writerow(row); all_rows.append(row); n += 1
-            if n and n % 200 == 0:
-                print(f"  wrote {n} rows...")
+            pbar.set_postfix(rows=n)
     print(f"Done. {n} rows -> {csv_path}")
 
     if wb_on:
