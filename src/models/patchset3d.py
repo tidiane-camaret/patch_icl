@@ -105,6 +105,9 @@ class PatchSet3D(nn.Module):
         full_attn: bool = False,
         query_self_attn: bool = False,
         image_size=None,
+        encoder: str = "conv",
+        encoder_frozen: bool = True,
+        primus_sidecar: str = None,
     ):
         super().__init__()
         self.resolution = resolution
@@ -118,7 +121,16 @@ class PatchSet3D(nn.Module):
         self.max_context = max_context
         self.image_size = image_size          # metadata only (unused in forward)
 
-        self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
+        if encoder == "primus":
+            if not primus_sidecar:
+                raise ValueError("encoder='primus' requires arch.primus_sidecar")
+            from src.models.primus_encoder import PrimusEncoder   # lazy: avoids import cycle
+            self.encoder = PrimusEncoder(primus_sidecar, resolution,
+                                         frozen=encoder_frozen, device="cpu")
+        elif encoder == "conv":
+            self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
+        else:
+            raise ValueError(f"unknown arch.encoder {encoder!r} (conv | primus)")
         self.img_embed = nn.Linear(self.encoder.out_ch, e)
         self.mask_embed = nn.Linear(self.mask_patch_size ** 3, e)   # occupancy tile p³ -> e
         self.pos = FourierPositionalEncoding(e, fourier_bands, n_axes=3)

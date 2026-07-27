@@ -191,6 +191,9 @@ def build_model(cfg: DictConfig):
             "full_attn": a.get("full_attn", False),
             "query_self_attn": a.get("query_self_attn", False),
             "image_size": list(cfg.data.image_size),
+            "encoder": a.get("encoder", "conv"),
+            "encoder_frozen": a.get("encoder_frozen", True),
+            "primus_sidecar": a.get("primus_sidecar", None),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")

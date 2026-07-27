@@ -1,0 +1,44 @@
+# @package _global_
+# PatchSet3D with a FROZEN CoLiPri (nnUNet Primus-M) image encoder:
+#   python experiments/3d/train.py model=patchset3d_colipri \
+#       data.image_size=[192,192,192] data.use_crop=true
+# Run at 1.5mm crop (data.crop_spacing_mm=1.5, the default) — the frozen-feature A/B
+# found 1.5mm beats 2mm for CoLiPri on organ-centered crops (more voxels-on-target).
+model: patchset3d
+
+arch:
+  encoder: primus
+  encoder_frozen: true
+  primus_sidecar: results/checkpoints/primus_colipri.json
+  resolution: 24               # map CoLiPri's 24^3 ViT tokens 1:1 to PatchSet3D cells
+  enc_dims: [32, 32, 32, 32]   # ignored when encoder=primus (kept for schema parity)
+  e: 256
+  h: 512
+  l: 6
+  a: 4
+  thinking_rows: 8
+  residual_decay: 0.95
+  fourier_bands: 8
+  mask_patch_size: 8
+  mask_patch_decode_size: 8    # 24*8 = 192^3 prediction
+  context_id_embed: true
+  max_context: 16
+  full_attn: true
+  query_self_attn: false       # R=24 (13824 tokens): the r×r query self-attn mask is prohibitive
+  compile: true
+
+train:
+  batch_size: 2
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: bce_dice
+  dice_weight: 1.0
+  muon: true
+  muon_lr_scale: 0.1
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  lawa_k: 10
+  checkpoint: null
