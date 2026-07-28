@@ -25,7 +25,10 @@ def count_gflops(module, inputs) -> float | None:
         flops.unsupported_ops_warnings(False)
         flops.uncalled_modules_warnings(False)
         return flops.total() / 1e9
-    except Exception:
+    except Exception as e:
+        # Don't swallow silently — a blank gflops with status=ok hides real bugs
+        # (e.g. tensor kernel_size under trace). Warn but keep the bench running.
+        print(f"[count_gflops] FLOP analysis failed: {type(e).__name__}: {e}")
         return None
 
 

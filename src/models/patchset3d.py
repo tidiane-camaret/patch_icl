@@ -29,7 +29,7 @@ def _down_to(f: torch.Tensor, R: int) -> torch.Tensor:
         return f
     if src > R:
         if src % R == 0:
-            k = src // R
+            k = int(src) // R   # int(): keep kernel a Python int so FLOP tracing (fvcore) works
             return F.avg_pool3d(f, k, k)
         return F.adaptive_avg_pool3d(f, (R, R, R))
     return F.interpolate(f, size=(R, R, R), mode="trilinear", align_corners=False)
