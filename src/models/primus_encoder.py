@@ -7,6 +7,7 @@ segmentation decoder) to the same contract as ConvEncoder3D:
 Weights + arch + HU preprocessing come from the CoLiPri extraction sidecar.
 """
 import json
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -18,8 +19,65 @@ from src.models.patchset3d import _down_to
 from src.totalseg_dataset import CT_MEAN, CT_STD
 
 
+class _EncodeCache:
+    """LRU, CPU-backed store of encoder outputs, keyed by an input fingerprint.
+
+    Features live on CPU (a cached 864×R³ tensor is ~14 MB; keeping thousands on
+    the GPU would blow VRAM shared with training). A cache hit costs one small
+    CPU→GPU copy, trivial next to a ViT encode. Sized to hold the whole eval set
+    so a frozen encoder pays each distinct crop once — then every later epoch's
+    val is a head-only pass.
+    """
+
+    def __init__(self, max_entries: int):
+        self.max_entries = int(max_entries)
+        self._d: "OrderedDict" = OrderedDict()
+
+    def get(self, key):
+        t = self._d.get(key)
+        if t is not None:
+            self._d.move_to_end(key)   # mark most-recently-used
+        return t
+
+    def put(self, key, tensor):
+        self._d[key] = tensor.detach().to("cpu")
+        self._d.move_to_end(key)
+        while len(self._d) > self.max_entries:
+            self._d.popitem(last=False)   # evict least-recently-used
+
+    def clear(self):
+        self._d.clear()
+
+    def __len__(self):
+        return len(self._d)
+
+
+def _cached_encode(encode_fn, x, key_fn, cache: _EncodeCache):
+    """Encode each distinct row of x once via encode_fn, reusing `cache`.
+
+    Rows whose key is absent are batched through encode_fn together (one call);
+    every row's feature is then read back from the cache and stacked in input
+    order, on x's device. Persistent across calls — a later call with the same
+    inputs re-encodes nothing.
+    """
+    keys = [key_fn(x[i]) for i in range(x.shape[0])]
+    # Unique missing keys only — dedupe repeats within this batch too, keeping one
+    # representative row index per key so a duplicated volume is encoded just once.
+    miss: "OrderedDict" = OrderedDict()
+    for i, k in enumerate(keys):
+        if k not in miss and cache.get(k) is None:
+            miss[k] = i
+    if miss:
+        rows = list(miss.values())
+        feats = encode_fn(x[rows])
+        for j, k in enumerate(miss):
+            cache.put(k, feats[j])
+    return torch.stack([cache.get(k).to(x.device) for k in keys], dim=0)
+
+
 class PrimusEncoder(nn.Module):
-    def __init__(self, sidecar_path, resolution, frozen=True, device="cuda"):
+    def __init__(self, sidecar_path, resolution, frozen=True, device="cuda",
+                 cache_max=4096):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
         with open(sidecar_path) as f:
@@ -44,13 +102,14 @@ class PrimusEncoder(nn.Module):
         self.primus.to(device)
         # Eval-only encode cache. Active only when frozen AND the module is in eval
         # mode (self.training is False) — where the loader is deterministic and no aug
-        # runs, so a given input volume's features are reusable. With use_crop=false a
-        # test subject's image is identical across all classes/contexts, so eval touches
-        # ~20 unique volumes but samples each hundreds of times; caching collapses the
-        # redundant frozen ViT encodes. Never used in training (aug makes each volume
-        # unique) or when trainable (grad required). Keyed on a cheap per-row fingerprint.
-        self._cache: dict = {}
-        self._cache_max = 256
+        # runs, so a given input crop's features are reusable. Because the encoder is
+        # frozen, its output for a fixed eval crop is invariant across epochs, so the
+        # cache persists across val calls: the first val encodes each distinct crop
+        # once, every later val is a head-only pass. CPU-backed + LRU so it can hold the
+        # whole eval set without eating VRAM. Never used in training (aug makes each
+        # volume unique) or when trainable (grad required). Keyed on a per-row
+        # fingerprint. Size the eval set (via eval.n_subjects) to fit cache_max.
+        self._cache = _EncodeCache(int(cache_max))
 
     def reset_cache(self):
         self._cache.clear()
@@ -106,12 +165,4 @@ class PrimusEncoder(nn.Module):
         # Cache only in frozen eval mode; train / trainable paths compute directly.
         if not (self.frozen and not self.training):
             return self._encode_batch(x)
-        keys = [self._key(x[i]) for i in range(x.shape[0])]
-        miss = [i for i, k in enumerate(keys) if k not in self._cache]
-        if miss:
-            feats = self._encode_batch(x[miss])
-            if len(self._cache) > self._cache_max:  # bound memory; eval reuse is short-lived
-                self._cache.clear()
-            for j, i in enumerate(miss):
-                self._cache[keys[i]] = feats[j].detach()
-        return torch.stack([self._cache[k] for k in keys], dim=0)
+        return _cached_encode(self._encode_batch, x, self._key, self._cache)

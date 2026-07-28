@@ -222,6 +222,11 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
         class_balanced=False,
         use_crop=d.use_crop,
         crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+        # eval.crop_jitter=0 makes each (subject, class) crop deterministic (centered,
+        # no random offset), so a crop is identical whether it appears as a target or
+        # another sample's context — letting the frozen encode cache reuse it within an
+        # epoch. Default None keeps the training-time jitter (T//4). See _load_crop.
+        crop_jitter=e.get("crop_jitter", None),
         # Deterministic per-item context shuffle + crop jitter (reproducible across
         # models/workers/order); see TotalSegInContextDataset.eval_seed.
         eval_seed=int(e.get("seed", 0)),

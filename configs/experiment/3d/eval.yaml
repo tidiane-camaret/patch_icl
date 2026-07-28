@@ -21,6 +21,7 @@ eval:
   batch_size: 8
   workers: 20
   seed: 0
+  crop_jitter: null           # use_crop eval: null=T//4 jitter; 0=centered crops
   save_figures: true
   max_figures: 200
   out_dir: ${paths.results}/3d_eval

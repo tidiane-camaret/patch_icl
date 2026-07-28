@@ -35,6 +35,8 @@ eval:                           # per-class validation during training
   n_subjects: 20
   batch_size: 8
   workers: 8
+  crop_jitter: null             # use_crop eval: null=T//4 jitter; 0=centered (lets the
+                                # frozen PrimusEncoder cache reuse crops within an epoch)
 wandb:
   project: patch_icl_3d_exps
   name: null
