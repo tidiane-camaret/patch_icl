@@ -109,8 +109,23 @@ def model_output_is_prob(cfg) -> bool:
 
 
 def _to_prob(logits, is_prob: bool):
-    """Map raw model output to a probability map (identity if already a prob; else sigmoid)."""
-    return logits if is_prob else torch.sigmoid(logits)
+    """Map raw model output to a probability map. For is_prob (medverse) the output is already
+    a probability but the plain-conv head can dip slightly outside [0,1]; clamp so it's a valid
+    probability — without it, tiny-negative background summed over ~262k voxels drives the
+    soft-Dice denominator negative and the soft metric below 0. Clamp is a no-op for the >=0.5
+    hard threshold. Non-prob models get a sigmoid."""
+    return logits.clamp(0.0, 1.0) if is_prob else torch.sigmoid(logits)
+
+
+def _st_clamp(x, lo, hi):
+    """Straight-through clamp: forward value is clamp(x, lo, hi) but the gradient passes
+    through as identity (d/dx == 1 everywhere). A plain torch.clamp has ZERO gradient outside
+    [lo, hi]; used on the soft-Dice term so it keeps a bounded gradient if the output briefly
+    leaves [0,1]. NB the clamp's real danger for Medverse is not the dead zone but the opposite:
+    clamp makes bce+dice BLIND to how far outside [0,1] the unbounded conv output goes, so
+    nothing bounds the raw output and it random-walks to ~1e24 and overflows to NaN. That is
+    fixed by the out-of-bounds anchor in build_loss, not here. See docs/logs.md 2026-07-29."""
+    return x + (x.clamp(lo, hi) - x).detach()
 
 
 def build_loss(cfg):
@@ -128,9 +143,27 @@ def build_loss(cfg):
         w = float(cfg.train.get("dice_weight", 1.0))
         if is_prob:   # output already in [0,1] -> plain BCE (with_logits would sigmoid again)
             eps = 1e-6
-            return lambda logits, target: (
-                F.binary_cross_entropy(_to_prob(logits.float(), True).clamp(eps, 1 - eps), target)
-                + w * _soft_dice(_to_prob(logits.float(), True), target))
+            oob_w = float(cfg.train.get("oob_weight", 10.0))
+
+            def _bce_dice_prob(logits, target):
+                out = logits.float()
+                prob_bce = out.clamp(eps, 1 - eps)     # hard clamp: value-safe log, smooth in-range
+                prob_dice = _st_clamp(out, 0.0, 1.0)
+                # F.binary_cross_entropy is autocast-UNSAFE and the train forward runs under
+                # bf16 autocast; compute it in fp32 with autocast disabled. Can't use the
+                # autocast-safe with_logits variant here — the output is already a probability,
+                # not a logit, so with_logits would sigmoid it again (the bug we fixed).
+                with torch.autocast(device_type=DEVICE.type, enabled=False):
+                    bce = F.binary_cross_entropy(prob_bce, target.float())
+                # Out-of-bounds anchor: Medverse's plain-conv head is UNBOUNDED, and the clamps
+                # above make bce+dice saturate (blind) once the output leaves [0,1] — so nothing
+                # keeps the raw output in range and it random-walks to ~1e24 and overflows to NaN
+                # (verified: exp31 resumed from best.pt diverged this way; docs/logs.md 2026-07-29).
+                # This quadratic penalty is exactly 0 while the output stays in [0,1] (never fights
+                # in-range learning) and only pulls it back when it escapes — pins |out| to ~[0,6].
+                oob = ((out - out.clamp(0.0, 1.0)) ** 2).mean()
+                return bce + w * _soft_dice(prob_dice, target) + oob_w * oob
+            return _bce_dice_prob
         return lambda logits, target: (
             F.binary_cross_entropy_with_logits(logits.float(), target)
             + w * _soft_dice(torch.sigmoid(logits.float()), target))
@@ -255,6 +288,20 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 logits = model.train_forward(batch["image"], batch["context_in"],
                                              batch["context_out"])      # (B,1,D,H,W)
                 target = lbl.unsqueeze(1)
+            # Fail fast + legibly on a non-finite forward: a NaN here otherwise passes through
+            # clamp() into F.binary_cross_entropy, tripping an async CUDA device-side assert
+            # (input in [0,1]) that surfaces at a later .backward() with a useless stack. Catch
+            # it at the source with the stats that say whether the MODEL diverged (NaN logits)
+            # vs the loss (finite logits). One cheap reduction per step.
+            lf = logits.float()
+            if not torch.isfinite(lf).all():
+                raise RuntimeError(
+                    f"non-finite forward @ epoch {epoch} step {n}: logits "
+                    f"nan={torch.isnan(lf).any().item()} inf={torch.isinf(lf).any().item()} "
+                    f"min={torch.nan_to_num(lf).min().item():.3g} "
+                    f"max={torch.nan_to_num(lf).max().item():.3g}; target_fg={target.float().mean().item():.3g}. "
+                    f"Model diverged (see docs/logs.md 2026-07-29): bce_dice near the clamp "
+                    f"boundary; don't resume from the collapse-edge best.pt, start from orig_weights.")
             loss = loss_fn(logits, target)
         loss.backward()
         if cfg.train.get("grad_clip"):

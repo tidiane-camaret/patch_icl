@@ -310,8 +310,10 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
             tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
             # output_is_prob (medverse): logits_fn already returns a [0,1] probability, so do
             # NOT sigmoid it again (that pins every voxel to foreground). See train.py's
-            # model_output_is_prob. Default False keeps eval.py's logit path byte-identical.
-            prob = (logits if output_is_prob else torch.sigmoid(logits)).cpu()
+            # model_output_is_prob. Clamp to [0,1] — the plain-conv head can dip slightly out of
+            # range, which else drives the soft-Dice denom negative. Default False keeps eval.py's
+            # logit path byte-identical.
+            prob = (logits.clamp(0, 1) if output_is_prob else torch.sigmoid(logits)).cpu()
             grid_pr = grid_gt = None
             if grid_res is not None:
                 grid_pr = F.adaptive_avg_pool3d(prob, (grid_res,) * 3)                 # (B,1,g,g,g)

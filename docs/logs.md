@@ -1,5 +1,92 @@
 # Change log
 
+## exp31 medverse bce_dice is unstable: clamp blinds the loss to the unbounded output → add out-of-bounds anchor (2026-07-29)
+
+The real root cause of exp31's instability (supersedes the same-day `_st_clamp`-only entry below,
+which was an incomplete diagnosis). Medverse's output head is a **plain, unbounded conv** (no
+activation), but the `is_prob` bce_dice loss operates on `out.clamp(0,1)`. So **once the raw
+output leaves [0,1] the loss saturates and can no longer see its magnitude** — there is no
+gradient pressure keeping the output bounded. Two failure modes, same cause:
+
+- **Original run (hard clamp on BOTH terms):** out-of-range → `torch.clamp` gives zero gradient →
+  the run FROZE at all-background (val/loss stuck at 1.1099 = mean fg ~0.8%·−log eps + Dice≈1;
+  grad L2 exactly 0.000 at that state).
+- **After the first `_st_clamp` "fix" (Dice gradient restored):** the gradient flowed again but
+  still nothing bounded the output, so resuming from the epoch-50 best.pt it DIVERGED —
+  `logits|max|` climbed 0.79 → 199 → 1e5 → 1e8 → … → **3.7e24** over ~950 steps and overflowed to
+  Inf → NaN → CUDA device-side assert (BCE `input∈[0,1]`), while the loss stayed a flat ~1.0 the
+  whole time (clamp hid it). `_st_clamp` traded a freeze for an explosion.
+
+Diagnostics that pinned it: a grad-norm comparison at the fixed e50 state showed BCE is INERT —
+`bce_dice`, `dice_only`, and `sl1_dice` gave IDENTICAL grad norms (so the earlier "BCE 1/p
+explosion" story was wrong); norms scaled inversely with fg fraction (soft-Dice `1/denominator`
+on near-empty targets, amplified by the U-Net Jacobian) and are clipped by grad_clip anyway. The
+divergence is the UNBOUNDED OUTPUT, not any single loss term. (Why patchset3d's bce_dice is fine:
+it emits logits, and BCEWithLogits' restoring gradient `sigmoid(z)−y ∈ [−1,1]` bounds them; the
+clamp-on-probability destroys that.)
+
+Fix (train.py `build_loss`, is_prob bce_dice path): add an **out-of-bounds anchor**
+`oob_w * mean((out − clamp(out,0,1))²)`, `oob_w = cfg.train.oob_weight` (default 10). It is
+exactly 0 while the output is in [0,1] (never fights in-range learning) and only pulls it back
+when it escapes. Verified over 700 real optimizer steps from best.pt: `logits|max|` stays ~[0,6]
+(vs 3.7e24 without it) and running train dice holds/rises to ~0.257. `SmoothL3L1`-on-raw was too
+weak (spiked to 1e4, and corrupted in-range values → dice fell to 0.095). exp31 config now sets
+`train.oob_weight: 10.0`. Recommend a FRESH run from orig_weights (best.pt is a collapse-edge
+state); the anchor also makes resume safe if desired.
+
+## exp31 medverse: bce_dice collapse from torch.clamp zero-gradient trap → straight-through Dice (2026-07-29, SUPERSEDED)
+
+NB superseded by the entry above — `_st_clamp` alone stops the freeze but not the divergence; the
+out-of-bounds anchor is the actual fix. Kept for history.
+
+exp31 (loss=bce_dice, run dark-capybara-204) trained healthily for 50 epochs (train dice
+0.16→0.30, val 0.16→0.30) then collapsed at epoch 51-53: train dice 0.26→0.009, and from
+epoch 53 on the loss was **frozen** — val/loss exactly 1.1099 for 57 straight epochs, dice
+~0.007. Model stuck at all-background, permanently, never recovered.
+
+Root cause (partial): the `is_prob` bce_dice loss fed Medverse's raw (unbounded, linear) conv head
+through `prob = out.clamp(eps, 1-eps)` before `F.binary_cross_entropy`. `torch.clamp` has
+**zero gradient outside [eps, 1-eps]**, so once the whole output sat in the dead zone the gradient
+was exactly 0 → frozen. Fix attempted: `_st_clamp` straight-through clamp on the Dice term. This
+removed the freeze but exposed the deeper problem (unbounded output) — see the entry above.
+
+## Fix negative soft-Dice metric for medverse (clamp output to [0,1]) (2026-07-29)
+
+Train `soft` and val `dice_soft` could go negative for medverse (reported soft=-0.05). The
+plain-conv head dips slightly below 0 in background; summed over ~262k voxels `prob.sum()`
+goes negative, driving the soft-Dice denominator negative and the coefficient >1 (so
+`1-softdice` < 0). Metric-only artifact — the bce_dice LOSS already clamps to [eps,1-eps], so
+training was fine (hard dice kept rising). Fix: `_to_prob` (train.py) and the eval prob
+(evaluate.py) now `clamp(0,1)` the medverse output. No-op for the >=0.5 hard threshold; loss
+unchanged. Verified: soft metric -0.11 -> 0.667 on the repro. The already-running process
+keeps the old code, so its soft curves stay cosmetically off until relaunch (headline
+val/dice from predict is unaffected).
+
+## exp31 medverse: smooth_l1 collapses under class imbalance → switch to bce_dice (2026-07-29)
+
+The first exp31 run (loss=smooth_l1) collapsed: val dice fell from zero-shot ~0.17 to 0.044
+after ONE epoch and stayed ~0.01, while train loss sat flat at ~0.085 (= 50·SmoothL3L1, so
+SmoothL3L1 ≈ 0.0017 ≈ foreground_fraction/3 → the model predicts background everywhere).
+
+Root cause: `smooth_l1` (SmoothL3L1) is a per-voxel mean regression loss with no foreground
+normalization. TotalSeg organs occupy <1% of the 128³/256mm crop, so for most classes
+`SmoothL3L1(good mask) ≈ SmoothL3L1(all-zeros)` — no gradient to segment. Measured zero-shot
+on real tasks: the loss "signal" (L_zeros − L_pred) tracks foreground fraction — liver
+(fg 9%) signal 1.09 / dice 0.64; spleen/aorta/stomach (fg 1–1.6%) signal 0.06–0.13 / dice
+0.3–0.4; everything <0.2% fg → signal ~0 / dice ~0. The imbalanced batch gradient pushes
+everything to background, eroding even the large organs the pretrained model handled.
+patchset3d (val 0.32) is immune because its bce_dice has a soft-Dice term (imbalance-robust).
+
+Fix: exp31 loss `smooth_l1 → bce_dice` (plain BCE + soft-Dice on the [0,1] output; the Dice
+term restores gradient — synthetic 0.13%-fg check: loss(good)=0.05 vs loss(zeros)=1.02).
+NB `F.binary_cross_entropy` is autocast-UNSAFE and the train forward runs under bf16 autocast,
+so build_loss computes the medverse BCE in fp32 under `torch.autocast(enabled=False)` (can't
+use the autocast-safe with_logits variant — the output is already a probability, not a logit).
+Also switched optim to Medverse-native Adam(3e-5)/no-wd (gentle finetune) from AdamW(1e-4,
+wd 0.01). Killed the collapsing run; rerun: `python experiments/3d/train.py
+experiment=31_medverse_colipri_task`. NB smooth_l1 worked in Medverse pretraining only
+because its brain-ICL data has far higher foreground fraction than abdominal organs here.
+
 ## Log params + FLOPs in 3d/train.py (2026-07-29)
 
 `experiments/3d/train.py` now logs, at startup, trainable/total param counts and the model's

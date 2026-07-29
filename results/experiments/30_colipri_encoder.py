@@ -6,15 +6,11 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    # ── single 3D training-run: detailed val breakdown (patch_icl_3d_exps) ───────────────────────
-    # Point RUN at any training run of the project; the class list, sample set and shape families
-    # are all DERIVED from the logged data — no hardcoded values — so this is reusable across runs.
-    # Focus is the FINAL-epoch val/samples table, broken down by class, morphology family and
-    # per-sample geometry. (Aggregate learning curves live in W&B; not repeated here.)
-    #
-    # Morphology families are clustered from real-mask geometry via the shared
-    # totalseg_geometry_extract helpers (same taxonomy as nb 20). Caches the samples table, the
-    # config+summary, and the geometry under artifacts/21_<id>_*.{csv,json}; delete to refresh.
+    # ── two-run comparison: detailed val breakdown (patch_icl_3d_exps) ───────────────────────────
+    # Set RUNS = {display_name: wandb_run_id}. Every table/figure below reports the SAME per-run
+    # metrics side by side (delta = <run2> − <run1>). The class list, sample set and shape families
+    # are DERIVED from the logged data and SHARED across both runs, so this is reusable for any pair.
+    # Caches each run under artifacts/21_<id>_*.{csv,json} (+ a combined geometry); delete to refresh.
     import json
     import sys
     from pathlib import Path
@@ -30,306 +26,294 @@ def _():
     pd.set_option("display.width", 240)
     pd.set_option("display.float_format", lambda v: f"{v:.3f}")
 
-    RUN = "tidiane/patch_icl_3d_exps/93cz8fba"
+    PROJECT = "tidiane/patch_icl_3d_exps"
+    RUNS = {"run_name_1": "93cz8fba", "run_name_2": "mj19797e"}
     N_SHAPE = 10                     # morphology cluster count (thick→thin families)
-    _id = RUN.split("/")[-1]
-    _samp_c = _ARTIFACTS / f"21_{_id}_samples.csv"
-    _meta_c = _ARTIFACTS / f"21_{_id}_meta.json"
-    if _samp_c.exists() and _meta_c.exists():
-        S = pd.read_csv(_samp_c)
-        META = json.loads(_meta_c.read_text())
-        print(f"loaded cached samples {S.shape}")
-    else:
-        import wandb
-        _run = wandb.Api().run(RUN)
-        S = get_latest_table(_run, table_key="val/samples.table.json")
-        META = {"name": _run.name, "config": dict(_run.config),
-                "summary": {k: _run.summary.get(k) for k in ("epoch", "val/dice", "val/best_dice")}}
-        _ARTIFACTS.mkdir(parents=True, exist_ok=True)
-        S.to_csv(_samp_c, index=False)
-        _meta_c.write_text(json.dumps(META, default=float))
-        print(f"fetched {_run.name}: samples {S.shape}")
 
-    # morphology families + per-sample geometry from the evaluated (subject,class) real masks
-    GEOM = load_or_build_geometry(S[["subject", "class"]], _ARTIFACTS / f"21_{_id}_geometry.csv")
+    def _load(_id):
+        """Load one run's cached samples table + meta, fetching from W&B on cache miss."""
+        _samp_c = _ARTIFACTS / f"21_{_id}_samples.csv"
+        _meta_c = _ARTIFACTS / f"21_{_id}_meta.json"
+        if _samp_c.exists() and _meta_c.exists():
+            return pd.read_csv(_samp_c), json.loads(_meta_c.read_text())
+        import wandb
+        _run = wandb.Api().run(f"{PROJECT}/{_id}")
+        _s = get_latest_table(_run, table_key="val/samples.table.json")
+        _m = {"name": _run.name, "config": dict(_run.config),
+              "summary": {k: _run.summary.get(k) for k in ("epoch", "val/dice", "val/best_dice")}}
+        _ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        _s.to_csv(_samp_c, index=False)
+        _meta_c.write_text(json.dumps(_m, default=float))
+        return _s, _m
+
+    RUN_NAMES = list(RUNS)
+    _frames, META = [], {}
+    for _name, _id in RUNS.items():
+        _s, _m = _load(_id)
+        _s = _s.copy(); _s["run"] = _name
+        _frames.append(_s); META[_name] = _m
+        print(f"loaded {_name} ({_id}): samples {_s.shape}  | {_m['name']}")
+    S = pd.concat(_frames, ignore_index=True)
+
+    # shared morphology families + per-sample geometry from ALL evaluated (subject,class) real masks
+    _pairs = S[["subject", "class"]].drop_duplicates()
+    GEOM = load_or_build_geometry(_pairs, _ARTIFACTS / f"21_cmp_{'_'.join(RUNS.values())}_geometry.csv")
     SHAPE, SHAPE_ORDER = shape_families(GEOM, k=N_SHAPE)
     S = S.merge(GEOM, on=["subject", "class"], how="left")
     S["shape"] = S["class"].map(SHAPE).fillna("other")
     if (S["shape"] == "other").any():
         SHAPE_ORDER = SHAPE_ORDER + ["other"]
 
-    def _cfg(*path, d=META["config"]):
+    def _cfg(_name, *path):
+        d = META[_name]["config"]
         for k in path:
             d = d.get(k) if isinstance(d, dict) else None
         return d
-    _sm = META["summary"]
-    print("  " + "  ".join(f"{k}={v}" for k, v in {
-        "model": _cfg("model"), "synth": _cfg("data", "synth_method"),
-        "ctx": _cfg("data", "context_size"), "size": _cfg("data", "image_size"),
-        "val_classes": _cfg("data", "val_classes")}.items() if v is not None))
-    print(f"  epoch {int(_sm['epoch'])} | {S['class'].nunique()} classes / {len(S)} samples | "
-          f"val/dice={_sm['val/dice']:.4f}  best={_sm['val/best_dice']:.4f}")
+    for _name in RUN_NAMES:
+        _sm = META[_name]["summary"]
+        _kv = {"model": _cfg(_name, "model"), "synth": _cfg(_name, "data", "synth_method"),
+               "ctx": _cfg(_name, "data", "context_size"), "size": _cfg(_name, "data", "image_size")}
+        print(f"  [{_name}] " + "  ".join(f"{k}={v}" for k, v in _kv.items() if v is not None)
+              + f" | epoch {int(_sm['epoch'])} val/dice={_sm['val/dice']:.4f} best={_sm['val/best_dice']:.4f}")
+    print(f"  {S['class'].nunique()} classes / {len(S)} samples across {len(RUN_NAMES)} runs")
     print(f"  shape families (k={N_SHAPE}, thick→thin): {SHAPE_ORDER}")
-    return S, SHAPE_ORDER, np, pd, plt
+    return RUN_NAMES, S, SHAPE_ORDER, np, pd, plt
 
 
 @app.cell
-def _(S, SHAPE_ORDER, np, plt):
-    # ── 1. PER-CLASS VAL DICE (coloured by morphology family) ────────────────────────────────────
-    # Every class ranked by mean dice, bar colour = its shape family; macro mean (mean over classes)
-    # is the reference line. Table adds sample count, median target size and family.
-    _g = S.groupby("class").agg(dice=("dice", "mean"), soft=("soft_dice", "mean"),
-                                n=("dice", "size"), tgt_size=("tgt_size", "median")).sort_values("dice")
-    _g["shape"] = S.groupby("class").shape.first()
-    _g["in_train"] = S.groupby("class").in_train.first()  # class seen during training?
-    _macro = _g.dice.mean()
-    print(f"{len(_g)} classes | macro dice={_macro:.4f} | micro dice={S.dice.mean():.4f} | "
-          f"complete-miss (mean<0.01): {int((_g.dice < 0.01).sum())}")
-    print(_g.to_string())
+def _(RUN_NAMES, S, SHAPE_ORDER, pd, plt):
+    # ── 1. PER-CLASS VAL DICE — run comparison ───────────────────────────────────────────────────
+    # Per-class mean dice for each run, pivoted side by side with delta = <run2> − <run1>. The scatter
+    # plots run1 (x) vs run2 (y) with a parity line; points ABOVE the diagonal improved in run2. Colour
+    # = shape family; the largest movers (either direction) are annotated.
+    _r0, _r1 = RUN_NAMES[0], RUN_NAMES[1]
+    _pc = S.groupby(["class", "run"]).dice.mean().unstack("run").reindex(columns=RUN_NAMES)
+    _meta = S.groupby("class").agg(shape=("shape", "first"), in_train=("in_train", "first"),
+                                   n=("dice", "size"), tgt_size=("tgt_size", "median"))
+    _tab = _pc.join(_meta)
+    _tab["delta"] = _tab[_r1] - _tab[_r0]
+    _tab = _tab.sort_values("delta")
 
-    _pal = (plt.cm.tab20.colors + plt.cm.tab20b.colors)
+    _macro = _pc.mean()
+    _micro = S.groupby("run").dice.mean().reindex(RUN_NAMES)
+    print("macro dice: " + "  ".join(f"{r}={_macro[r]:.4f}" for r in RUN_NAMES)
+          + f"  Δ={_macro[_r1] - _macro[_r0]:+.4f}")
+    print("micro dice: " + "  ".join(f"{r}={_micro[r]:.4f}" for r in RUN_NAMES)
+          + f"  Δ={_micro[_r1] - _micro[_r0]:+.4f}")
+    print(f"biggest movers (Δ dice = {_r1} − {_r0}):")
+    print(pd.concat([_tab.head(8), _tab.tail(8)]).to_string())
+
+    _pal = plt.cm.tab20.colors + plt.cm.tab20b.colors
     _cmap = {f: _pal[i % len(_pal)] for i, f in enumerate(SHAPE_ORDER)}
-    _y = np.arange(len(_g))
-    _fig, _ax = plt.subplots(figsize=(9, max(6, 0.24 * len(_g))))
-    # bar fill = shape family; hatch marks held-out (unseen) classes so train/held-out is legible
-    _ax.barh(_y, _g.dice.values, color=[_cmap[s] for s in _g["shape"]],
-             hatch=["" if t else "///" for t in _g["in_train"]], edgecolor="k", linewidth=0.3)
-    _ax.axvline(_macro, color="k", lw=0.8, ls="--", label=f"macro {_macro:.3f}")
-    _ax.set_yticks(_y)
-    # trailing "*" flags held-out classes not seen in training
-    _ax.set_yticklabels([f"{c}{'' if t else ' *'} (n={int(n)})"
-                         for c, t, n in zip(_g.index, _g["in_train"], _g.n)], fontsize=7)
-    _ax.set_ylim(-0.5, len(_g) - 0.5)
-    _ax.set(xlabel="mean val dice (final epoch)", title="Per-class val dice, coloured by shape family")
-    # legend: macro line + one swatch per family that actually appears
+    _d = _tab.dropna(subset=[_r0, _r1])
+    _fig, _ax = plt.subplots(figsize=(9, 9))
+    _ax.scatter(_d[_r0], _d[_r1], s=36, c=[_cmap[s] for s in _d["shape"]],
+                alpha=0.85, edgecolor="k", linewidth=0.3, zorder=3)
+    _ax.plot([0, 1], [0, 1], "k--", lw=0.8, label="parity")
+    _mv = pd.concat([_d.sort_values("delta").head(6), _d.sort_values("delta").tail(6)])
+    for _c, _row in _mv.iterrows():
+        _ax.annotate(_c, (_row[_r0], _row[_r1]), fontsize=6, xytext=(3, 3), textcoords="offset points")
+    _ax.set(xlim=(0, 1), ylim=(0, 1), xlabel=f"{_r0} dice", ylabel=f"{_r1} dice",
+            title=f"Per-class val dice: {_r1} vs {_r0}  (Δmacro={_macro[_r1] - _macro[_r0]:+.3f})")
     from matplotlib.patches import Patch
-    _seen = [f for f in SHAPE_ORDER if f in set(_g["shape"])]
+    _seen = [f for f in SHAPE_ORDER if f in set(_d["shape"])]
     _ax.legend(handles=[Patch(color=_cmap[f], label=f) for f in _seen]
-               + [Patch(facecolor="white", hatch="///", edgecolor="k", label="held-out (unseen)")]
-               + _ax.get_legend_handles_labels()[0], fontsize=7, ncol=2)
-    _ax.grid(alpha=0.3, axis="x")
+               + _ax.get_legend_handles_labels()[0], fontsize=7, ncol=2, loc="lower right")
+    _ax.grid(alpha=0.3)
     _fig.tight_layout()
     _fig
     return
 
 
 @app.cell
-def _(S, SHAPE_ORDER, np, pd, plt):
-    # ── 1b. TRAIN vs HELD-OUT CLASS GENERALIZATION ──────────────────────────────────────────────
-    # The point of in-context segmentation is generalising to classes UNSEEN in training. `in_train`
-    # splits the eval set into seen vs held-out when both are present. Some runs contain only seen
-    # classes, so the comparison below degrades gracefully to train-only summaries instead of failing.
+def _(RUN_NAMES, S, SHAPE_ORDER, np, pd, plt):
+    # ── 1b. TRAIN vs HELD-OUT GENERALIZATION — run comparison ────────────────────────────────────
+    # Held-out (unseen) classes are the point of in-context seg. For EACH run: macro/micro dice and
+    # miss-rate split by membership, plus the train−heldout gap. Held-out dice by shape family and
+    # matched lateral-mirror pairs (morphology-fair) are compared per run so the runs are judged on the
+    # same anatomy, not confounded by which classes each held out.
     def _macro(g):
         return g.groupby("class").dice.mean().mean()
 
-    _ov = S.groupby("in_train").apply(lambda g: pd.Series({
+    _ov = S.groupby(["run", "in_train"]).apply(lambda g: pd.Series({
         "n_cls": g["class"].nunique(), "n_samp": len(g),
         "macro_dice": _macro(g), "micro_dice": g.dice.mean(),
         "miss_rate": (g.dice < 0.01).mean(), "med_tgt_size": g.tgt_size.median(),
     }), include_groups=False).rename(index={True: "train", False: "held-out"})
-    print("overall (in_train=True → seen, False → held-out when present):")
-    print(_ov.T.to_string())
+    print("per-run overall (membership: train=seen, held-out=unseen):")
+    print(_ov.to_string())
+    for _r in RUN_NAMES:
+        if (_r, "train") in _ov.index and (_r, "held-out") in _ov.index:
+            _gap = _ov.loc[(_r, "train"), "macro_dice"] - _ov.loc[(_r, "held-out"), "macro_dice"]
+            print(f"  [{_r}] macro gap train−heldout = {_gap:+.3f}  (heldout med tgt "
+                  f"{_ov.loc[(_r, 'held-out'), 'med_tgt_size']:.0f} vs {_ov.loc[(_r, 'train'), 'med_tgt_size']:.0f})")
+        else:
+            print(f"  [{_r}] no held-out classes; skipping gap")
 
-    if {"train", "held-out"}.issubset(_ov.index):
-        _raw = _ov.loc["train", "macro_dice"] - _ov.loc["held-out", "macro_dice"]
-        print(f"  RAW macro gap = {_raw:+.3f}  ← confounded: held-out med tgt_size "
-              f"{_ov.loc['held-out','med_tgt_size']:.0f} vs {_ov.loc['train','med_tgt_size']:.0f} (smaller)")
-    else:
-        print("  no held-out classes in this run; skipping train-vs-held-out gap")
-
-    # (a) within shape family — same morphology bucket, split by membership
-    _sf = (S.groupby(["shape", "in_train", "class"]).dice.mean()
-           .groupby(["shape", "in_train"]).mean().unstack().reindex(SHAPE_ORDER))
-    _sf = _sf.rename(columns={True: "train", False: "heldout"})
-    if "heldout" in _sf.columns:
-        _sf["delta"] = _sf["train"] - _sf["heldout"]
-    else:
-        _sf["delta"] = np.nan
-    print("\n(a) macro dice by shape family × membership (thick→thin):")
-    print(_sf.to_string())
-
-    # (c) matched lateral-mirror pairs: same organ, trained side vs held-out side (morphology-fair)
-    _cls = S.groupby("class").agg(dice=("dice", "mean"), in_train=("in_train", "first")).to_dict("index")
+    # matched lateral-mirror pairs per run (same organ, trained side vs held-out side)
     def _flip(c):
         return (c.replace("_left", "_TMP").replace("_right", "_left").replace("_TMP", "_right")
                 if ("_left" in c or "_right" in c) else None)
-    _rows = []
-    for _c, _r in _cls.items():
-        _o = _flip(_c)
-        if _o in _cls and _r["in_train"] and not _cls[_o]["in_train"]:
-            _organ = _c.replace("_left", "").replace("_right", "")
-            _rows.append((_organ, _r["dice"], _cls[_o]["dice"]))
-    _M = pd.DataFrame(_rows, columns=["organ", "trained_side", "heldout_side"])
-    _M["delta"] = _M.trained_side - _M.heldout_side
-    print(f"\n(c) matched lateral-mirror pairs (n={len(_M)}, same organ → morphology controlled):")
+    _mrows = []
+    for _r in RUN_NAMES:
+        _cls = S[S.run == _r].groupby("class").agg(dice=("dice", "mean"),
+                                                   in_train=("in_train", "first")).to_dict("index")
+        for _c, _rr in _cls.items():
+            _o = _flip(_c)
+            if _o in _cls and _rr["in_train"] and not _cls[_o]["in_train"]:
+                _mrows.append((_r, _c.replace("_left", "").replace("_right", ""),
+                               _rr["dice"], _cls[_o]["dice"]))
+    _M = pd.DataFrame(_mrows, columns=["run", "organ", "trained_side", "heldout_side"])
     if len(_M):
-        print(_M.sort_values("delta").to_string(index=False))
-        print(f"  mean trained={_M.trained_side.mean():.3f} held-out={_M.heldout_side.mean():.3f} "
-              f"delta={_M.delta.mean():+.3f}  → near-parity when anatomy is matched")
+        _M["delta"] = _M.trained_side - _M.heldout_side
+        print("\nmatched lateral-mirror pairs (mean over pairs, per run → morphology controlled):")
+        print(_M.groupby("run").agg(n=("organ", "size"), trained=("trained_side", "mean"),
+                                    heldout=("heldout_side", "mean"), delta=("delta", "mean")).to_string())
     else:
-        print("  no matched train/held-out mirror pairs in this run")
+        print("\nno matched train/held-out mirror pairs")
 
-    _fig, (_a0, _a1) = plt.subplots(1, 2, figsize=(14, 5))
-    # left: macro dice per shape family, train vs held-out side by side when available
-    _sd = _sf.dropna(how="all", subset=[c for c in ("train", "heldout") if c in _sf.columns])
-    _x = np.arange(len(_sd))
-    if "train" in _sd.columns:
-        _a0.bar(_x - (0.2 if "heldout" in _sd.columns else 0.0), _sd["train"], 0.4 if "heldout" in _sd.columns else 0.6,
-                color="tab:blue", label="train (seen)")
-    if "heldout" in _sd.columns:
-        _a0.bar(_x + 0.2, _sd["heldout"], 0.4, color="tab:orange", label="held-out (unseen)")
-    _a0.set_xticks(_x); _a0.set_xticklabels(_sd.index, rotation=45, ha="right", fontsize=7)
-    _a0.set(ylabel="macro val dice", title="(a) dice by shape family × membership")
-    if len(_sd.columns):
-        _a0.legend(fontsize=8)
-    _a0.grid(alpha=0.3, axis="y")
-    # right: matched-mirror scatter, points below diagonal = held-out side better
-    if len(_M):
-        _a1.scatter(_M.trained_side, _M.heldout_side, s=40, color="tab:purple")
-        for _, _p in _M.iterrows():
-            _a1.annotate(_p.organ, (_p.trained_side, _p.heldout_side), fontsize=6,
-                         xytext=(3, 3), textcoords="offset points")
-    _lim = [0, 1]
-    _a1.plot(_lim, _lim, "k--", lw=0.8, label="parity")
-    _delta_txt = f"{_M.delta.mean():+.3f}" if len(_M) else "n/a"
-    _a1.set(xlim=_lim, ylim=_lim, xlabel="trained side dice", ylabel="held-out side dice",
-            title=f"(c) matched mirror pairs (Δ={_delta_txt})")
-    _a1.legend(fontsize=8); _a1.grid(alpha=0.3)
+    _w = 0.8 / len(RUN_NAMES)
+    _fig, (_a0, _a1) = plt.subplots(1, 2, figsize=(15, 5))
+    # (a) macro dice by membership × run
+    _mem = ["train", "held-out"]
+    _x = np.arange(len(_mem))
+    for _i, _r in enumerate(RUN_NAMES):
+        _vals = [_ov.loc[(_r, _m), "macro_dice"] if (_r, _m) in _ov.index else np.nan for _m in _mem]
+        _a0.bar(_x + (_i - (len(RUN_NAMES) - 1) / 2) * _w, _vals, _w, label=_r)
+    _a0.set_xticks(_x); _a0.set_xticklabels(_mem)
+    _a0.set(ylabel="macro val dice", title="(a) macro dice by membership × run")
+    _a0.legend(fontsize=8); _a0.grid(alpha=0.3, axis="y")
+    # (b) held-out macro dice by shape family × run
+    _hd = (S[~S.in_train].groupby(["shape", "run", "class"]).dice.mean()
+           .groupby(["shape", "run"]).mean().unstack("run").reindex(SHAPE_ORDER).dropna(how="all"))
+    if len(_hd):
+        _xf = np.arange(len(_hd))
+        for _i, _r in enumerate(RUN_NAMES):
+            if _r in _hd.columns:
+                _a1.bar(_xf + (_i - (len(RUN_NAMES) - 1) / 2) * _w, _hd[_r].values, _w, label=_r)
+        _a1.set_xticks(_xf); _a1.set_xticklabels(_hd.index, rotation=45, ha="right", fontsize=7)
+        _a1.legend(fontsize=8)
+    _a1.set(ylabel="held-out macro dice", title="(b) held-out dice by shape family × run (thick→thin)")
+    _a1.grid(alpha=0.3, axis="y")
     _fig.tight_layout()
     _fig
     return
 
 
 @app.cell
-def _(S, SHAPE_ORDER):
-    # ── 1c. PER-CLASS DICE vs VOLUME (labels via textalloc) ──────────────────────────────────────
-    import numpy as np
-    import matplotlib.pyplot as plt
+def _(RUN_NAMES, S, SHAPE_ORDER, np, plt):
+    # ── 1c. PER-CLASS DICE vs VOLUME — run comparison ────────────────────────────────────────────
+    # One labelled panel per shape family; both runs plotted (colour = run) with a faint vertical
+    # connector per class (volume is fixed per class, so the segment length = dice change between
+    # runs). Below, a membership scatter PER RUN (no labels) shows train vs held-out at a glance.
+    import marimo as mo
     import matplotlib.ticker as mticker
-    from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
     import textalloc as ta
 
-    # ---- aggregate per class ----
-    _pc = (S.groupby("class")
-             .agg(dice=("dice", "mean"),
-                  volume=("volume", "mean"),
-                  in_train=("in_train", "first"),
-                  shape=("shape", "first"))
-             .dropna(subset=["volume"]))
-    _pc = _pc[_pc.volume > 0].sort_index()
-
-    # Work in log10(volume) on a LINEAR axis, then relabel ticks as 10^n.
-    # This makes textalloc's placement correct and evenly spread.
+    _pc = (S.groupby(["class", "run"])
+             .agg(dice=("dice", "mean"), volume=("volume", "mean"),
+                  in_train=("in_train", "first"), shape=("shape", "first"))
+             .dropna(subset=["volume"]).reset_index())
+    _pc = _pc[_pc.volume > 0]
     _pc["logvol"] = np.log10(_pc["volume"].values)
-    _names = _pc.index.tolist()
-    _lx = _pc["logvol"].values
-    _dy = _pc["dice"].values
 
-    # ---- fixed bounds ----
-    _xmin, _xmax = float(_lx.min()), float(_lx.max())
-    _ymin, _ymax = float(_dy.min()), float(_dy.max())
-    _xpad = 0.05 * (_xmax - _xmin + 1e-9)
-    _ypad = max(0.03, 0.08 * (_ymax - _ymin + 1e-9))
-    _xlim = (_xmin - _xpad, _xmax + _xpad)
-    _ylim = (max(0.0, _ymin - _ypad), min(1.0, _ymax + _ypad))
+    # shared bounds across all panels
+    _xmin, _xmax = float(_pc.logvol.min()), float(_pc.logvol.max())
+    _ymin, _ymax = float(_pc.dice.min()), float(_pc.dice.max())
+    _xpad = 0.05 * (_xmax - _xmin + 1e-9); _ypad = max(0.03, 0.08 * (_ymax - _ymin + 1e-9))
+    _xlim = (_xmin - _xpad, _xmax + _xpad); _ylim = (max(0.0, _ymin - _ypad), min(1.0, _ymax + _ypad))
 
-    # ---- colour maps ----
-    _shape_pal = plt.cm.tab20.colors + plt.cm.tab20b.colors
-    _shape_cmap = {f: _shape_pal[i % len(_shape_pal)] for i, f in enumerate(SHAPE_ORDER)}
+    _run_pal = plt.cm.tab10.colors
+    _run_cmap = {r: _run_pal[i % len(_run_pal)] for i, r in enumerate(RUN_NAMES)}
     _mem_cmap = {True: "tab:blue", False: "tab:orange"}
 
     def _log_ticks(ax):
-        """Give the linear (log10) axis proper 10^n majors and log-style minors."""
         lo, hi = int(np.floor(_xmin)), int(np.ceil(_xmax))
         majors = list(range(lo, hi + 1))
         ax.xaxis.set_major_locator(mticker.FixedLocator(majors))
-        ax.xaxis.set_major_formatter(
-            mticker.FuncFormatter(lambda v, _: rf"$10^{{{int(round(v))}}}$"))
-        minors = [d + np.log10(m) for d in majors for m in range(2, 10)]
-        ax.xaxis.set_minor_locator(mticker.FixedLocator(minors))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: rf"$10^{{{int(round(v))}}}$"))
+        ax.xaxis.set_minor_locator(
+            mticker.FixedLocator([d + np.log10(m) for d in majors for m in range(2, 10)]))
 
-    def _allocate_labels(ax):
-        """Run textalloc on an axis whose limits/scale are already set."""
-        ta.allocate(
-            ax, _lx, _dy, _names,
-            x_scatter=_lx, y_scatter=_dy,   # avoid the data points
-            textsize=7,
-            margin=0.008,                   # padding around each label (axis fraction)
-            min_distance=0.012,             # min gap label→point
-            max_distance=0.30,              # how far a label may travel into empty space
-            linewidth=0.5,
-            linecolor="0.45",
-            draw_lines=True,                # connector lines
-            nbr_candidates=500,             # more candidate slots → tighter packing
-            draw_all=True,                  # force all 115 to appear
-        )
+    def _labels(ax, lx, dy, names):
+        if len(names):
+            ta.allocate(ax, lx, dy, names, x_scatter=lx, y_scatter=dy, textsize=6,
+                        margin=0.01, min_distance=0.015, max_distance=0.5, linewidth=0.4,
+                        linecolor="0.6", draw_lines=True, nbr_candidates=400, draw_all=True)
 
-    # ---- figure (bigger canvas = more room for 115 labels) ----
-    _fig, (_a0, _a1) = plt.subplots(1, 2, figsize=(24, 13), sharey=True)
+    # ===== FIG 1: per-shape small multiples, both runs + connectors =====
+    _shapes = [f for f in SHAPE_ORDER if f in set(_pc["shape"])]
+    _ncol = 3; _nrow = int(np.ceil(len(_shapes) / _ncol))
+    _fig1, _axes = plt.subplots(_nrow, _ncol, figsize=(6.5 * _ncol, 4.8 * _nrow),
+                                sharex=True, sharey=True, squeeze=False)
+    _axes = _axes.ravel()
+    for _i, _sh in enumerate(_shapes):
+        _ax = _axes[_i]
+        _sub = _pc[_pc["shape"] == _sh]
+        for _, _cc in _sub.groupby("class"):      # connector per class across runs
+            if len(_cc) >= 2:
+                _ax.plot(_cc.logvol, _cc.dice, "-", color="0.7", lw=0.6, zorder=1)
+        for _r in RUN_NAMES:
+            _rr = _sub[_sub.run == _r]
+            _ax.scatter(_rr.logvol, _rr.dice, s=34, color=_run_cmap[_r], alpha=0.9,
+                        zorder=3, edgecolor="k", linewidth=0.3, label=_r)
+        _ax.set_xlim(_xlim); _ax.set_ylim(_ylim); _log_ticks(_ax)
+        _last = _sub.groupby("class").tail(1)     # label each class once
+        _labels(_ax, _last.logvol.values, _last.dice.values, _last["class"].tolist())
+        _ax.set_title(f"{_sh} ({_sub['class'].nunique()} cls)", fontsize=9)
+        _ax.grid(alpha=0.3, which="both")
+    for _j in range(len(_shapes), len(_axes)):
+        _axes[_j].set_visible(False)
+    _axes[0].legend(fontsize=8, loc="lower right")
+    _fig1.supxlabel("mean object volume (voxels, log)")
+    _fig1.supylabel("mean per-class dice")
+    _fig1.suptitle("Per-class dice vs volume by shape family — run comparison (grey line = same class)")
+    _fig1.tight_layout()
 
-    # ================= LEFT: shape-coloured =================
-    _shape_colors = _pc["shape"].map(lambda s: _shape_cmap.get(s, "tab:gray")).tolist()
-    _a0.scatter(_lx, _dy, s=32, c=_shape_colors, alpha=0.85, zorder=3)
-    _a0.set_xlim(_xlim); _a0.set_ylim(_ylim)
-    _log_ticks(_a0)
-    _allocate_labels(_a0)
+    # ===== FIG 2: membership scatter, one panel per run (no labels) =====
+    _fig2, _ax2 = plt.subplots(1, len(RUN_NAMES), figsize=(8 * len(RUN_NAMES), 6.5),
+                               sharex=True, sharey=True, squeeze=False)
+    _ax2 = _ax2.ravel()
+    for _i, _r in enumerate(RUN_NAMES):
+        _rr = _pc[_pc.run == _r]
+        _ax2[_i].scatter(_rr.logvol, _rr.dice, s=36, c=_rr.in_train.map(_mem_cmap).tolist(),
+                         alpha=0.85, zorder=3, edgecolor="k", linewidth=0.3)
+        _ax2[_i].set_xlim(_xlim); _ax2[_i].set_ylim(_ylim); _log_ticks(_ax2[_i])
+        _ax2[_i].set(xlabel="mean object volume (voxels, log)", title=f"{_r} — membership")
+        _ax2[_i].grid(alpha=0.3, which="both")
+    _ax2[0].set_ylabel("mean per-class dice")
+    _ax2[0].legend(handles=[Line2D([], [], marker="o", ls="", color=_mem_cmap[True], label="train (seen)"),
+                            Line2D([], [], marker="o", ls="", color=_mem_cmap[False], label="held-out")],
+                   fontsize=9, loc="upper left")
+    _fig2.tight_layout()
 
-    _seen = [f for f in SHAPE_ORDER if f in set(_pc["shape"])]
-    if "other" in set(_pc["shape"]) and "other" not in _seen:
-        _seen.append("other")
-    _a0.legend(handles=[Patch(color=_shape_cmap.get(f, "tab:gray"), label=f) for f in _seen],
-               title="shape", fontsize=7, title_fontsize=8, loc="upper left", frameon=True)
-    _a0.set(xlabel="mean object volume (voxels, log)", ylabel="mean per-class dice",
-            title=f"per-class dice vs volume — shape coloured ({len(_pc)} labels)")
-    _a0.grid(alpha=0.3, which="both")
-
-    # ================= RIGHT: membership-coloured =================
-    _mem_colors = _pc["in_train"].map(_mem_cmap).tolist()
-    _a1.scatter(_lx, _dy, s=32, c=_mem_colors, alpha=0.85, zorder=3)
-    _a1.set_xlim(_xlim); _a1.set_ylim(_ylim)
-    _log_ticks(_a1)
-    _allocate_labels(_a1)
-
-    _a1.legend(handles=[Line2D([], [], marker="o", ls="", color=_mem_cmap[True], label="train (seen)"),
-                        Line2D([], [], marker="o", ls="", color=_mem_cmap[False], label="held-out")],
-               fontsize=9, loc="upper left")
-    _a1.set(xlabel="mean object volume (voxels, log)",
-            title="per-class dice vs volume — membership")
-    _a1.grid(alpha=0.3, which="both")
-
-    _fig.subplots_adjust(left=0.045, right=0.985, bottom=0.06, top=0.95, wspace=0.10)
-    _fig
-    return np, plt
+    mo.vstack([_fig1, _fig2])
+    return
 
 
 @app.cell
-def _(S, SHAPE_ORDER, np, plt):
-    # ── 2. PER-SHAPE FAMILY BREAKDOWN ───────────────────────────────────────────────────────────
-    # Dice aggregated by morphology family (SHAPE_ORDER is thick→thin, so this reads as a
-    # dice-vs-thickness profile). MACRO = mean over classes (so many-class families don't dominate);
-    # micro = per-sample mean; miss = per-sample complete-miss rate; thick_p90 = family median.
-    _cls = S.groupby(["shape", "class"]).dice.mean()  # Series (shape,class) -> mean dice
-    _fam = _cls.groupby("shape").agg(n_cls="size", macro="mean").reindex(SHAPE_ORDER)
-    _fam["n_samp"] = S.groupby("shape").size().reindex(SHAPE_ORDER)
-    _fam["micro"] = S.groupby("shape").dice.mean().reindex(SHAPE_ORDER)
-    _fam["miss"] = S.groupby("shape").apply(lambda g: (g.dice < 0.01).mean(),
-                                            include_groups=False).reindex(SHAPE_ORDER)
-    _fam["thick_p90"] = S.groupby("shape").thick_p90.median().reindex(SHAPE_ORDER)
-    _fam = _fam.dropna(subset=["n_cls"])
-    print("dice by shape family (macro over classes):\n" + _fam.to_string())
+def _(RUN_NAMES, S, SHAPE_ORDER, np, plt):
+    # ── 2. PER-SHAPE FAMILY BREAKDOWN — run comparison ───────────────────────────────────────────
+    # Macro dice (mean over classes) per morphology family for each run, side by side. SHAPE_ORDER is
+    # thick→thin, so this reads as a dice-vs-thickness profile compared across runs; delta = <run2>−<run1>.
+    _cls = S.groupby(["run", "shape", "class"]).dice.mean()
+    _fam = _cls.groupby(["run", "shape"]).mean().unstack("run").reindex(SHAPE_ORDER).dropna(how="all")
+    _ncls = S.groupby("shape")["class"].nunique()
+    _show = _fam.copy()
+    if len(RUN_NAMES) == 2:
+        _show["delta"] = _fam[RUN_NAMES[1]] - _fam[RUN_NAMES[0]]
+    print("macro dice by shape family × run (thick→thin):\n" + _show.to_string())
 
-    _x = np.arange(len(_fam))
-    _fig, _ax = plt.subplots(figsize=(max(9, 1.1 * len(_fam)), 5))
-    _ax.bar(_x - 0.2, _fam.macro, 0.4, color="tab:blue", label="macro dice")
-    _ax.bar(_x + 0.2, _fam.micro, 0.4, color="tab:cyan", label="micro dice")
-    for _i, (_m, _mi, _ms) in enumerate(zip(_fam.macro, _fam.micro, _fam.miss)):
-        _ax.text(_i - 0.2, _m + .002, f"{_m:.3f}", ha="center", va="bottom", fontsize=7)
-        _ax.text(_i, -0.006, f"miss {_ms:.0%}", ha="center", va="top", fontsize=6, color="gray")
+    _x = np.arange(len(_fam)); _w = 0.8 / len(RUN_NAMES)
+    _fig, _ax = plt.subplots(figsize=(max(9, 1.4 * len(_fam)), 5))
+    for _i, _r in enumerate(RUN_NAMES):
+        if _r in _fam.columns:
+            _b = _ax.bar(_x + (_i - (len(RUN_NAMES) - 1) / 2) * _w, _fam[_r].values, _w, label=_r)
+            _ax.bar_label(_b, fmt="%.2f", fontsize=6, padding=1)
     _ax.set_xticks(_x)
-    _ax.set_xticklabels([f"{s}\n({int(c)} cls, n={int(n)})" for s, c, n in
-                         zip(_fam.index, _fam.n_cls, _fam.n_samp)], fontsize=7)
-    _ax.set(ylabel="val dice", title="Val dice by morphology family (thick→thin)")
+    _ax.set_xticklabels([f"{s}\n({int(_ncls.get(s, 0))} cls)" for s in _fam.index], fontsize=7)
+    _ax.set(ylabel="macro val dice", title="Macro dice by morphology family × run (thick→thin)")
     _ax.legend(fontsize=8); _ax.grid(alpha=0.3, axis="y")
     _fig.tight_layout()
     _fig
@@ -337,34 +321,33 @@ def _(S, SHAPE_ORDER, np, plt):
 
 
 @app.cell
-def _(S, pd, plt):
-    # ── 3. PER-SAMPLE DICE vs GEOMETRY DRIVERS ──────────────────────────────────────────────────
-    # Where does the run succeed/fail at the sample level? Dice vs four drivers: object thickness
-    # (interior-EDT p90), target volume, target occupancy, and CONTEXT occupancy (does a fuller
-    # in-context example help?). Scatter (per sample) + mean over quantile bins (line).
+def _(RUN_NAMES, S, pd, plt):
+    # ── 3. PER-SAMPLE DICE vs GEOMETRY DRIVERS — run comparison ───────────────────────────────────
+    # Binned-mean dice vs four geometry drivers (object thickness, target volume, target/context
+    # occupancy), ONE line per run over the same quantile bins. Faint points show the raw per-sample
+    # spread. Diverging lines mean the runs respond differently to that driver.
     _drivers = [("thick_p90", True), ("volume", True), ("tgt_occ", True), ("ctx_occ", True)]
-    _fig, _axes = plt.subplots(2, 2, figsize=(13, 9))
-    _axes = _axes.ravel()
+    _run_pal = plt.cm.tab10.colors
+    _run_cmap = {r: _run_pal[i % len(_run_pal)] for i, r in enumerate(RUN_NAMES)}
+    _fig, _axes = plt.subplots(2, 2, figsize=(13, 9)); _axes = _axes.ravel()
     for _k, (_f, _logx) in enumerate(_drivers):
         _ax = _axes[_k]
         if _f not in S.columns:
             _ax.set_visible(False); continue
-        _d = S[[_f, "dice"]].dropna()
-        _d = _d[_d[_f] > 0] if _logx else _d
-        _ax.scatter(_d[_f], _d.dice, s=10, alpha=0.3, color="tab:blue")
-        try:
-            _b = pd.qcut(_d[_f], 8, duplicates="drop")
-            _grp = _d.groupby(_b, observed=True)
-            _ax.plot(_grp[_f].median(), _grp.dice.mean(), "-o", color="tab:red", ms=4,
-                     label="binned mean")
-            _ax.legend(fontsize=8)
-        except (ValueError, IndexError):
-            pass
+        for _r in RUN_NAMES:
+            _d = S[S.run == _r][[_f, "dice"]].dropna()
+            _d = _d[_d[_f] > 0] if _logx else _d
+            _ax.scatter(_d[_f], _d.dice, s=6, alpha=0.12, color=_run_cmap[_r])
+            try:
+                _grp = _d.groupby(pd.qcut(_d[_f], 8, duplicates="drop"), observed=True)
+                _ax.plot(_grp[_f].median(), _grp.dice.mean(), "-o", color=_run_cmap[_r], ms=4, label=_r)
+            except (ValueError, IndexError):
+                pass
         if _logx:
             _ax.set_xscale("log")
         _ax.set(xlabel=_f, ylabel="dice", title=f"dice vs {_f}")
-        _ax.grid(alpha=0.3)
-    _fig.suptitle("Per-sample dice vs geometry drivers", y=1.002)
+        _ax.legend(fontsize=8); _ax.grid(alpha=0.3)
+    _fig.suptitle("Per-sample dice vs geometry drivers — run comparison", y=1.002)
     _fig.tight_layout()
     _fig
     return
@@ -373,15 +356,16 @@ def _(S, pd, plt):
 @app.cell
 def _():
     # ── Contents ─────────────────────────────────────────────────────────────────────────────────
-    # cell 0:  fetch + cache (samples / config+summary / geometry) + morphology clustering + header.
-    # cell 1:  per-class val dice ranked, coloured by shape family, held-out classes hatched (+ table).
-    # cell 1b: train vs held-out generalisation — raw gap is confounded by size; controlled within
-    #          shape family (a), and via matched lateral-mirror pairs (c) → near-parity when matched.
-    # cell 1c: per-class dice vs volume, labelled scatter ×2 (by class / by train membership).
-    # cell 2:  per-shape family breakdown (macro/micro dice, miss rate, thickness) — dice-vs-shape.
-    # cell 3:  per-sample dice vs geometry drivers (thickness, volume, target/context occupancy).
-    # Set RUN (cell 0) to any patch_icl_3d_exps run; N_SHAPE controls the family granularity.
-    # Shape taxonomy + geometry come from totalseg_geometry_extract (shared with nb 20).
+    # Compares TWO runs (RUNS dict in cell 0) on the SAME per-run metrics; delta = <run2> − <run1>.
+    # cell 0:  fetch + cache both runs, tag with `run`, concat, shared morphology clustering + header.
+    # cell 1:  per-class dice pivoted per run (+ movers table); scatter run1 vs run2 with parity line.
+    # cell 1b: train vs held-out per run — membership × run bars (a), held-out dice by shape family (b),
+    #          matched lateral-mirror pairs per run (morphology-controlled).
+    # cell 1c: per-class dice vs volume — per-shape panels with both runs + connectors (labelled);
+    #          membership scatter per run (no labels).
+    # cell 2:  per-shape family macro dice, grouped bars per run (+ delta table).
+    # cell 3:  per-sample dice vs geometry drivers, one binned-mean line per run.
+    # Edit RUNS / N_SHAPE in cell 0. Shape taxonomy + geometry come from totalseg_geometry_extract.
     print("tables: cells 0-2;  figures: cells 1-3")
     return
 
