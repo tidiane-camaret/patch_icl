@@ -62,7 +62,7 @@ sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from
 
 from data.totalseg_classes import resolve_classes
 from common import DEVICE, _source_root, train_loader, make_eval_loader
-from evaluate import evaluate_classes, build_sample_table
+from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
 
@@ -98,15 +98,39 @@ def _soft_dice(prob, target, eps: float = 1e-6):
     return (1 - (2 * inter + eps) / (den + eps)).mean()
 
 
+def model_output_is_prob(cfg) -> bool:
+    """True when the model output is already a [0,1] probability map, so it must NOT be
+    sigmoided before loss/metrics. Medverse regresses the mask straight into [0,1] — its
+    released checkpoint has loss_seg='smoothl3_l1' and no output activation (verified: raw
+    output ranges ~[0,1], and its own predict() thresholds the raw output at 0.5). patchset3d
+    emits real logits, which do need a sigmoid. Sigmoiding Medverse's [0,1] output pins every
+    voxel to foreground (sigmoid(x)>=0.5 for x>=0), collapsing dice to ~0.1."""
+    return cfg.get("model", "medverse") == "medverse"
+
+
+def _to_prob(logits, is_prob: bool):
+    """Map raw model output to a probability map (identity if already a prob; else sigmoid)."""
+    return logits if is_prob else torch.sigmoid(logits)
+
+
 def build_loss(cfg):
-    """Return loss_fn(logits, target) -> scalar, selected by cfg.train.loss."""
+    """Return loss_fn(logits, target) -> scalar, selected by cfg.train.loss.
+
+    Losses operate on the probability map via _to_prob — no sigmoid for models whose output
+    is already a probability (medverse; see model_output_is_prob)."""
     name = cfg.train.get("loss", "smooth_l1")
+    is_prob = model_output_is_prob(cfg)
     if name == "smooth_l1":
         crit = SmoothL3L1()
         scale = float(cfg.train.get("loss_scale", 50.0))
-        return lambda logits, target: scale * crit(torch.sigmoid(logits.float()), target)
+        return lambda logits, target: scale * crit(_to_prob(logits.float(), is_prob), target)
     if name == "bce_dice":
         w = float(cfg.train.get("dice_weight", 1.0))
+        if is_prob:   # output already in [0,1] -> plain BCE (with_logits would sigmoid again)
+            eps = 1e-6
+            return lambda logits, target: (
+                F.binary_cross_entropy(_to_prob(logits.float(), True).clamp(eps, 1 - eps), target)
+                + w * _soft_dice(_to_prob(logits.float(), True), target))
         return lambda logits, target: (
             F.binary_cross_entropy_with_logits(logits.float(), target)
             + w * _soft_dice(torch.sigmoid(logits.float()), target))
@@ -114,8 +138,8 @@ def build_loss(cfg):
 
 
 @torch.no_grad()
-def _hard_dice(logits, target):
-    pred = (torch.sigmoid(logits) >= 0.5).float()
+def _hard_dice(logits, target, is_prob: bool = False):
+    pred = (_to_prob(logits, is_prob) >= 0.5).float()
     inter = (pred * target).sum().item()
     den = pred.sum().item() + target.sum().item()
     return (2 * inter + 1) / (den + 1)
@@ -210,6 +234,7 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     scheduler drives AdamW = optimizers[0]; Muon is unscheduled, cf. experiments/2d/train.py)."""
     net = getattr(model, "model", model)
     net.train()
+    is_prob = model_output_is_prob(cfg)           # medverse output is already a probability
     total, dice_sum, soft_run, n = 0.0, 0.0, 0.0, 0
     gh = ghc = gs = gsc = gc = gcc = 0.0          # grid-metric running sums
     rd = None
@@ -240,8 +265,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             scheduler.step()
 
         total += loss.item()
-        dice_sum += _hard_dice(logits.float(), target)
-        soft_run += 1.0 - _soft_dice(torch.sigmoid(logits.float()), target).item()
+        dice_sum += _hard_dice(logits.float(), target, is_prob)
+        soft_run += 1.0 - _soft_dice(_to_prob(logits.float(), is_prob), target).item()
         n += 1
         if is_patchset:
             rd = logits.shape[-1]
@@ -314,7 +339,8 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # is at grid res — the two loss scales are intentionally not directly comparable.
     rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
                                    logits_fn=model.train_forward, loss_fn=loss_fn,
-                                   grid_res=getattr(model, "grid_size", None))
+                                   grid_res=getattr(model, "grid_size", None),
+                                   output_is_prob=model_output_is_prob(cfg))
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
     soft = [r["mean_soft_dice"] for r in valid if "mean_soft_dice" in r]
@@ -367,7 +393,15 @@ def main(cfg: DictConfig) -> None:
     net = getattr(model, "model", model)
     if is_patchset:
         net.to(DEVICE)
-    print(f"Trainable params: {sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6:.1f}M")
+    # Param counts + compute (GFLOPs of one predict() call, same metric eval.py logs so the
+    # two are comparable). Measured before any torch.compile so FlopCounterMode isn't tripped
+    # by graph breaks; FLOP count is weight-independent so pre-checkpoint-load is fine.
+    n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in net.parameters())
+    gflops = measure_flops(model, image_size, cfg.data.context_size, DEVICE)
+    print(f"Params: {n_trainable/1e6:.1f}M trainable / {n_total/1e6:.1f}M total "
+          f"({100 * n_trainable / max(n_total, 1):.0f}%) | predict GFLOPs: {gflops:.2f} "
+          f"(K={cfg.data.context_size}, size={image_size})")
 
     # train.checkpoint is the single weight-source knob. Sentinels ("orig_weights",
     # "random") are handled at model construction (build_model); only an actual path
@@ -450,6 +484,9 @@ def main(cfg: DictConfig) -> None:
     from hydra.core.hydra_config import HydraConfig
     wb_config = OmegaConf.to_container(cfg, resolve=True)
     wb_config["hydra_choices"] = dict(HydraConfig.get().runtime.choices)
+    wb_config["params_trainable_M"] = round(n_trainable / 1e6, 3)
+    wb_config["params_total_M"] = round(n_total / 1e6, 3)
+    wb_config["gflops"] = round(gflops, 2)
     run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
                      mode="online" if wb_on else "disabled",
                      config=wb_config)

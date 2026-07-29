@@ -251,7 +251,8 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
 
 
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
-                     loader=None, logits_fn=None, loss_fn=None, grid_res=None):
+                     loader=None, logits_fn=None, loss_fn=None, grid_res=None,
+                     output_is_prob=False):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -307,7 +308,10 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
             with torch.no_grad():
                 logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
             tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
-            prob = torch.sigmoid(logits).cpu()
+            # output_is_prob (medverse): logits_fn already returns a [0,1] probability, so do
+            # NOT sigmoid it again (that pins every voxel to foreground). See train.py's
+            # model_output_is_prob. Default False keeps eval.py's logit path byte-identical.
+            prob = (logits if output_is_prob else torch.sigmoid(logits)).cpu()
             grid_pr = grid_gt = None
             if grid_res is not None:
                 grid_pr = F.adaptive_avg_pool3d(prob, (grid_res,) * 3)                 # (B,1,g,g,g)

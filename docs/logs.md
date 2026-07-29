@@ -1,5 +1,59 @@
 # Change log
 
+## Log params + FLOPs in 3d/train.py (2026-07-29)
+
+`experiments/3d/train.py` now logs, at startup, trainable/total param counts and the model's
+compute: `Params: X.XM trainable / Y.YM total (Z%) | predict GFLOPs: G (K=…, size=…)`. GFLOPs
+reuse `evaluate.measure_flops` (one `predict()` call, the same metric eval.py reports, so
+train/eval are comparable); measured before any `torch.compile` (FLOP count is weight-
+independent). Also written to the wandb run config as `params_trainable_M`, `params_total_M`,
+`gflops`. Medverse@128³/K=1: 71.1M (100% trainable), 2362.56 GFLOPs.
+
+## Fix: Medverse finetune loss double-activated its already-[0,1] output (2026-07-29)
+
+Root-caused a Medverse finetune that trained/val'd at ~0.1 dice. **The Medverse net outputs
+the segmentation map directly in [0,1]** — the released checkpoint has `loss_seg='smoothl3_l1'`
+and no output activation (the output block is a plain conv; `predict()`/`demo.py` threshold the
+*raw* output at 0.5). Our self-written training helpers instead treated the output as raw logits
+and applied a sigmoid in both the loss and the metric:
+- `_hard_dice` / train soft-dice / `evaluate.py` val soft-dice: `sigmoid(output)`. Since
+  `output ≥ 0 ⇒ sigmoid(output) ≥ 0.5`, this **predicts foreground in every voxel** → dice ≈
+  2·FG/(N+FG) ≈ 0.1 regardless of learning.
+- `build_loss`: `smooth_l1` did `SmoothL3L1(sigmoid(output), y)` and `bce_dice` did
+  `BCEWithLogits(output, y)` — both mis-scale an already-[0,1] map, corrupting gradients.
+
+Verified on real in-context tasks with the zero-shot released model (at its `smoothl3_l1`
+optimum): raw-output path → dice 0.81, `SmoothL3L1(out,y)=0.003`; sigmoid path → dice 0.14,
+loss 0.041, foreground fraction 1.0. Output range measured ~[0,1] (min ~0, max ~1).
+
+Fix (model-aware; patchset3d still emits logits and is unchanged): added
+`model_output_is_prob(cfg)` + `_to_prob()` in `experiments/3d/train.py`. `build_loss`,
+`_hard_dice`, and the train-epoch soft metric now skip the sigmoid for medverse; `bce_dice`
+uses plain `binary_cross_entropy` (not `_with_logits`) on the [0,1] output.
+`evaluate.py:evaluate_classes` gained `output_is_prob=False` (default keeps eval.py's logit
+path byte-identical) and `validate_mean` passes it through. Re-verified through the real
+trainer functions: fixed path → good cases dice ~0.95 / small loss, old sigmoid path ~0.14.
+
+Also switched `experiment=31_medverse_colipri_task` loss `bce_dice → smooth_l1` (scale 50) —
+Medverse's native pretraining objective on the raw [0,1] output.
+
+## Medverse twin of the exp-30 CoLiPri task (2026-07-29)
+
+Added `configs/experiment/3d/experiment/31_medverse_colipri_task.yaml`: the Medverse
+counterpart to `experiment=30_colipri_encoder`, for A/B against the frozen-CoLiPri
+PatchSet3D trained with `experiment=30_colipri_encoder data.crop_spacing_mm=2
+data.train_classes=all`.
+
+Same data recipe (totalseg, `nnunet` aug, `use_crop=true`, `crop_spacing_mm=2`,
+`train_classes=all`, `val_classes=all`, no synth, `class_balanced=false`,
+`max_ds_len_train=1000`, `context_size=1`) and same optim recipe (bce_dice, AdamW, cosine,
+lr 1e-4, wd 0.01, warmup 1, 1000 epochs, eval split=test n_subjects=20). Two deliberate
+differences: **model=medverse** (released weights, `checkpoint=orig_weights`, level=1 no AR)
+and **input size 128³** (Medverse native, vs 192³). `crop_spacing_mm=2` is held constant, so
+FOV = 128·2 = **256mm @ 2mm/vox** (the patchset3d run was 384mm @ 2mm/vox) — same voxel
+resolution, smaller body crop. `batch_size=1` kept from exp30 (raise it; 128³ Medverse has
+memory headroom). Run: `python experiments/3d/train.py experiment=31_medverse_colipri_task`.
+
 ## Crop path: pad thin-FOV axes instead of stretching (2026-07-28)
 
 Fixed anisotropic (elongated) crops under `data.use_crop=true`. `_load_crop` /

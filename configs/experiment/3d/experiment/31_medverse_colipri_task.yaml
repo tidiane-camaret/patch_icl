@@ -1,0 +1,53 @@
+# @package _global_
+# Experiment 31 — Medverse on the exp-30 CoLiPri *task*, at Medverse's native 128³.
+# The medverse twin of experiment=30_colipri_encoder: identical data selection + optim
+# recipe, but swaps the frozen-CoLiPri PatchSet3D for the released Medverse U-Net running
+# at 128³ (level=1, no AR).
+#
+# Task-matching decisions (see docs/logs.md 2026-07-29):
+#   - input size 128³ (Medverse native) instead of 192³.
+#   - crop_spacing_mm=2 held constant → FOV = 128·2 = 256mm @ 2mm/voxel. Same voxel
+#     resolution as the patchset3d run (which had 384mm FOV at 192³), a smaller body crop.
+#   - optim = exp30's AdamW/cosine/lr-1e-4 recipe, but loss = Medverse's NATIVE smooth_l1
+#     (SmoothL3L1 on the raw output, scale 50). Medverse regresses the mask directly into
+#     [0,1] (checkpoint loss_seg='smoothl3_l1', no output activation) — bce_dice/BCE-with-
+#     logits would sigmoid an already-[0,1] map and collapse dice to ~0.1 (verified on real
+#     tasks: raw-output dice 0.81 vs sigmoid-path 0.14). See docs/logs.md 2026-07-29.
+#   - init = released Medverse weights (checkpoint=orig_weights, fine-tune).
+#   - train_classes=all, val_classes=all (matches the patchset3d run's `train_classes=all`
+#     override of exp30's `benchmark`).
+#
+# Run with (no extra overrides needed — the exp30 CLI overrides are baked in here):
+#   python experiments/3d/train.py experiment=31_medverse_colipri_task
+defaults:
+  - override /model: medverse
+  - override /dataset: totalseg
+  - override /augmentations: nnunet
+
+data:
+  image_size: [128, 128, 128]
+  use_crop: true
+  crop_spacing_mm: 2
+  max_ds_len_train: 1000
+  train_classes: all
+  val_classes: all
+  synth_method: null
+  p_synth: 0
+  class_balanced: false
+
+train:
+  epochs: 1000
+  batch_size: 1          # exp30 used bs=1 (forced by 192³ patchset memory); at 128³ Medverse
+                         # has headroom — raise with train.batch_size=N if you want throughput.
+  checkpoint: orig_weights
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: smooth_l1        # Medverse's pretraining objective; operates on the raw [0,1] output
+  loss_scale: 50.0
+
+eval:
+  split: test
+  n_subjects: 20
