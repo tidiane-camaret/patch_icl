@@ -553,6 +553,18 @@ class TotalSegInContextDataset(Dataset):
         """Return effective spacing (3,) for subject, defaulting to 1mm isotropic."""
         return self._spacings.get(subj, torch.ones(3, dtype=torch.float32))
 
+    def _reported_spacing(self, subj: str) -> torch.Tensor:
+        """Effective mm/voxel of the returned image tensor (for item['spacing']).
+
+        Under use_crop the crop covers T*crop_spacing_mm and is resampled to T³, so
+        the output is crop_spacing_mm/voxel isotropic — regardless of the native
+        spacing used internally by _load_crop to size the crop. Otherwise the resized
+        effective spacing from _get_spacing already describes the output tensor.
+        """
+        if self.use_crop:
+            return torch.full((3,), self.crop_spacing_mm, dtype=torch.float32)
+        return self._get_spacing(subj)
+
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
         if split is not None:
@@ -753,7 +765,7 @@ class TotalSegInContextDataset(Dataset):
             "context_out": torch.stack(ctx_masks),                     # (K, D, H, W) int64
             "subject":     subj,
             "label_name":  f"sv_{sv_groups[0][0]}",
-            "spacing":     self._get_spacing(subj),                    # (3,) mm/voxel; 1mm default for synth
+            "spacing":     self._reported_spacing(subj),               # (3,) mm/voxel of output tensor
         }
         if self.random_coloring:
             item["label_palette"] = self._sample_palette(
@@ -856,7 +868,7 @@ class TotalSegInContextDataset(Dataset):
             "context_out": torch.stack(context_out),  # (K, D, H, W) int64 always
             "subject":     subj,
             "label_name":  label_name,
-            "spacing":     self._get_spacing(subj),   # (3,) mm/voxel
+            "spacing":     self._reported_spacing(subj),   # (3,) mm/voxel of output tensor
         }
         if self.random_coloring and len(context_out) > 0:
             item["label_palette"] = self._sample_palette(
@@ -868,34 +880,31 @@ class TotalSegInContextDataset(Dataset):
     # Loading helpers
     # ------------------------------------------------------------------
 
-    def _load_crop(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Load native ct.npy + label.npy and return an organ-centred crop resized to T³.
+    def _organ_crop_arrays(
+        self,
+        subj_dir,
+        label_mm: np.ndarray,
+        center: tuple[int, int, int],
+        sp: list[float],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Slice an organ-centred crop of fixed physical extent (T*crop_spacing_mm/axis).
 
-        Physical extent is fixed at T*1.5mm (192mm at T=128), matching the CT dataset
-        (always 1.5mm isotropic).  Crop voxel counts vary per axis and subject to cover
-        this extent, then trilinear resample to T³ gives 1.5mm/voxel isotropic for all
-        subjects and modalities.
+        The crop covers a fixed extent so that, after resampling to T³, every axis is
+        crop_spacing_mm/voxel isotropic regardless of native FOV.  When an axis has fewer
+        native voxels than that extent (a thin/limited-FOV scan), the slice is clamped to
+        what exists and the shortfall is symmetrically padded — air for the CT, background
+        0 for the label.  Padding (rather than stretching the short axis to T³) keeps the
+        object's true aspect ratio; stretching would elongate it (see docs/logs.md).
+
+        Returns (crop_ct, crop_lbl) numpy arrays of the fixed target voxel size.
         """
-        subj_dir = self.root / subj
         T = self.image_size[0]
-
-        label_mm = np.load(subj_dir / "label.npy", mmap_mode="r")
+        cd, ch, cw = center
         D, H, W = label_mm.shape
 
-        center = self._bbox_cache.get(subj, {}).get(cls)
-        if center is not None:
-            cd, ch, cw = center
-        else:
-            cd, ch, cw = D // 2, H // 2, W // 2
-
-        # Fixed physical crop: T * 1.5mm = 192mm at T=128, matching CT (always 1.5mm).
-        # Using a fixed extent gives identical effective spacing (1.5mm/voxel) across
-        # all subjects and modalities after the crop is resampled to T³.
-        sp = self._get_spacing(subj).tolist()   # native mm/voxel (3,)
         phys_ref = T * self.crop_spacing_mm
-        crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
-                      for spi, dim in zip(sp, (D, H, W))]
+        target_sizes = [max(1, round(phys_ref / spi)) for spi in sp]      # fixed extent
+        crop_sizes   = [min(dim, t) for t, dim in zip(target_sizes, (D, H, W))]  # available
 
         j = self.crop_jitter
         starts = []
@@ -909,7 +918,35 @@ class TotalSegInContextDataset(Dataset):
         ct_mm = np.load(subj_dir / "ct.npy", mmap_mode="r")
         crop_ct  = ct_mm   [d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
         crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
-        s = crop_ct.shape
+
+        # Symmetric-pad thin axes up to the fixed extent so they aren't stretched to T³.
+        pad = [t - c for t, c in zip(target_sizes, crop_sizes)]
+        if any(pad):
+            pad_width = [(p // 2, p - p // 2) for p in pad]
+            crop_ct  = np.pad(crop_ct,  pad_width, mode="constant",
+                              constant_values=float(crop_ct.min()))   # air/background
+            crop_lbl = np.pad(crop_lbl, pad_width, mode="constant", constant_values=0)
+        return crop_ct, crop_lbl
+
+    def _load_crop(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load native ct.npy + label.npy and return an organ-centred crop resized to T³.
+
+        Physical extent is fixed at T*crop_spacing_mm, so after resampling to T³ the
+        output is crop_spacing_mm/voxel isotropic for every subject.  See
+        _organ_crop_arrays for how thin-FOV axes are padded (not stretched).
+        """
+        subj_dir = self.root / subj
+        T = self.image_size[0]
+
+        label_mm = np.load(subj_dir / "label.npy", mmap_mode="r")
+        D, H, W = label_mm.shape
+
+        center = self._bbox_cache.get(subj, {}).get(cls)
+        center = center if center is not None else (D // 2, H // 2, W // 2)
+
+        sp = self._get_spacing(subj).tolist()   # native mm/voxel (3,)
+        crop_ct, crop_lbl = self._organ_crop_arrays(subj_dir, label_mm, center, sp)
 
         # Resize to T³ (trilinear for image, nearest for label)
         image_t = F.interpolate(
@@ -940,25 +977,10 @@ class TotalSegInContextDataset(Dataset):
             center = self._bbox_cache.get(subj, {}).get(cls)
             if center is not None:
                 break
-        cd, ch, cw = center if center is not None else (D // 2, H // 2, W // 2)
+        center = center if center is not None else (D // 2, H // 2, W // 2)
 
         sp = self._get_spacing(subj).tolist()
-        phys_ref = T * self.crop_spacing_mm
-        crop_sizes = [max(1, min(dim, round(phys_ref / spi)))
-                      for spi, dim in zip(sp, (D, H, W))]
-
-        j = self.crop_jitter
-        starts = []
-        for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
-            ideal = c - cs // 2
-            lo = max(0, ideal - j)
-            hi = max(lo, min(max(0, s - cs), ideal + j))
-            starts.append(self._cur_rng.randint(lo, hi))
-        d0, h0, w0 = starts
-
-        ct_mm   = np.load(subj_dir / "ct.npy", mmap_mode="r")
-        crop_ct  = ct_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
-        crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
+        crop_ct, crop_lbl = self._organ_crop_arrays(subj_dir, label_mm, center, sp)
 
         image_t = F.interpolate(
             torch.from_numpy(crop_ct.astype(np.float32)).unsqueeze(0).unsqueeze(0),

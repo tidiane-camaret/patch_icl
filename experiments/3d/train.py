@@ -194,6 +194,7 @@ def build_model(cfg: DictConfig):
             "encoder": a.get("encoder", "conv"),
             "encoder_frozen": a.get("encoder_frozen", True),
             "primus_sidecar": a.get("primus_sidecar", None),
+            "img_embed_mlp": a.get("img_embed_mlp", False),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
@@ -261,8 +262,9 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
 @torch.no_grad()
 def _feature_sim_trace(net, loader, n_tasks):
     """Per-layer feature-matching trace on a val subsample (patchset3d only): transfer_dice
-    + retrieval_at1 at the transformer INPUT (encoder image features pre-attention, tag
-    'encoder') and after each block ('L{i}'), all at res=R. One hooked forward per task —
+    + retrieval_at1 at the transformer INPUT (img token after the trainable img_embed+pos,
+    pre-attention, tag 'transformer_input') and after each block ('L{i}'), all at res=R.
+    NB: this is NOT the frozen encoder output. One hooked forward per task —
     cheap on a subsample — traces how the jointly-trained encoder and transformer co-evolve.
 
     Returns a list of per-task records {class, subject, fs_<name>_dice, fs_<name>_retr, ...}

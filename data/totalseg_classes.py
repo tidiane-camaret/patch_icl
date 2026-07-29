@@ -47,6 +47,11 @@ ALL_CLASSES: list[str] = [
     "lung_left", "lung_right",     # whole-lung; CT has 5 lobe-level labels instead
     "intervertebral_discs",        # MRI-only merged disc label
     "vertebrae",                   # merged vertebrae; CT has per-level labels
+    # Subtask / pathology classes (index 122+): NOT present in the standard
+    # `total` label.npy — they come from separate TotalSegmentator subtask
+    # datasets (own subject cohorts, converted via scripts/convert_nnunet_task.py).
+    # Appended at the end so all existing indices stay stable.
+    "hip_implant",                 # Zenodo 20272030 / Dataset260 (71 subj, CT)
 ]
 
 
@@ -125,6 +130,62 @@ BENCHMARK_CLASSES: list[str] = [
 ]
 
 
+BALANCED_CLASSES: list[str] = [
+    # A training set balanced across category AND object thickness (unlike BENCHMARK_CLASSES,
+    # which oversamples thick organs), while leaving a graded out-of-distribution pool. The
+    # redundant rib/vertebra families are subsampled to a spanning ladder rather than dumped
+    # whole into OOD. The held-out complement (`not_balanced`) splits into three tiers — see
+    # balanced_ood_tiers(): near (contralateral of a trained pair, morphology-matched),
+    # level (unseen rib/vertebra levels), far (genuinely novel structures).
+    # --- Organs (Abd/Pelvis): 12 ---
+    "liver", "spleen", "kidney_left", "pancreas", "stomach", "colon", "small_bowel",
+    "esophagus", "gallbladder", "urinary_bladder", "adrenal_gland_left", "duodenum",
+    # --- Organs (Thorax/Head/Spine): 8 ---
+    "heart", "lung_lower_lobe_left", "lung_upper_lobe_right", "lung_middle_lobe_right",
+    "trachea", "thyroid_gland", "brain", "spinal_cord",
+    # --- Muscles: 5 (one side of each pair; contralateral → near-OOD) ---
+    "autochthon_left", "iliopsoas_right", "gluteus_maximus_left", "gluteus_medius_right",
+    "gluteus_minimus_left",
+    # --- Bones (Limbs/Shoulder/Pelvis): 6 ---
+    "femur_left", "hip_right", "humerus_left", "clavicula_right", "scapula_left", "skull",
+    # --- Bones (Spine): 11 (ladder spanning C/T/L/S; adjacent levels → level-OOD) ---
+    "vertebrae_C3", "vertebrae_C7", "vertebrae_T3", "vertebrae_T6", "vertebrae_T9",
+    "vertebrae_T12", "vertebrae_L1", "vertebrae_L3", "vertebrae_L5", "vertebrae_S1", "sacrum",
+    # --- Bones (Ribs/Sternum): 7 (rib #2/3/6/9/11/12 spread over sides + flat bones) ---
+    "rib_left_2", "rib_right_2", "rib_left_3", "rib_right_6", "rib_left_9", "rib_right_11",
+    "rib_left_12", "sternum", "costal_cartilages",
+    # --- Vessels: 10 (large → small, incl. thin subclavian/iliac_vena for thin coverage) ---
+    "aorta", "inferior_vena_cava", "portal_vein_and_splenic_vein", "iliac_artery_left",
+    "common_carotid_artery_left", "brachiocephalic_trunk", "superior_vena_cava",
+    "pulmonary_vein", "subclavian_artery_left", "iliac_vena_left",
+]
+
+
+def balanced_ood_tiers() -> dict[str, list[str]]:
+    """Split the held-out complement of BALANCED_CLASSES into graded OOD tiers (CT).
+
+    Returns a dict with keys:
+      ``near``  — contralateral of a trained L/R pair (same morphology, unseen exact class),
+      ``level`` — unseen rib/vertebra levels (instance/level generalisation),
+      ``far``   — genuinely novel structures with no close trained analogue.
+    ``kidney_cyst_*`` (no CT geometry) is excluded. Useful for grouping eval metrics.
+    """
+    train = set(BALANCED_CLASSES)
+    pool = [c for c in ALL_CLASSES[:117] if c not in train and "kidney_cyst" not in c]
+
+    def flip(c: str):
+        if "_left" in c:
+            return c.replace("_left", "_right")
+        if "_right" in c:
+            return c.replace("_right", "_left")
+        return None
+
+    near = [c for c in pool if flip(c) in train]
+    level = [c for c in pool if c not in near and (c.startswith("rib_") or c.startswith("vertebrae_"))]
+    far = [c for c in pool if c not in near and c not in level]
+    return {"near": near, "level": level, "far": far}
+
+
 def resolve_classes(
     value: Union[str, list],
     totalseg_root: Union[str, Path, None] = None,
@@ -136,6 +197,8 @@ def resolve_classes(
     Special string values (CT by default; pass ``is_mri=True`` for MRI variants):
       ``"benchmark"``     → BENCHMARK_CLASSES / MRI_BENCHMARK_CLASSES
       ``"not_benchmark"`` → ALL_CLASSES[:117] / MRI_ALL_CLASSES minus the benchmark set
+      ``"balanced"``      → BALANCED_CLASSES (CT only — thickness/category-balanced train set)
+      ``"not_balanced"``  → ALL_CLASSES[:117] minus the balanced set (the graded OOD pool)
     Otherwise read ``{totalseg_root}/label_stats.csv`` and return classes whose
     ``split`` column matches *value* (e.g. ``"train"`` / ``"val"``).
 
@@ -162,6 +225,13 @@ def resolve_classes(
             return [c for c in MRI_ALL_CLASSES if c not in bench_set]
         bench_set = set(BENCHMARK_CLASSES)
         return [c for c in ALL_CLASSES[:117] if c not in bench_set]
+
+    if value == "balanced":
+        return list(BALANCED_CLASSES)  # CT only; MRI has no balanced split defined
+
+    if value == "not_balanced":
+        bal_set = set(BALANCED_CLASSES)
+        return [c for c in ALL_CLASSES[:117] if c not in bal_set]
 
     if totalseg_root is None:
         raise ValueError("totalseg_root must be provided when train/val_classes is a split name")

@@ -16,6 +16,8 @@ arch:
   resolution: 16               # token grid R (prediction at R³, tiled to (R·d)³)
   enc_dims: [32, 32, 32, 32]   # 3D per-stage widths; stem + 3 stride-2 stages (len=log2(128/16)+1)
   e: 256
+  img_embed_mlp: false         # true = MLP img_embed (Linear(oc,oc)->GELU->Linear(oc,e));
+                               # helps when encoder out_ch >> e (e.g. primus 864 -> 256)
   h: 512
   l: 6
   a: 4

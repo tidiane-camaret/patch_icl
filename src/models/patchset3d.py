@@ -108,6 +108,7 @@ class PatchSet3D(nn.Module):
         encoder: str = "conv",
         encoder_frozen: bool = True,
         primus_sidecar: str = None,
+        img_embed_mlp: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -131,7 +132,14 @@ class PatchSet3D(nn.Module):
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
             raise ValueError(f"unknown arch.encoder {encoder!r} (conv | primus)")
-        self.img_embed = nn.Linear(self.encoder.out_ch, e)
+        # Encoder feature -> token width e. Default: a single Linear. When the encoder
+        # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
+        # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width
+        # through a GELU before compressing (Linear(oc,oc) -> GELU -> Linear(oc,e)),
+        # preserving more of the frozen features. Off by default (identical to before).
+        oc = self.encoder.out_ch
+        self.img_embed = (nn.Sequential(nn.Linear(oc, oc), nn.GELU(), nn.Linear(oc, e))
+                          if img_embed_mlp else nn.Linear(oc, e))
         self.mask_embed = nn.Linear(self.mask_patch_size ** 3, e)   # occupancy tile p³ -> e
         self.pos = FourierPositionalEncoding(e, fourier_bands, n_axes=3)
         if context_id_embed:

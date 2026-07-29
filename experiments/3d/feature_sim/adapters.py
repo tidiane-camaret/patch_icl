@@ -39,6 +39,13 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         self.model = model.eval()
         self.enc = model.encoder
         self._concat_ch = self.enc.out_ch
+        # A Primus encoder emits a single native token grid (no .stem/.stages), so the
+        # multi-scale stage/concat tiers don't apply. For a primus-encoder checkpoint we
+        # expose 'backbone' (the raw encoder map, == the standalone PrimusEncoderAdapter's
+        # features since the encoder is frozen and self-preprocesses) and 'img_embed' (the
+        # trainable projection of it); the transformer tiers work unchanged (they hook the
+        # full forward, which runs the primus encoder internally).
+        self._is_primus = not hasattr(self.enc, "stages")
 
     @property
     def R(self):
@@ -49,15 +56,29 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         return len(self.enc.stages)               # excludes the stem
 
     def tiers(self):
+        if self._is_primus:
+            return ["backbone", "img_embed"]
         stages = [f"stage:{i}" for i in range(self.n_stages + 1)]
         return stages + ["concat", "img_embed"]
 
     def native_res(self, tier, input_res):
+        if self._is_primus:
+            if tier in ("backbone", "img_embed"):
+                return self.R                      # encoder emits R^3 regardless of input_res
+            raise ValueError(f"unknown primus tier {tier!r}")
         if tier.startswith("stage:"):
             return input_res >> int(tier.split(":")[1])
         if tier in ("concat", "img_embed"):
             return input_res                       # stem-limited, finest genuine
         raise ValueError(f"unknown tier {tier!r}")
+
+    def _apply_img_embed(self, f):
+        """(B,C,r,r,r) raw features -> (B,e,r,r,r) via the model's trainable img_embed
+        projection (isolated: no per-task norm / pos, matching the tier's intent)."""
+        B, r = f.shape[0], f.shape[-1]
+        flat = f.flatten(2).transpose(1, 2)         # (B, r^3, C)
+        emb = self.model.img_embed(flat)            # (B, r^3, e)
+        return emb.transpose(1, 2).reshape(B, emb.shape[-1], r, r, r)
 
     @torch.no_grad()
     def _stage_feats(self, volumes):
@@ -75,6 +96,11 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
 
     @torch.no_grad()
     def features(self, volumes, tier, res):
+        if self._is_primus:
+            if tier not in ("backbone", "img_embed"):
+                raise ValueError(f"unknown primus tier {tier!r}")
+            f = _down_to(self.enc(volumes), res)   # (B, out_ch, res,res,res); enc self-caches
+            return self._apply_img_embed(f) if tier == "img_embed" else f
         feats = self._stage_feats(volumes)
         if tier.startswith("stage:"):
             f = feats[int(tier.split(":")[1])]
@@ -86,22 +112,24 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
             raise ValueError(f"unknown tier {tier!r}")
         f = _down_to(f, res)                        # (B,C,res,res,res)
         if tier == "img_embed":
-            B, C = f.shape[0], f.shape[1]
-            flat = f.flatten(2).transpose(1, 2)     # (B, res^3, C)
-            emb = self.model.img_embed(flat)        # (B, res^3, e)
-            f = emb.transpose(1, 2).reshape(B, emb.shape[-1], res, res, res)
+            f = self._apply_img_embed(f)
         return f
 
     @torch.no_grad()
     def sample_features(self, volumes, tier, coords):
         """coords (B,N,3) normalized in (z,y,x)=(d,h,w) order -> (B,N,C)."""
-        feats = self._stage_feats(volumes)
-        if tier.startswith("stage:"):
-            f = feats[int(tier.split(":")[1])]
-        elif tier in ("concat", "img_embed"):
-            f = self._concat_native(feats)
+        if self._is_primus:
+            if tier not in ("backbone", "img_embed"):
+                raise ValueError(f"unknown primus tier {tier!r}")
+            f = self.enc(volumes)                   # (B, out_ch, R,R,R); enc self-caches
         else:
-            raise ValueError(f"unknown tier {tier!r}")
+            feats = self._stage_feats(volumes)
+            if tier.startswith("stage:"):
+                f = feats[int(tier.split(":")[1])]
+            elif tier in ("concat", "img_embed"):
+                f = self._concat_native(feats)
+            else:
+                raise ValueError(f"unknown tier {tier!r}")
         xyz = coords.flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)  # ->(x,y,z)
         s = F.grid_sample(f, xyz, mode="bilinear", align_corners=True)          # (B,C,N,1,1)
         s = s.squeeze(-1).squeeze(-1).transpose(1, 2)                           # (B,N,C)
@@ -113,12 +141,12 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         """(module, example_inputs) for the encode-cost probe: the encoder stem+stages
         forward on one 1-channel volume at the study input res — the exact path
         features() drives, so cost compares like-for-like against other encoders."""
-        adapter = self
+        adapter, is_primus = self, self._is_primus
         dev = next(self.enc.parameters()).device
 
         class _EncodeFwd(nn.Module):
             def forward(self, x):
-                return adapter._stage_feats(x)
+                return adapter.enc(x) if is_primus else adapter._stage_feats(x)
 
         x = torch.zeros(1, 1, input_res, input_res, input_res, device=dev)
         return _EncodeFwd().to(dev), (x,)
@@ -179,14 +207,15 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
 
     @torch.no_grad()
     def transformer_trace(self, image, context_in, context_out):
-        """One forward -> named (target, context) img-token pairs: 'encoder' (the transformer
-        INPUT = encoder image features before any attention) then 'L{i}' after each block, all
-        at res=R on the same token grid. Lets a training run trace how correspondence evolves
-        from the (jointly-trained) encoder through the transformer stack. Free: the forward
-        already runs every block; hooks only capture tensors. Returns [(name, tgt, ctx), ...]."""
+        """One forward -> named (target, context) img-token pairs: 'transformer_input' (the
+        transformer INPUT — the img token AFTER the trainable img_embed + pos, before any
+        attention; NOT the frozen encoder output) then 'L{i}' after each block, all at res=R
+        on the same token grid. Lets a training run trace how correspondence evolves from the
+        input embedding through the transformer stack. Free: the forward already runs every
+        block; hooks only capture tensors. Returns [(name, tgt, ctx), ...]."""
         outs = []
         hp = self.model.transformer.register_forward_pre_hook(
-            lambda m, a: outs.append(("encoder", a[0], a[1])))     # (x_in, sep_t)
+            lambda m, a: outs.append(("transformer_input", a[0], a[1])))   # (x_in, sep_t)
         hs = [b.register_forward_hook(
                   lambda m, a, o, i=i: outs.append((f"L{i}", o, a[1])))
               for i, b in enumerate(self.model.transformer.blocks)]

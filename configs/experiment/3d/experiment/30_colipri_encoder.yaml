@@ -1,0 +1,58 @@
+# @package _global_
+# Experiment 30 — frozen CoLiPri (nnUNet Primus-M) image encoder for PatchSet3D.
+# Same data/optim recipe as experiment 22, but swaps the trainable conv encoder for the
+# FROZEN CoLiPri Primus ViT and runs at 192³ on organ-centered crops. Equivalent to:
+#   python experiments/3d/train.py experiment=22_totalseg_train_test model=patchset3d \
+#     arch.encoder=primus arch.primus_sidecar=results/checkpoints/primus_colipri.json \
+#     arch.l=2 arch.e=512 arch.resolution=24 arch.img_embed_mlp=true \
+#     data.image_size=[192,192,192] data.use_crop=true
+# Run with:
+#   python experiments/3d/train.py experiment=30_colipri_encoder
+#
+# Coherence notes (see docs/logs.md 2026-07-28):
+#   - use_crop=true is REQUIRED: at 192³ there is no pre-resized cache, so use_crop=false
+#     falls to the slow native-nii resize path (~0.8 it/s → training stalls). The crop path
+#     reads native ct.npy/label.npy and is compute-bound (data <2% of the step).
+#   - resolution=24 = 192/8 maps 1:1 onto Primus's 24³ ViT token grid (no token resampling);
+#     mask_patch_decode_size=8 (inherited) → 24·8 = 192³ prediction grid = image_size.
+#   - e=512 + img_embed_mlp=true widen the 864-dim frozen features into the transformer
+#     (a lone Linear(864→256) is a rank bottleneck). ~+20% step vs e=256, ~3.9 GB peak,
+#     ~3.5 steps/s at B=1 — mem headroom to raise train.batch_size if desired.
+defaults:
+  - override /model: patchset3d
+  - override /dataset: totalseg
+  - override /augmentations: nnunet
+
+arch:
+  encoder: primus
+  encoder_frozen: true
+  primus_sidecar: results/checkpoints/primus_colipri.json
+  resolution: 24
+  e: 512
+  l: 2
+  img_embed_mlp: true
+
+data:
+  image_size: [192, 192, 192]
+  use_crop: true
+  max_ds_len_train: 1000
+  train_classes: benchmark
+  val_classes: all
+  synth_method: null
+  p_synth: 0
+  class_balanced: false
+
+train:
+  epochs: 1000
+  batch_size: 1
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: bce_dice
+  dice_weight: 1.0
+
+eval:
+  split: test
+  n_subjects: 20

@@ -13,6 +13,8 @@ arch:
   resolution: 24               # map CoLiPri's 24^3 ViT tokens 1:1 to PatchSet3D cells
   enc_dims: [32, 32, 32, 32]   # ignored when encoder=primus (kept for schema parity)
   e: 256
+  img_embed_mlp: false         # true = MLP img_embed (Linear(oc,oc)->GELU->Linear(oc,e))
+                               # preserves more of the 864-dim primus features vs a lone Linear->e
   h: 512
   l: 6
   a: 4

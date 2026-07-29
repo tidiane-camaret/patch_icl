@@ -118,7 +118,7 @@ def main(cfg: DictConfig) -> None:
             for key, dice in transfer_sweep(tf, tl, cf, cl, TAUS).items():
                 rows.append((f"img_embed@{ENC_RES}", key, real_dice, obj_vox, dice))
 
-            # transformer trace (encoder pre-attention + each block) at res=R
+            # transformer trace (transformer_input pre-attention + each block) at res=R
             tlR = grid_labels(gt, R, threshold=None).flatten().to(DEVICE)
             clR = torch.stack([grid_labels(cout[0, k], R, threshold=None).flatten()
                                for k in range(K)]).flatten().to(DEVICE)
