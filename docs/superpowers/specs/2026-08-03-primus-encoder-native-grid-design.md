@@ -71,8 +71,10 @@ feature-sim path (`experiments/3d/feature_sim/adapters.py`) are unchanged.
   `primus_kwargs["patch_embed_size"]`.
 - `src/models/patchset3d.py`: thread `arch.encoder_native_grid` (default `false`) into
   the `PrimusEncoder(...)` construction (~line 130).
-- Compute-study experiment config: set `encoder_native_grid: true` and vary
-  `data.image_size`.
+- No new experiment file. `encoder_native_grid` defaults to `false` in the model
+  schema (`configs/experiment/3d/model/patchset3d.yaml`); the study is run via CLI
+  overrides, e.g. `arch.encoder_native_grid=true data.image_size=[128,128,128]` on top
+  of `experiment=30_colipri_encoder`. The 192³ baseline stays reproducible unchanged.
 - `docs/logs.md`: log the change.
 
 ## Expected result
@@ -94,5 +96,5 @@ answers.
 
 - `src/models/primus_encoder.py`
 - `src/models/patchset3d.py`
-- compute-study experiment config (new or extend `30_colipri_encoder`)
+- `configs/experiment/3d/model/patchset3d.yaml` (add `arch.encoder_native_grid: false`)
 - `docs/logs.md`
