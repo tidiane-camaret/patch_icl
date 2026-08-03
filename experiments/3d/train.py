@@ -253,6 +253,7 @@ def build_model(cfg: DictConfig):
             "primus_sidecar": a.get("primus_sidecar", None),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
+            "encoder_native_grid": a.get("encoder_native_grid", False),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")

@@ -1,5 +1,20 @@
 # Change log
 
+## PrimusEncoder gains opt-in `arch.encoder_native_grid` flag (2026-08-03)
+
+Added `arch.encoder_native_grid: false` (default off) to `PatchSet3D` / `PrimusEncoder`.
+When **false** (default): the frozen ViT always resamples its input to a fixed 192³ grid before
+tokenizing — encoder FLOPs are independent of `data.image_size`.
+When **true**: the encoder tokenizes at `image_size/8` (patch size 8) directly; a per-call
+identity-RoPE grid is built to match the actual token count, so encoder FLOPs scale linearly
+with `data.image_size`. The transformer/decode path is unchanged — `_down_to` pools the
+native-grid features to the configured `resolution` before the attention stack, so the rest of
+the model is unaffected.
+
+Config: `configs/experiment/3d/model/patchset3d.yaml` → `arch.encoder_native_grid`.
+Wired through `experiments/3d/train.py` arch dict and `PatchSet3D.__init__` (after
+`encoder_stage`). Design doc: `docs/superpowers/specs/2026-08-03-primus-encoder-native-grid-design.md`.
+
 ## Occupancy mask downsampling: keep thin-structure signal under heavy downsampling (2026-07-30)
 
 At coarse crops (e.g. crop_spacing_mm=4 → ~2.7× downsample from 1.5mm native), nearest-mode label
