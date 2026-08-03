@@ -1,0 +1,11 @@
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#     "marimo>=0.8.22",
+#     "matplotlib>=3.7.5",
+#     "numpy>=1.24.4",
+#     "pandas>=2.0.3",
+#     "textalloc>=1.2.3",
+# ]
+# ///
+

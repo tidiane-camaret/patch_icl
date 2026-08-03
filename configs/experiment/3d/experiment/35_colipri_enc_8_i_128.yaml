@@ -1,0 +1,55 @@
+# @package _global_
+# Experiment 35 — CoLiPri native-grid encoder at 128³, 8-block early-exit, resolution=16.
+# Builds on experiment 30 (frozen CoLiPri Primus encoder) and turns it into a genuine
+# compute-scaled variant:
+#   - arch.encoder_native_grid=true: the frozen ViT tokenizes at image_size/8 = 16³ (no
+#     resample to 192³), so encoder FLOPs scale with data.image_size.
+#   - arch.encoder_stage=8: keep only the first 8/16 EVA blocks (~half the encoder compute).
+#   - arch.resolution=16: matches the 16³ native grid, so _down_to is a no-op and the
+#     transformer + decode also run at 16³ (mask_patch_decode_size=8 → 16·8 = 128³ = image_size).
+#   - data.crop_spacing_mm=2: CoLiPri's native 2 mm spacing (FOV = 128·2 = 256 mm).
+#   - occupancy mask downsample @0.5 (keeps thin masks under the 8× cell pooling).
+#   - balanced train class set; nnUNet task aug with elastic on + stronger affine.
+# Equivalent to:
+#   python experiments/3d/train.py experiment=30_colipri_encoder \
+#     data.image_size=[128,128,128] data.crop_spacing_mm=2 data.mask_downsample=occupancy \
+#     data.mask_occupancy_thr=0.5 data.train_classes=balanced arch.encoder_native_grid=true \
+#     arch.encoder_stage=8 arch.resolution=16 \
+#     augmentations.task.elastic.p=0.2 augmentations.task.elastic.alpha=0.02 \
+#     augmentations.task.elastic.grid_scale=16 augmentations.task.affine.p=0.5 \
+#     augmentations.task.affine.max_angle_deg=30.0 augmentations.task.affine.scale_min=0.85 \
+#     augmentations.task.affine.scale_max=1.15 augmentations.task.affine.max_translate=0.1 \
+#     train.eval_every=10
+# Run with:
+#   python experiments/3d/train.py experiment=35_colipri_enc_8_i_128
+defaults:
+  - 30_colipri_encoder
+  - _self_
+
+data:
+  image_size: [128, 128, 128]
+  crop_spacing_mm: 2
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  train_classes: balanced
+
+arch:
+  encoder_native_grid: true
+  encoder_stage: 8
+  resolution: 16
+
+augmentations:
+  task:
+    elastic:
+      p: 0.2
+      alpha: 0.02
+      grid_scale: 16
+    affine:
+      p: 0.5
+      max_angle_deg: 30.0
+      scale_min: 0.85
+      scale_max: 1.15
+      max_translate: 0.1
+
+train:
+  eval_every: 10

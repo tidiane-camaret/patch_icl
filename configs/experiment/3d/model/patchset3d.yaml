@@ -17,6 +17,9 @@ arch:
                                # latency/compute ≈ N/16; later blocks are never computed.
   encoder_native_grid: false   # native_grid: ViT tokenizes at image_size/8 (encoder FLOPs
                                # scale with data.image_size). false = fixed 192^3 resample.
+  encoder_spacing_aware: false # scale the frozen ViT's RoPE by physical voxel spacing so
+                               # positions are in mm, not tokens (variable-spacing training;
+                               # implies native_grid). Pair with data.spacing_range.
   resolution: 16               # token grid R (prediction at R³, tiled to (R·d)³)
   enc_dims: [32, 32, 32, 32]   # 3D per-stage widths; stem + 3 stride-2 stages (len=log2(128/16)+1)
   e: 256

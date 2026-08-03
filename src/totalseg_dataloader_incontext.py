@@ -255,6 +255,10 @@ class TotalSegInContextDataset(Dataset):
         # Output mm/voxel of use_crop=True crops: crop covers T*crop_spacing_mm and is
         # resampled to T³. Default 1.5 (native CT). Set 2.0 to match CoLiPri's 2mm training.
         self.crop_spacing_mm = crop_spacing_mm
+        # Per-__getitem__ crop-spacing override (variable-spacing training). Set from a
+        # (idx, spacing) index by the spacing batch sampler; None → fixed crop_spacing_mm.
+        # Instance state is safe: a worker processes one item at a time (cf. _cur_rng).
+        self._cur_crop_spacing = None
         # Mask downsampling mode (all resize call sites: crop paths + synth slow path):
         #   "nearest"   — point-sample one native voxel per output voxel (default; thin
         #                 structures can vanish under heavy downsampling, e.g. 4mm crops).
@@ -574,6 +578,12 @@ class TotalSegInContextDataset(Dataset):
         """Return effective spacing (3,) for subject, defaulting to 1mm isotropic."""
         return self._spacings.get(subj, torch.ones(3, dtype=torch.float32))
 
+    @property
+    def _crop_mm(self) -> float:
+        """Effective crop spacing for the current item: the per-item override when the
+        spacing batch sampler set one, else the fixed crop_spacing_mm."""
+        return self.crop_spacing_mm if self._cur_crop_spacing is None else self._cur_crop_spacing
+
     def _reported_spacing(self, subj: str) -> torch.Tensor:
         """Effective mm/voxel of the returned image tensor (for item['spacing']).
 
@@ -583,7 +593,7 @@ class TotalSegInContextDataset(Dataset):
         effective spacing from _get_spacing already describes the output tensor.
         """
         if self.use_crop:
-            return torch.full((3,), self.crop_spacing_mm, dtype=torch.float32)
+            return torch.full((3,), self._crop_mm, dtype=torch.float32)
         return self._get_spacing(subj)
 
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
@@ -793,7 +803,13 @@ class TotalSegInContextDataset(Dataset):
             )
         return item
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx) -> dict:
+        # The spacing batch sampler indexes with (idx, spacing) so every item in a batch
+        # crops (and reports) the same physical spacing; a plain int → fixed crop_spacing_mm.
+        if isinstance(idx, (tuple, list)):
+            idx, self._cur_crop_spacing = int(idx[0]), float(idx[1])
+        else:
+            self._cur_crop_spacing = None
         # Deterministic eval draws every per-item random choice (context shuffle, crop
         # jitter) from a Random seeded by (eval_seed, idx); training keeps the global
         # `random` module. `_load`/`_load_crop` read self._cur_rng, so this covers the
@@ -934,7 +950,7 @@ class TotalSegInContextDataset(Dataset):
         cd, ch, cw = center
         D, H, W = label_mm.shape
 
-        phys_ref = T * self.crop_spacing_mm
+        phys_ref = T * self._crop_mm
         target_sizes = [max(1, round(phys_ref / spi)) for spi in sp]      # fixed extent
         crop_sizes   = [min(dim, t) for t, dim in zip(target_sizes, (D, H, W))]  # available
 

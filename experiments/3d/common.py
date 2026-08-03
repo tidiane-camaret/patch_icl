@@ -7,6 +7,8 @@ plot scripts should build their datasets through here so they see exactly the
 same data the models are trained on.
 """
 
+import math
+import random
 import sys
 from pathlib import Path
 
@@ -157,30 +159,63 @@ def build_dataset(cfg, split: str):
     )
 
 
+class SpacingBatchSampler:
+    """Wrap a base sampler into fixed-size batches of (idx, spacing), one spacing per
+    batch drawn log-uniformly in [lo, hi] mm. One spacing per batch lets the spacing-aware
+    frozen encoder use a single shared (compile-safe) RoPE table for the whole forward,
+    while the dataset crops each item at that same physical spacing (content matches rope).
+    Log-uniform is scale-natural (equal weight per octave over 1-4 mm)."""
+
+    def __init__(self, sampler, batch_size, spacing_range, drop_last=False, seed=0):
+        self.sampler = sampler
+        self.batch_size = int(batch_size)
+        self.lo, self.hi = float(spacing_range[0]), float(spacing_range[1])
+        self.drop_last = drop_last
+        self._rng = random.Random(seed)
+
+    def _sample(self) -> float:
+        return math.exp(self._rng.uniform(math.log(self.lo), math.log(self.hi)))
+
+    def __iter__(self):
+        batch = []
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                s = self._sample()
+                yield [(i, s) for i in batch]
+                batch = []
+        if batch and not self.drop_last:
+            s = self._sample()
+            yield [(i, s) for i in batch]
+
+    def __len__(self):
+        n = len(self.sampler)
+        return n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
+
+
 def train_loader(cfg) -> DataLoader:
     """Multi-class train loader over build_dataset(cfg, "train") — aug + synth on.
 
     Uses cfg.train.batch_size/workers; optionally caps samples per epoch via
-    RandomSampler(cfg.data.max_ds_len_train). Mirrors scripts/train.py.
+    RandomSampler(cfg.data.max_ds_len_train). Mirrors scripts/train.py. When
+    cfg.data.spacing_range is set, batches use one random physical spacing each
+    (SpacingBatchSampler) for variable-spacing training.
     """
     ds = build_dataset(cfg, "train")
     nw = int(cfg.train.workers)
     max_len = cfg.data.get("max_ds_len_train", None)
-    sampler = None
-    if max_len is not None:
-        n = min(int(max_len), len(ds))
-        sampler = RandomSampler(ds, replacement=False, num_samples=n)
-    return DataLoader(
-        ds,
-        batch_size=int(cfg.train.batch_size),
-        shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=nw,
-        collate_fn=incontext_collate_fn,
-        pin_memory=DEVICE.type == "cuda",
-        persistent_workers=nw > 0,
-        prefetch_factor=2 if nw > 0 else None,
-    )
+    bs = int(cfg.train.batch_size)
+    base = (RandomSampler(ds, replacement=False, num_samples=min(int(max_len), len(ds)))
+            if max_len is not None else RandomSampler(ds))
+    common = dict(num_workers=nw, collate_fn=incontext_collate_fn,
+                  pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
+                  prefetch_factor=2 if nw > 0 else None)
+    spacing_range = cfg.data.get("spacing_range", None)
+    if spacing_range is not None:
+        batch_sampler = SpacingBatchSampler(base, bs, spacing_range,
+                                            seed=int(cfg.train.get("seed", 0)))
+        return DataLoader(ds, batch_sampler=batch_sampler, **common)
+    return DataLoader(ds, batch_size=bs, sampler=base, **common)
 
 
 def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:

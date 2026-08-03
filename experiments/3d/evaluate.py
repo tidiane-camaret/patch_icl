@@ -148,8 +148,15 @@ def _occupancy_stats(label_i: torch.Tensor, ctx_masks_i: torch.Tensor) -> dict:
     }
 
 
-def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> float:
-    """GFLOPs for one predict() call with a single-sample dummy input (0.0 on failure)."""
+def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> dict:
+    """GFLOPs for one predict() call with a single-sample dummy input.
+
+    Returns {"total", "encoder", "transformer"} in GFLOPs. FlopCounterMode keys its
+    per-module breakdown by class name (each top-level key aggregates its subtree), so
+    the encoder / transformer shares come from the submodule class names; the small
+    img/mask embeds + decoder fall outside both. encoder/transformer are None for models
+    lacking those submodules (e.g. medverse). All-zero total on failure.
+    """
     D, H, W = image_size
     dummy_target  = torch.zeros(1, 1, D, H, W, device=device)
     dummy_ctx_img = torch.zeros(1, K, 1, D, H, W, device=device)
@@ -157,10 +164,20 @@ def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> flo
     try:
         with FlopCounterMode(display=False) as fc:
             model.predict(dummy_target, dummy_ctx_img, dummy_ctx_msk)
-        return fc.get_total_flops() / 1e9
+        counts = fc.get_flop_counts()
+
+        def _share(attr):
+            sub = getattr(model, attr, None)
+            if sub is None:
+                return None
+            c = counts.get(type(sub).__name__)
+            return sum(c.values()) / 1e9 if c else None
+
+        return {"total": fc.get_total_flops() / 1e9,
+                "encoder": _share("encoder"), "transformer": _share("transformer")}
     except Exception as exc:  # noqa: BLE001
         print(f"    [FLOPs] Could not count: {exc}")
-        return 0.0
+        return {"total": 0.0, "encoder": None, "transformer": None}
 
 
 # ---------------------------------------------------------------------------
@@ -314,18 +331,23 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         # logits the soft metrics use — one forward — instead of a separate model.predict pass
         # (predict == threshold(train_forward) for patchset3d / single-ROI medverse). Default
         # path (reuse_logits=False, e.g. eval.py) is unchanged: predict is the timed inference.
+        # Per-batch physical spacing for the spacing-aware frozen encoder (eval spacing is
+        # fixed, so batch[0] represents the whole batch). Only forwarded to models that opt
+        # in (PatchSet3D.spacing_aware) — medverse's predict/logits_fn take no spacing.
+        sp_kw = ({"spacing": float(batch["spacing"][0, 0])}
+                 if getattr(model, "spacing_aware", False) and "spacing" in batch else {})
         prob = None
         logits = None
         _sync()
         t0 = time.perf_counter()
         if reuse_logits and logits_fn is not None:
             with torch.no_grad(), _eval_autocast(autocast):
-                logits = logits_fn(target_img, context_imgs, context_masks).float()   # (B,1,D,H,W)
+                logits = logits_fn(target_img, context_imgs, context_masks, **sp_kw).float()  # (B,1,D,H,W)
             pred = ((logits.clamp(0, 1) if output_is_prob else torch.sigmoid(logits)) >= 0.5
                     ).float().squeeze(1)                                              # (B,D,H,W)
         else:
             with _eval_autocast(autocast):
-                pred = model.predict(target_img, context_imgs, context_masks)
+                pred = model.predict(target_img, context_imgs, context_masks, **sp_kw)
         _sync()
         per_sample_ms = (time.perf_counter() - t0) * 1000 / pred.shape[0]
 
@@ -335,7 +357,7 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         if logits_fn is not None:
             if logits is None:
                 with torch.no_grad(), _eval_autocast(autocast):
-                    logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
+                    logits = logits_fn(target_img, context_imgs, context_masks, **sp_kw).float()  # (B,1,D,H,W)
             tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
             # output_is_prob (medverse): logits_fn already returns a [0,1] probability, so do
             # NOT sigmoid it again (that pins every voxel to foreground). See train.py's

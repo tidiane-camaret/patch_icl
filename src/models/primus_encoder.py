@@ -32,21 +32,37 @@ def _native_target_shape(shape, patch):
     return tuple(out)
 
 
-def _set_rope_identity_grid(rope, grid):
-    """Rebuild a timm RoPE table for `grid` with identity frequencies (ref == feat).
+def _set_rope_scaled_grid(rope, grid, spacing_mm, train_mm):
+    """Rebuild a timm RoPE table for `grid`, positions scaled to physical spacing.
 
-    Identity keeps adjacent tokens exactly 1 apart — the local rotary frequency the
-    encoder trained on — so a smaller grid is a sub-block of the training positional
-    field (no fractional/stretched positions). update_feat_shape is a no-op when the
-    grid is unchanged, so this is cheap to call every forward.
+    ref_feat_shape[axis] = grid[axis] * spacing[axis] / train_mm makes the rotary phase
+    proportional to physical distance in units of the training voxel pitch, so the frozen
+    encoder's pretrained frequencies stay valid across spacings. spacing_mm == train_mm
+    reduces to the identity native-grid table (adjacent tokens exactly 1 apart), so this
+    is a strict superset of the old identity path. `spacing_mm` is a scalar (isotropic) or
+    a per-axis sequence.
+
+    The table is written IN PLACE (copy_) whenever the grid shape is unchanged, preserving
+    the buffer's tensor identity — required so a torch.compile'd eva reads the new values
+    without recompiling (verified: constant grid + copy_ -> one graph). Assignment happens
+    only on the first build for a grid / a genuine grid-shape change.
     """
     grid = list(grid)
-    # Assumes feat_shape == ref_feat_shape coming in; if only ref changed while feat_shape
-    # already equaled grid, the update_feat_shape no-op would leave a stale table.
-    if list(rope.feat_shape) == grid and list(rope.ref_feat_shape or []) == grid:
-        return
-    rope.ref_feat_shape = grid
-    rope.update_feat_shape(grid)
+    if isinstance(spacing_mm, (int, float)):
+        spacing_mm = [float(spacing_mm)] * len(grid)
+    rope.ref_feat_shape = [g * s / train_mm for g, s in zip(grid, spacing_mm)]
+    # Build on the existing buffer's device/dtype (cf. RotaryEmbeddingCat.update_feat_shape):
+    # _get_pos_embed_values defaults to CPU/float32, which would put the table on the wrong
+    # device and break the (bf16, cuda) eva matmul on the first grid-change build.
+    old = rope.pos_embed
+    dev = old.device if old is not None else None
+    dt = old.dtype if old is not None else None
+    table = rope._get_pos_embed_values(grid, device=dev, dtype=dt)
+    if old is not None and tuple(old.shape) == tuple(table.shape):
+        old.copy_(table)                # in place -> stable identity -> compile-safe
+    else:
+        rope.pos_embed = table          # first build for this grid, or grid shape changed
+    rope.feat_shape = grid
 
 
 class _EncodeCache:
@@ -107,7 +123,8 @@ def _cached_encode(encode_fn, x, key_fn, cache: _EncodeCache):
 
 class PrimusEncoder(nn.Module):
     def __init__(self, sidecar_path, resolution, frozen=True, device="cuda",
-                 cache_max=4096, encoder_stage=None, native_grid=False):
+                 cache_max=4096, encoder_stage=None, native_grid=False,
+                 spacing_aware=False):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
         with open(sidecar_path) as f:
@@ -115,7 +132,12 @@ class PrimusEncoder(nn.Module):
         kw = dict(meta["primus_kwargs"])
         self.input_shape = tuple(kw["input_shape"])
         self.patch_size = int(kw["patch_embed_size"][0])
-        self.native_grid = bool(native_grid)
+        # spacing_aware scales RoPE by physical voxel spacing (variable-spacing training);
+        # it needs the native token grid, so it implies native_grid. train pitch (mm/voxel
+        # the encoder was pretrained at) comes from the sidecar preproc (CoLiPri: 2 mm).
+        self.spacing_aware = bool(spacing_aware)
+        self.native_grid = bool(native_grid) or self.spacing_aware
+        self.train_spacing_mm = float((meta.get("preproc") or {}).get("spacing_mm", 2.0))
         self._warned_resize = False
         self.preproc = meta.get("preproc")
         self.resolution = int(resolution)
@@ -172,14 +194,19 @@ class PrimusEncoder(nn.Module):
         self._cache.clear()
 
     @staticmethod
-    def _key(xi):
-        """Cheap collision-resistant fingerprint of one input row (1,D,H,W)."""
+    def _key(xi, spacing=None):
+        """Cheap collision-resistant fingerprint of one input row (1,D,H,W).
+
+        Spacing is part of the key: in spacing-aware mode the RoPE table (hence the
+        features) depends on it, so the same crop at two spacings must not collide.
+        """
         flat = xi.reshape(-1)
         n = flat.numel()
         k = min(n, 512)
         idx = torch.linspace(0, n - 1, steps=k, device=flat.device).long()
         sig = torch.round(flat[idx] * 1000).to(torch.int64).tolist()
-        return (tuple(xi.shape), round(float(flat.sum()), 3), hash(tuple(sig)))
+        sp = round(float(spacing), 4) if spacing is not None else None
+        return (tuple(xi.shape), round(float(flat.sum()), 3), hash(tuple(sig)), sp)
 
     def _preprocess(self, x):
         """(B,1,D,H,W) loader z-scored HU -> resized to input_shape or native patch-aligned size, encoder-normalised."""
@@ -198,13 +225,19 @@ class PrimusEncoder(nn.Module):
             v = F.interpolate(v, size=target, mode="trilinear", align_corners=False)
         return v
 
-    def _encode(self, x):
-        """Primus ViT encoder only (down_projection + eva) -> (B, out_ch, g, g, g)."""
+    def _encode(self, x, spacing=None):
+        """Primus ViT encoder only (down_projection + eva) -> (B, out_ch, g, g, g).
+
+        `spacing` (mm/voxel, isotropic scalar or 3-seq) is honoured only in spacing-aware
+        mode; native_grid uses the train pitch (identity). One shared RoPE table serves the
+        whole batch, so callers must pass a single per-batch spacing.
+        """
         p = self.primus
         x = p.down_projection(x)
         B, C, W, H, D = x.shape
         if self.native_grid:
-            _set_rope_identity_grid(p.eva.rope, (W, H, D))
+            s = spacing if (self.spacing_aware and spacing is not None) else self.train_spacing_mm
+            _set_rope_scaled_grid(p.eva.rope, (W, H, D), s, self.train_spacing_mm)
         x = x.flatten(2).transpose(1, 2)
         if p.register_tokens is not None:
             x = torch.cat([p.register_tokens.expand(B, -1, -1), x], dim=1)
@@ -214,20 +247,21 @@ class PrimusEncoder(nn.Module):
             x = x[:, p.register_tokens.shape[1]:]
         return x.transpose(1, 2).reshape(B, self.out_ch, W, H, D)
 
-    def _encode_batch(self, x):
+    def _encode_batch(self, x, spacing=None):
         """(B,1,D,H,W) -> (B,out_ch,R,R,R), grad only when trainable."""
         v = self._preprocess(x)
         if self.frozen:
             with torch.no_grad():
-                f = self._encode(v)
+                f = self._encode(v, spacing)
         else:
-            f = self._encode(v)
+            f = self._encode(v, spacing)
         return _down_to(f.float(), self.resolution)
 
-    def forward(self, x):
+    def forward(self, x, spacing=None):
         dev = next(self.primus.parameters()).device
         x = x.to(dev)
         # Cache only in frozen eval mode; train / trainable paths compute directly.
         if not (self.frozen and not self.training):
-            return self._encode_batch(x)
-        return _cached_encode(self._encode_batch, x, self._key, self._cache)
+            return self._encode_batch(x, spacing)
+        return _cached_encode(lambda v: self._encode_batch(v, spacing), x,
+                              lambda xi: self._key(xi, spacing), self._cache)

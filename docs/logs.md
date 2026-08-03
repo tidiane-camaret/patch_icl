@@ -1,5 +1,46 @@
 # Change log
 
+## Spacing-aware RoPE for the frozen CoLiPri encoder + variable-spacing training (2026-08-03)
+
+Lets the frozen Primus/CoLiPri ViT honour physical voxel spacing so we can train over a
+range of spacings (e.g. 1-4 mm) at fixed image_size. Position is injected through RoPE's
+`ref_feat_shape`: `ref[axis] = grid[axis] * spacing[axis] / train_pitch` (train_pitch = 2 mm
+from the sidecar), making rotary phase proportional to physical distance instead of token
+index. At 2 mm this is bit-for-bit identical to the native-grid identity table (strict
+superset). Anisotropic spacing falls out per-axis. Verified: real compiled eva stays ONE
+graph across 5 spacings (in-place `copy_` of the RoPE buffer preserves tensor identity —
+never reassign, or torch.compile recompiles/goes stale).
+
+- `src/models/primus_encoder.py`: `_set_rope_identity_grid` -> `_set_rope_scaled_grid`
+  (spacing + train_mm args, in-place copy_; builds the table on the existing buffer's
+  device/dtype — else the first grid-change build lands on CPU and breaks the cuda/bf16 eva
+  matmul); `PrimusEncoder(spacing_aware=...)` (implies
+  native_grid; train pitch from sidecar `preproc.spacing_mm`); `forward/_encode(_batch)`
+  thread a per-batch `spacing`; encode-cache key includes spacing.
+- `src/models/patchset3d.py`: `PatchSet3D(encoder_spacing_aware=...)` + `.spacing_aware`;
+  `forward/predict/train_forward/_native_logit` thread `spacing`; conv path unchanged.
+- `experiments/3d/common.py`: `SpacingBatchSampler` (one log-uniform spacing per batch so a
+  single shared RoPE table serves the forward); `train_loader` uses it when
+  `data.spacing_range` is set. `src/totalseg_dataloader_incontext.py`: `__getitem__` accepts
+  `(idx, spacing)`, `_crop_mm` per-item override drives crop extent + reported spacing.
+- `experiments/3d/train.py` + `evaluate.py`: pass per-batch `batch["spacing"][0]` to
+  spacing-aware models only (medverse untouched). Configs: `arch.encoder_spacing_aware`,
+  `data.spacing_range`; new `experiment=36_colipri_spacing_aware_128` (spacing_range=[1,4]).
+- NOTE: 4 mm extrapolates RoPE past its trained max token position (1 mm is safe interp);
+  narrow toward [1,3] if the coarse end regresses. Eval runs at fixed crop_spacing_mm.
+
+## Startup FLOPs logging split into encoder / transformer / total (2026-08-03)
+
+`measure_flops` (`experiments/3d/evaluate.py`) now returns a `{total, encoder, transformer}`
+dict of GFLOPs instead of a single float. The per-component shares come from
+`FlopCounterMode.get_flop_counts()`, keyed by submodule class name (`PrimusEncoder`/`ConvEncoder3D`
+and `TransformerEncoderStack`); the small img/mask embeds + decoder are the unreported remainder.
+`encoder`/`transformer` are `None` for models without those submodules (e.g. medverse). Both
+`train.py` and `eval.py` print the breakdown (`predict GFLOPs: X [encoder=… transformer=…]`) and
+`train.py` logs `gflops_encoder` / `gflops_transformer` to wandb alongside `gflops`. Useful for
+seeing how much of the total scales with `data.image_size` under `arch.encoder_native_grid`
+(only the encoder share moves; the transformer stays fixed at `resolution`).
+
 ## PrimusEncoder gains opt-in `arch.encoder_native_grid` flag (2026-08-03)
 
 Added `arch.encoder_native_grid: false` (default off) to `PatchSet3D` / `PrimusEncoder`.

@@ -111,7 +111,7 @@ class _FakePrimusEncoder(PrimusEncoder):
         self._cache = _EncodeCache(64)
         self.rows = 0
 
-    def _encode_batch(self, x):
+    def _encode_batch(self, x, spacing=None):
         self.rows += x.shape[0]
         return x * 10.0                        # shape-preserving stub
 

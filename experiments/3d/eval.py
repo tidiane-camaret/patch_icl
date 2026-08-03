@@ -124,8 +124,11 @@ def main(cfg: DictConfig) -> None:
 
     model = _build_model(cfg)
     print(f"  Measuring FLOPs (K={K}, size={image_size})...")
-    gflops = measure_flops(model, image_size, K, DEVICE)
-    print(f"  GFLOPs: {gflops:.2f}\n")
+    flops = measure_flops(model, image_size, K, DEVICE)
+    gflops = flops["total"]
+    _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer")
+                     if flops[k] is not None)
+    print(f"  GFLOPs: {gflops:.2f}{('  [' + _brk + ']') if _brk else ''}\n")
 
     # ── wandb / output dir ───────────────────────────────────────────────────
     wb_on = bool(cfg.wandb.get("project"))

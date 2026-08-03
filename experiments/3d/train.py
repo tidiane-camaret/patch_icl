@@ -254,6 +254,7 @@ def build_model(cfg: DictConfig):
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
             "encoder_native_grid": a.get("encoder_native_grid", False),
+            "encoder_spacing_aware": a.get("encoder_spacing_aware", False),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
@@ -296,10 +297,15 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             opt.zero_grad(set_to_none=True)
         with _autocast():
             if is_patchset:
+                # Per-batch physical spacing (the batch sampler makes it constant across the
+                # batch) → one shared RoPE table in the spacing-aware frozen encoder. None
+                # when not spacing-aware (encoder falls back to the train-pitch identity grid).
+                spacing = (float(batch["spacing"][0, 0])
+                           if getattr(net, "spacing_aware", False) and "spacing" in batch else None)
                 out = model(batch["image"].to(DEVICE, non_blocking=True),
                             context_in=batch["context_in"].to(DEVICE, non_blocking=True),
                             context_out=batch["context_out"].to(DEVICE, non_blocking=True),
-                            mode="train")
+                            mode="train", spacing=spacing)
                 logits = out["final_logit"].float()                    # (B,1,Rd,Rd,Rd)
                 target = target_like(lbl.unsqueeze(1), logits)         # GT pooled to grid
             else:
@@ -481,10 +487,13 @@ def main(cfg: DictConfig) -> None:
     # by graph breaks; FLOP count is weight-independent so pre-checkpoint-load is fine.
     n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in net.parameters())
-    gflops = measure_flops(model, image_size, cfg.data.context_size, DEVICE)
+    flops = measure_flops(model, image_size, cfg.data.context_size, DEVICE)
+    gflops = flops["total"]
+    _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer")
+                     if flops[k] is not None)
     print(f"Params: {n_trainable/1e6:.1f}M trainable / {n_total/1e6:.1f}M total "
-          f"({100 * n_trainable / max(n_total, 1):.0f}%) | predict GFLOPs: {gflops:.2f} "
-          f"(K={cfg.data.context_size}, size={image_size})")
+          f"({100 * n_trainable / max(n_total, 1):.0f}%) | predict GFLOPs: {gflops:.2f}"
+          f"{('  [' + _brk + ']') if _brk else ''} (K={cfg.data.context_size}, size={image_size})")
 
     # train.checkpoint is the single weight-source knob. Sentinels ("orig_weights",
     # "random") are handled at model construction (build_model); only an actual path
@@ -588,6 +597,10 @@ def main(cfg: DictConfig) -> None:
     wb_config["params_trainable_M"] = round(n_trainable / 1e6, 3)
     wb_config["params_total_M"] = round(n_total / 1e6, 3)
     wb_config["gflops"] = round(gflops, 2)
+    if flops["encoder"] is not None:
+        wb_config["gflops_encoder"] = round(flops["encoder"], 2)
+    if flops["transformer"] is not None:
+        wb_config["gflops_transformer"] = round(flops["transformer"], 2)
     run = wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
                      mode="online" if wb_on else "disabled",
                      config=wb_config)

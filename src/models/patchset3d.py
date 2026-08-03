@@ -111,6 +111,7 @@ class PatchSet3D(nn.Module):
         img_embed_mlp: bool = False,
         encoder_stage: int = None,
         encoder_native_grid: bool = False,
+        encoder_spacing_aware: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -123,6 +124,9 @@ class PatchSet3D(nn.Module):
         self.context_id_embed = context_id_embed
         self.max_context = max_context
         self.image_size = image_size          # metadata only (unused in forward)
+        # True when the frozen encoder scales its RoPE by physical voxel spacing; gates
+        # whether callers (train loop / eval loop) thread a per-batch `spacing` through.
+        self.spacing_aware = bool(encoder_spacing_aware)
 
         if encoder == "primus":
             if not primus_sidecar:
@@ -131,7 +135,8 @@ class PatchSet3D(nn.Module):
             self.encoder = PrimusEncoder(primus_sidecar, resolution,
                                          frozen=encoder_frozen, device="cpu",
                                          encoder_stage=encoder_stage,
-                                         native_grid=encoder_native_grid)
+                                         native_grid=encoder_native_grid,
+                                         spacing_aware=encoder_spacing_aware)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
@@ -235,28 +240,35 @@ class PatchSet3D(nn.Module):
         q = x[:, sep_t:, 0, :]                               # (B,Q,e) query img-col
         return self._tile_logits(self.decoder(q))           # (B,1,Rd,Rd,Rd)
 
-    def forward(self, image, context_in, context_out, mode="train"):
+    def forward(self, image, context_in, context_out, mode="train", spacing=None):
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
         T = imgs.shape[1]
-        feat_map = self.encoder(imgs.reshape(B * T, 1, D, H, W))       # (B*T,Cf,R,R,R)
+        feat_map = self._encode(imgs.reshape(B * T, 1, D, H, W), spacing)  # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
         logit = self._attn(sup_feat, qry_feat, self._occupancy(context_out), K)
         return {"final_logit": logit}
 
-    def _native_logit(self, image, context_in, context_out):
+    def _encode(self, x, spacing):
+        """Dispatch to the encoder, passing per-batch `spacing` only when it accepts it
+        (PrimusEncoder in spacing-aware mode); the conv encoder takes only the image."""
+        if self.spacing_aware:
+            return self.encoder(x, spacing=spacing)
+        return self.encoder(x)
+
+    def _native_logit(self, image, context_in, context_out, spacing=None):
         dev = next(self.parameters()).device
         image = image.to(dev); context_in = context_in.to(dev); context_out = context_out.to(dev)
-        logit = self.forward(image, context_in, context_out)["final_logit"].float()
+        logit = self.forward(image, context_in, context_out, spacing=spacing)["final_logit"].float()
         return F.interpolate(logit, size=image.shape[-3:], mode="trilinear", align_corners=False)
 
-    def train_forward(self, target_img, context_imgs, context_masks):
+    def train_forward(self, target_img, context_imgs, context_masks, spacing=None):
         """Native-resolution logits (B,1,D,H,W) — used by the val soft-Dice / loss path."""
-        return self._native_logit(target_img, context_imgs, context_masks)
+        return self._native_logit(target_img, context_imgs, context_masks, spacing=spacing)
 
     @torch.no_grad()
-    def predict(self, target_img, context_imgs, context_masks):
+    def predict(self, target_img, context_imgs, context_masks, spacing=None):
         """Native binary mask (B,D,H,W) — used by the eval Dice path."""
-        logit = self._native_logit(target_img, context_imgs, context_masks)
+        logit = self._native_logit(target_img, context_imgs, context_masks, spacing=spacing)
         return (torch.sigmoid(logit) >= 0.5).float().squeeze(1)
