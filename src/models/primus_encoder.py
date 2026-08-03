@@ -19,6 +19,34 @@ from src.models.patchset3d import _down_to
 from src.totalseg_dataset import CT_MEAN, CT_STD
 
 
+def _native_target_shape(shape, patch):
+    """Round each spatial dim to the nearest positive multiple of `patch`.
+
+    In native-grid mode the ViT token grid is input/patch, so the input must be
+    divisible by `patch`. Divisible inputs (e.g. 128, 192) pass through unchanged.
+    """
+    out = []
+    for s in shape:
+        m = max(1, round(s / patch)) * patch
+        out.append(int(m))
+    return tuple(out)
+
+
+def _set_rope_identity_grid(rope, grid):
+    """Rebuild a timm RoPE table for `grid` with identity frequencies (ref == feat).
+
+    Identity keeps adjacent tokens exactly 1 apart — the local rotary frequency the
+    encoder trained on — so a smaller grid is a sub-block of the training positional
+    field (no fractional/stretched positions). update_feat_shape is a no-op when the
+    grid is unchanged, so this is cheap to call every forward.
+    """
+    grid = list(grid)
+    if list(rope.feat_shape) == grid and list(rope.ref_feat_shape or []) == grid:
+        return
+    rope.ref_feat_shape = grid
+    rope.update_feat_shape(grid)
+
+
 class _EncodeCache:
     """LRU, CPU-backed store of encoder outputs, keyed by an input fingerprint.
 

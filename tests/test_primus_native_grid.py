@@ -1,0 +1,42 @@
+"""Unit tests for PrimusEncoder native-grid helpers (no model weights loaded)."""
+import math
+
+import torch
+from timm.layers import RotaryEmbeddingCat
+
+from src.models.primus_encoder import _native_target_shape, _set_rope_identity_grid
+
+
+def test_native_target_shape_divisible_is_passthrough():
+    assert _native_target_shape((128, 128, 128), 8) == (128, 128, 128)
+    assert _native_target_shape((192, 192, 192), 8) == (192, 192, 192)
+
+
+def test_native_target_shape_rounds_to_nearest_multiple():
+    # 130 -> 128 (nearest), 132 -> 136 (ties/above), min is one patch
+    assert _native_target_shape((130, 130, 130), 8) == (128, 128, 128)
+    assert _native_target_shape((4, 4, 4), 8) == (8, 8, 8)
+
+
+def _make_rope(grid):
+    # Mirror Primus' construction: fixed feat_shape (bands=None), identity ref.
+    dim = 24  # rope_dim; divisible by 4
+    return RotaryEmbeddingCat(dim, in_pixels=False, feat_shape=list(grid),
+                              ref_feat_shape=list(grid))
+
+
+def test_set_rope_identity_grid_rebuilds_for_new_grid():
+    rope = _make_rope((24, 24, 24))
+    _set_rope_identity_grid(rope, (16, 16, 16))
+    assert tuple(rope.feat_shape) == (16, 16, 16)
+    assert tuple(rope.ref_feat_shape) == (16, 16, 16)
+    # pos_embed rows == number of tokens in the new grid
+    assert rope.pos_embed.shape[0] == 16 ** 3
+
+
+def test_set_rope_identity_grid_stable_recall():
+    rope = _make_rope((24, 24, 24))
+    _set_rope_identity_grid(rope, (16, 16, 16))
+    emb1 = rope.pos_embed.clone()
+    _set_rope_identity_grid(rope, (16, 16, 16))  # same grid again
+    assert torch.equal(emb1, rope.pos_embed)
