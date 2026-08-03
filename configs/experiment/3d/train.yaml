@@ -21,6 +21,10 @@ train:
   seed: 42
   eval_every: 1
   grad_clip: 1.0
+  # Per-step wall-clock breakdown (patchset3d, CUDA): logs train/time/{data,encode,attn}_ms
+  # (data-wait, image-encode, attention). CUDA events on encoder/transformer; ~free (loop
+  # already syncs each step). false = off.
+  profile_timing: false
   # Per-layer feature-matching trace at eval (patchset3d only): logs val/transfer_dice/{encoder,L0..}
   # + val/retrieval/* at res=R, tracing encoder(pre-attention)->transformer co-evolution. One hooked
   # forward per task over feature_sim_n_tasks val tasks. 0 = off; e.g. 5 = every 5 epochs.

@@ -19,6 +19,8 @@ data:
   class_balanced: true
   use_crop: true
   crop_spacing_mm: 1.5          # output mm/voxel of use_crop crops (FOV = image_size*this); 2.0 = CoLiPri native
+  mask_downsample: nearest      # nearest | occupancy (area-pool + threshold; keeps thin masks under heavy downsampling)
+  mask_occupancy_thr: 0.5       # occupancy foreground-fraction threshold: ->0 keeps every touched voxel, 0.5 = majority
   random_coloring: false
   num_labels_per_sample: 1
   train_classes: not_benchmark

@@ -252,6 +252,7 @@ def build_model(cfg: DictConfig):
             "encoder_frozen": a.get("encoder_frozen", True),
             "primus_sidecar": a.get("primus_sidecar", None),
             "img_embed_mlp": a.get("img_embed_mlp", False),
+            "encoder_stage": a.get("encoder_stage", None),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
@@ -271,8 +272,24 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     total, dice_sum, soft_run, n = 0.0, 0.0, 0.0, 0
     gh = ghc = gs = gsc = gc = gcc = 0.0          # grid-metric running sums
     rd = None
+    # Optional per-phase timing: data-wait (perf_counter between steps) + image-encode and
+    # attention GPU time (CUDA events on net.encoder / net.transformer, each called once per
+    # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
+    # cheap; OFF by default (train.profile_timing) → zero overhead. patchset3d + CUDA only.
+    prof = bool(cfg.train.get("profile_timing", False)) and is_patchset and DEVICE.type == "cuda"
+    tsum, hooks = {"data": 0.0, "encode": 0.0, "attn": 0.0}, []
+    if prof:
+        ee = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        ea = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        hooks = [net.encoder.register_forward_pre_hook(lambda m, i: ee[0].record()),
+                 net.encoder.register_forward_hook(lambda m, i, o: ee[1].record()),
+                 net.transformer.register_forward_pre_hook(lambda m, i: ea[0].record()),
+                 net.transformer.register_forward_hook(lambda m, i, o: ea[1].record())]
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
+    t_prev = time.perf_counter()
     for batch in pbar:
+        if prof:
+            tsum["data"] += (time.perf_counter() - t_prev) * 1000
         lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -323,11 +340,24 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             c, cc = cos_sum(prob, target);  gc += c; gcc += cc
         pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
                          soft=f"{soft_run/n:.4f}", lr=f"{optimizers[0].param_groups[0]['lr']:.1e}")
+        if prof:
+            torch.cuda.synchronize()
+            tsum["encode"] += ee[0].elapsed_time(ee[1])
+            tsum["attn"]   += ea[0].elapsed_time(ea[1])
+            t_prev = time.perf_counter()
+    for h in hooks:
+        h.remove()
     grid = {}
     if is_patchset and rd is not None:
         grid[f"dice_ds@{rd}"] = float(gh) / max(float(ghc), 1)
         grid[f"dice_ds_soft@{rd}"] = float(gs) / max(float(gsc), 1)
         grid[f"cossim@{rd}"] = float(gc) / max(float(gcc), 1)
+    if prof and n:
+        grid["time/data_ms"]   = tsum["data"] / n
+        grid["time/encode_ms"] = tsum["encode"] / n
+        grid["time/attn_ms"]   = tsum["attn"] / n
+        tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
+                   f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms")
     return total / max(n, 1), dice_sum / max(n, 1), soft_run / max(n, 1), grid
 
 
@@ -384,10 +414,15 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # NB: for patchset3d, train_forward returns NATIVE-res logits, so val/loss and
     # val/dice_soft are computed at native res (comparable to Medverse) while train/loss
     # is at grid res — the two loss scales are intentionally not directly comparable.
+    # patchset3d: predict == threshold(train_forward), so reuse the logits (one forward, no
+    # separate predict pass) and run eval under bf16 (matches training, avoids recompiling the
+    # compiled encoder/transformer between dtypes). Off for medverse to keep its val byte-identical.
+    fast_eval = cfg.get("model", "medverse") == "patchset3d"
     rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
                                    logits_fn=model.train_forward, loss_fn=loss_fn,
                                    grid_res=getattr(model, "grid_size", None),
-                                   output_is_prob=model_output_is_prob(cfg))
+                                   output_is_prob=model_output_is_prob(cfg),
+                                   autocast=fast_eval, reuse_logits=fast_eval)
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
     soft = [r["mean_soft_dice"] for r in valid if "mean_soft_dice" in r]
@@ -474,7 +509,19 @@ def main(cfg: DictConfig) -> None:
         net.transformer = torch.compile(net.transformer, dynamic=True)
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
-        print("Compiled net.transformer + Newton–Schulz (dynamic=True); conv encoder runs eager")
+        msg = "Compiled net.transformer + Newton–Schulz (dynamic=True)"
+        # The frozen Primus ViT is the dominant per-step cost yet runs eager by default. It is a
+        # pure attention/MLP stack (compiles cleanly, unlike the conv encoder), so compile the eva
+        # block stack — the interpolate/_down_to that would graph-break live OUTSIDE it (in
+        # _preprocess/_encode_batch). dynamic=True so target/context batch-size differences don't
+        # retrigger compilation. No-op for encoder=conv.
+        enc = getattr(net, "encoder", None)
+        if cfg.arch.get("encoder", "conv") == "primus" and enc is not None and hasattr(enc, "primus"):
+            enc.primus.eva = torch.compile(enc.primus.eva, dynamic=True)
+            msg += " + frozen Primus eva stack"
+        else:
+            msg += "; conv encoder runs eager"
+        print(msg)
 
     # Medverse perf knobs (medverse.grad_checkpoint / .compile — see model/medverse.yaml,
     # benchmarked in experiments/3d/bench_arch.py). Applied AFTER weight load so names/keys
@@ -522,6 +569,12 @@ def main(cfg: DictConfig) -> None:
     # each epoch; at eval the queue is averaged into the model, evaluated + saved, then the raw
     # training weights are restored so optimization continues from them (cf. 2D trainer).
     lawa_queue = collections.deque(maxlen=cfg.train.get("lawa_k", 10)) if use_muon else None
+    # LAWA averages only TRAINABLE weights. With a frozen Primus encoder (~145M params) the
+    # rest of state_dict never changes, so copying it to CPU each epoch — and averaging it into
+    # itself — is pure waste (~580 MB/epoch × lawa_k in RAM). Snapshot the trainable key set once,
+    # AFTER compile so the `_orig_mod.` prefixes match state_dict keys.
+    lawa_keys = ({n for n, p in net.named_parameters() if p.requires_grad}
+                 if lawa_queue is not None else None)
 
     wb_on = bool(cfg.wandb.get("project"))
     # Config-group selections (dataset=, augmentations=, model=, cluster=, experiment=) are
@@ -554,8 +607,9 @@ def main(cfg: DictConfig) -> None:
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
         log.update({f"train/{k}": v for k, v in tr_grid.items()})
 
-        if lawa_queue is not None:   # push this epoch's raw weights to the LAWA buffer
-            lawa_queue.append({k: v.cpu().clone() for k, v in net.state_dict().items()})
+        if lawa_queue is not None:   # push this epoch's raw TRAINABLE weights to the LAWA buffer
+            lawa_queue.append({k: v.cpu().clone()
+                               for k, v in net.state_dict().items() if k in lawa_keys})
 
         if epoch % cfg.train.get("eval_every", 1) == 0 or epoch == cfg.train.epochs - 1:
             # Eval (and any checkpoint saved below) uses LAWA-averaged weights; the raw
@@ -620,7 +674,7 @@ def main(cfg: DictConfig) -> None:
                 }, ckpt_path)
                 log["val/best_dice"] = best
             if saved is not None:   # restore raw training weights after LAWA-averaged eval
-                net.load_state_dict(saved)
+                net.load_state_dict(saved, strict=False)  # `saved` holds only trainable keys
         wandb.log(log)
 
     print(f"Done. Best val Dice={best:.4f} -> {ckpt_path}")

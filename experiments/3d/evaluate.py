@@ -11,6 +11,7 @@ Ported from scripts/eval.py so the 3D experiments harness is self-contained;
 scripts/eval.py stays as the legacy CLI benchmark.
 """
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -171,6 +172,14 @@ def _sync():
         torch.cuda.synchronize()
 
 
+def _eval_autocast(enabled: bool):
+    """bf16 CUDA autocast when enabled (else a no-op). Matches training's autocast dtype so
+    a compiled encoder/transformer isn't recompiled between the train (bf16) and eval paths."""
+    if enabled and torch.cuda.is_available():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 def validate(model, loader, cls: str, *, fig_dir: Path | None = None) -> tuple[dict, list[dict]]:
     """Run inference over one single-class loader.
 
@@ -252,7 +261,7 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
 
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
                      loader=None, logits_fn=None, loss_fn=None, grid_res=None,
-                     output_is_prob=False):
+                     output_is_prob=False, autocast=False, reuse_logits=False):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -268,9 +277,15 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     `logits_fn(target, ctx_in, ctx_out) -> (B,1,D,H,W) raw logits` enables the soft
     monitoring metrics: when given, each case also gets `soft_dice` (threshold-free
     overlap of σ(logits) vs GT) and, if `loss_fn(logits, target)` is also given, a
-    per-sample `loss`. The hard `dice` still comes from model.predict (the benchmark
-    inference), so the reported val/dice is unchanged. eval.py passes neither, so its
-    path is byte-identical. Only used by train.py's val step (medverse.train_forward).
+    per-sample `loss`. By default the hard `dice` comes from model.predict (the benchmark
+    inference). eval.py passes none of these + leaves autocast/reuse_logits off, so its path
+    is byte-identical.
+
+    `autocast=True` runs the eval forward(s) under bf16 (matches training; ~4x faster cold
+    encode and no compile recompile between train/eval dtypes). `reuse_logits=True` (requires
+    logits_fn) derives the hard prediction from the SAME native logits used for the soft
+    metrics — one forward instead of predict + a second logits_fn pass. Both are opt-in and
+    used only by train.py's val step for patchset3d, where predict == threshold(train_forward).
 
     Shared by experiments/3d/eval.py (benchmark) and train.py's val step.
     """
@@ -295,18 +310,32 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         label_names   = batch["label_names"]
         metas         = batch.get("meta")
 
+        # Hard prediction. With reuse_logits (+ logits_fn), derive it from the SAME native
+        # logits the soft metrics use — one forward — instead of a separate model.predict pass
+        # (predict == threshold(train_forward) for patchset3d / single-ROI medverse). Default
+        # path (reuse_logits=False, e.g. eval.py) is unchanged: predict is the timed inference.
+        prob = None
+        logits = None
         _sync()
         t0 = time.perf_counter()
-        pred = model.predict(target_img, context_imgs, context_masks)
+        if reuse_logits and logits_fn is not None:
+            with torch.no_grad(), _eval_autocast(autocast):
+                logits = logits_fn(target_img, context_imgs, context_masks).float()   # (B,1,D,H,W)
+            pred = ((logits.clamp(0, 1) if output_is_prob else torch.sigmoid(logits)) >= 0.5
+                    ).float().squeeze(1)                                              # (B,D,H,W)
+        else:
+            with _eval_autocast(autocast):
+                pred = model.predict(target_img, context_imgs, context_masks)
         _sync()
         per_sample_ms = (time.perf_counter() - t0) * 1000 / pred.shape[0]
 
-        # Soft monitoring pass (train.py val step only): raw logits -> σ for soft Dice +
-        # the training loss. Single-ROI forward; untimed (timing stays on predict above).
-        prob = None
+        # Soft monitoring pass (train.py val step only): raw logits -> σ for soft Dice + the
+        # training loss. Reuse the logits computed above when available, else a single-ROI
+        # forward; untimed (timing stays on the hard-prediction pass above).
         if logits_fn is not None:
-            with torch.no_grad():
-                logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
+            if logits is None:
+                with torch.no_grad(), _eval_autocast(autocast):
+                    logits = logits_fn(target_img, context_imgs, context_masks).float()  # (B,1,D,H,W)
             tgt = label.to(logits.device).float().unsqueeze(1)                        # (B,1,D,H,W)
             # output_is_prob (medverse): logits_fn already returns a [0,1] probability, so do
             # NOT sigmoid it again (that pins every voxel to foreground). See train.py's

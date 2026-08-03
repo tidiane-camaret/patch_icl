@@ -109,6 +109,7 @@ class PatchSet3D(nn.Module):
         encoder_frozen: bool = True,
         primus_sidecar: str = None,
         img_embed_mlp: bool = False,
+        encoder_stage: int = None,
     ):
         super().__init__()
         self.resolution = resolution
@@ -127,7 +128,8 @@ class PatchSet3D(nn.Module):
                 raise ValueError("encoder='primus' requires arch.primus_sidecar")
             from src.models.primus_encoder import PrimusEncoder   # lazy: avoids import cycle
             self.encoder = PrimusEncoder(primus_sidecar, resolution,
-                                         frozen=encoder_frozen, device="cpu")
+                                         frozen=encoder_frozen, device="cpu",
+                                         encoder_stage=encoder_stage)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:

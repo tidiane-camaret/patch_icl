@@ -148,6 +148,8 @@ def build_dataset(cfg, split: str):
         class_balanced=d.class_balanced,
         use_crop=d.use_crop,
         crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+        mask_downsample=d.get("mask_downsample", "nearest"),
+        mask_occupancy_thr=d.get("mask_occupancy_thr", 0.5),
         random_coloring=d.get("random_coloring", False),
         num_labels_per_sample=d.get("num_labels_per_sample", 1),
         n_synth_merge_min=d.get("n_synth_merge_min", 1),
@@ -222,6 +224,8 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
         class_balanced=False,
         use_crop=d.use_crop,
         crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+        mask_downsample=d.get("mask_downsample", "nearest"),
+        mask_occupancy_thr=d.get("mask_occupancy_thr", 0.5),
         # eval.crop_jitter=0 makes each (subject, class) crop deterministic (centered,
         # no random offset), so a crop is identical whether it appears as a target or
         # another sample's context — letting the frozen encode cache reuse it within an

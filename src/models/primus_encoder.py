@@ -77,7 +77,7 @@ def _cached_encode(encode_fn, x, key_fn, cache: _EncodeCache):
 
 class PrimusEncoder(nn.Module):
     def __init__(self, sidecar_path, resolution, frozen=True, device="cuda",
-                 cache_max=4096):
+                 cache_max=4096, encoder_stage=None):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
         with open(sidecar_path) as f:
@@ -96,6 +96,11 @@ class PrimusEncoder(nn.Module):
             missing, unexpected = self.primus.load_state_dict(sd, strict=False)
             print(f"[PrimusEncoder] loaded weights: {len(missing)} missing "
                   f"(up_projection decoder, unused), {len(unexpected)} unexpected")
+        # Early-exit truncation: keep only the first `encoder_stage` EVA blocks so
+        # later blocks are never built into the graph (Eva.forward_features just
+        # iterates self.blocks then applies the final norm). Load full weights first
+        # so load_state_dict matches, then drop the tail — freeing its params/VRAM.
+        self.encoder_stage = self._truncate_blocks(encoder_stage)
         if self.frozen:
             for p in self.primus.parameters():
                 p.requires_grad_(False)
@@ -110,6 +115,25 @@ class PrimusEncoder(nn.Module):
         # volume unique) or when trainable (grad required). Keyed on a per-row
         # fingerprint. Size the eval set (via eval.n_subjects) to fit cache_max.
         self._cache = _EncodeCache(int(cache_max))
+
+    def _truncate_blocks(self, encoder_stage):
+        """Keep only the first `encoder_stage` EVA blocks (early-exit tap).
+
+        None/<=0 or >= depth means no truncation (full encoder). Returns the
+        effective stage kept. The final Eva `norm` still runs on the stage-k
+        output — the standard normed hidden state at that layer.
+        """
+        blocks = self.primus.eva.blocks
+        depth = len(blocks)
+        if encoder_stage is None:
+            return depth
+        k = int(encoder_stage)
+        if k <= 0 or k >= depth:
+            return depth
+        self.primus.eva.blocks = nn.ModuleList(list(blocks)[:k])  # drop tail → frees VRAM
+        print(f"[PrimusEncoder] truncated eva to stage {k}/{depth} "
+              f"(dropped {depth - k} blocks; ~{k/depth:.0%} of encoder compute)")
+        return k
 
     def reset_cache(self):
         self._cache.clear()

@@ -223,13 +223,20 @@ def augment(images: torch.Tensor, masks: torch.Tensor, K: int, cfg):
 # ── LAWA ─────────────────────────────────────────────────────────────────────
 
 def lawa_average(queue: collections.deque, model: nn.Module, device: torch.device):
-    """Average checkpoint queue into model weights; return original state for restore."""
+    """Average checkpoint queue into model weights; return original state for restore.
+
+    Only the keys present in the queued snapshots are averaged/overwritten (callers may
+    queue a trainable-only subset to skip frozen weights), so both the load and the
+    returned `saved` are restricted to those keys — restore with strict=False. Passing a
+    full state_dict (2D trainers) keeps the original behaviour (all keys present)."""
     if len(queue) <= 1:
         return None
-    avg = {k: sum(s[k].float() for s in queue) / len(queue) for k in queue[0]}
+    keys = list(queue[0].keys())
+    avg = {k: sum(s[k].float() for s in queue) / len(queue) for k in keys}
     avg = {k: v.to(dtype=queue[0][k].dtype, device=device) for k, v in avg.items()}
-    saved = {k: v.clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(avg)
+    full = model.state_dict()
+    saved = {k: full[k].clone() for k in keys}   # restore only what we overwrite
+    model.load_state_dict(avg, strict=False)
     return saved
 
 
