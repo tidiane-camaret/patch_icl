@@ -105,13 +105,16 @@ def _cached_encode(encode_fn, x, key_fn, cache: _EncodeCache):
 
 class PrimusEncoder(nn.Module):
     def __init__(self, sidecar_path, resolution, frozen=True, device="cuda",
-                 cache_max=4096, encoder_stage=None):
+                 cache_max=4096, encoder_stage=None, native_grid=False):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
         with open(sidecar_path) as f:
             meta = json.load(f)
         kw = dict(meta["primus_kwargs"])
         self.input_shape = tuple(kw["input_shape"])
+        self.patch_size = int(kw["patch_embed_size"][0])
+        self.native_grid = bool(native_grid)
+        self._warned_resize = False
         self.preproc = meta.get("preproc")
         self.resolution = int(resolution)
         self.out_ch = int(kw["embed_dim"])
@@ -183,8 +186,14 @@ class PrimusEncoder(nn.Module):
             hu = v * CT_STD + CT_MEAN
             hu = hu.clamp(self.preproc["clip_min"], self.preproc["clip_max"])
             v = (hu - self.preproc["mean"]) / self.preproc["std"]
-        if tuple(v.shape[-3:]) != self.input_shape:
-            v = F.interpolate(v, size=self.input_shape, mode="trilinear", align_corners=False)
+        target = (_native_target_shape(tuple(v.shape[-3:]), self.patch_size)
+                  if self.native_grid else self.input_shape)
+        if tuple(v.shape[-3:]) != target:
+            if self.native_grid and not self._warned_resize:
+                print(f"[PrimusEncoder] native_grid: input {tuple(v.shape[-3:])} not a "
+                      f"multiple of patch {self.patch_size}; resampling to {target}")
+                self._warned_resize = True
+            v = F.interpolate(v, size=target, mode="trilinear", align_corners=False)
         return v
 
     def _encode(self, x):
@@ -192,6 +201,8 @@ class PrimusEncoder(nn.Module):
         p = self.primus
         x = p.down_projection(x)
         B, C, W, H, D = x.shape
+        if self.native_grid:
+            _set_rope_identity_grid(p.eva.rope, (W, H, D))
         x = x.flatten(2).transpose(1, 2)
         if p.register_tokens is not None:
             x = torch.cat([p.register_tokens.expand(B, -1, -1), x], dim=1)
