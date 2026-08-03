@@ -20,7 +20,7 @@ from pathlib import Path
 import hydra
 import torch
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -30,6 +30,46 @@ from data.totalseg_classes import resolve_classes
 from src.benchmark_models import load_model
 from common import DEVICE, _source_root
 from evaluate import measure_flops, evaluate_classes, build_sample_table
+
+
+# Data params that change what the model actually sees at inference. eval.py restores only
+# `arch` from the checkpoint — data.* comes from the eval config — so drift on these keys
+# silently produces plausible-but-wrong numbers instead of an error. Warn on any mismatch.
+_FIDELITY_KEYS = ("image_size", "crop_spacing_mm", "use_crop", "context_size",
+                  "mask_downsample", "mask_occupancy_thr", "source")
+
+
+def _warn_uninherited_data(cfg: DictConfig) -> None:
+    """Warn about eval-config data params that differ from the checkpoint's training data.
+
+    The checkpoint stores the full training `cfg.data` but eval.py does NOT restore it (only
+    `arch`): the eval config stays authoritative. So a run trained at crop_spacing_mm=2 /
+    occupancy masks but evaluated with the loader defaults (1.5 / nearest) reports a
+    train-test mismatch as if nothing were wrong. This prints those uninherited differences up
+    front so the user can re-supply matching data.* overrides."""
+    ckpt_path = cfg.eval.get("checkpoint")
+    if not ckpt_path:
+        return
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    train_data = ckpt.get("data")
+    if not train_data:
+        print("  [warn] checkpoint has no stored `data` (older run) — cannot check eval-config "
+              "drift; ensure data.* matches training manually.")
+        return
+    drift = []
+    for k in _FIDELITY_KEYS:
+        ev = cfg.data.get(k)
+        if isinstance(ev, (DictConfig, ListConfig)):
+            ev = OmegaConf.to_container(ev, resolve=True)
+        tr = train_data.get(k)
+        if tr != ev:
+            drift.append((k, tr, ev))
+    if drift:
+        print("  [warn] eval data config NOT inherited from the checkpoint (only `arch` is); "
+              "these differ from training and change what the model sees:")
+        for k, tr, ev in drift:
+            print(f"         - {k}: train={tr!r}  eval={ev!r}")
+        print("         Re-supply matching data.* overrides for a faithful eval.\n")
 
 
 def _build_model(cfg: DictConfig):
@@ -122,6 +162,7 @@ def main(cfg: DictConfig) -> None:
     print(f"Classes ({len(classes)}): {', '.join(classes)}")
     print(f"K={K}  image_size={image_size}  n_subjects<={cfg.eval.n_subjects}\n")
 
+    _warn_uninherited_data(cfg)
     model = _build_model(cfg)
     print(f"  Measuring FLOPs (K={K}, size={image_size})...")
     flops = measure_flops(model, image_size, K, DEVICE)

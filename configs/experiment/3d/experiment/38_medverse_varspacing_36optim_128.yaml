@@ -1,0 +1,28 @@
+# @package _global_
+# Experiment 38 — exp 37 (medverse, variable-spacing, no injection) but with exp 36's EXACT
+# train/optim recipe instead of the medverse-native one. A "just trying" variant: does
+# medverse survive the patchset3d optimizer? Inherits everything from exp 37 (medverse model,
+# exp 36 data/aug, spacing_range=[1,4]) and swaps only the optim knobs to match exp 36:
+#   adam 3e-5 / wd 0  ->  adamw 1e-4 / wd 0.01   (loss/scheduler/warmup/dice_weight/batch_size/
+#   epochs/grad_clip already equal exp 36 via exp 37); eval_every 1 -> 10 to match exp 36.
+# Two params intentionally NOT copied from exp 36, with reasons:
+#   - checkpoint: exp 36 is null (fresh for patchset); kept at orig_weights here — null would
+#     random-init medverse from scratch, a different (useless) experiment, not an optim change.
+#   - oob_weight: exp 36 doesn't set it, but train.py defaults it to 10.0 (== exp 37's value),
+#     so it already matches exp 36's resolved recipe and medverse keeps its NaN guard.
+# EXPECT INSTABILITY: medverse's unbounded conv head was moved off adamw/1e-4 precisely
+# because it diverges (docs/logs.md 2026-07-29); this run tests that boundary on purpose.
+# Run with:
+#   python experiments/3d/train.py experiment=38_medverse_varspacing_36optim_128
+defaults:
+  - 37_medverse_varspacing_128
+  - _self_
+
+medverse:
+  compile: true
+
+train:
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+  eval_every: 10

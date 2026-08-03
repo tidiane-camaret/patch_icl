@@ -1,0 +1,42 @@
+# @package _global_
+# Experiment 37 — Medverse under experiment 36's variable-spacing regime, WITHOUT spacing
+# injection. The medverse baseline for the spacing-aware CoLiPri run (exp 36): identical
+# data/task/augmentation and the same 1-4 mm per-batch crop spacing, but medverse never
+# receives the spacing signal (train.py only threads `spacing` into spacing-aware patchset3d;
+# medverse's train_forward path ignores it). So this isolates "does injecting spacing into the
+# frozen encoder help?" against "just train on the same variable-spacing crops blind".
+#
+# Composition: inherits experiment 31 (the Medverse twin of the CoLiPri task) for the
+# medverse-specific recipe that exp 36 does NOT carry and that medverse REQUIRES —
+# checkpoint=orig_weights, gentle Adam(3e-5, wd 0), bce_dice, oob_weight=10 (medverse's
+# unbounded conv head diverges to NaN under adamw/1e-4 or smooth_l1; see docs/logs.md
+# 2026-07-29). On top of 31 it layers exp 36's data + augmentation deltas:
+#   - data.spacing_range=[1,4]: per-batch log-uniform crop spacing (SpacingBatchSampler),
+#     the whole point — medverse sees the same 4x FOV range at fixed 128³.
+#   - data.mask_downsample=occupancy @0.5, train_classes=balanced: match exp 35/36 exactly.
+#   - augmentations.task elastic/affine: the exp 35 task-aug tweaks (36 inherits them).
+# Eval (like exp 36) runs at fixed crop_spacing_mm=2, so both models are compared at 2 mm.
+# Run with:
+#   python experiments/3d/train.py experiment=37_medverse_varspacing_128
+defaults:
+  - 31_medverse_colipri_task
+  - _self_
+
+data:
+  train_classes: balanced
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  spacing_range: [1.0, 4.0]
+
+augmentations:
+  task:
+    elastic:
+      p: 0.2
+      alpha: 0.02
+      grid_scale: 16
+    affine:
+      p: 0.5
+      max_angle_deg: 30.0
+      scale_min: 0.85
+      scale_max: 1.15
+      max_translate: 0.1

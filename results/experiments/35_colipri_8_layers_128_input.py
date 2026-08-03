@@ -38,7 +38,7 @@ def _():
     pd.set_option("display.float_format", lambda v: f"{v:.3f}")
 
     PROJECT = "tidiane/patch_icl_3d_exps"
-    RUNS = {"patchset": "61d2bm8d"}
+    RUNS = {"patchset_multiscale": "nzxp4nw9", "patchset_2mm" : "61d2bm8d"}
     N_SHAPE = 10                     # morphology cluster count (thick→thin families)
 
     def _load(_id):

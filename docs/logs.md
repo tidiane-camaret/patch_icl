@@ -1,5 +1,29 @@
 # Change log
 
+## Exp 38: medverse variable-spacing with exp 36's exact optim (trial) (2026-08-03)
+
+`configs/experiment/3d/experiment/38_medverse_varspacing_36optim_128.yaml` — exp 37 but with
+exp 36's train/optim recipe (adamw 1e-4 / wd 0.01, eval_every 10) instead of medverse-native
+adam 3e-5 / wd 0. A deliberate stress test: medverse was moved OFF adamw/1e-4 because its
+unbounded head diverges (docs/logs.md 2026-07-29), so instability is expected. Verified every
+optim key equals exp 36; oob_weight resolves to 10.0 in both (exp 36 via train.py's default),
+so the NaN guard stays. Two params NOT copied from exp 36: `checkpoint` (kept orig_weights —
+36's null would random-init medverse, a different experiment) and oob_weight (already matches).
+
+## Medverse variable-spacing baseline for exp 36 (no spacing injection) (2026-08-03)
+
+`configs/experiment/3d/experiment/37_medverse_varspacing_128.yaml` — the medverse baseline
+against the spacing-aware CoLiPri run (exp 36). Trains medverse on exp 36's data/task/aug and
+the same 1-4 mm per-batch crop spacing (`data.spacing_range=[1,4]`), but medverse never sees
+the spacing signal: `train_epoch`'s medverse branch calls `train_forward(image, ctx_in,
+ctx_out)` with no `spacing` (only spacing-aware patchset3d threads it). Isolates "inject
+spacing into the frozen encoder" vs "train blind on the same variable-spacing crops".
+Inherits exp 31 (Medverse-twin recipe: `orig_weights`, Adam 3e-5/wd0, bce_dice, oob_weight=10
+— medverse NaNs under adamw/1e-4 or smooth_l1) and layers exp 36's deltas (spacing_range,
+mask_downsample=occupancy@0.5, train_classes=balanced, exp-35 task elastic/affine). Eval, like
+exp 36, is fixed at crop_spacing_mm=2, so both models compare at 2 mm. Config-only; the
+SpacingBatchSampler loader is already model-agnostic.
+
 ## Spacing-aware RoPE for the frozen CoLiPri encoder + variable-spacing training (2026-08-03)
 
 Lets the frozen Primus/CoLiPri ViT honour physical voxel spacing so we can train over a
@@ -28,6 +52,11 @@ never reassign, or torch.compile recompiles/goes stale).
   `data.spacing_range`; new `experiment=36_colipri_spacing_aware_128` (spacing_range=[1,4]).
 - NOTE: 4 mm extrapolates RoPE past its trained max token position (1 mm is safe interp);
   narrow toward [1,3] if the coarse end regresses. Eval runs at fixed crop_spacing_mm.
+- `experiments/3d/eval.py`: eval restores only `arch` from the checkpoint, not `data`, so
+  `_warn_uninherited_data` prints (at eval start) any input-fidelity data param
+  (image_size, crop_spacing_mm, use_crop, context_size, mask_downsample, mask_occupancy_thr,
+  source) whose eval-config value differs from the checkpoint's stored training `data` —
+  guarding against silent train/test drift (e.g. defaults 1.5 mm/nearest vs trained 2 mm/occupancy).
 
 ## Startup FLOPs logging split into encoder / transformer / total (2026-08-03)
 
