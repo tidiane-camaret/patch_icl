@@ -41,6 +41,8 @@ def _set_rope_identity_grid(rope, grid):
     grid is unchanged, so this is cheap to call every forward.
     """
     grid = list(grid)
+    # Assumes feat_shape == ref_feat_shape coming in; if only ref changed while feat_shape
+    # already equaled grid, the update_feat_shape no-op would leave a stale table.
     if list(rope.feat_shape) == grid and list(rope.ref_feat_shape or []) == grid:
         return
     rope.ref_feat_shape = grid
@@ -180,7 +182,7 @@ class PrimusEncoder(nn.Module):
         return (tuple(xi.shape), round(float(flat.sum()), 3), hash(tuple(sig)))
 
     def _preprocess(self, x):
-        """(B,1,D,H,W) loader z-scored HU -> resampled to input_shape, encoder-normalised."""
+        """(B,1,D,H,W) loader z-scored HU -> resized to input_shape or native patch-aligned size, encoder-normalised."""
         v = x.float()
         if self.preproc is not None:
             hu = v * CT_STD + CT_MEAN

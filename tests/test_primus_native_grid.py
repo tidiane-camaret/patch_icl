@@ -1,6 +1,4 @@
 """Unit tests for PrimusEncoder native-grid helpers (no model weights loaded)."""
-import math
-
 import torch
 from timm.layers import RotaryEmbeddingCat
 
