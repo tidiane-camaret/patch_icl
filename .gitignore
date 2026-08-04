@@ -42,3 +42,4 @@ results/omnisynth_preview*.png
 results/3d/*.png
 results/encoder_bench/*.png
 results/encoder_bench_full/*.png
+**/__marimo__/session/**
