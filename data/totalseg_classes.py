@@ -250,6 +250,39 @@ def resolve_classes(
     return classes
 
 
+def resolve_more_labels_classes(root, value) -> list[str]:
+    """Resolve the extra `more_labels` eval class list (task-qualified "{task}/{name}").
+
+    Reads {root}/more_labels_classes.json + more_labels_subject_classes.json.
+      value == "all" -> every class present in >=2 subjects (context-viable: an
+                        in-context item needs a target + >=1 same-class context),
+                        sorted.
+      list/ListConfig -> validated pass-through (each entry must be a known key).
+    """
+    import json
+    from collections import Counter
+    from pathlib import Path
+
+    root = Path(root)
+    index = json.load(open(root / "more_labels_classes.json"))
+    subj_gids = json.load(open(root / "more_labels_subject_classes.json"))
+    gid_to_key = {int(c["global_id"]): f"{c['task']}/{c['name']}" for c in index["classes"]}
+    keys = set(gid_to_key.values())
+
+    if not isinstance(value, str):
+        want = list(value)
+        bad = [k for k in want if k not in keys]
+        if bad:
+            raise ValueError(f"unknown more_labels classes: {bad[:5]}")
+        return want
+
+    if value != "all":
+        raise ValueError(f"more_labels val_classes must be 'all' or a list, got {value!r}")
+
+    cnt = Counter(g for gids in subj_gids.values() for g in gids)
+    return sorted(gid_to_key[g] for g, k in cnt.items() if k >= 2 and g in gid_to_key)
+
+
 # Category mappings (only for TotalSeg datasets)
 category_map_ct = {
     # --- ORGANS (ABDOMINAL & PELVIC) ---

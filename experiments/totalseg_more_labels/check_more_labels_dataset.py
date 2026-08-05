@@ -22,7 +22,18 @@ MAIN = DATA / "totalseg"
 SIZE = (64, 64, 64)
 
 
+def _check_resolve():
+    from data.totalseg_classes import resolve_more_labels_classes
+    allc = resolve_more_labels_classes(MORE, "all")
+    assert len(allc) == 285, len(allc)          # classes present in >=2 subjects
+    assert all("/" in k for k in allc)          # task-qualified keys
+    picked = resolve_more_labels_classes(MORE, [allc[0]])
+    assert picked == [allc[0]]
+    print(f"resolve OK  n_all={len(allc)}")
+
+
 def main():
+    _check_resolve()
     with open(MORE / "more_labels_classes.json") as f:
         idx = json.load(f)
     with open(MORE / "more_labels_subject_classes.json") as f:
