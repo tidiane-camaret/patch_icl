@@ -17,11 +17,12 @@ from torch.utils.data import DataLoader, RandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from data.totalseg_classes import resolve_classes
+from data.totalseg_classes import resolve_classes, resolve_more_labels_classes
 from src.totalseg_dataloader_incontext import (
     TotalSegInContextDataset,
     incontext_collate_fn,
 )
+from src.totalseg_more_labels_dataset import TotalSegMoreLabelsDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -32,6 +33,12 @@ _TOTALSEG_SOURCES = ("totalseg", "totalsegmri")
 def _source_root(cfg) -> tuple[str, str, bool]:
     """Resolve (source, root, is_mri) from cfg.data.source — shared by all builders."""
     source = cfg.data.get("source", "totalseg")
+    if source == "totalseg_more_labels":
+        root = cfg.paths.get("totalseg_more_labels")
+        if root is None:
+            raise ValueError("cfg.paths.totalseg_more_labels is not set "
+                             "(needed for data.source=totalseg_more_labels)")
+        return source, root, False
     if source not in _TOTALSEG_SOURCES:
         raise ValueError(
             f"unknown data.source {source!r} (expected one of {_TOTALSEG_SOURCES})"
@@ -130,6 +137,16 @@ def build_dataset(cfg, split: str):
             aug_cfg=(cfg.get("augmentations") if is_train else None),
             max_subjects=(cfg.data.get("max_train_subjects") if is_train
                           else cfg.data.get("max_val_subjects")))
+    if cfg.data.get("source") == "totalseg_more_labels":
+        d = cfg.data
+        root = cfg.paths.get("totalseg_more_labels")
+        classes = resolve_more_labels_classes(root, d.val_classes)
+        return TotalSegMoreLabelsDataset(
+            root=root, classes=classes, image_size=tuple(d.image_size),
+            split=split, context_size=d.context_size,
+            max_subjects=d.get("max_val_subjects"),
+            eval_seed=int(cfg.get("eval", {}).get("seed", 0)),
+        )
     d = cfg.data
     _, root, is_mri = _source_root(cfg)
     class_spec = d.train_classes if split == "train" else d.val_classes
@@ -231,7 +248,7 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
     the same config surface as training.
     """
     d, e = cfg.data, cfg.eval
-    if d.get("source") in ("omnisynth3d", "anchor_synth3d"):
+    if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
         # omniSynth3D / anchor_synth3d compose their own deterministic multi-class
         # eval scenes; route through build_dataset (the same dataset the trainer
         # uses, deterministic for val/test). Their pool already spans every anchor/
