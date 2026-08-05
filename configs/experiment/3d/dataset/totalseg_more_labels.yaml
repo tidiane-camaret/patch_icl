@@ -1,14 +1,18 @@
 # @package _global_
 # Extra TotalSegmentator `more_labels` eval classes (converted by
 # experiments/totalseg_more_labels/convert_more_labels.py). Composed as
-# `dataset=totalseg_more_labels`. Eval-only: fast path, no crop/synth/aug.
+# `dataset=totalseg_more_labels`. Eval-only: no synth/aug.
 #   python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse
+#   # eval at a chosen spacing (native crop path; needs generate_crop_assets.py run once):
+#   python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse \
+#       data.use_crop=true data.crop_spacing_mm=2.0
 paths:
   totalseg_more_labels: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg_test_more_labels
 data:
   source: totalseg_more_labels
-  image_size: [64, 64, 64]     # only grid the extra masks are pre-sized at
+  image_size: [64, 64, 64]     # fast path: only grid the extra masks are pre-sized at
   context_size: 1
-  use_crop: false
+  use_crop: false              # true -> native organ-centred crop at crop_spacing_mm/voxel
+  crop_spacing_mm: 1.5         # use_crop output mm/voxel (FOV = image_size*this); e.g. 2.0, 4.0
   val_classes: all             # all = 285 classes present in >=2 subjects; or a list of "task/name"
   max_val_subjects: null

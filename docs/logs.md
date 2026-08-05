@@ -14,7 +14,25 @@ and the binary mask as `task_array == local_id`. New `data.source=totalseg_more_
 routes through `common.py`/`eval.py`; `resolve_more_labels_classes` exposes the 285
 classes present in ≥2 subjects (`val_classes=all`). Run:
 `python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse`.
-Eval-only: fast path (64³), no crop/synth/aug.
+Eval-only: no synth/aug.
+
+2026-08-05: **Added a `use_crop` path so `more_labels` can be evaluated at a chosen
+spacing.** The extra subjects' `ct.nii.gz` is the same 1.5 mm-isotropic scan as the main
+tree (identical spacing+shape; task masks share that grid). New
+`experiments/totalseg_more_labels/generate_crop_assets.py` writes per-subject native
+`ct.npy` (float16, reproducing `convert_to_npy`'s `_normalise_ct`; ~0.9 GB/25 subj) + root
+`spacings.json`, so the crop path mmaps+slices the CT (cheap under many workers) and reads
+true native spacing. `TotalSegMoreLabelsDataset` now accepts `use_crop`/`crop_spacing_mm`/
+`crop_jitter`: `_load_crop` crops the task mask (`==local_id`) + `ct.npy` at fixed physical
+extent `T*crop_spacing_mm` → resampled to T³ (isotropic `crop_spacing_mm`/voxel), reusing
+the base `_organ_crop_arrays`/`_place_*`/`_resample_binary`; centroids come from a
+per-`{task}/{name}` cache built once from the native task masks (pickled). Also fixes the
+reported `item["spacing"]` (was a 1 mm placeholder → now effective/crop spacing via the new
+`spacings.json`). `common.build_dataset` threads the crop knobs; config gains
+`data.crop_spacing_mm`. Verified: crops organ-centred (label mass at voxel ~32/64),
+reported spacing tracks 1.5/2/4 mm, foreground shrinks with FOV. Run:
+`python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse
+data.use_crop=true data.crop_spacing_mm=2.0`.
 
 ## Exp 38: medverse variable-spacing with exp 36's exact optim (trial) (2026-08-03)
 

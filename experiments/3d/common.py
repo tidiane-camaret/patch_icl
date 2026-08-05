@@ -146,6 +146,10 @@ def build_dataset(cfg, split: str):
             split=split, context_size=d.context_size,
             max_subjects=d.get("max_val_subjects"),
             eval_seed=int(cfg.get("eval", {}).get("seed", 0)),
+            use_crop=d.get("use_crop", False),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            # eval.crop_jitter: null -> T//4 training jitter; 0 -> centered deterministic crops
+            crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
         )
     d = cfg.data
     _, root, is_mri = _source_root(cfg)
