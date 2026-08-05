@@ -149,6 +149,10 @@ def main(cfg: DictConfig) -> None:
             cfg.eval.split, tuple(resolve_classes(s3.get("classes") or (),
                                                   totalseg_root=cfg.paths.get("totalseg"))))
         classes = [bank.alphabet(c) for c in bank.task_ids()]
+    elif source == "totalseg_more_labels":
+        from data.totalseg_classes import resolve_more_labels_classes
+        root = cfg.paths.get("totalseg_more_labels")
+        classes = resolve_more_labels_classes(root, cfg.data.val_classes)
     else:
         _, root, is_mri = _source_root(cfg)
         classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)

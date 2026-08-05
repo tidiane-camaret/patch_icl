@@ -1,0 +1,14 @@
+# @package _global_
+# Extra TotalSegmentator `more_labels` eval classes (converted by
+# experiments/totalseg_more_labels/convert_more_labels.py). Composed as
+# `dataset=totalseg_more_labels`. Eval-only: fast path, no crop/synth/aug.
+#   python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse
+paths:
+  totalseg_more_labels: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg_test_more_labels
+data:
+  source: totalseg_more_labels
+  image_size: [64, 64, 64]     # only grid the extra masks are pre-sized at
+  context_size: 1
+  use_crop: false
+  val_classes: all             # all = 285 classes present in >=2 subjects; or a list of "task/name"
+  max_val_subjects: null
