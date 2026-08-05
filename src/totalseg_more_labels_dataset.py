@@ -104,6 +104,8 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
             vol = _normalise_ct(img.get_fdata(dtype=np.float32))
             if self.image_size is not None:
                 vol = _iso_resize(vol, self.image_size, order=1, aa=True, spacing=sp)
+            # This on-the-fly path returns float32; convert_to_npy stores ct_{size}.npy as
+            # float16, so alignment checks use atol≈1e-2 to account for rounding.
             t = torch.from_numpy(np.ascontiguousarray(vol, dtype=np.float32)).unsqueeze(0)
         self._ct_cache[subj] = t
         return t
@@ -117,7 +119,13 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
             arr = np.load(sized, mmap_mode="r")[:]
         else:
             native = np.load(mdir / f"{task}.npy", mmap_mode="r")[:]
-            arr = (_iso_resize(native, self.image_size, order=0, aa=False)
-                   if self.image_size is not None else native)
+            if self.image_size is not None:
+                # Compute voxel spacing from CT header to align the fallback mask resize
+                # with the fast path (convert_to_npy.py uses true spacing for iso_resize).
+                img = nib.as_closest_canonical(nib.load(str(self.root / subj / "ct.nii.gz")))
+                sp = tuple(float(x) for x in nib.affines.voxel_sizes(img.affine)[:3])
+                arr = _iso_resize(native, self.image_size, order=0, aa=False, spacing=sp)
+            else:
+                arr = native
         label_t = torch.from_numpy((arr == local_id).astype(np.int64))
         return image_t, label_t

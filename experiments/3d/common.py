@@ -249,11 +249,12 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
     """
     d, e = cfg.data, cfg.eval
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
-        # omniSynth3D / anchor_synth3d compose their own deterministic multi-class
-        # eval scenes; route through build_dataset (the same dataset the trainer
-        # uses, deterministic for val/test). Their pool already spans every anchor/
-        # tile-cache class, so the `classes` arg isn't re-applied here — each item
-        # carries its own label_name for the same per-class grouping downstream.
+        # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
+        # deterministic multi-class eval datasets; route through build_dataset (the
+        # same dataset the trainer uses, deterministic for val/test). Their pool
+        # already spans every anchor/tile-cache/more-labels class, so the `classes`
+        # arg isn't re-applied here — each item carries its own label_name for
+        # the same per-class grouping downstream.
         ds = build_dataset(cfg, split)
         nw = int(e.get("workers", 4))
         return DataLoader(
