@@ -194,11 +194,25 @@ def main(cfg: DictConfig) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = (out_dir / "figures") if cfg.eval.get("save_figures", True) else None
 
+    # Training class set for the table's `in_train` zero-shot flag (resolved like train.py).
+    # Guarded: sources whose classes don't come from a totalseg root (omnisynth/anchor) can't
+    # be resolved via _source_root here -> in_train falls back to None (its pre-change value).
+    try:
+        _, _troot, _is_mri = _source_root(cfg)
+        train_classes = set(resolve_classes(cfg.data.get("train_classes"), _troot, is_mri=_is_mri))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] could not resolve train_classes for the `in_train` flag ({exc}); "
+              "leaving it unset.")
+        train_classes = None
+
     # ── per-class eval (shared loop, also used by train.py's val step) ────────
+    # No logits_fn: soft-Dice would need a second (untimed) forward per batch — ~2x eval time —
+    # so eval leaves `soft_dice`/`loss` empty and reports only the timed model.predict Dice.
     rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
     # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
-    # per case with Dice, timing, GT/context occupancy stats + source-adaptive `detail`.
-    case_table = build_sample_table(all_cases) if wb_on else None
+    # per case with Dice, timing, GT/context occupancy stats, per-sample spacing + source-
+    # adaptive `detail`, and an `in_train` flag. epoch stays -1 (build_sample_table's sentinel).
+    case_table = build_sample_table(all_cases, train_classes=train_classes) if wb_on else None
     for row in rows:
         cls = row["class"]
         if "error" in row:

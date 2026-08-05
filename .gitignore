@@ -43,3 +43,4 @@ results/3d/*.png
 results/encoder_bench/*.png
 results/encoder_bench_full/*.png
 **/__marimo__/session/**
+experiments/totalseg_more_labels/*.png

@@ -1,5 +1,22 @@
 # Change log
 
+## eval.py per-sample in_train (2026-08-05)
+
+2026-08-05: **eval.py's per-sample `cases` table now logs `in_train`, matching train.py's
+`val/samples`.** `in_train` is filled by resolving `cfg.data.train_classes` via
+`_source_root` (guarded; falls back to None for non-totalseg sources) and passing
+`train_classes` to `build_sample_table`. `soft_dice`/`loss` stay empty on the eval path:
+soft-Dice needs a second (untimed) forward per batch (~2x eval time), so it was dropped —
+eval reports only the timed `model.predict` Dice. (train.py's val step still logs soft_dice,
+since it already runs that forward.)
+
+2026-08-05: **Per-sample `spacing` column added to the shared sample table (train + eval).**
+`evaluate_classes` now writes `case["spacing"] = float(batch["spacing"][i, 0])` when the
+dataset reports spacing (the first-axis scalar the spacing-aware model consumes; the crop
+path is isotropic), and `_SAMPLE_TABLE_COLS`/`build_sample_table` gained the `spacing`
+column. Since both train.py's val step and eval.py route through `evaluate_classes`, both
+`val/samples` and eval's `cases` tables get it; NaN for datasets that emit no spacing.
+
 ## More-labels eval wiring (2026-08-05)
 
 2026-08-05: **Wired the extra TotalSegmentator `more_labels` classes into eval.**

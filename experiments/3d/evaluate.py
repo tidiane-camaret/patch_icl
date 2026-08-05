@@ -101,7 +101,8 @@ def _sample_detail(meta: dict | None) -> str:
 # no coarse-grid / refine family like 2D's patchset_cnn). One row per eval case, carrying
 # the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
 _SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "dice", "soft_dice", "loss",
-                      "time_ms", "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "detail"]
+                      "time_ms", "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "spacing",
+                      "detail"]
 
 
 def build_sample_table(cases: list[dict], epoch: int | None = None, train_classes=None):
@@ -126,7 +127,7 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
                        c.get("ctx_size", float("nan")), c.get("ctx_occ", float("nan")),
-                       c.get("detail", ""),
+                       c.get("spacing", float("nan")), c.get("detail", ""),
                        *[c.get(k, float("nan")) for k in fs_cols])
     return table
 
@@ -397,6 +398,12 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 "detail":  _sample_detail(metas[i] if metas is not None else None),
             }
             case.update(_occupancy_stats(label[i], context_masks[i]))
+            # Per-sample effective spacing (mm/voxel) when the dataset reports it. Spacing is a
+            # (3,) tensor; the crop path is isotropic and the spacing-aware model consumes the
+            # first axis as its scalar, so log that same scalar. Absent for datasets that emit no
+            # spacing (spacing key missing) -> the column stays NaN.
+            if "spacing" in batch:
+                case["spacing"] = round(float(batch["spacing"][i, 0]), 4)
             if prob is not None:
                 case["soft_dice"] = round(soft_dice_binary(prob[i, 0], label[i]), 4)
                 if sample_loss is not None:
