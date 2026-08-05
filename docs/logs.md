@@ -1,5 +1,21 @@
 # Change log
 
+## More-labels eval wiring (2026-08-05)
+
+2026-08-05: **Wired the extra TotalSegmentator `more_labels` classes into eval.**
+New `src/totalseg_more_labels_dataset.py` (`TotalSegMoreLabelsDataset`, subclass of
+`TotalSegInContextDataset`) roots at `totalseg_test_more_labels/`: class identity is
+the task-qualified key `"{task}/{name}"` from `more_labels_classes.json` (329 unique
+names collide across 37 tasks), subject→classes from `more_labels_subject_classes.json`
+(no label.npy scan). `_load` loads CT from `ct.nii.gz` reproducing `convert_to_npy`'s
+normalise + `_iso_resize` (aligns pixel-for-pixel with the pre-sized `{task}_64³.npy`
+masks; verified by `experiments/totalseg_more_labels/check_more_labels_dataset.py`),
+and the binary mask as `task_array == local_id`. New `data.source=totalseg_more_labels`
+routes through `common.py`/`eval.py`; `resolve_more_labels_classes` exposes the 285
+classes present in ≥2 subjects (`val_classes=all`). Run:
+`python experiments/3d/eval.py dataset=totalseg_more_labels eval.model=medverse`.
+Eval-only: fast path (64³), no crop/synth/aug.
+
 ## Exp 38: medverse variable-spacing with exp 36's exact optim (trial) (2026-08-03)
 
 `configs/experiment/3d/experiment/38_medverse_varspacing_36optim_128.yaml` — exp 37 but with
@@ -3533,3 +3549,5 @@ separability headline.
 - 2026-08-02: **exp30 eval ~8x faster: single autocast forward in `evaluate_classes` (patchset3d val).** The per-epoch val ran two full forwards per batch — `model.predict` (hard Dice) AND `logits_fn=train_forward` (soft-Dice/loss) — but for patchset3d these are the *same* native forward (`predict` = `sigmoid(train_forward)≥0.5`), and both ran in **fp32** (no autocast), which also forced torch.compile to recompile the eva/transformer between the train (bf16) and eval (fp32) dtypes. Added two **opt-in** params to `evaluate_classes`: `reuse_logits` (derive the hard prediction from the same logits used for the soft metrics — one forward, no separate predict pass) and `autocast` (run the eval forward under bf16, matching training). `validate_mean` sets both **only for `model==patchset3d`** (`fast_eval`); medverse keeps the current fp32 double-forward path byte-identical, and `eval.py` (defaults off, `_eval_autocast(False)`=nullcontext) is unchanged. **Verified** on exp30 val: reuse@fp32 vs predict = **EXACT** (0/340M voxels); reuse@bf16 vs predict flips 0.19% of boundary voxels but **mean |ΔDice| 0.00000 / max 0.00001** (metric unchanged); warm per-batch **2283→291 ms (7.8x)**, ~336→43 s per eval. Encoder cache still amortizes epoch-2+ (head-only). Not touched (Fix 1, deferred): `eval.n_subjects=20`×117 classes = 1173 samples/epoch — reduce for cheaper routine monitoring.
 
 - 2026-08-02: **train.py: opt-in per-step timing breakdown (data / image-encode / attention).** New `train.profile_timing` (default false) logs `train/time/{data,encode,attn}_ms` per epoch (+ a `tqdm.write` line). data-wait = perf_counter between steps (dataloader stall); encode/attn = CUDA events bracketing `net.encoder` and `net.transformer`, each called exactly once per patchset3d forward (hooks on the outer modules, so compatible with the compiled eva/transformer). Nearly free — the loop already syncs each step via `loss.item()`, so `elapsed_time` reads add no extra stall; OFF by default = zero overhead (no hooks, phase timers guarded by `prof`). patchset3d + CUDA only. Verified: 12-step profiled epoch fires all hooks, returns positive timings, prints the breakdown. NB epoch 0 numbers include torch.compile warmup (first forward compiles) — read steady-state from epoch 1+. Usage: `python experiments/3d/train.py experiment=30_colipri_encoder train.profile_timing=true`.
+
+- 2026-08-04: **Converted the extra TotalSegmentator `more_labels` masks to .npy + built a lossless global index.** The 37 produced multilabel tasks (`totalseg_test_more_labels/s*/segmentations/{task}.nii.gz`, 25 test subjects) overlap heavily — ~85% of fg voxels are covered by 2+ tasks (max depth 5), and there are 362 (task, local_id) pairs / 329 unique names, exceeding uint8. So flattening into one `label.npy`-style volume is impossible losslessly. New `experiments/totalseg_more_labels/convert_more_labels.py` keeps each task its own array (Approach A): per subject writes `more_labels/{task}.npy` (uint8, native, canonical) + `more_labels/{task}_DxHxW.npy` (nearest iso-resize via the **same** `_iso_resize` as convert_to_npy → aligns with `ct_DxHxW.npy`/`label_DxHxW.npy`). At the data root: `more_labels_classes.json` (global index, contiguous global_id 1..362 ↔ task/local_id/name, all classes incl. cross-task duplicates like vertebrae_pp vs _refined — no curation) and `more_labels_subject_classes.json` ({subject: [global_id present with >0 voxels]}, so eval never picks a class a subject lacks). Excludes the 4 `*_auxiliary` label-merge pseudo-tasks + the 2 missing-model tasks (total_highres_test, covid). Parallel per-subject (mp.Pool, forkserver). **Verified:** native .npy byte-exact vs source .nii.gz (lossless); sized on the 64³ grid matching main `label_64x64x64.npy`; index contiguous; 25 subjects, 38/102/200 present-classes (min/med/max), 1260 .npy files (630 masks × native+64³), 0 errors, 2.2 min. NOT yet wired into `TotalSegInContextDataset` — that's the next step (bridge the dataloader to read these extra labels + index for eval).
