@@ -23,8 +23,10 @@ SIZE = (64, 64, 64)
 
 
 def main():
-    idx = json.load(open(MORE / "more_labels_classes.json"))
-    sc = json.load(open(MORE / "more_labels_subject_classes.json"))
+    with open(MORE / "more_labels_classes.json") as f:
+        idx = json.load(f)
+    with open(MORE / "more_labels_subject_classes.json") as f:
+        sc = json.load(f)
     gid_to = {int(c["global_id"]): c for c in idx["classes"]}
 
     # a class present in >=2 subjects (context-viable), on a subject that also

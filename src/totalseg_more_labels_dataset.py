@@ -72,6 +72,8 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         """No meta.csv in this tree; the 25 subjects are all 'test'. List dirs that
         actually carry a more_labels/ folder (ignores the two root JSON files)."""
+        assert split in (None, "test"), \
+            f"TotalSegMoreLabelsDataset is eval-only (split={split!r})"
         subs = sorted(p.name for p in self.root.iterdir()
                       if p.is_dir() and (p / "more_labels").is_dir())
         if max_subjects is not None:
@@ -112,9 +114,9 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
         mdir = self.root / subj / "more_labels"
         sized = (mdir / f"{task}_{self._size_str}.npy") if self._size_str else None
         if sized is not None and sized.exists():
-            arr = np.asarray(np.load(sized, mmap_mode="r"))
+            arr = np.load(sized, mmap_mode="r")[:]
         else:
-            native = np.asarray(np.load(mdir / f"{task}.npy", mmap_mode="r"))
+            native = np.load(mdir / f"{task}.npy", mmap_mode="r")[:]
             arr = (_iso_resize(native, self.image_size, order=0, aa=False)
                    if self.image_size is not None else native)
         label_t = torch.from_numpy((arr == local_id).astype(np.int64))
