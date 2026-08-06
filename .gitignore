@@ -44,3 +44,4 @@ results/encoder_bench/*.png
 results/encoder_bench_full/*.png
 **/__marimo__/session/**
 experiments/totalseg_more_labels/*.png
+results/3d_feature_sim_colipri_crop192/*.csv

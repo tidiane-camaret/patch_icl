@@ -7,10 +7,17 @@
 #   python experiments/3d/feature_sim/run.py eval.model=primus \
 #       eval.primus_sidecar=results/checkpoints/primus_colipri.json \
 #       'feature_sim.tiers=[backbone]' 'feature_sim.resolutions=[8,16]'
+# Per eva-block depth sweep (one row per layer, tier bb:L{i}):
+#       'feature_sim.tiers=[backbone_layers]'
 defaults:
   - cluster: nfs
   - augmentations: multiverseg
   - dataset: totalseg
+  # `model` group so train-time experiment presets (e.g. experiment=36_colipri_*, which do
+  # `override /model: patchset3d`) compose here too. run.py rebuilds the real arch from the
+  # checkpoint (_load_patchset) and dispatches on eval.model, so this group's arch/train
+  # blocks are only a placeholder — never read by the primus path.
+  - model: patchset3d
   - _self_
   - optional experiment:
 hydra:
@@ -24,17 +31,22 @@ eval:
   workers: 8
   seed: 0
   out_dir: ${paths.results}/3d_feature_sim
+  # Forward-path perf (feature extraction only; metrics stay fp32). autocast≈2.8x on the
+  # frozen ViT, ~free; compile adds ~2.2x for a ~15-25s one-time warmup (worth it past a few
+  # hundred tasks). Measured on exp 36: bench_compile.py. See docs/logs.md 2026-08-06.
+  autocast: true             # bf16 autocast on model/encoder forwards (matches train/eval)
+  compile: false             # torch.compile the transformer + frozen eva (opt-in; slow 1st batch)
   checkpoint: null            # REQUIRED for model=patchset3d: trained best.pt
   # model=primus: supply weights + arch via a sidecar written by
   # scripts/extract_colipri_backbone.py, or inline primus_kwargs/preproc below.
   weights: null               # plain Primus state_dict (.pt); null = random-init floor
-  primus_sidecar: null        # JSON: {primus_kwargs, preproc, weights}
+  primus_sidecar: results/checkpoints/primus_colipri.json        # JSON: {primus_kwargs, preproc, weights}
   primus_kwargs: null         # inline alternative to the sidecar
   preproc: null               # {clip_min,clip_max,mean,std} HU re-normalisation
 feature_sim:
   tiers: [stage:0, stage:1, stage:2, concat, img_embed, transformer_layers]
   resolutions: [16, 32, 48]     # >48^3 auto-switches to point mode
-  budget: 110592                    # 48^3; res^3 above this uses point sampling
+  budget: 262144 # = 64^3       110592  = 48^3; above this, uses point sampling
   n_fg: 512
   n_bg: 512
   band: null                        # null = BG anywhere; int = dilated shell (voxels)

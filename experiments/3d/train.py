@@ -387,6 +387,10 @@ def _feature_sim_trace(net, loader, n_tasks):
     for batch in loader:
         subjects = batch.get("subjects", [None] * batch["image"].shape[0])
         names = batch["label_names"]
+        # Per-batch physical spacing for the spacing-aware encoder's RoPE (constant across the
+        # batch); None when not spacing-aware -> encoder uses the train-pitch identity grid.
+        spacing = (float(batch["spacing"][0, 0])
+                   if getattr(net, "spacing_aware", False) and "spacing" in batch else None)
         for b in range(batch["image"].shape[0]):
             if seen >= n_tasks:
                 break
@@ -398,7 +402,7 @@ def _feature_sim_trace(net, loader, n_tasks):
             cl = torch.stack([grid_labels(cout[0, k], R, threshold=None).flatten()
                               for k in range(K)]).flatten().to(DEVICE)
             rec = {"class": names[b], "subject": subjects[b]}
-            for name, tf, cf in adapter.transformer_trace(image, cin, cout):
+            for name, tf, cf in adapter.transformer_trace(image, cin, cout, spacing=spacing):
                 rec[f"fs_{name}_dice"] = round(label_transfer(tf[0], tl, cf[0], cl)["transfer_dice"], 4)
                 rec[f"fs_{name}_retr"] = round(retrieval_at1(tf[0], tl, cf[0], cl), 4)
             records.append(rec)

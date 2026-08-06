@@ -5,6 +5,7 @@ eval loader, and write a tidy per-(task,tier,res) CSV of matching metrics + real
         eval.model=patchset3d
 """
 import collections
+import contextlib
 import csv
 import math
 import sys
@@ -27,6 +28,36 @@ from feature_sim.cost import measure_encode_cost                   # noqa: E402
 from feature_sim.labels import grid_labels, sample_points          # noqa: E402
 from feature_sim.metrics import (                                  # noqa: E402
     prototype_cosine, fg_match_margin, retrieval_at1, label_transfer)
+
+
+def _fwd_ctx(cfg):
+    """Autocast context for the model/encoder forwards. Default on (bf16, matching the
+    train/eval regime) — feature_sim historically ran fp32, leaving ~2.8x on the table on
+    the frozen ViT. Metrics stay fp32 (see _metric_row, which disables autocast). CPU/off
+    -> nullcontext (no-op)."""
+    if cfg.eval.get("autocast", True) and DEVICE.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def _maybe_compile(adapter, model, cfg):
+    """Opt-in torch.compile of the heavy forward modules — the read-out transformer and the
+    frozen Primus eva stack — mirroring experiments/3d/train.py (~2.2x forward on exp 36).
+    Called AFTER measure_encode_cost so fvcore doesn't try to trace a compiled graph.
+    dynamic=True: target vs context batch sizes differ, so avoid recompiling per shape."""
+    if not cfg.eval.get("compile", False):
+        return
+    done = []
+    if model is not None and hasattr(model, "transformer"):
+        model.transformer = torch.compile(model.transformer, dynamic=True)
+        done.append("transformer")
+    # frozen Primus eva: on the patchset3d model's encoder, or a generic PrimusEncoderAdapter.
+    enc = getattr(model, "encoder", None) if model is not None else None
+    prim = getattr(enc, "primus", None) or getattr(adapter, "primus", None)
+    if prim is not None and hasattr(prim, "eva"):
+        prim.eva = torch.compile(prim.eva, dynamic=True)
+        done.append("frozen eva")
+    print(f"  torch.compile (dynamic=True) on: {', '.join(done) or '(nothing)'} — first batch slow")
 
 
 def plan_sweep(tiers, resolutions, budget, R):
@@ -97,8 +128,11 @@ def build_adapter(cfg):
         return PatchSet3DEncoderAdapter(m), m
     if which == "primus":
         weights, pk, preproc = _primus_spec(cfg)
+        # The generic adapter self-autocasts internally (its encode isn't wrapped by
+        # _fwd_ctx's cost probe / standalone use), so it honours eval.autocast directly.
         return PrimusEncoderAdapter(weights_path=weights, primus_kwargs=pk,
-                                    preproc=preproc, device=DEVICE.type), None
+                                    preproc=preproc, device=DEVICE.type,
+                                    autocast=bool(cfg.eval.get("autocast", True))), None
     raise ValueError(f"unknown eval.model {which!r} (expected patchset3d | primus)")
 
 
@@ -116,11 +150,18 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     K = cin.shape[1]
     cls = item["label_names"][0]
     obj_vox = int((gt > 0).sum().item())
+    # Per-task physical spacing for a spacing-aware model: thread the crop's mm/voxel into
+    # both real_dice and every feature encode so the frozen ViT's RoPE matches the crop
+    # (mirrors evaluate.py). Empty for non-spacing-aware models / generic encoders, so those
+    # adapter/predict signatures never receive the kwarg (unchanged). See adapters.features.
+    sp = ({"spacing": float(item["spacing"][0, 0])}
+          if model is not None and getattr(model, "spacing_aware", False) and "spacing" in item
+          else {})
     # real_dice needs a trained segmenter; a generic frozen encoder (model is None)
     # reports intrinsic metrics only -> real_dice stays None (coupling analyses drop it).
     if model is not None:
         with torch.no_grad():
-            real = model.predict(image, cin, cout)   # cin (1,K,1,D,H,W) -> (1,D,H,W)
+            real = model.predict(image, cin, cout, **sp)   # cin (1,K,1,D,H,W) -> (1,D,H,W)
         inter = (real[0] * (gt.to(DEVICE) > 0)).sum().item()
         den = real[0].sum().item() + (gt > 0).sum().item()
         real_dice = (2 * inter) / den if den > 0 else 0.0
@@ -131,14 +172,14 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
     for p in plan:
         tier, res, mode = p["tier"], p["res"], p["mode"]
         if tier == "transformer_q":
-            q = adapter.transformer_query(image, cin, cout)[0]          # (N,e)
+            q = adapter.transformer_query(image, cin, cout, **sp)[0]    # (N,e)
             tl = grid_labels(gt, adapter.R, threshold=None).flatten()   # soft occupancy
             cl = torch.stack([grid_labels(cout[0, k], adapter.R, threshold=None).flatten()
                               for k in range(K)]).flatten()
             # context side uses img_embed tier (concat→e projection) so its channel dim
             # matches the transformer query rep e; note this is an approximate ceiling
             # reference (post-transformer target vs pre-transformer context embeddings)
-            cf = adapter.features(ctx_imgs.unsqueeze(1), "img_embed", adapter.R)
+            cf = adapter.features(ctx_imgs.unsqueeze(1), "img_embed", adapter.R, **sp)
             cf = cf.flatten(2).transpose(1, 2).reshape(-1, cf.shape[1])
             yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
                               adapter.native_res("concat", input_res),
@@ -152,28 +193,64 @@ def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):
             cl = torch.stack([grid_labels(cout[0, k], adapter.R, threshold=None).flatten()
                               for k in range(K)]).flatten()
             for li, (tq, cq) in enumerate(
-                    adapter.transformer_pair_per_layer(image, cin, cout)):
+                    adapter.transformer_pair_per_layer(image, cin, cout, **sp)):
                 yield _metric_row(cls, obj_vox, real_dice, f"tf:L{li}", res, mode,
                                   adapter.R, tq[0], tl, cq[0], cl, K)
             continue
+        if tier == "backbone_layers":
+            # Frozen-encoder depth sweep: one forward captures every eva block's grid; emit a
+            # row per block (tier "bb:L{i}"), the ViT analogue of the conv stage:* sweep. Same
+            # prototype/retrieval metrics as the dense/point paths below, just per layer.
+            if mode == "dense":
+                tgrids = adapter.features_per_layer(image, res)
+                cgrids = adapter.features_per_layer(ctx_imgs.unsqueeze(1), res)
+                tl = grid_labels(gt, res, threshold=None).flatten()
+                cl = torch.stack([grid_labels(cout[0, k], res, threshold=None).flatten()
+                                  for k in range(K)]).flatten()
+                for li, (tg, cvol) in enumerate(zip(tgrids, cgrids)):
+                    tf = tg[0].flatten(1).transpose(0, 1)              # (res^3, C)
+                    cf = cvol.flatten(2).transpose(1, 2).reshape(-1, cvol.shape[1])
+                    yield _metric_row(cls, obj_vox, real_dice, f"bb:L{li}", res, mode,
+                                      adapter.native_res("backbone", input_res),
+                                      tf, tl, cf, cl, K)
+            else:
+                tcoords, tl = sample_points(gt, fs.n_fg, fs.n_bg,
+                                            band=fs.get("band"), generator=gen)
+                tfs = adapter.sample_features_per_layer(image, tcoords.to(DEVICE).unsqueeze(0))
+                cfs = [[] for _ in tfs]
+                ctx_labels = []
+                for k in range(K):
+                    cc, ll = sample_points(cout[0, k].cpu(), fs.n_fg, fs.n_bg,
+                                           band=fs.get("band"), generator=gen)
+                    per = adapter.sample_features_per_layer(
+                        ctx_imgs[k][None, None], cc.to(DEVICE).unsqueeze(0))
+                    for li, s in enumerate(per):
+                        cfs[li].append(s[0])
+                    ctx_labels.append(ll)
+                cl = torch.cat(ctx_labels, 0)
+                for li, tg in enumerate(tfs):
+                    yield _metric_row(cls, obj_vox, real_dice, f"bb:L{li}", res, mode,
+                                      adapter.native_res("backbone", input_res),
+                                      tg[0], tl, torch.cat(cfs[li], 0), cl, K)
+            continue
         if mode == "dense":
-            tf = adapter.features(image, tier, res)[0]                  # (C,res,res,res)
+            tf = adapter.features(image, tier, res, **sp)[0]           # (C,res,res,res)
             tf = tf.flatten(1).transpose(0, 1)                         # (res^3, C)
             tl = grid_labels(gt, res, threshold=None).flatten()        # soft occupancy fraction
-            cvol = adapter.features(ctx_imgs.unsqueeze(1), tier, res)  # (K,C,res^3...)
+            cvol = adapter.features(ctx_imgs.unsqueeze(1), tier, res, **sp)  # (K,C,res^3...)
             cf = cvol.flatten(2).transpose(1, 2).reshape(-1, cvol.shape[1])
             cl = torch.stack([grid_labels(cout[0, k], res, threshold=None).flatten()
                               for k in range(K)]).flatten()
         else:
             tcoords, tl = sample_points(gt, fs.n_fg, fs.n_bg,
                                         band=fs.get("band"), generator=gen)
-            tf = adapter.sample_features(image, tier, tcoords.to(DEVICE).unsqueeze(0))[0]
+            tf = adapter.sample_features(image, tier, tcoords.to(DEVICE).unsqueeze(0), **sp)[0]
             cfs, ctx_labels = [], []
             for k in range(K):
                 cc, ll = sample_points(cout[0, k].cpu(), fs.n_fg, fs.n_bg,
                                        band=fs.get("band"), generator=gen)
                 cfs.append(adapter.sample_features(
-                    ctx_imgs[k][None, None], tier, cc.to(DEVICE).unsqueeze(0))[0])
+                    ctx_imgs[k][None, None], tier, cc.to(DEVICE).unsqueeze(0), **sp)[0])
                 ctx_labels.append(ll)
             cf = torch.cat(cfs, 0); cl = torch.cat(ctx_labels, 0); tf = tf
         yield _metric_row(cls, obj_vox, real_dice, tier, res, mode,
@@ -187,12 +264,19 @@ def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
     # matmuls that are far faster there. Labels may come from CPU (target GT) or GPU
     # (context_out), so align them to the feature device rather than assuming a common one.
     dev = tf.device
+    # Metrics run fp32 regardless of the forward regime: cast the (possibly bf16) features up
+    # and disable autocast so the cosine matmuls / argmax ranking aren't computed in bf16
+    # (the encode is autocast for speed; the similarity ranking must stay precise).
+    tf, cf = tf.float(), cf.float()
     tl, cf, cl = tl.to(dev), cf.to(dev), cl.to(dev)
-    proto = prototype_cosine(tf, tl, cf, cl, mode=mode)
-    # Full-volume label-transfer overlap is the segmentation-quality proxy (replaces the
-    # old size-collinear min-max soft_dice); dense only — point pools are 50/50 sampled so
-    # precision would be distorted. Yields transfer_dice/precision/recall from one NN pass.
-    lt = label_transfer(tf, tl, cf, cl) if mode == "dense" else {}
+    with torch.autocast(DEVICE.type, enabled=False):
+        proto = prototype_cosine(tf, tl, cf, cl, mode=mode)
+        # Full-volume label-transfer overlap is the segmentation-quality proxy (replaces the
+        # old size-collinear min-max soft_dice); dense only — point pools are 50/50 sampled so
+        # precision would be distorted. Yields transfer_dice/precision/recall from one NN pass.
+        lt = label_transfer(tf, tl, cf, cl) if mode == "dense" else {}
+        margin = fg_match_margin(tf, tl, cf, cl)
+        retr = retrieval_at1(tf, tl, cf, cl)
     row = {"class": cls, "obj_vox": obj_vox, "real_dice": real_dice,
            "tier": tier, "res": res, "mode": mode, "tier_native_res": tier_native,
            "K": K, "auroc": proto["auroc"],
@@ -203,8 +287,8 @@ def _metric_row(cls, obj_vox, real_dice, tier, res, mode, tier_native,
            "transfer_dice": lt.get("transfer_dice"),
            "transfer_precision": lt.get("transfer_precision"),
            "transfer_recall": lt.get("transfer_recall"),
-           "margin": fg_match_margin(tf, tl, cf, cl),
-           "retrieval_at1": retrieval_at1(tf, tl, cf, cl)}
+           "margin": margin,
+           "retrieval_at1": retr}
     return row
 
 
@@ -359,6 +443,16 @@ def main(cfg: DictConfig) -> None:
         if dropped:
             print(f"  adapter has no transformer probes; dropping tiers {dropped}")
         tiers = [t for t in tiers if t not in tf_tiers]
+    # Fail early + actionably on encoder-tiers the adapter can't serve (the config default
+    # is conv-oriented [stage:*, concat, ...]; a generic Primus/CoLiPri encoder only exposes
+    # `backbone`). Without this the run dies mid-loop with a cryptic assert deep in features().
+    supported = set(adapter.tiers()) | tf_tiers
+    bad = [t for t in tiers if t not in supported]
+    if bad:
+        raise ValueError(
+            f"eval.model={cfg.eval.model} encoder does not support tiers {bad}; "
+            f"supported: {sorted(adapter.tiers())}. Set e.g. "
+            f"'feature_sim.tiers=[{','.join(adapter.tiers())}]'.")
     plan = plan_sweep(tiers, list(cfg.feature_sim.resolutions),
                       int(cfg.feature_sim.budget), adapter.R)
     gen = torch.Generator().manual_seed(cfg.eval.seed)
@@ -366,6 +460,9 @@ def main(cfg: DictConfig) -> None:
     # Image-encoding cost (frozen forward): FLOPs / peak VRAM / it-s, once per run.
     cost = measure_encode_cost(adapter, input_res, DEVICE)
     print(f"  encode cost @ {input_res}^3: {cost}")
+
+    # Opt-in torch.compile of the heavy modules (after the FLOP probe above; see _maybe_compile).
+    _maybe_compile(adapter, model, cfg)
 
     # W&B: online when a project is configured, disabled otherwise (CSV still written).
     wb_on = bool(cfg.wandb.get("project"))
@@ -388,8 +485,11 @@ def main(cfg: DictConfig) -> None:
             for b in range(B):
                 item = {k: (v[b:b + 1] if torch.is_tensor(v) else [v[b]])
                         for k, v in batch.items()}
-                for row in _rows_for_task(adapter, model, item, cfg, plan,
-                                          input_res, gen):
+                # Autocast wraps only the forwards inside _rows_for_task; metrics re-disable it.
+                with _fwd_ctx(cfg):
+                    rows = list(_rows_for_task(adapter, model, item, cfg, plan,
+                                               input_res, gen))
+                for row in rows:
                     if writer is None:
                         fields = list(row.keys())
                         writer = csv.DictWriter(fh, fieldnames=fields)

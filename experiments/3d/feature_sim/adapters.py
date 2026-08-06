@@ -6,6 +6,7 @@ EncoderAdapter maps volumes -> per-cell feature grids at an arbitrary resolution
 wraps a loaded PatchSet3D; PrimusEncoderAdapter wraps a frozen nnUNet Primus ViT
 (weights-pluggable — e.g. a CoLiPri backbone). Future SAM/DINO adapters implement the
 same interface."""
+import contextlib
 from abc import ABC, abstractmethod
 
 import torch
@@ -95,11 +96,14 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         return torch.cat([_down_to(f, r) if f.shape[-1] != r else f for f in feats], 1)
 
     @torch.no_grad()
-    def features(self, volumes, tier, res):
+    def features(self, volumes, tier, res, spacing=None):
         if self._is_primus:
             if tier not in ("backbone", "img_embed"):
                 raise ValueError(f"unknown primus tier {tier!r}")
-            f = _down_to(self.enc(volumes), res)   # (B, out_ch, res,res,res); enc self-caches
+            # spacing scales the frozen ViT's RoPE in spacing-aware mode; threaded so the
+            # study encodes at the crop's physical spacing (matches evaluate.py), not the
+            # train-pitch fallback. Ignored by the encoder when not spacing-aware.
+            f = _down_to(self.enc(volumes, spacing=spacing), res)   # (B,out_ch,res^3); enc self-caches
             return self._apply_img_embed(f) if tier == "img_embed" else f
         feats = self._stage_feats(volumes)
         if tier.startswith("stage:"):
@@ -116,12 +120,12 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         return f
 
     @torch.no_grad()
-    def sample_features(self, volumes, tier, coords):
+    def sample_features(self, volumes, tier, coords, spacing=None):
         """coords (B,N,3) normalized in (z,y,x)=(d,h,w) order -> (B,N,C)."""
         if self._is_primus:
             if tier not in ("backbone", "img_embed"):
                 raise ValueError(f"unknown primus tier {tier!r}")
-            f = self.enc(volumes)                   # (B, out_ch, R,R,R); enc self-caches
+            f = self.enc(volumes, spacing=spacing)  # (B, out_ch, R,R,R); enc self-caches
         else:
             feats = self._stage_feats(volumes)
             if tier.startswith("stage:"):
@@ -140,31 +144,42 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
     def cost_target(self, input_res):
         """(module, example_inputs) for the encode-cost probe: the encoder stem+stages
         forward on one 1-channel volume at the study input res — the exact path
-        features() drives, so cost compares like-for-like against other encoders."""
+        features() drives, so cost compares like-for-like against other encoders.
+
+        The primus branch traces `_encode` (down_projection + eva) on an EAGERLY preprocessed
+        input, avoiding the cached `enc(x)` forward: (1) the frozen-eval cache path hashes the
+        input via `_key` (`round(float(x.sum()))`) — untraceable and it would make the repeated-
+        input timing loop measure cache hits, not the real encode; (2) `_preprocess`'s
+        native_grid target uses `round(shape/patch)`, which fvcore's jit trace turns into
+        `round(Tensor)` (TypeError -> encode_gflops stayed None). Preprocessing eagerly gives
+        concrete shapes, so only the tensor-op encode is traced."""
         adapter, is_primus = self, self._is_primus
         dev = next(self.enc.parameters()).device
 
         class _EncodeFwd(nn.Module):
             def forward(self, x):
-                return adapter.enc(x) if is_primus else adapter._stage_feats(x)
+                return adapter.enc._encode(x) if is_primus else adapter._stage_feats(x)
 
         x = torch.zeros(1, 1, input_res, input_res, input_res, device=dev)
+        if is_primus:
+            x = adapter.enc._preprocess(x)      # eager: strips the untraceable round()/resample
         return _EncodeFwd().to(dev), (x,)
 
     @torch.no_grad()
-    def transformer_query(self, image, context_in, context_out):
+    def transformer_query(self, image, context_in, context_out, spacing=None):
         """Post-transformer query rep (B,N,e) via a decoder-input hook (res=R only)."""
         captured = {}
         h = self.model.decoder.register_forward_pre_hook(
             lambda mod, args: captured.setdefault("q", args[0]))
         try:
-            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+            self.model(image, context_in=context_in, context_out=context_out,
+                       mode="train", spacing=spacing)
         finally:
             h.remove()
         return captured["q"]
 
     @torch.no_grad()
-    def transformer_pair(self, image, context_in, context_out):
+    def transformer_pair(self, image, context_in, context_out, spacing=None):
         """Post-transformer img-column tokens for BOTH target and context, in the same
         space e (res=R). Unlike transformer_query (target post- vs context PRE-transformer,
         a mismatched probe), this reads the context tokens the transformer actually produced,
@@ -179,7 +194,8 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
 
         h = self.model.transformer.register_forward_hook(hook)
         try:
-            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+            self.model(image, context_in=context_in, context_out=context_out,
+                       mode="train", spacing=spacing)
         finally:
             h.remove()
         x, sep_t = cap["x"], cap["sep_t"]
@@ -187,7 +203,7 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         return x[:, sep_t:, 0, :], x[:, n:sep_t, 0, :]
 
     @torch.no_grad()
-    def transformer_pair_per_layer(self, image, context_in, context_out):
+    def transformer_pair_per_layer(self, image, context_in, context_out, spacing=None):
         """Like transformer_pair but returns the (target, context) img-token pair after
         EACH transformer block, so correspondence can be traced layer by layer. Free: the
         forward already runs every block; the hooks only capture its output tensor.
@@ -198,7 +214,8 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         hs = [b.register_forward_hook(lambda m, a, o: outs.append((o, a[1])))
               for b in self.model.transformer.blocks]
         try:
-            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+            self.model(image, context_in=context_in, context_out=context_out,
+                       mode="train", spacing=spacing)
         finally:
             for h in hs:
                 h.remove()
@@ -206,7 +223,7 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
         return [(x[:, s:, 0, :], x[:, n:s, 0, :]) for x, s in outs]
 
     @torch.no_grad()
-    def transformer_trace(self, image, context_in, context_out):
+    def transformer_trace(self, image, context_in, context_out, spacing=None):
         """One forward -> named (target, context) img-token pairs: 'transformer_input' (the
         transformer INPUT — the img token AFTER the trainable img_embed + pos, before any
         attention; NOT the frozen encoder output) then 'L{i}' after each block, all at res=R
@@ -220,7 +237,8 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
                   lambda m, a, o, i=i: outs.append((f"L{i}", o, a[1])))
               for i, b in enumerate(self.model.transformer.blocks)]
         try:
-            self.model(image, context_in=context_in, context_out=context_out, mode="train")
+            self.model(image, context_in=context_in, context_out=context_out,
+                       mode="train", spacing=spacing)
         finally:
             hp.remove()
             for h in hs:
@@ -251,7 +269,7 @@ class PrimusEncoderAdapter(EncoderAdapter):
     """
 
     def __init__(self, weights_path=None, primus_kwargs=None, preproc=None,
-                 device="cuda"):
+                 device="cuda", autocast=True):
         from dynamic_network_architectures.architectures.primus import Primus
         kw = dict(primus_kwargs or {})
         self.input_shape = tuple(kw["input_shape"])
@@ -270,6 +288,10 @@ class PrimusEncoderAdapter(EncoderAdapter):
                       f"{len(unexpected)} unexpected keys")
         self.preproc = preproc
         self.device = device
+        # Honour eval.autocast (run.py): True = bf16 encode (fast, default, matches train/eval);
+        # False = full fp32 encode (exact reference / reproducibility). Metrics are fp32 either
+        # way (_encode_native .float()s the output; _metric_row re-disables autocast).
+        self.autocast = bool(autocast)
         self._embed_dim = self.primus.embed_dim
         self._g = self.input_shape[-1] // self.patch[-1]
         # Native-encode cache: the study re-requests the SAME volume at several resolutions
@@ -284,8 +306,16 @@ class PrimusEncoderAdapter(EncoderAdapter):
     def R(self):
         return self._g                              # native token grid res
 
+    @property
+    def n_layers(self):
+        eva = getattr(self.primus.eva, "_orig_mod", self.primus.eva)
+        return len(eva.blocks)                       # eva depth (may be truncated)
+
     def tiers(self):
-        return ["backbone"]
+        # 'backbone' = final eva output (post final-norm). 'backbone_layers' is a fan-out
+        # meta-tier: run.py emits one row per eva block (tier 'bb:L{i}'), so correspondence
+        # can be traced along transformer depth (the ViT analogue of the conv stage:* sweep).
+        return ["backbone", "backbone_layers"]
 
     def native_res(self, tier, input_res):
         return self._g                              # fixed: inputs resampled to input_shape
@@ -317,7 +347,36 @@ class PrimusEncoderAdapter(EncoderAdapter):
             x = x[:, p.register_tokens.shape[1]:]
         return x.transpose(1, 2).reshape(B, self._embed_dim, W, H, D)
 
+    def _encode_layers(self, x):
+        """Run the Primus ViT encoder capturing the token grid AFTER each eva block.
+        Returns a list (len n_layers) of (B, embed_dim, g, g, g). x already preprocessed.
+
+        Reimplements eva.forward_features' block loop (rather than forward-hooking) so it is
+        robust when eva has been torch.compile-wrapped (hooks on a compiled graph's submodules
+        don't fire reliably) — the underlying module is unwrapped via `_orig_mod`. Grids are
+        post-block, PRE the final eva `norm` (standard intermediate-layer features); the last
+        grid therefore differs slightly from the `backbone` tier (which includes final norm)."""
+        p = self.primus
+        x = p.down_projection(x)                    # (B,C,W,H,D)
+        B, C, W, H, D = x.shape
+        x = x.flatten(2).transpose(1, 2)            # (B,N,C)
+        n_reg = 0
+        if p.register_tokens is not None:
+            x = torch.cat([p.register_tokens.expand(B, -1, -1), x], dim=1)
+            n_reg = p.register_tokens.shape[1]
+        eva = getattr(p.eva, "_orig_mod", p.eva)     # unwrap torch.compile if present
+        x, rope, keep = eva._pos_embed(x)
+        assert keep is None, "patch dropping must be off for dense features"
+        grids = []
+        for blk in eva.blocks:
+            x = blk(x, rope=rope)
+            t = x[:, n_reg:] if n_reg else x         # drop register/prefix tokens
+            grids.append(t.transpose(1, 2).reshape(B, self._embed_dim, W, H, D).float())
+        return grids
+
     def _autocast(self):
+        if not self.autocast:
+            return contextlib.nullcontext()        # fp32 encode (eval.autocast=false)
         return torch.autocast("cuda", dtype=torch.bfloat16) if self.device == "cuda" \
             else torch.autocast("cpu", dtype=torch.bfloat16)
 
@@ -352,6 +411,37 @@ class PrimusEncoderAdapter(EncoderAdapter):
         xyz = coords.to(self.device).flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)
         s = F.grid_sample(f, xyz, mode="bilinear", align_corners=True)   # (B,C,N,1,1)
         return s.squeeze(-1).squeeze(-1).transpose(1, 2)                 # (B,N,C)
+
+    # -- per-layer (backbone_layers tier) ---------------------------------
+    @torch.no_grad()
+    def _encode_native_layers(self, volumes):
+        """Preprocess + ViT encode, keeping every eva block's native grid. Cached by
+        (storage ptr, shape) so the target/context volumes are encoded once even when the
+        sweep asks for several resolutions."""
+        key = ("layers", volumes.untyped_storage().data_ptr(), tuple(volumes.shape))
+        cached = self._native_cache.get(key)
+        if cached is not None:
+            return cached
+        x = self._preprocess(volumes.to(self.device))
+        with self._autocast():
+            grids = self._encode_layers(x)
+        self._native_cache[key] = grids
+        return grids
+
+    @torch.no_grad()
+    def features_per_layer(self, volumes, res):
+        """List (len n_layers) of (B, embed_dim, res, res, res) — one entry per eva block."""
+        return [_down_to(g, res) for g in self._encode_native_layers(volumes)]
+
+    @torch.no_grad()
+    def sample_features_per_layer(self, volumes, coords):
+        """coords (B,N,3) in (z,y,x) -> list (len n_layers) of (B,N,embed_dim)."""
+        xyz = coords.to(self.device).flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)
+        out = []
+        for g in self._encode_native_layers(volumes):
+            s = F.grid_sample(g, xyz, mode="bilinear", align_corners=True)   # (B,C,N,1,1)
+            out.append(s.squeeze(-1).squeeze(-1).transpose(1, 2))            # (B,N,C)
+        return out
 
     # -- cost probe hook ---------------------------------------------------
     def cost_target(self, input_res):

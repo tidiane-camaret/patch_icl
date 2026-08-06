@@ -68,6 +68,10 @@ def main(cfg: DictConfig) -> None:
     seen = 0
     for batch in loader:
         B = batch["image"].shape[0]
+        # Per-batch crop spacing for the spacing-aware encoder's RoPE (None otherwise).
+        spacing = (float(batch["spacing"][0, 0])
+                   if getattr(model, "spacing_aware", False) and "spacing" in batch else None)
+        sp = {"spacing": spacing} if spacing is not None else {}
         for b in range(B):
             image = batch["image"][b:b + 1].to(DEVICE)
             cin = batch["context_in"][b:b + 1].to(DEVICE)
@@ -75,7 +79,7 @@ def main(cfg: DictConfig) -> None:
             gt = batch["label"][b]
             K = cin.shape[1]
             with torch.no_grad():
-                real = model.predict(image, cin, cout)[0]
+                real = model.predict(image, cin, cout, **sp)[0]
             inter = (real * (gt.to(DEVICE) > 0)).sum().item()
             den = real.sum().item() + (gt > 0).sum().item()
             dice.append((2 * inter / den) if den > 0 else 0.0)
@@ -85,12 +89,12 @@ def main(cfg: DictConfig) -> None:
                               for k in range(K)]).flatten().to(DEVICE)
 
             # pre-transformer baseline: img_embed@R on both sides
-            tf_ie = ad.features(image, "img_embed", R)[0].flatten(1).transpose(0, 1)   # (N,e)
-            cvol = ad.features(cin[0].squeeze(1).unsqueeze(1), "img_embed", R)          # (K,e,R,R,R)
+            tf_ie = ad.features(image, "img_embed", R, **sp)[0].flatten(1).transpose(0, 1)  # (N,e)
+            cvol = ad.features(cin[0].squeeze(1).unsqueeze(1), "img_embed", R, **sp)        # (K,e,R,R,R)
             ctx_ie = cvol.flatten(2).transpose(1, 2).reshape(-1, cvol.shape[1])         # (K*N,e)
 
             # per-block post-transformer target/context (same forward, hooked)
-            layers = ad.transformer_pair_per_layer(image, cin, cout)                    # [(tgt,ctx)]*L
+            layers = ad.transformer_pair_per_layer(image, cin, cout, **sp)              # [(tgt,ctx)]*L
 
             for name, (tf, cf) in zip(variants,
                                       [(tf_ie, ctx_ie)] + [(t[0], c[0]) for t, c in layers]):

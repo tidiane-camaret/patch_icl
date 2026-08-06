@@ -92,6 +92,10 @@ def main(cfg: DictConfig) -> None:
     rows = []          # (tier, key, real_dice, obj_vox, dice)
     seen = 0
     for batch in loader:
+        # Per-batch crop spacing for the spacing-aware encoder's RoPE (None otherwise).
+        spacing = (float(batch["spacing"][0, 0])
+                   if getattr(model, "spacing_aware", False) and "spacing" in batch else None)
+        sp = {"spacing": spacing} if spacing is not None else {}
         for b in range(batch["image"].shape[0]):
             if seen >= N_TASKS:
                 break
@@ -102,16 +106,16 @@ def main(cfg: DictConfig) -> None:
             K = cin.shape[1]
             obj_vox = int((gt > 0).sum().item())
             with torch.no_grad():
-                real = model.predict(image, cin, cout)
+                real = model.predict(image, cin, cout, **sp)
             inter = (real[0] * (gt.to(DEVICE) > 0)).sum().item()
             den = real[0].sum().item() + (gt > 0).sum().item()
             real_dice = (2 * inter) / den if den > 0 else 0.0
 
             # encoder tier img_embed@ENC_RES (dense full volume)
-            tf = adapter.features(image, "img_embed", ENC_RES)[0].flatten(1).transpose(0, 1)
+            tf = adapter.features(image, "img_embed", ENC_RES, **sp)[0].flatten(1).transpose(0, 1)
             tl = grid_labels(gt, ENC_RES, threshold=None).flatten().to(DEVICE)
             ctx = cin[0].squeeze(1)                       # (K,D,H,W)
-            cvol = adapter.features(ctx.unsqueeze(1), "img_embed", ENC_RES)
+            cvol = adapter.features(ctx.unsqueeze(1), "img_embed", ENC_RES, **sp)
             cf = cvol.flatten(2).transpose(1, 2).reshape(-1, cvol.shape[1])
             cl = torch.stack([grid_labels(cout[0, k], ENC_RES, threshold=None).flatten()
                               for k in range(K)]).flatten().to(DEVICE)
@@ -122,7 +126,7 @@ def main(cfg: DictConfig) -> None:
             tlR = grid_labels(gt, R, threshold=None).flatten().to(DEVICE)
             clR = torch.stack([grid_labels(cout[0, k], R, threshold=None).flatten()
                                for k in range(K)]).flatten().to(DEVICE)
-            for name, tq, cq in adapter.transformer_trace(image, cin, cout):
+            for name, tq, cq in adapter.transformer_trace(image, cin, cout, **sp):
                 for key, dice in transfer_sweep(tq[0], tlR, cq[0], clR, TAUS).items():
                     rows.append((name, key, real_dice, obj_vox, dice))
             seen += 1
