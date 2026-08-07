@@ -72,6 +72,24 @@ def _warn_uninherited_data(cfg: DictConfig) -> None:
         print("         Re-supply matching data.* overrides for a faithful eval.\n")
 
 
+def _assert_sweep_supported(cfg: DictConfig) -> None:
+    """Fail fast when eval.spacing_sweep is set on an unsupported config.
+
+    The per-spacing crop override only takes effect on the totalseg direct-build path
+    with use_crop=true (the resized path ignores _cur_crop_spacing; build_dataset-routed
+    sources build their own datasets). Reject anything else with a clear message rather
+    than silently producing a single-spacing result."""
+    if not cfg.data.get("use_crop"):
+        raise ValueError(
+            "eval.spacing_sweep requires data.use_crop=true — the crop-spacing override is a "
+            "no-op on the pre-resized path (it reports fixed voxel spacing).")
+    source = cfg.data.get("source", "totalseg")
+    if source in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
+        raise ValueError(
+            f"eval.spacing_sweep is unsupported for data.source={source!r} (routed through "
+            "build_dataset); it works only on the totalseg direct-build eval path.")
+
+
 def _build_model(cfg: DictConfig):
     """Instantiate the eval model. Medverse is inference-only (no checkpoint needed);
     other models need eval.checkpoint. Handles medverse ckpt/sw_roi that load_model
