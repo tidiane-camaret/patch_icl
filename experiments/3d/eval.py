@@ -84,10 +84,11 @@ def _assert_sweep_supported(cfg: DictConfig) -> None:
             "eval.spacing_sweep requires data.use_crop=true — the crop-spacing override is a "
             "no-op on the pre-resized path (it reports fixed voxel spacing).")
     source = cfg.data.get("source", "totalseg")
-    if source in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
+    if source in ("omnisynth3d", "anchor_synth3d"):
         raise ValueError(
             f"eval.spacing_sweep is unsupported for data.source={source!r} (routed through "
-            "build_dataset); it works only on the totalseg direct-build eval path.")
+            "build_dataset with no per-item spacing override). Supported: totalseg (direct "
+            "build) and totalseg_more_labels (a TotalSegInContextDataset subclass).")
     if cfg.eval.get("spacing_locator"):
         sweep = cfg.eval.get("spacing_sweep")
         sl = list(sweep) if sweep else []

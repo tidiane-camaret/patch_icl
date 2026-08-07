@@ -256,8 +256,8 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     spacing via SpacingBatchSampler([s, s]) over a SequentialSampler — the (idx, s)
     tuples reach __getitem__ inside worker processes (mutating ds.crop_spacing_mm
     would not). Only the totalseg direct-build branch honours it; the build_dataset-
-    routed sources (omnisynth3d/anchor_synth3d/totalseg_more_labels) ignore it (the
-    sweep is guarded to totalseg in eval.py). None = today's fixed-crop_spacing_mm pass.
+    routed omnisynth3d/anchor_synth3d ignore it; totalseg_more_labels (a
+    TotalSegInContextDataset subclass) honours it too. None = fixed-crop_spacing_mm pass.
     """
     d, e = cfg.data, cfg.eval
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
@@ -269,12 +269,20 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         # the same per-class grouping downstream.
         ds = build_dataset(cfg, split)
         nw = int(e.get("workers", 4))
-        return DataLoader(
-            ds, batch_size=int(e.get("batch_size", 8)), shuffle=False,
+        common = dict(
             num_workers=nw, collate_fn=incontext_collate_fn,
             pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
             prefetch_factor=2 if nw > 0 else None,
         )
+        if spacing is not None:
+            # totalseg_more_labels subclasses TotalSegInContextDataset, so it honours the
+            # (idx, spacing) crop override (its _load_crop sizes the FOV as T*self._crop_mm);
+            # drive a constant-spacing pass like the direct totalseg path. omnisynth3d /
+            # anchor_synth3d never reach here with spacing set (guarded out in eval.py).
+            batch_sampler = SpacingBatchSampler(
+                SequentialSampler(ds), int(e.get("batch_size", 8)), [spacing, spacing])
+            return DataLoader(ds, batch_sampler=batch_sampler, **common)
+        return DataLoader(ds, batch_size=int(e.get("batch_size", 8)), shuffle=False, **common)
     _, root, is_mri = _source_root(cfg)
     ds = TotalSegInContextDataset(
         root=root,

@@ -26,10 +26,16 @@ def test_use_crop_false_rejected():
         _assert_sweep_supported(_cfg(use_crop=False))
 
 
-@pytest.mark.parametrize("src", ["omnisynth3d", "anchor_synth3d", "totalseg_more_labels"])
+@pytest.mark.parametrize("src", ["omnisynth3d", "anchor_synth3d"])
 def test_unsupported_source_rejected(src):
     with pytest.raises(ValueError, match="spacing_sweep"):
         _assert_sweep_supported(_cfg(source=src))
+
+
+def test_totalseg_more_labels_crop_ok():
+    # more_labels subclasses TotalSegInContextDataset, so it honours the per-item spacing
+    # override (its _load_crop sizes the FOV as T*self._crop_mm) — supported like totalseg.
+    _assert_sweep_supported(_cfg(source="totalseg_more_labels"))  # no raise
 
 
 def test_locator_with_descending_sweep_ok():
