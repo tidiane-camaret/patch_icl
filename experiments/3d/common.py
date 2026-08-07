@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -240,7 +240,7 @@ def train_loader(cfg) -> DataLoader:
     return DataLoader(ds, batch_size=bs, sampler=base, **common)
 
 
-def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
+def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = None) -> DataLoader:
     """Multi-class eval loader (deterministic, no aug, no synth, class_balanced off).
 
     Builds ONE dataset over all `classes`, so the scan/bbox caches are loaded once
@@ -251,6 +251,13 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
     Sources image_size / context_size / use_crop from cfg.data and
     n_subjects / batch_size / workers from cfg.eval, so the eval set is built from
     the same config surface as training.
+
+    `spacing` (mm/voxel) forces every crop in the eval pass to that one physical
+    spacing via SpacingBatchSampler([s, s]) over a SequentialSampler — the (idx, s)
+    tuples reach __getitem__ inside worker processes (mutating ds.crop_spacing_mm
+    would not). Only the totalseg direct-build branch honours it; the build_dataset-
+    routed sources (omnisynth3d/anchor_synth3d/totalseg_more_labels) ignore it (the
+    sweep is guarded to totalseg in eval.py). None = today's fixed-crop_spacing_mm pass.
     """
     d, e = cfg.data, cfg.eval
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
@@ -294,16 +301,21 @@ def make_eval_loader(cfg, classes, split: str = "test") -> DataLoader:
         eval_seed=int(e.get("seed", 0)),
     )
     nw = int(e.get("workers", 4))
-    return DataLoader(
-        ds,
-        batch_size=int(e.get("batch_size", 8)),
-        shuffle=False,
+    common = dict(
         num_workers=nw,
         collate_fn=incontext_collate_fn,
         pin_memory=DEVICE.type == "cuda",
         persistent_workers=nw > 0,
         prefetch_factor=2 if nw > 0 else None,
     )
+    if spacing is not None:
+        # Constant-spacing pass: SpacingBatchSampler([s, s]) makes every batch that one
+        # physical spacing; the (idx, s) tuples travel into worker __getitem__ so both the
+        # crop and the reported `spacing` follow. SequentialSampler keeps eval order stable.
+        batch_sampler = SpacingBatchSampler(
+            SequentialSampler(ds), int(e.get("batch_size", 8)), [spacing, spacing])
+        return DataLoader(ds, batch_sampler=batch_sampler, **common)
+    return DataLoader(ds, batch_size=int(e.get("batch_size", 8)), shuffle=False, **common)
 
 
 def make_loader(cfg, cls: str, split: str = "test") -> DataLoader:
