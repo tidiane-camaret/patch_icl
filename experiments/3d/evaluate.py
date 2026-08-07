@@ -422,3 +422,28 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         rows.append(_summarize(cls, cases) if cases
                     else {"class": cls, "error": "no samples"})
     return rows, all_cases
+
+
+def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir=None):
+    """Run evaluate_classes once per physical crop spacing; tag rows with their spacing.
+
+    Builds a constant-spacing eval loader per `s` (make_eval_loader(..., spacing=s)) and
+    calls the unmodified evaluate_classes with that prebuilt loader. `idx` is stable across
+    passes, so each spacing sees the same task + context subjects — only the crop spacing
+    changes. Figures are saved on the first spacing only (later passes reuse the filenames).
+    Returns (rows, cases): rows are per-(class, spacing); cases are all passes concatenated
+    (each case already carries case["spacing"]).
+    """
+    from common import make_eval_loader  # local import: common/evaluate are siblings
+
+    rows, cases = [], []
+    for i, s in enumerate(spacings):
+        loader = make_eval_loader(cfg, classes, split=split or cfg.eval.split, spacing=s)
+        rows_s, cases_s = evaluate_classes(
+            model, cfg, classes, loader=loader,
+            fig_dir=fig_dir if i == 0 else None)
+        for r in rows_s:
+            r["spacing"] = s
+        rows.extend(rows_s)
+        cases.extend(cases_s)
+    return rows, cases
