@@ -277,6 +277,59 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
     return row
 
 
+def _locator_containment(prob, label, ratio):
+    """Coarse->fine locator containment for one sample (pure geometry).
+
+    prob : (D,H,W) tensor — soft probability or 0/1 hard mask (locator weights).
+    label: (D,H,W) tensor — GT; foreground = label > 0.
+    ratio: s_fine / s_coarse in (0,1). Box side per axis = max(1, round(T_a*ratio)).
+
+    Locator center = prob-weighted centroid over ALL voxels; sum(prob) < 1e-6 -> crop
+    center + locator_empty=True. The fine box (that side, clamped inside the volume) is
+    placed at the locator center; the oracle box is placed at the GT-foreground centroid.
+    Returns (containment, containment_oracle, locator_empty, loc_err_vox):
+      containment        = |GT_fg ∩ box|        / |GT_fg|   (NaN if no GT foreground)
+      containment_oracle = |GT_fg ∩ box_oracle| / |GT_fg|   (NaN if no GT foreground)
+      locator_empty      = bool
+      loc_err_vox        = ||center - gt_centroid|| in voxels (NaN if no GT foreground).
+                           The caller scales by the coarse spacing to get loc_err_mm.
+    """
+    p = prob.detach().float().cpu().numpy()
+    gt = (label.detach().cpu().numpy() > 0)
+    T = p.shape                                    # (D, H, W)
+    box = [max(1, int(round(t * ratio))) for t in T]
+    idx = np.indices(T, dtype=float)               # (3, D, H, W)
+
+    def _frac_in_box(center):
+        total = float(gt.sum())
+        lo = []
+        for a in range(3):
+            l = int(round(center[a] - box[a] / 2))
+            l = max(0, min(l, T[a] - box[a]))       # clamp so the box fits in [0, T_a]
+            lo.append(l)
+        sub = gt[lo[0]:lo[0] + box[0], lo[1]:lo[1] + box[1], lo[2]:lo[2] + box[2]]
+        return float(sub.sum()) / total
+
+    # Locator center: prob-weighted centroid over all voxels; empty -> crop center.
+    s = float(p.sum())
+    if s < 1e-6:
+        center = np.array([t / 2.0 for t in T])
+        locator_empty = True
+    else:
+        center = np.array([(idx[a] * p).sum() / s for a in range(3)])
+        locator_empty = False
+
+    gt_n = float(gt.sum())
+    if gt_n == 0.0:
+        return float("nan"), float("nan"), locator_empty, float("nan")
+
+    gt_centroid = np.array([(idx[a] * gt).sum() / gt_n for a in range(3)])
+    containment = _frac_in_box(center)
+    containment_oracle = _frac_in_box(gt_centroid)
+    loc_err_vox = float(np.linalg.norm(center - gt_centroid))
+    return containment, containment_oracle, locator_empty, loc_err_vox
+
+
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
                      loader=None, logits_fn=None, loss_fn=None, grid_res=None,
                      output_is_prob=False, autocast=False, reuse_logits=False):
