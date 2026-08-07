@@ -274,6 +274,19 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
         vals = [c[key] for c in cases if key in c]
         if vals:
             row[f"mean_{key}"] = round(sum(vals) / len(vals), 4)
+    # Locator containment (only when evaluate_classes ran with locator_ratio set).
+    if any("containment" in c for c in cases):
+        cont = [c["containment"] for c in cases
+                if "containment" in c and not np.isnan(c["containment"])]
+        orc = [c["containment_oracle"] for c in cases
+               if "containment_oracle" in c and not np.isnan(c["containment_oracle"])]
+        err = [c["loc_err_mm"] for c in cases
+               if "loc_err_mm" in c and not np.isnan(c["loc_err_mm"])]
+        row["n_locator"] = len(cont)
+        row["n_locator_empty"] = sum(1 for c in cases if c.get("locator_empty"))
+        row["mean_containment"] = round(sum(cont) / len(cont), 4) if cont else float("nan")
+        row["mean_containment_oracle"] = round(sum(orc) / len(orc), 4) if orc else float("nan")
+        row["mean_loc_err_mm"] = round(sum(err) / len(err), 2) if err else float("nan")
     return row
 
 
@@ -332,7 +345,8 @@ def _locator_containment(prob, label, ratio):
 
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
                      loader=None, logits_fn=None, loss_fn=None, grid_res=None,
-                     output_is_prob=False, autocast=False, reuse_logits=False):
+                     output_is_prob=False, autocast=False, reuse_logits=False,
+                     locator_ratio: float | None = None):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -457,6 +471,17 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
             # spacing (spacing key missing) -> the column stays NaN.
             if "spacing" in batch:
                 case["spacing"] = round(float(batch["spacing"][i, 0]), 4)
+            if locator_ratio is not None:
+                # Locate a fine-spacing box from the coarse prediction and measure how much
+                # GT it contains. Soft prob when available (logits_fn), else the hard mask.
+                lp = prob[i, 0] if prob is not None else pred[i]
+                cont, cont_orc, loc_empty, loc_err_vox = _locator_containment(
+                    lp, label[i], locator_ratio)
+                sp_c = float(batch["spacing"][i, 0]) if "spacing" in batch else 1.0
+                case["containment"] = round(float(cont), 4)              # NaN safe: round(nan)=nan
+                case["containment_oracle"] = round(float(cont_orc), 4)
+                case["locator_empty"] = bool(loc_empty)
+                case["loc_err_mm"] = round(loc_err_vox * sp_c, 2)
             if prob is not None:
                 case["soft_dice"] = round(soft_dice_binary(prob[i, 0], label[i]), 4)
                 if sample_loss is not None:
