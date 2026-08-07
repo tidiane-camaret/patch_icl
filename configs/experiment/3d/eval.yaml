@@ -22,6 +22,13 @@ eval:
   workers: 20
   seed: 0
   crop_jitter: null           # use_crop eval: null=T//4 jitter; 0=centered crops
+  # Evaluate every sample at each of these physical crop spacings (mm/voxel), e.g.
+  # [1.5, 2.5, 3.5], instead of the single data.crop_spacing_mm. Produces per-(class,
+  # spacing) rows in eval.csv/json and class/<c>/mean_dice@<s> wandb scalars. Same
+  # GFLOPs/sample at every spacing; wall time is len(list)x. null = single-spacing eval.
+  # Requires data.use_crop=true and the totalseg source; pair with crop_jitter=0 for a
+  # fully controlled sweep (centered crops, only spacing changes across passes).
+  spacing_sweep: null
   save_figures: true
   max_figures: 200
   out_dir: ${paths.results}/3d_eval

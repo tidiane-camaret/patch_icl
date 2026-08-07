@@ -3844,3 +3844,5 @@ forward + predict shapes correct, encoder no-grad while img_embed trains; eval c
   log-uniform crop spacing (plain plot loader ignored spacing_range → every row was
   fixed crop_spacing_mm). spacing_range is a loader-level knob (only train_loader/
   SpacingBatchSampler read it); crop_spacing_mm is the fixed fallback for all splits.
+
+- 2026-08-07: **eval.spacing_sweep config key added (gated + off by default).** New `cfg.eval.spacing_sweep` parameter in `configs/experiment/3d/eval.yaml` enables multi-spacing evaluation sweeps on the same dataset. When set to a list like `[1.5, 2.5, 3.5]`, eval produces per-(class, spacing) rows in eval.csv/json and per-class wandb scalars tagged with spacing (`class/<c>/mean_dice@<s>`). All samples evaluated at each spacing with same GFLOPs/sample; wall time scales linearly with number of spacings. Figures are saved only on the first spacing to reduce I/O. Requires `data.use_crop=true` and totalseg source; pair with `crop_jitter=0` for a fully controlled sweep (centered crops, only spacing changes). Usage: `python experiments/3d/eval.py 'eval.spacing_sweep=[1.5,2.5,3.5]' eval.crop_jitter=0`.
