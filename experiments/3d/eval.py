@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 from data.totalseg_classes import resolve_classes
 from src.benchmark_models import load_model
 from common import DEVICE, _source_root
-from evaluate import measure_flops, evaluate_classes, build_sample_table
+from evaluate import measure_flops, evaluate_classes, evaluate_spacing_sweep, build_sample_table
 
 
 # Data params that change what the model actually sees at inference. eval.py restores only
@@ -226,23 +226,34 @@ def main(cfg: DictConfig) -> None:
     # ── per-class eval (shared loop, also used by train.py's val step) ────────
     # No logits_fn: soft-Dice would need a second (untimed) forward per batch — ~2x eval time —
     # so eval leaves `soft_dice`/`loss` empty and reports only the timed model.predict Dice.
-    rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
+    sweep = cfg.eval.get("spacing_sweep")
+    if sweep:
+        _assert_sweep_supported(cfg)
+        spacings = list(sweep)
+        print(f"  Spacing sweep: {spacings} mm  ({len(spacings)}x eval time)\n")
+        rows, all_cases = evaluate_spacing_sweep(model, cfg, classes,
+                                                 spacings, fig_dir=fig_dir)
+    else:
+        rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
     # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
     # per case with Dice, timing, GT/context occupancy stats, per-sample spacing + source-
     # adaptive `detail`, and an `in_train` flag. epoch stays -1 (build_sample_table's sentinel).
     case_table = build_sample_table(all_cases, train_classes=train_classes) if wb_on else None
     for row in rows:
         cls = row["class"]
+        sp = row.get("spacing")
+        sp_str = f" @{sp:g}mm" if sp is not None else ""
+        sp_key = f"@{sp:g}" if sp is not None else ""
         if "error" in row:
-            print(f"  {cls:<35s}  ERROR: {row['error']}")
+            print(f"  {cls:<35s}{sp_str}  ERROR: {row['error']}")
             continue
         row["gflops"] = round(gflops, 2)
-        print(f"  {cls:<35s}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
+        print(f"  {cls:<35s}{sp_str}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
               f"  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}")
         if wb_on:
-            wandb.log({f"class/{cls}/mean_dice": row["mean_dice"],
-                       f"class/{cls}/std_dice": row["std_dice"],
-                       f"class/{cls}/mean_time_ms": row["mean_time_ms"]})
+            wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"],
+                       f"class/{cls}/std_dice{sp_key}": row["std_dice"],
+                       f"class/{cls}/mean_time_ms{sp_key}": row["mean_time_ms"]})
 
     valid = [r for r in rows if "mean_dice" in r]
     if valid:
@@ -253,14 +264,26 @@ def main(cfg: DictConfig) -> None:
         if wb_on:
             wandb.log({"mean_dice": round(mean_dice, 4), "mean_time_ms": round(mean_ms, 1),
                        "gflops": round(gflops, 2), "cases": case_table})
+        if sweep:
+            # Aggregate curve: mean Dice over classes at each spacing.
+            print("  spacing -> mean_dice:")
+            for s in spacings:
+                vs = [r["mean_dice"] for r in valid if r.get("spacing") == s]
+                if vs:
+                    md = sum(vs) / len(vs)
+                    print(f"    {s:g}mm : {md:.4f}  (n_classes={len(vs)})")
+                    if wb_on:
+                        wandb.log({f"mean_dice@{s:g}": round(md, 4)})
 
     # ── save outputs ─────────────────────────────────────────────────────────
     (out_dir / "eval.json").write_text(json.dumps(
         {"model": model_name, "config": OmegaConf.to_container(cfg.eval, resolve=True),
          "rows": rows}, indent=2))
-    csv = ["model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples"]
+    sweep_col = ",spacing" if sweep else ""
+    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}"]
     csv += [f"{model_name},{r['class']},{r['mean_dice']},{r['std_dice']},"
             f"{r.get('mean_time_ms','')},{r.get('gflops','')},{r['n_samples']}"
+            + (f",{r.get('spacing','')}" if sweep else "")
             for r in rows if "mean_dice" in r]
     (out_dir / "eval.csv").write_text("\n".join(csv) + "\n")
     print(f"  Saved -> {out_dir}")
