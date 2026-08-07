@@ -29,6 +29,12 @@ eval:
   # Requires data.use_crop=true and the totalseg source; pair with crop_jitter=0 for a
   # fully controlled sweep (centered crops, only spacing changes across passes).
   spacing_sweep: null
+  # Coarse->fine localization metric layered on spacing_sweep. For each descending
+  # consecutive pair (e.g. [4,2]), use the coarse (4mm) target prediction to place a
+  # fine-spacing (2mm) box and measure |GT ∩ box| / |GT| (containment), plus an oracle
+  # box on the GT centroid. Adds one soft-prob forward per non-final spacing. Requires a
+  # spacing_sweep with a descending step (+ totalseg / use_crop). false = sweep only.
+  spacing_locator: false
   save_figures: true
   max_figures: 200
   out_dir: ${paths.results}/3d_eval
