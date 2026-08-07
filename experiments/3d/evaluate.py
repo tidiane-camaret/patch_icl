@@ -502,26 +502,52 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     return rows, all_cases
 
 
-def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir=None):
+def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir=None,
+                           locator=False):
     """Run evaluate_classes once per physical crop spacing; tag rows with their spacing.
 
     Builds a constant-spacing eval loader per `s` (make_eval_loader(..., spacing=s)) and
-    calls the unmodified evaluate_classes with that prebuilt loader. `idx` is stable across
+    calls the shared evaluate_classes with that prebuilt loader. `idx` is stable across
     passes, so each spacing sees the same task + context subjects — only the crop spacing
     changes. Figures are saved on the first spacing only (later passes reuse the filenames).
-    Returns (rows, cases): rows are per-(class, spacing); cases are all passes concatenated
-    (each case already carries case["spacing"]).
+
+    When locator=True, each coarse pass that has a next-finer spacing also runs the
+    coarse->fine localization metric (see _locator_containment): it forwards a soft
+    probability via model.train_forward and passes locator_ratio = s_fine/s_coarse so
+    evaluate_classes records per-sample containment. A model without train_forward falls
+    back to the hard predicted mask centroid (a one-time warning). The finest spacing has
+    no successor, so it runs the plain single-predict path with no extra forward.
+
+    Returns (rows, cases): rows are per-(class, spacing); cases are all passes concatenated.
     """
     from common import make_eval_loader  # local import: common/evaluate are siblings
 
+    lf = op = None
+    if locator:
+        lf = getattr(model, "train_forward", None)
+        if lf is None:
+            print("  [warn] model has no train_forward; locator uses the hard predicted "
+                  "mask centroid (no soft prob).")
+        else:
+            from train import model_output_is_prob  # local import: sibling module
+            op = model_output_is_prob(cfg)
+
     rows, cases = [], []
     for i, s in enumerate(spacings):
+        ratio = None
+        if locator and i + 1 < len(spacings) and spacings[i + 1] < s:
+            ratio = spacings[i + 1] / s
         loader = make_eval_loader(cfg, classes, split=split or cfg.eval.split, spacing=s)
         rows_s, cases_s = evaluate_classes(
             model, cfg, classes, loader=loader,
-            fig_dir=fig_dir if i == 0 else None)
+            fig_dir=fig_dir if i == 0 else None,
+            logits_fn=(lf if ratio is not None else None),
+            output_is_prob=bool(op),
+            locator_ratio=ratio)
         for r in rows_s:
             r["spacing"] = s
+            if ratio is not None:
+                r["locator_to"] = spacings[i + 1]
         rows.extend(rows_s)
         cases.extend(cases_s)
     return rows, cases
