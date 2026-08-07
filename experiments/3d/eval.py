@@ -88,6 +88,13 @@ def _assert_sweep_supported(cfg: DictConfig) -> None:
         raise ValueError(
             f"eval.spacing_sweep is unsupported for data.source={source!r} (routed through "
             "build_dataset); it works only on the totalseg direct-build eval path.")
+    if cfg.eval.get("spacing_locator"):
+        sweep = cfg.eval.get("spacing_sweep")
+        sl = list(sweep) if sweep else []
+        if len(sl) < 2 or not any(sl[i + 1] < sl[i] for i in range(len(sl) - 1)):
+            raise ValueError(
+                f"eval.spacing_locator requires eval.spacing_sweep with at least one "
+                f"descending step (e.g. [4, 2]); got {sl!r}.")
 
 
 def _build_model(cfg: DictConfig):

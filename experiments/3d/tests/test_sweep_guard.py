@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # sibling eval.py
 from eval import _assert_sweep_supported  # noqa: E402
 
 
-def _cfg(source="totalseg", use_crop=True):
-    return OmegaConf.create({"data": {"source": source, "use_crop": use_crop}})
+def _cfg(source="totalseg", use_crop=True, **eval_kw):
+    return OmegaConf.create(
+        {"data": {"source": source, "use_crop": use_crop}, "eval": dict(eval_kw)})
 
 
 def test_totalseg_crop_ok():
@@ -29,3 +30,17 @@ def test_use_crop_false_rejected():
 def test_unsupported_source_rejected(src):
     with pytest.raises(ValueError, match="spacing_sweep"):
         _assert_sweep_supported(_cfg(source=src))
+
+
+def test_locator_with_descending_sweep_ok():
+    _assert_sweep_supported(_cfg(spacing_locator=True, spacing_sweep=[4, 2]))  # no raise
+
+
+def test_locator_without_descending_step_rejected():
+    with pytest.raises(ValueError, match="spacing_locator"):
+        _assert_sweep_supported(_cfg(spacing_locator=True, spacing_sweep=[2, 4]))
+
+
+def test_locator_single_spacing_rejected():
+    with pytest.raises(ValueError, match="spacing_locator"):
+        _assert_sweep_supported(_cfg(spacing_locator=True, spacing_sweep=[2]))
