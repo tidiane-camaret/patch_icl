@@ -234,12 +234,14 @@ def main(cfg: DictConfig) -> None:
     # No logits_fn: soft-Dice would need a second (untimed) forward per batch — ~2x eval time —
     # so eval leaves `soft_dice`/`loss` empty and reports only the timed model.predict Dice.
     sweep = cfg.eval.get("spacing_sweep")
+    locator = bool(cfg.eval.get("spacing_locator"))
     if sweep:
         _assert_sweep_supported(cfg)
         spacings = list(sweep)
-        print(f"  Spacing sweep: {spacings} mm  ({len(spacings)}x eval time)\n")
-        rows, all_cases = evaluate_spacing_sweep(model, cfg, classes,
-                                                 spacings, fig_dir=fig_dir)
+        tag = "  (+ coarse->fine locator)" if locator else ""
+        print(f"  Spacing sweep: {spacings} mm  ({len(spacings)}x eval time){tag}\n")
+        rows, all_cases = evaluate_spacing_sweep(model, cfg, classes, spacings,
+                                                 fig_dir=fig_dir, locator=locator)
     else:
         rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
     # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
@@ -255,12 +257,17 @@ def main(cfg: DictConfig) -> None:
             print(f"  {cls:<35s}{sp_str}  ERROR: {row['error']}")
             continue
         row["gflops"] = round(gflops, 2)
+        cont_str = (f"  cont={row['mean_containment']:.3f} (orc={row['mean_containment_oracle']:.3f})"
+                    if "mean_containment" in row else "")
         print(f"  {cls:<35s}{sp_str}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
-              f"  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}")
+              f"  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}")
         if wb_on:
             wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"],
                        f"class/{cls}/std_dice{sp_key}": row["std_dice"],
                        f"class/{cls}/mean_time_ms{sp_key}": row["mean_time_ms"]})
+            if "mean_containment" in row:
+                wandb.log({f"class/{cls}/containment{sp_key}": row["mean_containment"],
+                           f"class/{cls}/containment_oracle{sp_key}": row["mean_containment_oracle"]})
 
     valid = [r for r in rows if "mean_dice" in r]
     if valid:
@@ -281,16 +288,27 @@ def main(cfg: DictConfig) -> None:
                     print(f"    {s:g}mm : {md:.4f}  (n_classes={len(vs)})")
                     if wb_on:
                         wandb.log({f"mean_dice@{s:g}": round(md, 4)})
+        if locator:
+            print("  pair (coarse->fine) : mean_containment (oracle, gap, n, empty):")
+            for r in valid:
+                if "mean_containment" in r:
+                    gap = r["mean_containment_oracle"] - r["mean_containment"]
+                    print(f"    {r['class']:<28s} {r['spacing']:g}->{r['locator_to']:g}mm : "
+                          f"{r['mean_containment']:.3f}  (orc {r['mean_containment_oracle']:.3f}, "
+                          f"gap {gap:.3f}, n={r['n_locator']}, empty={r['n_locator_empty']})")
 
     # ── save outputs ─────────────────────────────────────────────────────────
     (out_dir / "eval.json").write_text(json.dumps(
         {"model": model_name, "config": OmegaConf.to_container(cfg.eval, resolve=True),
          "rows": rows}, indent=2))
     sweep_col = ",spacing" if sweep else ""
-    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}"]
+    loc_col = ",locator_to,mean_containment,mean_containment_oracle,mean_loc_err_mm" if locator else ""
+    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}{loc_col}"]
     csv += [f"{model_name},{r['class']},{r['mean_dice']},{r['std_dice']},"
             f"{r.get('mean_time_ms','')},{r.get('gflops','')},{r['n_samples']}"
             + (f",{r.get('spacing','')}" if sweep else "")
+            + (f",{r.get('locator_to','')},{r.get('mean_containment','')},"
+               f"{r.get('mean_containment_oracle','')},{r.get('mean_loc_err_mm','')}" if locator else "")
             for r in rows if "mean_dice" in r]
     (out_dir / "eval.csv").write_text("\n".join(csv) + "\n")
     print(f"  Saved -> {out_dir}")
