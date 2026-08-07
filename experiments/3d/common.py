@@ -219,8 +219,9 @@ def train_loader(cfg) -> DataLoader:
 
     Uses cfg.train.batch_size/workers; optionally caps samples per epoch via
     RandomSampler(cfg.data.max_ds_len_train). Mirrors scripts/train.py. When
-    cfg.data.spacing_range is set, batches use one random physical spacing each
-    (SpacingBatchSampler) for variable-spacing training.
+    cfg.data.train_spacing_range is set, batches use one random physical spacing
+    each (SpacingBatchSampler) for variable-spacing training. Eval never uses it —
+    make_eval_loader always crops at the fixed cfg.data.crop_spacing_mm.
     """
     ds = build_dataset(cfg, "train")
     nw = int(cfg.train.workers)
@@ -231,9 +232,9 @@ def train_loader(cfg) -> DataLoader:
     common = dict(num_workers=nw, collate_fn=incontext_collate_fn,
                   pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
                   prefetch_factor=2 if nw > 0 else None)
-    spacing_range = cfg.data.get("spacing_range", None)
-    if spacing_range is not None:
-        batch_sampler = SpacingBatchSampler(base, bs, spacing_range,
+    train_spacing_range = cfg.data.get("train_spacing_range", None)
+    if train_spacing_range is not None:
+        batch_sampler = SpacingBatchSampler(base, bs, train_spacing_range,
                                             seed=int(cfg.train.get("seed", 0)))
         return DataLoader(ds, batch_sampler=batch_sampler, **common)
     return DataLoader(ds, batch_size=bs, sampler=base, **common)

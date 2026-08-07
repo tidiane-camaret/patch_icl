@@ -1,5 +1,43 @@
 # Change log
 
+## Renamed data.spacing_range → data.train_spacing_range (2026-08-07)
+The variable-spacing knob is train-only (train_loader wraps the sampler in
+SpacingBatchSampler when it's set; make_eval_loader never reads it — eval always
+crops at the fixed data.crop_spacing_mm). Renamed the config key to signpost that
+scope. crop_spacing_mm kept as-is: it's the fixed eval spacing AND the train spacing
+whenever train_spacing_range is null, so "spacing_eval" would have been wrong. Updated
+totalseg.yaml (+ clarifying comments), experiments 36/37/38/39, model/patchset3d.yaml,
+common.train_loader, and plot_dataset_items.py. SpacingBatchSampler's own `spacing_range`
+constructor arg is unchanged (generic component param).
+
+## Rebuilt .venv_thor as clean uv-managed venv (2026-08-06)
+
+2026-08-06: **`.venv_thor` had drifted from uv tracking** (pip-installed on top: torch stayed at
+2.5.1+cu121 while `uv.lock` had moved to 2.12.1; ~77 packages unknown to the lock; a mixed
+CUDA-12/CUDA-13 nvidia runtime). Snapshotted the working set and rebuilt a fresh venv at
+`.venv_thor_fresh` (uv venv, 200 pkgs) — original `.venv_thor` left untouched for safe swap.
+Recipe: (1) `uv pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url
+https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple
+--index-strategy unsafe-best-match`; (2) `uv pip install -r <clean freeze minus torch/nvidia/triton>`.
+Dropped `mamba_ssm` and its `tilelang`→`nvidia-cutlass-dsl`→CUDA-13 dependency chain: `mamba_ssm`
+2.3.2.post1 is **non-importable in the original venv too** (`triton.set_allocator` AttributeError on
+triton 3.1.0), and the repo's only use is a guarded fallback import in
+`experiments/3d/encoder_bench/encoders_standin.py` that already fails — so removing it is
+functionally equivalent and yields a clean cu12-only env. Exact pins snapshot in
+`requirements-thor.lock.txt`. Verified: torch runs a CUDA op on GPU; core libs (monai, nnunetv2,
+transformers, cupy, hydra, wandb, totalsegmentator, lightning, marimo) all import.
+
+2026-08-06 (follow-up): **Adopted the thor env into `pyproject.toml` so it is uv-lock-managed**
+(no more `UV_NO_SYNC`). Changes: (1) pinned the `cu121` extra to `torch==2.5.1` / `torchvision==0.20.1`
+(cu124/cu128 left free — nero/odin unaffected; lock kept `2.6.0+cu124` and `2.11.0+cu128`, only added
+a `2.8.0+cu128` branch); (2) added a non-default `[dependency-groups] thor` (transformers,
+totalsegmentator, cupy-cuda12x, cuda-bindings, nninteractive, fvcore, python-dotenv + dev tooling
+pytest/ipykernel/ninja/wheel/uvloop/httptools/watchfiles). Regenerated `uv.lock` and ran
+`uv sync --extra cu121 --group thor` into `.venv_thor_fresh` — re-resolve churned ~15 pkgs to latest
+(notably `fury` 0.12→2.0, which swaps vtk→pygfx/wgpu; verified fury/pygfx still import). Daily use:
+`UV_PROJECT_ENVIRONMENT=.venv_thor_fresh uv run --extra cu121 --group thor <cmd>` (extras can't be
+defaulted per-machine, so `--extra cu121 --group thor` stay explicit).
+
 ## eval.py per-sample in_train (2026-08-05)
 
 2026-08-05: **eval.py's per-sample `cases` table now logs `in_train`, matching train.py's
@@ -3600,3 +3638,209 @@ separability headline.
 - 2026-08-06: **tap-ct-b-3d (`experiments/encoders/tap_ct.py`) OOM on full-volume forward — root-caused to xformers-less O(L²) attention; fixed with SDPA.** The `fomofo/tap-ct-b-3d` ViT blocks use `MemEffAttention`, which needs **xformers** for O(L) memory; when xformers is absent (not installed in `.venv_thor`) it **silently falls back to explicit `q@k.T` softmax (O(L²))**. The processor always resizes in-plane to 224×224 and pads depth to a multiple of 4 (patch (4,8,8)), so token count is driven purely by depth: `N=(D_pad/4)·784+5`. Raw (179,192,294) → D_pad=180 → **35 285 tokens**, whose per-layer attention matrix alone is ~60 GB fp32 → OOM on the 48 GB RTX 6000 Ada (loki). **Benchmark** (`tap_ct_bench.py`, depth sweep, 3 configs): baseline O(L²) tops out at **D=48 / 9 413 tok (9 GB)** then OOMs by D=96. Swapping in PyTorch `F.scaled_dot_product_attention` (flash kernel, no xformers) makes memory **linear**: D=180 = 1.6 GB / 3.07 s, D=512 (100 k tok) = 3.85 GB — the OOM is gone entirely. **bf16 autocast** is the real latency lever: D=180 drops **3.07 s → 0.38 s (~8×)** at ≤1.3 GB. **torch.compile** (`tap_ct_compile.py`, max-autotune) gives negligible speed (**1.03×**, matmul-bound, already cuBLAS-optimal) but ~3.5× lower peak (1.33 → 0.38 GB); the Triton autotuner logs benign "out of resource: shared memory" warnings and falls back to cuBLAS — not worth the compile cost since memory is no longer the constraint. **Fix applied to `tap_ct.py`:** monkeypatch the attention module's `forward` to SDPA right after load (q not pre-scaled — SDPA applies the head-dim scale internally), so a whole-volume forward stays O(L). Note the sliding-window inferer path (roi [12,224,224]) never OOMs regardless of xformers; the SDPA patch is what makes the single full-volume `model.forward(x)` usable. Alternative fix if desired: `uv pip install xformers` (the model's native fast path).
 
 - 2026-08-06: **tap-ct profiling script (`experiments/encoders/tap_ct_profile.py`) — time/VRAM/FLOPs for full-volume vs sliding-window, `--precision`/`--compile` params.** FLOPs via torch `FlopCounterMode` (sees SDPA/flash; counted once on eager since FLOPs are precision/compile-independent), time+VRAM under the requested config. All at D_pad=180 (35 285 tok) on RTX 6000 Ada (loki, `.venv_thor`, SDPA patch on). **FLOPs: full volume 51.9 T vs sliding (roi 12×224×224, ovl 0.75) 34.6 T** — the sliding window is *cheaper* despite ~4× token overlap, because full-volume attention is O(L²) at 35k tokens while windowing caps attention at 2 357-tok blocks; both run ~17 TFLOP/s in fp32. **Time / peak VRAM:** full — fp32 3009 ms/1.70 GB, bf16 361 ms/1.44 GB (**8.3×**), fp16 384 ms, bf16+compile 350 ms/1.33 GB. sliding — fp32 1987 ms/0.70 GB, bf16 435 ms/0.85 GB, fp16 353 ms, bf16+compile 306 ms/0.68 GB. Notes: in **fp32** the quadratic-attention volume forward is compute-bound so sliding is faster (1987<3009); in **bf16** per-window inferer overhead (57 windows) dominates the FLOP saving so full ≤ sliding (361<435) — `--compile` recovers most of that (sliding 435→306) by cutting launch overhead, but barely moves the full forward (361→350). bf16 autocast peak > fp32 for sliding (0.85>0.70, autocast keeps fp32 copies). Bottom line: memory is a non-issue post-SDPA (<2 GB either path); bf16 is the ~8× lever; compile only worth it for the many-small-window sliding path.
+
+## 2026-08-06 — Bridge TotalSegInContext dataloader → tap-ct-b-3d features
+
+`experiments/encoders/tapct_features.py`: converts a `TotalSegInContextDataset`
+image tensor into TAP-CT `pixel_values`. The two pipelines are incompatible as-is;
+four reconciliations:
+
+1. **Intensity (mandatory).** Dataloader image is already z-scored
+   `clip([-1007,1573]) -> (x+167.3)/505.8`; TAP expects raw HU. Invert to HU
+   (`x*505.8 - 167.3`) before the processor, else TAP re-normalizes on top and every
+   voxel collapses to ~0.27. Effectively lossless (low clip matches; >822 HU clipped
+   by TAP anyway).
+2. **Padding.** Both dataloader paths pad in *normalized* space → padded voxels
+   invert to ~-167.3 HU (soft tissue), not air. With use_crop + T%8==0 the crop
+   usually fills T³ (no pad); optional `pad_hu=-1024` resets any fill region.
+3. **Orientation.** Dataloader is canonical RAS (axis0=L-R, axis2=S-I); TAP trained
+   LPS with axial (S) axis first. `ras_to_lps_axial_first = flip(transpose(2,1,0),
+   axis=(1,2))` so TAP's in-plane == the real axial plane.
+4. **Resolution.** Stock processor upsamples in-plane to 224². Use
+   `TAPCTProcessor(resize_dims=(T,T))` to keep a T³ cube native (T%8==0; pair with
+   use_crop).
+
+Verified: (1,64,64,64) dataloader cube → pixel_values (1,1,64,64,64), TAP-normalized
+[-2.86,2.82], last_hidden_state (1,1024,768) + pooler (1,768). tokens=(T/4)(T/8)²+5.
+
+## 2026-08-06 — tap-ct transfer-Dice sanity (liver, before wiring to feature_sim)
+
+`experiments/encoders/tapct_sanity_transfer.py`: 1-NN label transfer (feature_sim
+metric) on frozen tap-ct-b-3d features. use_crop=True, crop_spacing_mm=1.5,
+image_size=(224,224,224), liver, context_size=1. Feature grid = last_hidden_state
+reshaped (D/4,H/8,W/8)=(56,28,28)=43904 cells; masks reoriented RAS->LPS axial-first
+and area-pooled to the grid (soft occupancy). Target s0013 vs a different-subject liver:
+  cross-subject transfer_dice 0.433 | precision 0.336 | recall 0.610 | retrieval@1 0.617
+  self-context transfer_dice 0.897 (plumbing upper bound)
+Signal is real (retrieval@1 14x chance, dice 6x trivial-all-FG) but modest for an easy
+organ; precision low (FP on non-liver), self-context <1.0 (bf16 + soft-label boundary
+artifact + feature degeneracy in homogeneous interior). Bridge (tapct_features.py) verified
+end-to-end. Not yet wired into feature_sim/run.py adapters. Next: ablate to_lps and grid
+resolution before committing an adapter.
+
+## 2026-08-06 — orientation verified (tap-ct bridge)
+
+Probed original ct.nii.gz across s0000..s0010: ALL already RAS (as_closest_canonical
+is a no-op), all 1.5mm isotropic. So ct.npy is true RAS: axis0=+R, axis1=+A, axis2=+S
+(axial/craniocaudal stack = axis 2). Bridge's ras_to_lps_axial_first (transpose(2,1,0)
+then flip(1,2)) yields (+S,+P,+L) — EXACTLY the frame tap_ct.py produces via .T ->
+DICOMOrient('LPS') -> GetArrayFromImage (verified against its logged 179->depth,
+(192,294)->224² in-plane). => to_lps=True is confirmed correct, not assumed. Bridge is
+also more robust than the reference, which is only correct because originals happen to be
+RAS (it blind-.T's and drops the direction matrix).
+
+## 2026-08-06 — tap-ct transfer-Dice over BENCHMARK_CLASSES (20 subj, 1.5mm)
+
+`experiments/encoders/tapct_benchmark.py` (CSV: tapct_benchmark_transfer.csv). Frozen
+tap-ct-b-3d, use_crop, crop_spacing_mm=1.5, image_size=224³, crop_jitter=0 (each
+subject-class crop encoded once), round-robin K=1 label transfer over 47 classes.
+
+MACRO transfer_dice=0.218, retrieval_at1=0.332. Per-category dice: Muscles 0.348 >
+Organs Abd/Pelvis 0.263 > Bones Limbs 0.240 > Organs Thorax 0.208 > Bones Spine 0.176 >
+Vessels 0.140 > Bones Ribs 0.125. Best classes: liver 0.583, urinary_bladder 0.462,
+kidney_right 0.452, hip_right 0.435. Worst: ribs 0.02-0.03, vertebrae_T6/atrial_appendage
+0.027, common_carotid 0.031, pulmonary_vein/adrenal 0.06.
+
+Signal is strongly SIZE/THICKNESS-dependent: at 12mm in-plane / 6mm depth cells a thin
+structure (rib, vessel, small vertebra) is ~1 cell thick so a cell straddles fg+bg and
+correspondence collapses -> motivates crop_spacing_mm↓ (finer cells) for thin classes.
+Big blobby organs already usable (0.4-0.58). Same thick>thin pattern as patchset3d study.
+
+## 2026-08-06 — tap-ct benchmark made Hydra-configurable
+
+experiments/encoders/tapct_benchmark.py is now a @hydra.main driver reading
+configs/experiment/3d/encoders/tap_ct.yaml (singular `experiment`, repo convention).
+Exposed knobs: data.{root,classes,split,n_subjects,image_size,use_crop,crop_spacing_mm,
+crop_jitter,context_size,mask_downsample,mask_occupancy_thr,eval_seed};
+encoder.{precision,compile,compile_mode,to_lps,resize_native,pad_hu};
+metric.{soft,tau}; out.{csv,wandb_project,wandb_name}. context_size K pools the next K
+subjects (round-robin) as context. Reusable helpers dense_features()/occ_labels() moved
+into tapct_features.py (grid dims derived from proc.resize_dims, not hardcoded T). Smoke
+test (liver,spleen / 6 subj) OK; CSV -> results/3d_encoders/tap_ct_transfer.csv.
+Override examples: data.crop_spacing_mm=1.0 ; encoder.precision=fp32 encoder.to_lps=false.
+
+## 2026-08-06 — tap-ct benchmark QC plots
+
+Added plot.{n_per_task,dir,thr} to configs/experiment/3d/encoders/tap_ct.yaml and
+experiments/encoders/tapct_plot.py. n_per_task>0 saves per-sample 1x3 QC figures:
+[target+GT] [context+GT] [target+transfer-pred], titled task | tgt/ctx subject ids |
+spacing | dice/prec/rec/r@1. Drawn in the feature frame (reoriented iff encoder.to_lps),
+axial slice = max-GT slice; pred = 1-NN transfer grid upsampled to full res, thresholded
+at plot.thr. Verified liver/spleen figures render correctly (green/cyan GT, red pred).
+
+## 2026-08-06 — soft + hard transfer metrics
+
+feature_sim/metrics.py: added transfer_metrics() — one 1-NN pass scores BOTH soft
+(fractional occupancy overlap, threshold-free) and hard (ctx/pred/GT binarised at thr,
+real set-overlap Dice) + folds in retrieval_at1. Existing label_transfer left intact
+(run.py). tap benchmark now reports soft_/hard_ {dice,precision,recall}, retrieval_at1,
+and hard_frac (share of pairs with a non-nan hard Dice — <1 when a class's coarse cells
+never reach thr). config metric.soft/tau -> metric.thr. Plot title shows soft+hard.
+Smoke (liver/aorta/rib, 10 subj, thr=0.5): liver 0.544/0.567, aorta 0.379/0.502 (soft
+under-rates tube boundaries), rib 0.029/0.059. hard>=soft for thick/tubular; both ~0 for
+sub-cell ribs. macro reported over classes with any non-nan hard pair.
+
+## 2026-08-06 — plot: add soft-pred overlay panel
+tapct_plot.py now saves 1x4 figures: [target+GT] [context+GT] [target+pred hard@thr]
+[target+pred soft]. Soft panel = jet heatmap of the upsampled 1-NN occupancy prediction
+with per-pixel alpha=value (transparent where ~0), so the graded confidence the hard
+threshold discards is visible. Verified on aorta.
+
+## 2026-08-06 — wire tap_ct into feature_sim/run.py
+
+Added TapCTEncoderAdapter (feature_sim/adapters.py): frozen tap-ct-b-3d as an EncoderAdapter,
+tiers=[backbone]. Self-preprocesses via tapct_features bridge (de-norm HU / reorient / TAP
+processor); encodes once at the ANISOTROPIC native grid (T/4,T/8,T/8), inverse-reorients the
+LPS grid back to RAS (_inv_reorient = flip(2,3).permute(0,3,2,1)) so it aligns with
+grid_labels' loader-frame mask pooling, caches (storage ptr,shape), then resamples to res^3.
+Key fix: _down_to keys off shape[-1] (isotropic assumption) and no-ops on the anisotropic
+grid -> features() uses F.interpolate to res^3 explicitly. run.py build_adapter gains a
+tap_ct branch (+ _tapct_spec reading eval.tapct); feature_sim.yaml eval.model|tap_ct +
+eval.tapct{precision,to_lps,resize_native,pad_hu}. cost.py: adapters can set
+flops_traceable=False (TAP SDPA untraceable -> skip fvcore, still time/VRAM). Needs
+data.image_size%8==0; tiers must be [backbone]. Smoke (liver,3 subj,res16/32) OK, uses the
+same soft label_transfer/auroc/retrieval as colipri/primus -> directly comparable.
+Run: python experiments/3d/feature_sim/run.py eval.model=tap_ct 'feature_sim.tiers=[backbone]' ...
+
+## 2026-08-06 — tap_ct feature_sim: found+fixed feature-cache contamination bug
+
+Compared TapCTEncoderAdapter (run.py path) vs standalone native-grid scoring
+(tapct_compare_paths.py) on identical crops+pairing. Native path matched EXACTLY
+(_inv_reorient verified: inv(occ_lps)==occ_ras, max diff 0.0), but adapter.features()
+collapsed small organs (spleen 0.385->0.000). Localized: not resampling, not labels
+(grid_labels==area), not align_corners -> the native-encode CACHE. features() keyed
+_native_cache on `volumes.to(self.device)` (a throwaway temporary); its storage is freed and
+reused across target/context calls -> cache HIT returns the WRONG volume's features. Fix:
+key on the ORIGINAL caller-retained tensor (like PrimusEncoderAdapter); dense_features moves
+to device internally so volumes stay CPU here. Also reverted the interpolate to
+align_corners=False (cell-centered, matches grid_labels). Post-fix adapter tracks native:
+spleen native 0.385 -> res48 0.421; liver 0.460 -> 0.475, degrading gracefully to res16.
+run.py smoke (liver/spleen, 6 subj, 128^3, jitter=0): liver res32 td=0.590 r@1=0.632,
+spleen 0.579/0.623 — sane (earlier ~0.9 was the contamination). No gaps remain.
+
+## 2026-08-06 — tap_ct: compile + backbone_layers tier
+
+- eval.compile=true now compiles the TAP ViT: _maybe_compile gains a tap_ct branch
+  (torch.compile(adapter.model, dynamic=False) — static (1,1,T,T,T) shapes), guarded by
+  cfg.eval.model=='tap_ct'. Config: eval.tapct.compile_mode. Needs CC/CXX=/usr/bin for inductor.
+- TapCTEncoderAdapter now serves the backbone_layers tier: _encode_native_layers uses
+  model(output_hidden_states=True).hidden_states (one forward -> every block's token grid),
+  each reshaped+inverse-reoriented like backbone; features_per_layer/sample_features_per_layer
+  mirror Primus. Emits bb:L0..L{n-1}. Smoke (liver,3 subj): correspondence peaks mid-stack
+  (L6-7 td~0.807 @res32) then declines; bb:L11 ~= backbone. n_layers from vit.n_blocks.
+
+## 2026-08-06 — tap_ct encode_gflops populated
+
+fvcore can't trace SDPA (returned None + flooded). Replaced the flops_traceable skip with
+TapCTEncoderAdapter.count_encode_flops (torch FlopCounterMode, display=False — counts flash/
+SDPA). cost.py prefers adapter.count_encode_flops over fvcore. encode_cost.csv now: tap_ct
+128^3 -> 3872.6 GFLOP (8192 tok); scales ~quadratically in tokens (~52 TFLOP at 224^3).
+
+## 2026-08-06 — tap_ct: max_layers truncation (like Primus depth)
+
+eval.tapct.max_layers=N physically truncates the TAP ViT to the first N of 12 blocks
+(vit.blocks=blocks[:N], vit.n_blocks=N — the block loop runs ALL blocks so n alone saves
+nothing; count assert needs n_blocks updated). backbone then returns block-N's normed
+output. Measured (liver 3 subj, 128^3, res32): full 3872.6 GFLOP / 2.73 it/s / td 0.720;
+max_layers=7 -> 2260.3 GFLOP (-42%) / 3.65 it/s / td 0.807. Strict win: less compute AND
+better features (backbone@7 == bb:L6 full = mid-stack peak). Composes with backbone_layers
+(fans out bb:L0..L{N-1}) and eval.compile. Config eval.tapct.max_layers (null=all).
+
+## 2026-08-06 — tap_ct as a frozen PatchSet3D encoder (arch.encoder=tap_ct)
+
+Wired frozen fomofo/tap-ct-b-3d as a PatchSet3D image encoder, mirroring the CoLiPri/Primus
+path (exp 30/35). New src/models/tapct_encoder.py TapCTEncoder honours ConvEncoder3D's
+contract — forward(B,1,D,H,W) -> (B,out_ch=768,R,R,R), .out_ch/.resolution — reusing the
+feature-sim bridge (experiments/encoders/tapct_features.py: de-norm z-scored HU -> RAS->LPS
+axial-first -> TAP processor) so the training encoder ≡ the feature-sim tap_ct probe. Encodes
+at the native ANISOTROPIC token grid (patch (4,8,8): T/8 in-plane, T/4 axial), inverse-
+reorients LPS->RAS, F.interpolate to R^3 (NOT _down_to — anisotropic). Frozen-only (bridge
+runs under no_grad); kept in eval mode via a train() override for deterministic features;
+reuses Primus's _EncodeCache/_cached_encode for head-only re-eval. encoder_stage early-exits
+the transformer blocks (=feature-sim max_layers). NOT spacing-aware (learned pos-embeds are
+interpolated to the grid; cell scale set by data.crop_spacing_mm). arch.encoder_precision
+(bf16) threaded via train.py build_model; compile block compiles enc.model (dynamic=False).
+PatchSet3D __init__ gains the tap_ct branch (ignores native_grid/sidecar). Config
+experiment=39_tapct_enc_i_128 (inherits 35: 128^3, res=16, occ@0.5, balanced, nnUNet aug;
+overrides encoder=tap_ct, encoder_stage=7, crop_spacing_mm=1.5). Smoke (64^3, K=2): train
+forward + predict shapes correct, encoder no-grad while img_embed trains; eval cache path OK.
+
+- 2026-08-07: **train.py profile_timing now also reports per-item (÷ batch size).** The
+  `profile_timing` per-phase timers (data/encode/attn) summed whole-batch GPU time and
+  divided only by step count → per-step ms, which isn't comparable across batch sizes.
+  Added a `prof_items` counter (Σ batch sizes) and per-item metrics `time/{data,encode,
+  attn}_ms_item` alongside the existing per-step `time/*_ms`; the tqdm line now prints
+  both (`per-step: … || per-item (÷B): …`). Per-item normalizes throughput so a B-sweep
+  is comparable, and exposes batching efficiency: on tap_ct (exp39) encode/item stays
+  ~flat (101ms@B1 → 110ms@B8) = frozen ViT is compute-bound, batching gives no per-task
+  encode speedup. NB compare at e1+; e0 per-item is inflated by torch.compile warmup
+  (dynamic=True recompiles at the new batch shape). No-op unless train.profile_timing=true.
+
+- plot_dataset_items.py: tightened row/col spacing (gridspec hspace/wspace=0.02,
+  tight_layout h_pad/w_pad=0.2) for denser, more readable grids; row ylabel now
+  appends per-item voxel spacing (`d0×d1×d2 mm`) when the batch carries a `spacing` key.
+  Also: on the train split, when data.spacing_range is set, the loader now mirrors
+  train_loader via SpacingBatchSampler(batch_size=1) so each row draws its own
+  log-uniform crop spacing (plain plot loader ignored spacing_range → every row was
+  fixed crop_spacing_mm). spacing_range is a loader-level knob (only train_loader/
+  SpacingBatchSampler read it); crop_spacing_mm is the fixed fallback for all splits.
