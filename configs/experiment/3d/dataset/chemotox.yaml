@@ -19,3 +19,23 @@ data:
   max_val_subjects: null
   val_classes: benchmark
   train_classes: benchmark      # unused (eval-only) but resolve_classes needs a value
+  # build_dataset reads synth_unions + class_balanced UNCONDITIONALLY (not train-gated),
+  # so eval-only configs must still provide them. Mirror totalseg.yaml's data keys to
+  # avoid missing-key errors; the synth/self_context values are inert on the test split.
+  max_ds_len_train: 2000
+  max_train_subjects: null
+  synth_unions: false
+  synth_method: seeds3d
+  n_synth_merge_min: 1
+  n_synth_merge_max: 5
+  p_synth: 1
+  class_balanced: true
+  train_spacing_range: null
+  self_context:
+    p:
+      train: 0.0
+      eval: 0.0
+    augs:
+      per_image: false
+      intensity: false
+  random_coloring: false
