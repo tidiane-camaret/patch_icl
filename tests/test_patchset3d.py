@@ -88,3 +88,37 @@ def test_token_masking_off_in_eval():
     img, cin, cout = _dummy_batch(S=16)
     out = m(img, context_in=cin, context_out=cout, mode="train")
     assert out["mask_support"] is None and out["mask_query"] is None
+
+
+def test_token_masking_content_replaced():
+    """Masked cells must carry mask_token content, not the original embedding.
+
+    Strategy: use transformer_rope=True (no additive pos encoding) so _tokens output is
+    purely img_embed(feat) / mask_embed(occ) for unmasked or mask_token for masked cells.
+    Set mask_token to a known sentinel (all 99.0), then assert the masked position's
+    image and mask columns equal 99.0 while the unmasked position differs.
+    """
+    torch.manual_seed(42)
+    B, M, e = 1, 4, 32
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=e, h=64, l=2, a=2, thinking_rows=2,
+                   transformer_rope=True)   # rope=True => self.pos is None, no additive PE
+    with torch.no_grad():
+        m.mask_token.fill_(99.0)
+
+    # Build minimal token inputs: random feat/occ (B, M, enc_dim / p^3)
+    feat = torch.randn(B, M, m.encoder.out_ch)
+    occ = torch.rand(B, M, 1)
+    ijk = m.ijk_base[:M].unsqueeze(0).expand(B, M, 3)
+
+    # Mask only position 0; positions 1-3 unmasked
+    mask = torch.zeros(B, M, dtype=torch.bool)
+    mask[0, 0] = True
+
+    toks = m._tokens(feat, occ, ijk, mask=mask)   # (B, M, 2, e)
+
+    # Masked position: both image (col 0) and mask (col 1) must be 99.0
+    assert toks[0, 0, 0].eq(99.0).all(), "masked image column was not replaced by mask_token"
+    assert toks[0, 0, 1].eq(99.0).all(), "masked mask column was not replaced by mask_token"
+
+    # Unmasked position: image column must differ (img_embed output is random, not 99.0)
+    assert not toks[0, 1, 0].eq(99.0).all(), "unmasked position wrongly shows mask_token value"

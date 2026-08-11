@@ -238,8 +238,10 @@ class PatchSet3D(nn.Module):
         msk = self.mask_embed(occ)
         if mask is not None:                                # SimMIM in-place [MASK] replacement
             m = mask.unsqueeze(-1)                          # (B,M,1) bool
-            img = torch.where(m, self.mask_token[0], img)
-            msk = torch.where(m, self.mask_token[1], msk)
+            # Cast to the operand dtype so torch.where does not promote img/msk to fp32
+            # when mask_token is fp32 and the token stream runs under bf16 autocast.
+            img = torch.where(m, self.mask_token[0].to(img.dtype), img)
+            msk = torch.where(m, self.mask_token[1].to(msk.dtype), msk)
         else:
             # Keep mask_token in the compute graph (zero contribution) so it always
             # receives a gradient — required for optimizers that track all parameters.
