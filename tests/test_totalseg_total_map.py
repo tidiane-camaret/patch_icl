@@ -28,6 +28,11 @@ def test_remap_translates_by_name():
     assert out[0, 2] == _CLASS_TO_IDX["aorta"]
     assert out[0, 3] == _CLASS_TO_IDX["heart"]
 
+def test_remap_out_of_range_id_maps_to_background():
+    out = remap_ts_total(np.array([0, 5, 200], dtype=np.int16))
+    assert out[0] == 0   # background id 0 -> background
+    assert out[2] == 0   # stray id 200 -> background
+
 def test_matches_cohort_stats_file_if_present():
     # The cohort's per-subject stats json is keyed by name in TS id order; if reachable,
     # assert our embedded list matches it exactly (transcription guard).

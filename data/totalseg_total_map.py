@@ -48,8 +48,13 @@ def build_ts_to_project_lut() -> np.ndarray:
 
 
 def remap_ts_total(arr: np.ndarray) -> np.ndarray:
-    """Translate a TS-v2 `total` label volume to project ALL_CLASSES numbering."""
+    """Translate a TS-v2 `total` label volume to project ALL_CLASSES numbering.
+
+    Out-of-range ids (< 1 or >= len(lut)) map to 0 (background).
+    """
     lut = build_ts_to_project_lut()
     flat = np.asarray(arr).astype(np.int64)
-    flat = np.clip(flat, 0, len(lut) - 1)  # guard stray ids
-    return lut[flat].astype(np.uint8)
+    out = np.zeros(flat.shape, dtype=np.uint8)
+    valid = (flat >= 1) & (flat < len(lut))
+    out[valid] = lut[flat[valid]]
+    return out
