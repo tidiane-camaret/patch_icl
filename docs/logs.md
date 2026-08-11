@@ -1,5 +1,143 @@
 # Change log
 
+## 2026-08-11 — self-context ceiling probe + exp40 large-head config (CoLiPri size-stall study)
+Investigating why the frozen-CoLiPri in-context run stalls at val Dice ~0.60 with Dice strongly
+correlated to object size (small anatomy → low Dice). Established via `plot_dataset_items` +
+`measure_occupancy.py` that masks are NOT destroyed by aug (intact at native 128³) and — key arch
+fact — the mask I/O is full 128³ (`mask_patch_size=8` tiles in, `mask_patch_decode_size=8` tiles
+out, target pooled to the 128³ logit = identity), so there is NO coarse-grid target ceiling. The
+only stream still at 16³ is the IMAGE token grid (one CoLiPri feature per 8³=12 mm patch); small
+objects fill <35% of even their best image cell (`max_cell_occ`), so the bottleneck is image-side
+matching/discriminability, not the mask decoder. Decoder-ceiling test: feed the target's own
+image+mask as context (trivial matching) and see whether small-object Dice lifts.
+
+Changes:
+- `src/totalseg_dataloader_incontext.py`: `self_context` — after aug, with probability
+  `self_context` (0..1; True→1.0) overwrite the K contexts with clones of the (augmented) target
+  (bit-identical → trivial matching, leakage by design). `self_context_augs=true` re-augments each
+  clone INDEPENDENTLY via the new PER-IMAGE aug (`augmentations.per_image` geometric + the
+  already-per-image intensity) so target≠context by a controlled pose/appearance jitter — the
+  pose-invariance training lever (drift probe showed the copy model is fragile to rigid pose).
+  NB per_image, NOT task: `task` aug applies ONE shared transform across all K+1 volumes (preserves
+  correspondence) and must not be used per-image. Verified: per_image off → mask IoU 1.0; per_image
+  affine.p=1.0 → warped mask (IoU≈0.05). Default self_context=0.0.
+- `src/augmentations.py`: new `apply_per_image_aug(image, mask, cfg)` — independent flip/affine/
+  elastic on ONE volume (same schema as `task`), the per-image counterpart of the shared
+  `apply_task_aug`.
+- `configs/augmentations/nnunet.yaml`: new `augmentations.per_image` block (flip/affine/elastic,
+  all p=0 by default → no-op). Raise `per_image.affine.p` to warp the self-context copy.
+- `experiments/3d/common.py`: forward `data.self_context` + `data.self_context_augs` into both
+  train and eval dataset builds.
+- `configs/experiment/3d/dataset/totalseg.yaml`: declare `self_context: 0.0`, `self_context_augs: false`.
+- `experiments/3d/probe_context_drift.py`: context-drift probe (warp context only by known
+  translate/rotate/scale/elastic, Dice vs magnitude; mag0 == self-context ceiling sanity).
+- `configs/experiment/3d/experiment/40_colipri_large_head.yaml`: exp40 — larger transformer
+  (l=4/e=768/h=3072/a=12) on frozen CoLiPri, train_classes=all, class_balanced, crop_spacing=1.5,
+  mask_occupancy_thr=0.1, raw_ct, spacing-aware encoder + transformer RoPE.
+- `experiments/3d/measure_occupancy.py`: per-class target occupancy over an epoch (native + 16³
+  grid), writes results/3d/exp35_occupancy_{items,per_class}.csv.
+- `experiments/3d/probe_precision.py`: (from earlier) live per-module dtype probe.
+Run (b) status: warm-started exp40 from the 0.604 cross-subject best.pt with `data.self_context=true`
+(wandb `40_selfctx_ceiling`). Epoch 0 already val 0.776 (rising) — leans toward matching/encoder
+being the limiter, but the size-resolved per-class verdict awaits convergence.
+
+## 2026-08-11 — wire `encoder_precision` into the frozen primus/CoLiPri encoder + dtype probe
+Sanity-checking the CoLiPri-features-for-in-context-seg study (exp 35). Traced + empirically
+verified per-module precision: under the ambient bf16 autocast, the frozen CoLiPri ViT computes
+its attention/MLP in **bf16** (params stored fp32); `eva`/transformer tails emit fp32 (LayerNorm is
+autocast-fp32); loss is fp32. Train and eval are byte-identical in precision. Found `arch.encoder_precision`
+was a **no-op for primus** (only wired to tap_ct), so the "is bf16 rounding of the frozen features
+costing signal?" control was impossible.
+
+Changes:
+- `src/models/primus_encoder.py`: `precision` ctor arg + `_autocast_ctx()`; `_encode_batch` wraps the
+  ViT forward in it, overriding the ambient autocast for the encoder region only (fp32 disables autocast
+  → fp32 params compute in fp32; bf16/fp16 force that dtype). Off-cuda no-op.
+- `src/models/patchset3d.py`: `build_model` already read `encoder_precision`; now threaded into `PrimusEncoder`.
+- `configs/experiment/3d/model/patchset3d.yaml`: declare `arch.encoder_precision: bf16` (bf16|fp16|fp32)
+  so it's overridable in struct mode.
+- `experiments/3d/probe_precision.py`: new one-shot probe — synthetic batch, forward hooks, prints live
+  per-module in/out dtypes for TRAIN and EVAL. `python experiments/3d/probe_precision.py experiment=35_colipri_enc_8_i_128`.
+  Verified: default bf16 unchanged; `arch.encoder_precision=fp32` makes `down_projection`/`eva` fp32 while
+  downstream stays bf16. A/B run deferred (to test later).
+
+## 2026-08-11 — spacing-aware 3D RoPE for the PatchSet3D transformer (flag-gated)
+Gave the downstream transformer the same positional scheme as the spacing-aware encoder (exp 36):
+3D axial RoPE on the sample (cross-cell) axis, positions scaled by `spacing/train_mm` (2 mm), so a
+fixed anatomical distance maps to a fixed rotary phase across the 1–4 mm range. RoPE-only when on
+(drops the additive spacing-blind Fourier PE), mirroring the encoder (`use_abs_pos_embed=False`).
+Spec: `docs/superpowers/specs/2026-08-11-transformer-rope-spacing-design.md`.
+
+Changes:
+- `src/rope.py`: new `build_3d_rope_freqs_from_positions(head_dim, positions, theta)` — RoPE tables
+  from explicit float positions (spacing scaling + thinking-row zeros), consistent with the grid builder.
+- `src/models/pfn_seg_2d.py`: opt-in `rope=None` arg on `TransformerEncoderStack/Layer.forward`;
+  when set, rotates q,k in the sample-axis attention (before the `[:sep]` slice). `None` ⇒ byte-identical,
+  so `patchset_cnn`/`patchset_pfn`/2D `ImagePFN` are untouched.
+- `src/models/patchset3d.py`: `transformer_rope` / `rope_theta` args; `_tokens` skips the additive PE in
+  RoPE-only mode; `_attn` builds the row-sequence RoPE (thinking=(0,0,0)) and threads `spacing` through.
+- `experiments/3d/train.py`: `build_model` passes the two new arch keys.
+- `configs/experiment/3d/experiment/37_colipri_transformer_rope_128.yaml`: exp 37 (extends 36, adds
+  `arch.transformer_rope=true`) — both stages spacing-aware.
+- Tests: `tests/test_rope_positions.py`, `tests/test_patchset3d_rope.py` (grid-equivalence, RoPE-only drops
+  PE, spacing scales positions, 2 mm == no-spacing identity, forward+backward finite).
+
+## 2026-08-10 — raw_ct pipeline: store ct_raw + normalise in the loader (flag-gated)
+Implemented the raw-intensity store evaluated below. Opt-in, back-compatible, storage-neutral.
+
+- `scripts/convert_to_npy.py --store-raw`: also writes native `ct_raw.npy` (int16 raw HU for
+  CT — lossless, same 2 B/voxel as float16; float16 for MRI). For MRI also writes per-volume
+  norm stats to `ct_stats.json` (like spacings.json). Normalisation now delegates to shared
+  helpers so the written ct.npy is byte-identical to the loader's on-the-fly result.
+- `src/totalseg_dataset.py`: shared `normalize_ct` (global pointwise — crop==whole),
+  `mri_stats` (whole-volume percentile+z-score stats) + `normalize_mri` (apply stats to a
+  crop; verified Δ=0 vs the old `_normalise_mri`, and crop-with-whole-stats == slice of whole).
+- `TotalSegInContextDataset(raw_ct=False, modality="ct")`: when raw_ct, native reads
+  (`_organ_crop_arrays`, synth crop) load `ct_raw.npy` via `_load_native_ct_mmap` (int16
+  dtype guard against feeding raw HU as normalised) and normalise ONLY the crop. Pre-resized
+  fast path stays normalised (unaffected). `_normalize_native` dispatches CT/MRI. Threaded
+  through `common.build_dataset` + `make_eval_loader` (modality from `_source_root` is_mri),
+  the more_labels subclass, and `get_incontext_loader`. Config key `data.raw_ct` (default
+  false) in configs/.../dataset/totalseg.yaml.
+
+Verified end-to-end (primus crimson-deluge-224, use_crop, 128³): production raw_ct loader
+crop vs float16 crop max|Δ|=0.49 HU, labels identical; convert --store-raw writes int16 HU
+(range e.g. [-1094, 1865] — even preserves >1573 bone the old clip dropped); eval.py
+`data.raw_ct=true` vs false n=10 → Dice 0.7241 vs 0.7240. Enable for the whole dataset with:
+`python scripts/convert_to_npy.py --store-raw` then train/eval with `data.raw_ct=true`.
+Note: pre-resized files stay normalised, so raw_ct only changes native/use_crop reads.
+
+## 2026-08-10 — raw-HU store vs float16 store: no signal loss for frozen encoders
+Investigated storing raw CT intensities as .npy and delegating normalization to the
+dataloader (to standardize the pipeline across encoders that de-normalize back to HU:
+primus, tap_ct — see src/models/{primus,tapct}_encoder.py). Findings:
+
+- **Storage**: identical. Raw CT is integer-valued int16 HU (verified: ct.nii.gz header
+  dtype int16, get_fdata all-integer), so raw int16 = 2 B/voxel = the current float16 npy.
+  Zero storage cost, strictly lossless. nii.gz is ~61% the size but slow to decompress.
+- **Signal**: the storage clip [-1007, 1573] (CT_CLIP_MIN/MAX) is WIDER than both encoders'
+  own clip windows (primus preproc [-1000,1000] per primus_colipri.json; tap_ct [-1008,822]),
+  so the pre-clip is transparent — both re-clip tighter after de-norm. The ONLY real
+  difference a raw store makes to these frozen encoders is removing float16 quantization,
+  measured at max 0.49 HU / mean 0.066 HU per voxel (s0000; ≤0.24 HU p99).
+- **Dataloading time**: +clip+z-score is ~5 ms on the 128³ use_crop crop (the 65 ms figure
+  is the full ~9.5M-voxel native volume; use_crop only normalizes the crop). Hidden behind
+  the ~90–150 ms/sample frozen-ViT encode and worker parallelism → no throughput impact.
+
+Measured on the two trained checkpoints (test, 50 subj, benchmark 47 classes,
+experiments/3d/eval.py): primus (crimson-deluge-224) baseline Dice 0.7009 / 89 ms /
+1772 GFLOP; tap_ct (sweet-armadillo-237) baseline Dice 0.7015 / 149 ms / 5055 GFLOP.
+
+Paired A/B (experiments/3d/rawcheck_ab.py): same deterministic eval crops, loader reads
+float16 ct.npy vs int16 raw-HU ct_raw + in-loader normalize. Input differs by exactly the
+float16 bound (max|Δ|=0.49 HU, identical=False). Result — no meaningful change:
+  primus: ΔDice −0.000001 (max|Δ| 0.0015), pred voxel agreement 99.9995%
+  tap_ct: ΔDice +0.000010 (max|Δ| 0.011),  pred voxel agreement 99.9952%
+Conclusion: for these frozen encoders the raw-store proposal is a strict simplification/
+storage-neutral win with no accuracy cost; the current float16-clip round-trip is lossless
+in practice. (Caveat: the conv-from-scratch encoder expects z-scored input — a raw store
+must still hand the model a normalized tensor, or feed each encoder its own norm.)
+
 ## Renamed data.spacing_range → data.train_spacing_range (2026-08-07)
 The variable-spacing knob is train-only (train_loader wraps the sampler in
 SpacingBatchSampler when it's set; make_eval_loader never reads it — eval always
@@ -3850,3 +3988,78 @@ forward + predict shapes correct, encoder no-grad while img_embed trains; eval c
 - 2026-08-07: **eval.spacing_locator config key added (coarse→fine layered on spacing_sweep).** New `cfg.eval.spacing_locator` parameter in `configs/experiment/3d/eval.yaml` enables coarse→fine localization metric layered on `spacing_sweep`. For each descending consecutive pair (e.g. [4, 2] in `[4, 2]`), uses coarse (4 mm) prediction to place a fine-spacing (2 mm) bounding box and measures containment |GT ∩ box| / |GT|, plus an oracle box on GT centroid. Adds one soft-prob forward per non-final spacing; centroid via soft-prob-weighted voxel sum (hard-mask fallback) through `model.train_forward`. Produces per-(class, spacing-pair) columns in eval.csv/json + `class/<c>/containment@<s>` wandb scalars. Requires `spacing_sweep` with descending step (+ totalseg / use_crop). Default false. Usage: `python experiments/3d/eval.py 'eval.spacing_sweep=[4,2]' eval.spacing_locator=true eval.crop_jitter=0`.
 
 - 2026-08-07: **spacing_sweep + spacing_locator now support `data.source=totalseg_more_labels`.** `TotalSegMoreLabelsDataset` subclasses `TotalSegInContextDataset`, inheriting the `(idx, spacing)` crop override (`__getitem__` → `_cur_crop_spacing`), `_reported_spacing` (reports the swept `crop_spacing_mm` under use_crop), and `_organ_crop_arrays` (sizes the FOV as `T*self._crop_mm`); its overridden `_load_crop` delegates the extent to that base helper. Only two things blocked it: the guard rejected the source, and `make_eval_loader`'s build_dataset branch ignored the `spacing` arg. Fix: `_assert_sweep_supported` now rejects only omnisynth3d/anchor_synth3d; `make_eval_loader` wraps the build_dataset-routed dataset in `SpacingBatchSampler([s,s])` when `spacing` is set (only more_labels ever reaches there with spacing, since omnisynth/anchor stay guarded out). No new params. Usage: `python experiments/3d/eval.py dataset=totalseg_more_labels 'eval.spacing_sweep=[4,1.5]' eval.spacing_locator=true eval.crop_jitter=0`.
+
+- 2026-08-08: **Analysis notebook `results/experiments/37_patchset_spacing_locator.py`** (marimo) — pulls the patchset3d spacing-sweep+locator eval run (`tidiane/patch_icl_3d_eval/05kb6kcc`, `spacing_sweep=[4,1.5]`, `spacing_locator=true`) via the W&B API. Reuses `nb_common.get_latest_table(table_key="cases.table.json")` for the per-sample table (per-sample `spacing` → coarse 4 mm / fine 1.5 mm are two conditions in one table) and parses per-class locator `containment@4`/`containment_oracle@4` from `run.summary` (per-sample containment is not logged). Geometry + shape families from `totalseg_geometry_extract`; caches under `artifacts/37_05kb6kcc_*`. Focus = the FINE (@1.5 mm) dice distribution under three cuts, each with a morphology control: (1) trained vs held-out — raw held-out advantage (+0.186 macro) is an anatomy confound; matched lateral-mirror pairs collapse it to Δ=−0.023; (2) fine dice vs coarse containment — marginal ρ=−0.11 (low containment = large objects, containment↔log_volume=−0.18, not accuracy); (3) when the oracle fails (oracle<1 crop-size ceiling) — ceiling classes score HIGHER (0.597 vs 0.494, ceiling↔log_volume=+0.37) because oracle<1 marks large easy organs, so the fine window is not the accuracy bottleneck.
+
+- 2026-08-08: **Analysis notebook `results/experiments/38_patchset_more_labels_failure.py`** (marimo) — failure analysis of patchset3d on `totalseg_more_labels` (eval run `tidiane/patch_icl_3d_eval/gcoroxrx`: 285 novel held-out hierarchical classes `task/structure`, `spacing_sweep=[4,1.5]`+locator). Sibling of nb 37 but **no** `totalseg_geometry_extract` (different dataset root + hierarchical names) — size drivers come straight from the cases table (`tgt_size`/`tgt_occ`/`ctx_occ`); per-class locator containment parsed from `run.summary` (regex handles the '/' in class names; NaN=empty coarse pred). Caches `artifacts/38_gcoroxrx_*`. Focus = the fine (@1.5mm) accuracy distribution: cell 1 by **task** (per-sample dice box per group, macro/miss table), cell 2 by **class** (dice histogram+ECDF, worst/best-20 bars coloured by size), cell 3 by **size** (dice vs tgt_size & ctx_occ, ρ≈+0.5; miss-rate/box per size sextile — two-tailed tiny+huge failure), cell 4 **localization vs segmentation** taxonomy (empty-coarse 6 / diffuse-ceiling 13 / localization 14 / segmentation 126 / ok 126 → segmentation on tiny novel structures is the bottleneck, containment 0.83, 42% of well-localized still fail). Findings in memory `project_more_labels_failure`.
+
+- 2026-08-10: **Universal-coords invariance assessment** — `experiments/3d/universal_coords/coord_invariance.py` (+ `figs/`). Question: can the `coords` field (NN that maps every voxel→3D canonical body position; ChemoTox cohort, `coords_paths_chemotox.json`, 366 scans/220 patients) serve as a shared frame so a fixed coords-region generates the same anatomical synthetic label across subjects. Alignment: coords grid (~90×90×80, 4/4/8mm) and full-res totalseg share the same world origin — sample totalseg at coords-grid world points via affines (all coords voxels land in-volume). Three methods: (1) **centroid consistency ratio** = between-subject centroid spread / within-subject organ extent per totalseg label; majority <1 (position agrees tighter than the organ's own size). (2) **LOO nearest-centroid retrieval** of label identity from a coords centroid over 60 unique patients: top-1 **0.743**, top-5 **0.959** over 106 labels → coords IS a retrievable canonical body frame. (3) **synthetic-label round-trip**: apply LOO canonical centroid + coords-threshold to held-out subject, measure purity/Dice vs true label. Isotropic 25mm ball macro Dice 0.18 (purity high for big organs: liver 0.78/heart 0.71/lungs 0.67-0.70); anisotropic ellipsoid (k·within-std/axis) improves to Dice 0.27 @k=2. Conclusion: **position is invariant/retrievable; the coords-threshold shape is the weak link, not the coords field** — a good generator needs a per-label shape/extent model, not a fixed ball. CLI: `--extract [--unique] --n N`, `--analyze`, `--synth [--ellipsoid] --radius k`.
+
+- 2026-08-10: **coords-driven ellipsoid transfer, cheap matchers benchmarked** — `experiments/3d/universal_coords/{transfer_methods.py, plot_ellipsoid_transfer.py}`. Idea: draw ellipsoid on ctx in IMAGE space -> its voxels' coords form an irregular cloud Q -> select tgt voxels whose coords match Q (uses both ctx & tgt coords fields as a dense correspondence). Four matchers, eval = Dice/purity of transferred tgt mask vs tgt totalseg organ, over 6 pairs × 8 organs on the coarse 90³ coords grid: base (analytic axis-aligned ellipsoid in coords, no cloud) 0.265 D / 17ms; gauss (Mahalanobis mean+full 3×3 cov) 0.264→**0.285** D when source=real-organ footprint / 24ms; bin (b=8mm coords-bin hashing, O(N), no tree) 0.272 / 32ms; knn (cKDTree radius τ=8) 0.278→0.290 / **540ms (20×)**. Findings: (1) for an ELLIPSOID source all matchers ≈ equal (~0.27) — the ctx ellipsoid maps to a near-ellipsoid coords blob so the cloud adds nothing; (2) cloud transfer only helps when source shape is non-ellipsoidal (real organ) and only +0.02 D; (3) Dice ceiling ~0.29 is matcher-agnostic → bottleneck is coords resolution (4/8mm) + cross-subject anatomy, not the algorithm. **Recommendation: bin-hashing default (cheap, non-parametric, arbitrary shapes); gauss if a smooth parametric region is wanted; knn not worth 20×.** To raise ceiling: finer coords / intensity-based local refinement.
+
+- 2026-08-10: **next8 coords model CAN produce a finer map — coarseness is a stitch-grid choice, not a model limit.** Explored `experiments/3d/universal_coords/coords_predictor/next8.py` (PatchWork2 model `.../next8/model_patchwork.json`, applied via `model.apply_on_nifti(..., level="mixnohead", scale_to_original=False, sampling_factor=1)`). Config: `cropper.scheme.destvox_mm=[4,4,8]` → that is exactly why coords come out 4/4/8mm (90×90×80). But the pyramid (`patch_size=[32,32,32]`, `fov_mm=[400,400,800]`, `scale_fac=0.4`, `depth=4`) carries genuine detail per level 12.9/5.2/2.1/**0.83**mm in-plane (z 25.8/10.3/4.1/**1.65**mm); `mixnohead` already fuses fine levels, so 4/8mm is downsampling info the net holds. Resolution knob = `sampling_factor`(→`destshape_size_factor`, crop_generator.py:884 `dshape=round(dssf*psf*input_width/wperm+1)`, linear in dssf; supports `[dx,dy,dz,'mm']` target-voxel form) and/or `scale_to_original=True` (trilinear to input grid). Recipe to regenerate: set `sampling_factor=[2,2,4,'mm']` (→2/2/4mm, level-2 detail, real gain, ~8× voxels) or `[1,1,2,'mm']` (near finest; diminishing returns since coords were SUPERVISED at 4/8mm). **Blocker to actually re-run:** model saved under Keras 2; current `/software/anaconda3/envs/tensorflow` is TF2.18/Keras3 → `warpLayer`/`Conv3D` deserialize fails; also Blackwell GPU (sm_120) unsupported by TF2.18 (CUDA_ERROR_INVALID_HANDLE). Need a keras-2 TF env (CPU ok) to regenerate. Cheap stopgap w/o re-running: trilinear-upsample existing 4/8mm coords (smooth field) to kill the 90³ discretization in the transfer — no new detail but removes part of the 0.29-Dice grid penalty.
+
+- 2026-08-10: **Option-1 (trilinear-upsample coords) does NOT lift the transfer Dice ceiling — the limit is coords fidelity, not grid quantization.** `experiments/3d/universal_coords/finer_transfer.py`: trilinear-upsample existing 4/8mm coords to 2/4mm (factor 2), sample sharper totalseg GT on the fine grid, sweep ellipsoid size K∈{0.5..3.0} × matchers {base(diag ellipsoid), gauss(full-cov Mahalanobis), bin(8mm hash)}, knn excluded; all three transfer the SAME ctx ellipsoid cloud. Result (Dice vs tgt organ, 3 pairs × 8 organs): peak at **K≈2.5 ~0.236**, x1 vs x2 essentially identical (base K2.5: 0.236→0.236; bin only helps at tiny K: K0.5 0.036→0.049). Matchers tied (base≈gauss; bin marginally higher at small K). CONCLUSION: upsampling adds no info (coords is smooth), so the ~0.24 ceiling is intrinsic 4/8mm coords fidelity + cross-subject anatomy, NOT the 90³ discretization — refutes the cheap-stopgap hope. Real lever = regenerate genuinely finer coords from the model (sampling_factor=[2,2,4,'mm']), which needs the keras-2 TF env. Also: ellipsoid K≈2.5 is the sweet spot (K=3 over-inflates → purity loss).
+
+- 2026-08-10: **Free (label-agnostic) random-ellipsoid transfer works — the synthetic-label recipe.** `experiments/3d/universal_coords/random_ellipsoid_transfer.py`: draw an ellipsoid at RANDOM body position (center sampled from CT>-300 body mask on the coords grid), RANDOM radii 15-50mm and RANDOM orientation on ctx → coords cloud Q → transfer to tgt via bin/gauss. No label tie, so eval = totalseg label-histogram intersection (incl bg) ctx-region vs tgt-region. Over 160 samples × 4 pairs: **bin 0.773±0.206, gauss 0.770±0.217, random-placement baseline 0.522±0.219** → transfer is +0.25 over chance; empty-tgt ~1-2% (near FOV edges). bin≈gauss (tied). Figure random_ellipsoid_transfer.png: bin/gauss tgt regions near-identical, land on corresponding anatomy (iliac hist∩0.83, central 0.73); weak case = organ/body-wall boundary (0.28). Confirms: can generate position-consistent synthetic labels as free random blobs and transfer through coords with the cheap matchers. Caveat: baseline 0.52 is high because bg/fat (totalseg label 0) dominates and inflates intersection; use bg-excluded metric for sharper discrimination. Sweet spot from finer_transfer: none needed here (free size), but ellipsoid mm bounds set blob scale.
+
+- 2026-08-10: **Random-ellipsoid transfer, bg-EXCLUDED metric on 16 pairs — chance collapses, signal is decisive.** Re-ran random_ellipsoid_transfer.py with label-hist intersection restricted to totalseg labels 1-117 (bg/fat=0 dropped, renormalized) and only scoring blobs whose ctx region is >=30% labeled anatomy (else it's fat, meaningless). 16 pairs × 40 samples → 345 scored (295 skipped as mostly-fat). **bin 0.626±0.262, gauss 0.615±0.276, random-placement chance 0.052±0.148.** vs the incl-bg version (0.773/0.522) the bg was inflating BOTH; bg-excluded shows transfer places free blobs on the SAME labeled anatomy ~0.62 organ-composition overlap vs ~0.05 chance — ~12× over chance. bin≈gauss. ~46% of free-position blobs skipped (land in fat/muscle outside the 117 classes). Confirms coords-transfer of free random ellipsoids is a strong position-consistent synthetic-label generator.
+
+- 2026-08-10: **next8 coords model RUNS on nero — reproduced 4/8mm + generated genuine 2/2/4mm map.** Clean standalone runner `experiments/3d/universal_coords/coords_predictor/run_next8.py` (original next8.py needed NORA DPX_selectFiles + had undefined f1/f5). Env that works: `/software/anaconda3/envs/patchwork_minimal/bin/python` (TF 2.12 / **Keras 2.12** — Keras2 fixes the warpLayer/Conv3D deserialize that broke on odin's TF2.18/Keras3). GPU (A4000, Ampere) needs `LD_LIBRARY_PATH=/software/anaconda3/pkgs/cudatoolkit-11.8.0-h6a678d5_0/lib:/software/anaconda3/envs/tf215/lib/python3.10/site-packages/nvidia/cudnn/lib` (TF2.12 built cuda11.8/cudnn8; libs not on default path). Baseline (`--sampling 1`) reproduces original coords exactly: (90,90,80,3)@3.996/3.996/8.013mm. Finer: use SCALAR `--sampling 2` → (179,179,159,3)@2/2/4mm, 99% coverage, ~74s GPU. **BUG**: the `[dx,dy,dz,'mm']` sampling_factor form crashes (model.py:1066 `if sigma>0` on a vector sigma) — use scalar factor instead. Genuine-vs-interp check: model-2mm vs trilinear-up of 4mm map = mean|Δcoords| 3.7 (p95 7.3), +11% gradient magnitude, Δ concentrates at boundaries → real sub-4mm detail, but modest because coords is an intrinsically smooth position field (z-channel = smooth SI ramp). Next: batch-generate 2mm coords for the cohort (~74s/scan) and re-run transfer benchmark to see if real finer coords lifts the ~0.6 correspondence. Fig figs/model_finer_vs_upsample.png.
+
+- 2026-08-10: **Genuinely finer coords do NOT lift transfer correspondence — resolution is exhausted as a lever.** Generated factor-3 (1.33/1.33/2.67mm) coords for 20 scans via batch_next8.py, then `finer_random_transfer.py` re-ran the free random-ellipsoid transfer (bg-excluded label-hist intersection) on 8 cross-patient pairs, same seed, comparing orig 4/8mm vs fine 1.33mm coords. Result: orig bin 0.676/gauss 0.649/chance 0.041 vs fine bin 0.633/gauss 0.626/chance 0.062 — FLAT (fine a hair lower, within ~1-2 SE). Third consistent line of evidence (with trilinear-upsample no-help + model-2mm-vs-interp modest) that the ~0.65 correspondence ceiling is intrinsic to the coords model's cross-subject accuracy (supervised at 4/8mm), NOT the output grid. Levers left: better/finer-TRAINED coords model, or post-hoc intensity/boundary refinement after transfer. Highest res that runs as-is on 16GB A4000 = factor 3 (factor 4 OOMs on GPU anti-alias conv). 20 finer maps in coords_predictor/output_batch/ (2.4GB).
+
+## 2026-08-10 — Coords model on TotalSeg (loki): finest-level generation + ellipsoid-transfer Dice
+- Loki (RTX 6000 Ada, 48GB) coords inference: factors 1-6 all fit (nero A4000 OOM'd >3). Time ~28-32s flat for f1-3, 45.7s(f4)/64.4s(f5, 0.8/0.8/1.6mm)/89.9s(f6). ~3-4x faster than nero at matched res.
+- TotalSeg test set: uniformly 1.5mm iso, dims 99-454 (FOV up to ~680mm). Generated finest coords (sf=5, 0.8/0.8/1.6mm) for 20 test cases -> coords_predictor/output_totalseg/ (9.2GB, no OOM fallback even on 562^3). Scripts: coords_predictor/batch_totalseg.py.
+- Resampled those onto each case's native CT/label grid (1.5mm iso, full-affine trilinear) -> coords_predictor/output_totalseg_1p5/. Now coords/ct/label co-registered voxel-for-voxel (label.npy is on the CT grid). Script: resample_totalseg_coords.py.
+- Ellipsoid-transfer Dice (totalseg_ellipsoid_transfer.py, mirrors chemotox transfer_methods.py; 8 full-body pairs, 12 largest shared organs, ~3mm eval): base 0.191 / gauss 0.194 / bin 0.196. Matchers TIED (matcher-agnostic ceiling, as chemotox). vs ChemoTox coarse-grid 0.265/0.285/0.272 -> totalseg ~30% LOWER. Likely DOMAIN SHIFT (coords model trained on chemotox body-comp CT; totalseg = heterogeneous off-distribution cohort). Per-organ: thin/ambiguous worst (lung-lobe L13 0.06, L86 0.08), vertebrae/solid organs 0.20-0.29. Confirms: resolution not the lever, domain/training is.
+- Note re 1.5mm iso native gen: scalar sampling_factor keeps [4,4,8] anisotropy (only [4/f,4/f,8/f] reachable); per-axis '[1.5,1.5,1.5,mm]' path exists in crop_generator but crashes at model.py:1066 `if sigma>0` on vector sigma (one-line bug). Resampling the finer maps is equivalent in info (interpolation shown to add no correspondence), so used that.
+
+## 2026-08-10 — TotalSeg free-blob transfer viz + synthetic-task batch generator
+- plot_totalseg_free_transfer.py: freely-positioned ellipsoid transfer (random body pos + radii 15-50mm + orientation, NOT organ-tied) on aligned 1.5mm coords; overlays ctx blob -> tgt bin/gauss, annotated with bg-excluded label-hist intersection (HI), plus GT contour (green = union of ctx-covered organs projected on tgt). Figs for pairs s0040->s0667, s0029->s0687. Big organs land inside GT (HI ~0.5-0.9); free-blob HI >> organ Dice (softer composition metric).
+- free_synth_generator.py: batch generator of K+1 position-corresponding (subject,mask) in-context tasks over the 20 test cases. Reference free blob -> coords cloud Q -> bin-transfer to K contexts. Masks stored sparsely (flat nonzero idx) as npz/task + manifest.json -> output_synth_tasks/.
+- CRITICAL: needs a validity guard. Without it, mean cross-subject HI 0.336 +/- 0.307 (min 0.0) — partial-body contexts (head/extremity) give non-empty but OFF-anatomy masks. Added --min_hi reject-resample guard: HI>=0.3 -> mean 0.673 +/- 0.151 (min 0.406), 30/30 tasks in 57 tries (vs 31). Guard is essential for a usable generator on a mixed-anatomy cohort.
+
+## 2026-08-10 — All-scans coords generation for TotalSeg
+- coords_predictor/batch_all_totalseg_coords.py: generates coords for ALL 1228 totalseg scans (all splits). Per scan: run next8 model on ct.nii.gz at sampling_factor=2 (2/2/4mm), then trilinear-resample onto the NATIVE ct grid (1.5mm iso) via full affines, cast float16, save <scan>/coords.npy shape (X,Y,Z,3). Co-registered with ct.npy/label.npy (all share native grid, verified) -> rides use_crop=true crop_spacing_mm=1.5 with no bridge. Resumable (skip existing), OOM fallback sf2->1. ~17-20s/scan, ~6-8h total, ~50GB float16.
+- SPACING CHOICE (user): 1.5mm-iso float16 co-registered w/ label.npy. Rationale: correspondence is resolution-INVARIANT (proven), so fine gen wasted; must co-register with what use_crop reads (ct.npy/label.npy native 1.5mm). Generate coarse (sf2) + resample down is info-equivalent. Alternatives rejected: finest 0.8mm ~565GB no benefit; pre-resized 128^3 ~15GB but only fits the non-crop fast path.
+- apply_on_nifti(ofname=None) returns bare ndarray (no affine) -> route gen through a temp nifti to recover the 2mm affine for resampling.
+
+## 2026-08-11 — Coords quality on TotalSeg (balanced classes)
+- coords_quality.py: for 50 random subjects, centroid of each BALANCED_CLASS (61) in canonical coords frame (coords.npy voxel-aligned with label.npy, stride 2 ~3mm), per-class between-subject spread vs within-subject extent, + LOO nearest-centroid class retrieval.
+- RESULT: LOO retrieval top-1 0.386 / top-5 0.747 (chance 0.016) vs CHEMOTOX top-1 0.743 / top-5 0.959 -> accuracy ~halves off-distribution. Cross-subject centroid spread ~60-120mm (want 10-30mm). Only 1/61 classes tight (ratio<1), median ratio 2.22.
+- STRUCTURE: best = large solid organs/cavities (liver 1.18, colon 1.23, heart 1.59); worst = small/repeated instances (cervical vertebrae C3 6.45/C7 5.98, upper ribs, thin vessels brachiocephalic_trunk 8.93/SVC 4.39, thyroid 5.30, adrenal 5.11) — within-extent tiny so ratio explodes but raw between (90-110mm) genuinely bad. Vertebra/rib families = instance ambiguity (places "a vertebra" not "which").
+- Reconfirms DOMAIN SHIFT at the position level (not just downstream Dice). Frame usable for coarse large-anatomy positioning, noisy for thin/repeated/lateralized -> synth-gen should favor large free blobs on trunk anatomy + HI validity guard, not rely on coords to pin fine structures.
+
+## 2026-08-11 — What stable info is in the coords maps? (body-axis diagnostic)
+- shape_stability.py: 4 blob shape families (ellipsoid/metaball/noise/coords_ball) size-matched ~3000vox at SAME body positions, bin-hash transfer to K tgt, score same-region landing (bg-excl label-hist intersection HI). RESULT (40 refs, n=146/family): ALL TIED — HI 0.362-0.369, surv 0.73. Even coords_ball (shape defined in shared frame) no better => SHAPE is irrelevant to transfer stability; coords-map fidelity is the cap. Levers that matter = size, position, HI/survival guard, not shape.
+- coords_axes.py: per subject, correlate each coords channel vs RAS world axes (from ct affine) over labelled-anatomy voxels. RESULT (30 subj): c0<->LR |corr|0.986, c1<->AP 0.976, c2<->SI 0.931; axis assignment 100/100/97% consistent, SIGN 100% consistent across subjects; linear R^2 = 0.989/0.983/0.975 (mean 0.982). SI ordering: 16 landmark organs head->foot reproduced at Spearman |rho|=0.93 (min 1.0).
+- KEY: coords is ~98% an AFFINE transform of raw scanner RAS per subject -> only ~2% nonlinear body-normalization. Reconciles everything: BODY AXES / coarse position = excellent+stable (clean warped body-coordinate frame, reliable SI level/laterality/quadrant); FINE organ correspondence = weak (retrieval 0.39, 60-120mm spread) BECAUSE little nonlinear warp on top of affine. => coords good as COARSE localizer/positional prior (crop, region conditioning, large-region synth), not for pinning small structures.
+
+## 2026-08-11 — Coords-function synth labels: Phase-0 + visual QA (pre-wiring)
+- Design: synthetic label = smooth field f(coords) in [0,1], evaluated per subject -> cross-subject correspondence by construction (no matcher/transfer). Two tiers: hard bounded primitives + soft coords-Gaussians. Spec: docs/superpowers/specs/2026-08-11-coords-synth-labels-design.md. Field primitives in coords_synth_consistency.py (FIELDS, sample_params, LOCALIZED, coords_aabb).
+- Phase-0 consistency sweep (coords_synth_consistency.py, 20 subj): cross-subject anatomy HI ~0.25-0.31 (~5-6x random chance); VARIANCE is the selector -> scale floor ~40mm (below it HI std doubles/triples + masks miss FOV). gaussian sigma>=40, slab/cyl >=40 stable.
+- Visual QA (plot_coords_synth.py) CAUGHT A DESIGN BUG before wiring: unbounded primitives (half-space/full slab/long cylinder) FAIL on heterogeneous FOVs — a chest-anchored half-space hits lungs in a chest scan but SKULL 98% in a head-only scan (mean-pairwise HI averaged the bimodality away). FIX: (1) retire unbounded primitives, use LOCALIZED/bounded fields only (anisotropic ellipsoid, capped cylinder, gaussian); (2) FOV-aware grouping — precompute per-subject coords AABB, only group subjects whose covered region contains the anchor mu; (3) consistency backstop mean pairwise HI>=0.15 else redraw field. After fix: every montage row hits same anatomy across target+contexts (HI 0.53-0.83), skull-for-lung gone.
+- Also: existing supervoxel synth path uses 1 subject + K+1 AUG COPIES (identical position) -> coords synth (K+1 different subjects, one field) is complementary: injects cross-subject POSITION signal supervoxels lack. Integration = new p_coords mode; hard labels drop into integer pipeline unchanged (Phase A), soft labels need float plumbing (Phase B).
+
+## 2026-08-11 — self_context refactor into nested {p, augs.{intensity, per_image}} + translation-jitter drift result
+- WHY: the "translation-alone" self_context run (l7awfrqg) was actually translation + INDEPENDENT intensity jitter — line 984 applied apply_intensity_aug to every context clone unconditionally when self_context_augs=true. Previous ceiling run (self_context=true, augs off) had context = exact clone of the augmented target -> zero intensity mismatch. So the val-ceiling drop 0.95->0.88 was confounded (translation AND appearance).
+- REFACTOR: flat data.self_context (float) + data.self_context_augs (bool) -> nested data.self_context.{p, augs.{intensity, per_image}}. Two independent toggles so each aug family is isolatable for clean A/B. Dataloader ctor: self_context (=p) + self_context_intensity + self_context_per_image; getitem gates per_image via self_context_per_image, intensity via self_context_intensity (separately). common.py: _self_context(d) parser (nested form, scalar/bool fallback -> p only) used in build_dataset + make_eval_loader. totalseg.yaml nested block; nnunet.yaml comment updated. Verified: parser unit cases + hydra struct-mode compose of data.self_context.augs.per_image=true etc.
+- DRIFT RESULT (probe_context_drift.py, 120 val samples, ceiling vs translate ckpt; CSVs results/3d/exp40_context_drift_{ceiling,translate}.csv): translation jitter LIFTS THE WHOLE POSE-DRIFT SURFACE, transferring to UNTRAINED transforms. translate_vox@16 0.356->0.769 (+0.413); rotate@20deg 0.373->0.664 (+0.290, rotation NOT trained); scale@1.15 0.557->0.785 (+0.228, scale NOT trained); elastic@16 0.657->0.790 (+0.133). Cost: exact-match ceiling (mag0) 0.951->0.866 (-0.085), worst on small objects. Interpretation: ceiling model solved self-context by position-locked copying (output=ctx mask at same voxel addr); pose jitter breaks the shortcut -> forces feature-based localization -> generalizes across transform types. H2 (pose-invariant matching bottleneck) is trainable; pose jitter is the lever. NEXT: isolate translation from intensity (self_context.augs.intensity=false rerun), then add rotation+scale, then cross-subject (p<1.0).
+- SPLIT-AWARE p: data.self_context.p is now {train, eval} (was a single scalar) so you can train on self-context (p.train=1.0) but evaluate on real cross-subject contexts (p.eval=0.0). _self_context(d, split) resolves p.train for split=='train', p.eval for val/test; accepts scalar-p (both splits) and whole-block-scalar fallbacks. augs.{intensity,per_image} apply to both splits. Verified via parser cases + struct-mode compose of data.self_context.p.train/p.eval.
+
+## 2026-08-11 — feat_norm arch flag (context|self|none) for the encoder-feature normalization
+- CONTEXT: patchset3d _attn z-scored BOTH support and query by SUPPORT per-channel stats (mu/sig over dim=1, applied to sup_feat AND qry_feat) — inherited verbatim from patchset_cnn.py -> pfn_seg_2d.normalize_by_context ("matches TabPFN feature_sim backend"), never re-justified for frozen 3D CT. Puts the query in the context's feature frame; benign in self-context (support≈target clones) but distorts the query under cross-subject mismatch and is background-dominated for small objects — a suspected contributor to the size↔Dice / cross-subject stall (H2).
+- ADDED arch.feat_norm (patchset3d.py): _feat_norm() dispatch. context = current (support stats on both); self = each side by its OWN stats (query decoupled); none = pass-through. assert-guarded; default 'context' (unchanged). Wired: build_model (train.py a.get feat_norm), model/patchset3d.yaml declares it. Weight-free — eval.py adds an eval-time override (eval.feat_norm, default null) applied on top of the ckpt's stored arch so ONE checkpoint sweeps all three (older archs lack the key -> default context).
+- VERIFIED: 3 modes build/forward finite + mutually distinct outputs; bogus -> AssertionError; hydra struct compose of arch.feat_norm + eval.feat_norm. NEXT: eval-only sweep context|self|none on the base cross-subject ckpt (self_context.p.eval=0.0) to see if decoupling the query moves cross-subject Dice.
+
+## 2026-08-11 — Per-sample table: ctx_cases + self_ctx columns (self-context provenance)
+- WHY: with split-specific self_context.p (train self-context, eval cross-subject) the val/eval sample tables gave no way to tell which rows were self-context vs real cross-subject. Added per-context case-id provenance.
+- Dataset (totalseg_dataloader_incontext.py): track ctx_subjects list alongside context_in/out — real path records each sampled ctx subject; empty-fallback + resample-pad record the target/reused subject; self_context block sets [subj]*K; synth path sets [subj]*K (K aug-copies of same subject). Emitted as item['context_subjects'] (list[str] len K). Collate passes it through (guarded -> backward-compatible).
+- evaluate.py: evaluate_classes reads batch['context_subjects'] -> per case ctx_cases (';'-joined ids) + self_ctx (bool: all ctx == target case). _SAMPLE_TABLE_COLS + build_sample_table gain both columns (after 'subject'). Covers train.py val table AND eval.py (both go through evaluate_classes/build_sample_table; evaluate_spacing_sweep too; legacy validate() unused). Absent key -> ctx_cases='' self_ctx=None (non-totalseg sources).
+- VERIFIED: collate pass-through + backward-compat; build_sample_table 16-col/16-val alignment with defaults.
+
+## 2026-08-11 — plot_dataset_items.py: per-context case id + self-context markers
+- Uses the new batch['context_subjects']: each context cell gets a badge with its case id; when a context's case id == the target case (self-context / leaked clone) the badge turns crimson with "SELF" + a crimson cell border, and the row ylabel gains [SELF-CTX] (or [part-self n/K] when only some contexts are self). No-op when the source doesn't emit context_subjects. Verified on totalseg train: self_context.p.train=1.0 -> all SELF; =0.0 -> distinct cross-subject ids, no markers (results/3d/dataset_items_{selfctx,cross}.png).
+- GAP found: only augmentations/nnunet.yaml has the per_image block; the totalseg default preset (multiverseg_v2) lacks it, so data.self_context.augs.per_image=true silently no-ops there (and augmentations.per_image.* overrides raise struct errors). Needs per_image added to multiverseg_v2 (mirror nnunet) for the pose-jitter lever to work on the default preset.

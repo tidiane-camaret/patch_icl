@@ -19,10 +19,16 @@ arch:
                                # scale with data.image_size). false = fixed 192^3 resample.
   encoder_spacing_aware: false # scale the frozen ViT's RoPE by physical voxel spacing so
                                # positions are in mm, not tokens (variable-spacing training;
-                               # implies native_grid). Pair with data.spacing_range.
+                               # implies native_grid). Pair with data.train_spacing_range.
+  encoder_precision: bf16      # autocast dtype of the frozen encoder forward (primus + tap_ct),
+                               # overriding the ambient train/eval autocast for that region:
+                               # bf16 (default) | fp16 | fp32 (fp32 = clean no-rounding control).
   resolution: 16               # token grid R (prediction at R³, tiled to (R·d)³)
   enc_dims: [32, 32, 32, 32]   # 3D per-stage widths; stem + 3 stride-2 stages (len=log2(128/16)+1)
   e: 256
+  feat_norm: context           # encoder-feature norm before img_embed: context (per-channel
+                               # z-score by SUPPORT stats, applied to both — TabPFN/ICL default) |
+                               # self (each side by its own stats — query decoupled) | none
   img_embed_mlp: false         # true = MLP img_embed (Linear(oc,oc)->GELU->Linear(oc,e));
                                # helps when encoder out_ch >> e (e.g. primus 864 -> 256)
   h: 512

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
+from src.rope import build_3d_rope_freqs_from_positions
 
 
 def _down_to(f: torch.Tensor, R: int) -> torch.Tensor:
@@ -112,6 +113,10 @@ class PatchSet3D(nn.Module):
         encoder_stage: int = None,
         encoder_native_grid: bool = False,
         encoder_spacing_aware: bool = False,
+        encoder_precision: str = "bf16",
+        transformer_rope: bool = False,
+        rope_theta: float = 100.0,
+        feat_norm: str = "context",
     ):
         super().__init__()
         self.resolution = resolution
@@ -136,11 +141,24 @@ class PatchSet3D(nn.Module):
                                          frozen=encoder_frozen, device="cpu",
                                          encoder_stage=encoder_stage,
                                          native_grid=encoder_native_grid,
-                                         spacing_aware=encoder_spacing_aware)
+                                         spacing_aware=encoder_spacing_aware,
+                                         precision=encoder_precision)
+        elif encoder == "tap_ct":
+            # Frozen fomofo/tap-ct-b-3d ViT. Weights fixed on HF (no sidecar); it always
+            # tokenizes at the native anisotropic grid (image_size drives the token count)
+            # and is not spacing-aware — the physical cell size is set by data.crop_spacing_mm.
+            # encoder_stage early-exits the transformer blocks (like Primus). Needs image_size
+            # divisible by 8. Ignores encoder_native_grid/encoder_spacing_aware (always native).
+            from src.models.tapct_encoder import TapCTEncoder   # lazy: avoids import cycle
+            if not image_size:
+                raise ValueError("encoder='tap_ct' requires arch.image_size (from data.image_size)")
+            self.encoder = TapCTEncoder(resolution, image_size, frozen=encoder_frozen,
+                                        device="cpu", encoder_stage=encoder_stage,
+                                        precision=encoder_precision)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
-            raise ValueError(f"unknown arch.encoder {encoder!r} (conv | primus)")
+            raise ValueError(f"unknown arch.encoder {encoder!r} (conv | primus | tap_ct)")
         # Encoder feature -> token width e. Default: a single Linear. When the encoder
         # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
         # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width
@@ -150,7 +168,22 @@ class PatchSet3D(nn.Module):
         self.img_embed = (nn.Sequential(nn.Linear(oc, oc), nn.GELU(), nn.Linear(oc, e))
                           if img_embed_mlp else nn.Linear(oc, e))
         self.mask_embed = nn.Linear(self.mask_patch_size ** 3, e)   # occupancy tile p³ -> e
-        self.pos = FourierPositionalEncoding(e, fourier_bands, n_axes=3)
+        # Positional encoding. Default: additive Fourier features of the (i,j,k) cell (spacing
+        # -blind). transformer_rope=True instead applies 3D axial RoPE on the sample axis inside
+        # the transformer (mirrors the encoder's RoPE) and drops the additive term (RoPE-only).
+        # RoPE positions are scaled by physical spacing / rope_train_mm (the encoder's pretrain
+        # pitch, 2 mm) so they track physical distance across the variable-spacing range.
+        self.transformer_rope = bool(transformer_rope)
+        self.rope_theta = float(rope_theta)
+        # Encoder-feature normalization before img_embed (see _feat_norm):
+        #   context = per-channel z-score by SUPPORT stats, applied to both (TabPFN/ICL default)
+        #   self    = each side z-scored by its OWN stats (query decoupled from context)
+        #   none    = no extra norm (rely on encoder LN + learned img_embed)
+        assert feat_norm in ("context", "self", "none"), feat_norm
+        self.feat_norm = feat_norm
+        self.head_dim = e // a
+        self.rope_train_mm = float(getattr(self.encoder, "train_spacing_mm", 2.0))
+        self.pos = None if self.transformer_rope else FourierPositionalEncoding(e, fourier_bands, n_axes=3)
         if context_id_embed:
             self.ctx_id = nn.Embedding(max_context, e)
             self.qry_id = nn.Parameter(torch.zeros(e))
@@ -190,9 +223,12 @@ class PatchSet3D(nn.Module):
         return tiles.reshape(B, K * self.N, p ** 3)
 
     def _tokens(self, feat, occ, ijk):
-        pos = self.pos(ijk, self.resolution)
-        img = self.img_embed(feat) + pos
-        msk = self.mask_embed(occ) + pos
+        img = self.img_embed(feat)
+        msk = self.mask_embed(occ)
+        if self.pos is not None:                            # additive Fourier PE (non-RoPE mode)
+            pos = self.pos(ijk, self.resolution)
+            img = img + pos
+            msk = msk + pos
         return torch.stack([img, msk], dim=2)               # (B,M,2,e)
 
     def _tile_logits(self, out):
@@ -206,16 +242,46 @@ class PatchSet3D(nn.Module):
                    .reshape(B, r * d, r * d, r * d)
                    .unsqueeze(1))
 
-    def _attn(self, sup_feat, qry_feat, sup_occ, K):
+    def _rope(self, K, spacing, device):
+        """3D axial RoPE cos/sin for the row sequence [thinking, K·N support, N query].
+
+        Thinking rows get position (0,0,0) (no rotation); support/query use the (i,j,k)
+        lattice. Positions are scaled by spacing/rope_train_mm when a spacing is given, so
+        adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme."""
+        n_think = self.thinking.n
+        pos = torch.cat([torch.zeros(n_think, 3, device=device),
+                         self.ijk_base.repeat(K, 1).float(),
+                         self.ijk_base.float()], dim=0)               # (R,3)
+        if spacing is not None:
+            pos = pos * (float(spacing) / self.rope_train_mm)
+        return build_3d_rope_freqs_from_positions(self.head_dim, pos, self.rope_theta)
+
+    @staticmethod
+    def _zscore(x, mu, sig):
+        return ((x - mu) / sig).clamp(-10, 10)
+
+    def _feat_norm(self, sup_feat, qry_feat):
+        """Per-channel z-score of encoder features (dim=1 = token axis), by mode:
+        context = SUPPORT stats on both (query in the context frame); self = each side by
+        its OWN stats (query decoupled); none = pass-through."""
+        if self.feat_norm == "none":
+            return sup_feat, qry_feat
+        mu = sup_feat.mean(dim=1, keepdim=True)
+        sig = sup_feat.std(dim=1, keepdim=True) + 1e-8
+        if self.feat_norm == "context":
+            return self._zscore(sup_feat, mu, sig), self._zscore(qry_feat, mu, sig)
+        # self: query normalized by its own stats
+        qmu = qry_feat.mean(dim=1, keepdim=True)
+        qsig = qry_feat.std(dim=1, keepdim=True) + 1e-8
+        return self._zscore(sup_feat, mu, sig), self._zscore(qry_feat, qmu, qsig)
+
+    def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None):
         B, N = sup_feat.shape[0], self.N
         qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)
         qry_ijk = self.ijk_base.unsqueeze(0).expand(B, N, 3)
 
-        mu = sup_feat.mean(dim=1, keepdim=True)
-        sig = sup_feat.std(dim=1, keepdim=True) + 1e-8
-        sup_feat = ((sup_feat - mu) / sig).clamp(-10, 10)
-        qry_feat = ((qry_feat - mu) / sig).clamp(-10, 10)
+        sup_feat, qry_feat = self._feat_norm(sup_feat, qry_feat)
 
         sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk)   # (B,S,2,e)
         qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk)   # (B,Q,2,e)
@@ -236,7 +302,8 @@ class PatchSet3D(nn.Module):
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
             attn_mask[:, :sep_t] = True
             attn_mask[sep_t:, sep_t:] = True
-        x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn)
+        rope = self._rope(K, spacing, x.device) if self.transformer_rope else None
+        x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn, rope=rope)
         q = x[:, sep_t:, 0, :]                               # (B,Q,e) query img-col
         return self._tile_logits(self.decoder(q))           # (B,1,Rd,Rd,Rd)
 
@@ -247,7 +314,7 @@ class PatchSet3D(nn.Module):
         T = imgs.shape[1]
         feat_map = self._encode(imgs.reshape(B * T, 1, D, H, W), spacing)  # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        logit = self._attn(sup_feat, qry_feat, self._occupancy(context_out), K)
+        logit = self._attn(sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing)
         return {"final_logit": logit}
 
     def _encode(self, x, spacing):

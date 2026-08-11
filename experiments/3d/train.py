@@ -255,6 +255,10 @@ def build_model(cfg: DictConfig):
             "encoder_stage": a.get("encoder_stage", None),
             "encoder_native_grid": a.get("encoder_native_grid", False),
             "encoder_spacing_aware": a.get("encoder_spacing_aware", False),
+            "encoder_precision": a.get("encoder_precision", "bf16"),
+            "transformer_rope": a.get("transformer_rope", False),
+            "rope_theta": a.get("rope_theta", 100.0),
+            "feat_norm": a.get("feat_norm", "context"),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
@@ -279,7 +283,7 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
     # cheap; OFF by default (train.profile_timing) → zero overhead. patchset3d + CUDA only.
     prof = bool(cfg.train.get("profile_timing", False)) and is_patchset and DEVICE.type == "cuda"
-    tsum, hooks = {"data": 0.0, "encode": 0.0, "attn": 0.0}, []
+    tsum, hooks, prof_items = {"data": 0.0, "encode": 0.0, "attn": 0.0}, [], 0
     if prof:
         ee = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         ea = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -292,6 +296,7 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     for batch in pbar:
         if prof:
             tsum["data"] += (time.perf_counter() - t_prev) * 1000
+            prof_items += batch["image"].shape[0]      # per-item = per-step ÷ batch size
         lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -360,11 +365,15 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         grid[f"dice_ds_soft@{rd}"] = float(gs) / max(float(gsc), 1)
         grid[f"cossim@{rd}"] = float(gc) / max(float(gcc), 1)
     if prof and n:
-        grid["time/data_ms"]   = tsum["data"] / n
-        grid["time/encode_ms"] = tsum["encode"] / n
-        grid["time/attn_ms"]   = tsum["attn"] / n
+        pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
+        bs = prof_items / n                            # avg batch size
+        for k in ("data", "encode", "attn"):
+            grid[f"time/{k}_ms"] = tsum[k] / n         # per-step (per-batch) wall time
+            grid[f"time/{k}_ms_item"] = tsum[k] / pi   # per-item (÷ batch size): B-comparable
         tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
-                   f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms")
+                   f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
+                   f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
+                   f"encode {tsum['encode']/pi:4.0f}ms | attn {tsum['attn']/pi:4.0f}ms")
     return total / max(n, 1), dice_sum / max(n, 1), soft_run / max(n, 1), grid
 
 
@@ -530,9 +539,16 @@ def main(cfg: DictConfig) -> None:
         # _preprocess/_encode_batch). dynamic=True so target/context batch-size differences don't
         # retrigger compilation. No-op for encoder=conv.
         enc = getattr(net, "encoder", None)
-        if cfg.arch.get("encoder", "conv") == "primus" and enc is not None and hasattr(enc, "primus"):
+        which_enc = cfg.arch.get("encoder", "conv")
+        if which_enc == "primus" and enc is not None and hasattr(enc, "primus"):
             enc.primus.eva = torch.compile(enc.primus.eva, dynamic=True)
             msg += " + frozen Primus eva stack"
+        elif which_enc == "tap_ct" and enc is not None and hasattr(enc, "model"):
+            # Frozen TAP ViT: the dominant per-step cost. It encodes one volume at a time at a
+            # fixed T, so shapes are static -> dynamic=False. The SDPA-patched attention
+            # (F.scaled_dot_product_attention) compiles cleanly. Mirrors the feature-sim path.
+            enc.model = torch.compile(enc.model, dynamic=False)
+            msg += " + frozen tap-ct ViT"
         else:
             msg += "; conv encoder runs eager"
         print(msg)
