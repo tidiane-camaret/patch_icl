@@ -37,14 +37,20 @@ coords quality, controlled by the field's scale.
 
 "Hard" vs "soft" is one parameter (edge width), so both tiers share code:
 
-- **Tier 1 — hard, coarse, axis-aligned (binary label):**
-  - half-space: `sigmoid((coords·n − b)/w)`, small `w`
-  - slab / band: `sigmoid((hw − |coords·n − b|)/w)`
-  - cylinder: threshold on distance in the 2-D subspace ⊥ a chosen axis
-  - large ellipsoid: Mahalanobis threshold
-  - `n` is an **arbitrary** unit direction: since coords ≈ affine of RAS, any
-    linear function of coords is affine-consistent, so oblique planes are as
-    stable as pure LR/AP/SI and add variety. Binarize at 0.5 → integer label.
+All fields must be **localized/bounded** (anchored at a body point μ). Visual QA
+(`plot_coords_synth.py`) showed unbounded primitives (half-space, full slab, long
+cylinder) FAIL on heterogeneous FOVs: a fixed coords half-space anchored in the
+chest lands on lungs in a chest scan but on the **skull** in a head-only scan
+(HI-averaging hid this bimodality). Bounded fields don't have this problem — a
+subject either contains the anchored region (mass guard passes) or doesn't. So
+half-space/slab/unbounded-cylinder are RETIRED.
+
+- **Tier 1 — hard, bounded (binary label):**
+  - anisotropic ellipsoid: `‖R(coords−μ)/radii‖ ≤ 1`, random rotation R
+  - capped cylinder: radius r AND half-length L along a random axis
+  - Orientation is **arbitrary** (any oblique direction): since coords ≈ affine
+    of RAS, any linear function of coords is affine-consistent. Binarize at
+    0.5 → integer label.
 - **Tier 2 — soft, focused (float label):**
   - coords-Gaussian: `exp(−½ (coords−μ)ᵀ Σ⁻¹ (coords−μ))`, μ a real canonical
     body location, Σ anisotropic. Softness encodes positional uncertainty; small
@@ -71,18 +77,26 @@ triples (the "sometimes right, sometimes garbage" failure) and masks frequently
 miss FOV. Sampling ranges: gaussian σ∈[40,160], slab hw∈[40,160], cylinder
 r∈[40,160], half-spaces always allowed.
 
-## Task assembly (multi-subject)
+## Task assembly (multi-subject, FOV-aware)
 
-1. Sample a field `f` (family + params). μ / b anchored at a real canonical
-   location = coords value at a random labelled voxel of a random reference
-   subject.
-2. Pick K+1 subjects at random (no shared-organ / FOV constraint needed).
-3. For each subject: evaluate `f` on its coords, apply a **mass guard** — if the
-   in-crop label mass < `min_mass`, drop the subject and draw another (replaces
-   the old HI guard). Center that subject's crop on its own instance of the
-   region (argmax / centroid of `f`), matching how the supervoxel path centers
-   crops under `use_crop`.
-4. Emit `(image, label)` per subject; item[0] = target, items[1:] = K contexts.
+1. Sample a field `f` (localized family + params), anchor μ = coords value at a
+   random labelled voxel of a random reference subject.
+2. **FOV pre-filter:** keep only subjects whose precomputed coords bounding box
+   (min/max coords over labelled voxels = the canonical region the scan covers)
+   contains μ. This is the cheap grouping filter that prevents pairing a
+   chest-anchored field with a head-only scan.
+3. For each candidate: evaluate `f`, apply a **mass guard** (in-crop label mass ≥
+   `min_mass`) and collect K+1. Center that subject's crop on its own instance of
+   the region (argmax / centroid of `f`), matching how the supervoxel path
+   centers crops under `use_crop`.
+4. **Consistency backstop:** require the K+1 picked subjects to agree on anatomy
+   (mean pairwise soft-weighted label-histogram intersection ≥ `min_hi`, ~0.15);
+   otherwise redraw the field. Catches residual near-FOV-boundary clipping.
+5. Emit `(image, label)` per subject; item[0] = target, items[1:] = K contexts.
+
+Validated in `plot_coords_synth.py`: with this assembly every montage row hits
+the same anatomy across target + contexts (HI 0.53–0.83), and the earlier
+skull-for-lung failures disappear.
 
 This mirrors `_get_synth_item` but swaps "one subject, K+1 aug copies" for "K+1
 subjects, one shared field". Per-subject augmentation still applies on top.
@@ -96,8 +110,10 @@ subjects, one shared field". Per-subject augmentation still applies on top.
 - New method `_get_coords_item()` implementing the assembly above, reusing the
   existing `use_crop` crop machinery (`_organ_crop_arrays` / native-crop slice)
   with the crop center = coords-region center instead of organ centroid.
+- Precompute + cache a per-subject coords AABB (`coords_aabb`) once at init
+  (like the existing scan/bbox caches) for the FOV pre-filter.
 - Config: `data.p_coords`, `data.coords_fname="coords.npy"`, field sampling
-  ranges (families, scale bands, hard/soft mix), `min_mass`.
+  ranges (localized families, scale bands, hard/soft mix), `min_mass`, `min_hi`.
 
 ### Label dtype: phased
 
