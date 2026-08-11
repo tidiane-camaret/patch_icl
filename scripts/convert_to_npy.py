@@ -121,7 +121,8 @@ def enumerate_subjects(source: str, data, out, limit=None) -> list[dict]:
             tasks.append({"subj_id": s.name, "out_dir": str(Path(out) / s.name),
                           "inputs": {"subj_dir": str(s)}})
     elif source == "chemotox":
-        cohort = json.load(open(data)) if str(data).endswith(".json") else json.load(open(COHORT_JSON))
+        json_path = data if data else COHORT_JSON
+        cohort = json.load(open(json_path))
         for key, rec in cohort.items():
             subj_id = key.replace("#", "_")
             tasks.append({"subj_id": subj_id, "out_dir": str(Path(out) / subj_id),
@@ -334,9 +335,17 @@ def main():
           f"target_spacing={args.target_spacing} | size={size}")
 
     spacings_path = out_root / "spacings.json"
-    spacings = json.load(open(spacings_path)) if spacings_path.exists() else {}
+    if spacings_path.exists():
+        with open(spacings_path) as f:
+            spacings = json.load(f)
+    else:
+        spacings = {}
     stats_path = out_root / "ct_stats.json"
-    ct_stats = json.load(open(stats_path)) if stats_path.exists() else {}
+    if stats_path.exists():
+        with open(stats_path) as f:
+            ct_stats = json.load(f)
+    else:
+        ct_stats = {}
 
     done = ok = skipped = errors = 0
     t0 = time.time()
@@ -360,10 +369,12 @@ def main():
                   f"{rate:.1f} subj/s", end="", flush=True)
 
     if spacings:
-        json.dump(spacings, open(spacings_path, "w"))
+        with open(spacings_path, "w") as f:
+            json.dump(spacings, f)
         print(f"\nSpacings -> {spacings_path} ({len(spacings)})")
     if ct_stats:
-        json.dump(ct_stats, open(stats_path, "w"))
+        with open(stats_path, "w") as f:
+            json.dump(ct_stats, f)
     # meta.csv for sources with no native split (chemotox): all subjects -> test
     if args.source == "chemotox":
         with open(out_root / "meta.csv", "w", newline="") as f:
