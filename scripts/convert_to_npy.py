@@ -80,6 +80,16 @@ def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True,
     return out
 
 
+def _resample_to_spacing(vol: np.ndarray, native_sp, target_sp: float,
+                         order: int = 1) -> np.ndarray:
+    """Resample `vol` from native voxel spacing (mm, per axis) to `target_sp` mm
+    isotropic. order=1 (trilinear) for images, order=0 (nearest) for label maps.
+    out_shape[i] = round(shape[i] * native_sp[i] / target_sp)."""
+    zoom = [float(ns) / float(target_sp) for ns in native_sp]
+    out = ndi.zoom(vol, zoom, order=order)
+    return out.astype(vol.dtype, copy=False)
+
+
 def _default_data_dir() -> str:
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(config_name="config")
@@ -206,6 +216,15 @@ def main():
                         help="also write native ct_raw.npy (raw intensities: int16 HU for CT, "
                              "float16 for MRI) so the loader can normalise on the fly. For MRI "
                              "also writes per-volume stats to ct_stats.json.")
+    parser.add_argument("--source", choices=["totalseg", "chemotox"], default="totalseg",
+                        help="dataset source: totalseg (dir tree, default) or chemotox (JSON of paths)")
+    parser.add_argument("--out", default=None,
+                        help="output root; defaults to --data (in-place for totalseg)")
+    parser.add_argument("--target-spacing", type=float, default=None, dest="target_spacing",
+                        help="resample the native outputs to this mm-isotropic spacing "
+                             "(default: keep full native)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="convert only the first N subjects (smoke test)")
     args = parser.parse_args()
 
     data_dir = Path(args.data) if args.data else Path(_default_data_dir())
