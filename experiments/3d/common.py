@@ -23,11 +23,12 @@ from src.totalseg_dataloader_incontext import (
     incontext_collate_fn,
 )
 from src.totalseg_more_labels_dataset import TotalSegMoreLabelsDataset
+from src.chemotox_dataset import ChemoToxBCDataset, BC_NAMES
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # data.source values served by TotalSegInContextDataset (differ only in root + classes).
-_TOTALSEG_SOURCES = ("totalseg", "totalsegmri")
+_TOTALSEG_SOURCES = {"totalseg", "totalsegmri", "chemotox"}
 
 
 def _source_root(cfg) -> tuple[str, str, bool]:
@@ -38,6 +39,11 @@ def _source_root(cfg) -> tuple[str, str, bool]:
         if root is None:
             raise ValueError("cfg.paths.totalseg_more_labels is not set "
                              "(needed for data.source=totalseg_more_labels)")
+        return source, root, False
+    if source == "chemotox_bc":
+        root = cfg.paths.get("chemotox")
+        if root is None:
+            raise ValueError("cfg.paths.chemotox is not set (needed for source=chemotox_bc)")
         return source, root, False
     if source not in _TOTALSEG_SOURCES:
         raise ValueError(
@@ -171,6 +177,17 @@ def build_dataset(cfg, split: str):
             crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
             raw_ct=d.get("raw_ct", False),
         )
+    if cfg.data.get("source") == "chemotox_bc":
+        d = cfg.data
+        root = cfg.paths.get("chemotox")
+        return ChemoToxBCDataset(
+            root=root, classes=BC_NAMES, image_size=tuple(d.image_size),
+            split=split, context_size=d.context_size,
+            max_subjects=d.get("max_val_subjects"),
+            eval_seed=int(cfg.get("eval", {}).get("seed", 0)),
+            use_crop=True, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
+        )
     d = cfg.data
     _sc_p, _sc_int, _sc_pi = _self_context(d, split)
     _, root, is_mri = _source_root(cfg)
@@ -287,7 +304,8 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     """
     d, e = cfg.data, cfg.eval
     _sc_p, _sc_int, _sc_pi = _self_context(d, split)
-    if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels"):
+    if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
+                            "chemotox_bc"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool
