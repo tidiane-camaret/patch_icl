@@ -1,13 +1,13 @@
 # @package _global_
 # Experiment 36 — variable-spacing training with a spacing-aware frozen CoLiPri encoder.
 # Builds on experiment 35 (native-grid, 8-block, 128³ @ resolution 16) and adds:
-#   - data.spacing_range=[1,4]: each BATCH crops at one log-uniform physical spacing in
+#   - data.train_spacing_range=[1,4]: each BATCH crops at one log-uniform physical spacing in
 #     1-4 mm (SpacingBatchSampler), so the model sees 4x the FOV range at fixed 128³.
 #   - arch.encoder_spacing_aware=true: the frozen ViT's RoPE is scaled by that spacing so
 #     positions are in physical mm, not token index (implies native_grid). At 2 mm this is
 #     bit-for-bit identical to exp 35's identity grid, so it's a strict superset.
 # Note: 4 mm pushes RoPE past its trained max token position (extrapolation); 1 mm is safe
-# interpolation. If the coarse end underperforms, narrow spacing_range toward [1,3].
+# interpolation. If the coarse end underperforms, narrow train_spacing_range toward [1,3].
 # Run with:
 #   python experiments/3d/train.py experiment=36_colipri_spacing_aware_128
 defaults:
@@ -15,7 +15,7 @@ defaults:
   - _self_
 
 data:
-  spacing_range: [1.0, 4.0]
+  train_spacing_range: [1.0, 4.0]
 
 arch:
   encoder_spacing_aware: true

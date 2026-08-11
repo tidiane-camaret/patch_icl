@@ -140,6 +140,11 @@ def _build_model(cfg: DictConfig):
                 raise ValueError(
                     "checkpoint has no stored arch (older run); re-supply the training "
                     "arch, e.g. +model=patchset3d arch.l=2")
+            # feat_norm is weight-free -> allow an eval-time override on top of the stored
+            # arch so one checkpoint sweeps context|self|none (older archs lack the key).
+            fn = cfg.eval.get("feat_norm")
+            if fn is not None:
+                cfg.arch.feat_norm = fn
         model, _ = build_model(cfg)
         model = model.to(DEVICE)
         sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}

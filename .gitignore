@@ -45,3 +45,6 @@ results/encoder_bench_full/*.png
 **/__marimo__/session/**
 experiments/totalseg_more_labels/*.png
 results/3d_feature_sim_colipri_crop192/*.csv
+experiments/3d/universal_coords/figs/*.png
+experiments/encoders/*.csv
+results/3d/*.csv

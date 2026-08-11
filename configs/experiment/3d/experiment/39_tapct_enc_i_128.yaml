@@ -1,0 +1,32 @@
+# @package _global_
+# Experiment 39 — frozen tap-ct-b-3d (fomofo) image encoder for PatchSet3D at 128³.
+# The tap-ct twin of experiment 35 (CoLiPri native-grid encoder): same 128³ crop / 16³
+# grid / early-exit / optim recipe, but swaps the frozen CoLiPri Primus ViT for the frozen
+# tap-ct-b-3d ViT (weights fixed on HF — no sidecar). Differences from 35:
+#   - arch.encoder=tap_ct: de-norm->RAS-to-LPS reorient->TAP processor bridge, encodes at the
+#     native ANISOTROPIC token grid (patch (4,8,8): 128/8=16 in-plane, 128/4=32 axial), then
+#     resamples to resolution=16^3. Reuses experiments/encoders/tapct_features.py (the same
+#     bridge the feature-sim study uses), so encoder ≡ the feature-sim tap_ct probe.
+#   - arch.encoder_stage=7: keep the first 7/12 transformer blocks. The mid-stack layer gave
+#     the best frozen correspondence AND ~40% less compute in the feature-sim sweep
+#     (docs/logs.md, max_layers). out_ch=768 (vs CoLiPri 864); img_embed_mlp handles it.
+#   - data.crop_spacing_mm=1.5: TotalSeg's native data floor; feature cell = 8·1.5=12 mm
+#     in-plane / 4·1.5=6 mm axial, FOV = 128·1.5 = 192 mm. tap-ct is NOT spacing-aware (learned
+#     pos-embeds are interpolated to the grid), so crop_spacing_mm alone sets the cell scale.
+# Inherits 35's balanced train classes, occupancy mask downsample @0.5, and nnUNet task aug.
+# Run with:
+#   python experiments/3d/train.py experiment=39_tapct_enc_i_128
+#
+# Note: encoder_native_grid / primus_sidecar are inherited from 35 but IGNORED by the tap_ct
+# encoder (it is always native-grid and loads weights from HF).
+defaults:
+  - 35_colipri_enc_8_i_128
+  - _self_
+
+data:
+  crop_spacing_mm: 1.5
+  train_spacing_range: [1.0, 4.0]
+arch:
+  encoder: tap_ct
+  encoder_stage: 7
+  encoder_precision: bf16

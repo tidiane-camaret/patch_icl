@@ -1,3 +1,28 @@
+"""Produce embeddings from a CT nifti with `fomofo/tap-ct-b-3d` (3D DINOv2 ViT).
+
+Preprocessing pipeline (source of truth in parentheses):
+
+1. Orientation -> LPS          (this script, tap_ct.py): nibabel loads (X,Y,Z),
+   transposed to (Z,Y,X); spacing/origin copied but the direction matrix is
+   dropped; then `sitk.DICOMOrient(vol, 'LPS')`.
+2. Resize -> (z, 224, 224)     (TAPCTProcessor._resize_spatial): trilinear,
+   align_corners=False. ONLY H,W are resized to resize_dims=(224,224); depth is
+   left untouched. resize_dims is fixed at 224 for this checkpoint (no 512).
+3. Pad z to multiple of 4      (TAPCTProcessor._pad_axial): one-sided pad at the
+   END of z with a hardcoded -1024 HU (divisible_pad_z=4).
+4. Clip [-1008, 822]           (torch.clamp): runs AFTER the pad, so the -1024
+   pad voxels get clamped up to -1008 (-> ~-2.855 after normalization).
+5. Z-score normalize           (x - (-86.8086)) / 322.6347.
+
+Order inside the processor: resize -> pad_z -> clip -> normalize.
+Patch size (4,8,8), embed_dim 768, +4 register +1 cls. In-plane is always
+224/8=28 -> 28x28=784 patches/slice, so token count depends only on depth:
+    N = (D_pad / 4) * 784 + 5
+e.g. raw (179,192,294) -> pad z 179->180 -> 45*784 + 5 = 35285 tokens.
+
+Note: depth spacing is never resampled (only padded), so voxels stay
+anisotropic unless the input z-spacing already matches.
+"""
 import numpy as np
 import nibabel as nib
 import SimpleITK as sitk

@@ -24,7 +24,29 @@ augmentations:
       grid_scale: 8
 
   # -----------------------------------------------------------------------
-  # Intensity augmentations  —  nnUNet defaults
+  # Per-image geometric augmentations  —  INDEPENDENT transform per volume
+  # (unlike `task`, which shares one transform across all K+1 volumes to keep the
+  # target/context correspondence). Consumed by data.self_context.augs.per_image to jitter the
+  # self-context copy's pose. Default OFF (all p=0) → no-op.
+  # -----------------------------------------------------------------------
+  per_image:
+    flip:
+      p_d: 0.0
+      p_h: 0.0
+      p_w: 0.0
+    affine:
+      p: 0.0
+      max_angle_deg: 30.0
+      scale_min: 0.85
+      scale_max: 1.15
+      max_translate: 0.1
+    elastic:
+      p: 0.0
+      alpha: 0.12
+      grid_scale: 8
+
+  # -----------------------------------------------------------------------
+  # Intensity augmentations  —  nnUNet defaults (already per-image)
   # -----------------------------------------------------------------------
   intensity:
     hu_jitter: 0

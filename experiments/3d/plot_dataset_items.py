@@ -36,8 +36,26 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # for sibling `common` (dir name '3d' isn't importable)
 
+from torch.utils.data import RandomSampler
+
 from src.totalseg_dataloader_incontext import incontext_collate_fn
-from common import build_dataset  # noqa: E402  experiments/3d/common.py
+from common import build_dataset, SpacingBatchSampler  # noqa: E402  experiments/3d/common.py
+
+
+def _merge_batches(batches: list[dict]) -> dict:
+    """Concatenate a list of collated (batch-of-1) dicts into one batch dict.
+
+    Tensors are cat'd along the batch dim; list values (subjects, label_names)
+    are flattened. Lets us gather N items that were each drawn with their own
+    per-batch spacing by SpacingBatchSampler(batch_size=1).
+    """
+    out: dict = {}
+    for k, v in batches[0].items():
+        if torch.is_tensor(v):
+            out[k] = torch.cat([b[k] for b in batches], dim=0)
+        else:
+            out[k] = [x for b in batches for x in b[k]]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +133,31 @@ def main():
     N = min(args.n_samples, len(ds))
     num_labels = cfg.data.get("num_labels_per_sample", 1)
 
-    loader = DataLoader(ds, batch_size=N, shuffle=True, num_workers=0,
-                        collate_fn=incontext_collate_fn)
-    batch = next(iter(loader))
-    has_palette = "label_palette" in batch
+    # Variable-spacing train split: mirror train_loader by drawing each item's crop
+    # spacing log-uniformly from data.train_spacing_range via SpacingBatchSampler. We use
+    # batch_size=1 so every row (not every batch) gets its own spacing; without this
+    # the plot's single batch would report a constant crop_spacing_mm for all rows.
+    train_spacing_range = cfg.data.get("train_spacing_range", None)
+    use_spacing = args.split == "train" and train_spacing_range is not None
+    if use_spacing:
+        sampler = SpacingBatchSampler(RandomSampler(ds), batch_size=1,
+                                      spacing_range=train_spacing_range,
+                                      seed=int(cfg.get("train", {}).get("seed", 0)))
+        loader = DataLoader(ds, batch_sampler=sampler, num_workers=0,
+                            collate_fn=incontext_collate_fn)
+        singles = []
+        for b in loader:
+            singles.append(b)
+            if len(singles) >= N:
+                break
+        batch = _merge_batches(singles)
+    else:
+        loader = DataLoader(ds, batch_size=N, shuffle=True, num_workers=0,
+                            collate_fn=incontext_collate_fn)
+        batch = next(iter(loader))
+    has_palette  = "label_palette" in batch
+    has_spacing  = "spacing" in batch
+    has_ctx_subj = "context_subjects" in batch   # per-context case ids (self-context detect)
 
     # Layout: one column per volume (target + K contexts), or — with
     # --separate_overlay — two columns per volume (raw scan, then mask overlay).
@@ -128,7 +167,8 @@ def main():
     n_cols    = per_vol * (1 + K)
     col_w     = 2.4
     fig, axes = plt.subplots(N, n_cols, figsize=(col_w * n_cols, col_w * N),
-                             squeeze=False)
+                             squeeze=False,
+                             gridspec_kw={"hspace": 0.02, "wspace": 0.02})
 
     for v, name in enumerate(vol_names):
         if sep:
@@ -145,16 +185,49 @@ def main():
         vols += [(batch["context_in"][row, k], batch["context_out"][row, k])
                  for k in range(K)]
 
+        target_subj = batch["subjects"][row]
+        ctx_ids = batch["context_subjects"][row] if has_ctx_subj else None
+
         for v, (im, mk) in enumerate(vols):
             img_sl, mask_sl = _best_slice(im, mk)
+            cols = [2 * v, 2 * v + 1] if sep else [v]
             if sep:
                 axes[row, 2 * v].imshow(_raw_rgb(img_sl))               # scan only
                 axes[row, 2 * v + 1].imshow(_overlay(img_sl, mask_sl, colours))
             else:
                 axes[row, v].imshow(_overlay(img_sl, mask_sl, colours))
 
-        axes[row, 0].set_ylabel(f"{batch['subjects'][row]}\n{batch['label_names'][row]}",
-                                fontsize=7, rotation=0, labelpad=90, va="center")
+            # Per-context case id + self-context marker (context columns only). A context
+            # whose case id == the target case is self-context (leaked clone) — flag it red.
+            if ctx_ids is not None and v >= 1:
+                cid = ctx_ids[v - 1]
+                is_self = cid == target_subj
+                lead = axes[row, cols[0]]
+                lead.text(0.03, 0.97, f"{cid}{'  SELF' if is_self else ''}",
+                          transform=lead.transAxes, ha="left", va="top", fontsize=6,
+                          color="white", bbox=dict(
+                              facecolor=("crimson" if is_self else "0.2"),
+                              alpha=0.75, pad=1.5, edgecolor="none"))
+                if is_self:
+                    for c in cols:
+                        for spn in axes[row, c].spines.values():
+                            spn.set_color("crimson"); spn.set_linewidth(2.5)
+
+        sp_str = ""
+        if has_spacing:
+            sp = batch["spacing"][row].tolist()
+            sp_str = "\n" + "×".join(f"{s:.2g}" for s in sp) + " mm"
+        # Item-level self-context tag: all contexts == target (full) or some (part).
+        self_tag = ""
+        if ctx_ids is not None:
+            n_self = sum(c == target_subj for c in ctx_ids)
+            if n_self == len(ctx_ids):
+                self_tag = "\n[SELF-CTX]"
+            elif n_self > 0:
+                self_tag = f"\n[part-self {n_self}/{len(ctx_ids)}]"
+        axes[row, 0].set_ylabel(
+            f"{target_subj}\n{batch['label_names'][row]}{sp_str}{self_tag}",
+            fontsize=7, rotation=0, labelpad=90, va="center")
 
     for ax in axes.flat:
         ax.set_xticks([]); ax.set_yticks([])
@@ -182,12 +255,15 @@ def main():
         synth_on  = args.split == "train" and bool(cfg.data.synth_method)
         aug_tag   = " + aug"                          if aug_on   else ""
         synth_tag = f" + synth(p={cfg.data.p_synth})" if synth_on else ""
-        extra     = f"{aug_tag}{synth_tag}"
+        sp_tag    = (f" | spacing∈{list(train_spacing_range)}mm" if use_spacing
+                     else f" | crop_spacing={cfg.data.get('crop_spacing_mm', 1.5)}mm"
+                          if cfg.data.get("use_crop") else "")
+        extra     = f"{aug_tag}{synth_tag}{sp_tag}"
     fig.suptitle(
         f"{source}  |  split={args.split}  |  K={K}{extra}",
         fontsize=11, y=1.01,
     )
-    fig.tight_layout()
+    fig.tight_layout(h_pad=0.2, w_pad=0.2)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "experiments" / "3d"))      # common / eval / eval
 from common import DEVICE, make_eval_loader, _source_root          # noqa: E402
 from data.totalseg_classes import resolve_classes                  # noqa: E402
 from feature_sim.adapters import (                                 # noqa: E402
-    PatchSet3DEncoderAdapter, PrimusEncoderAdapter)
+    PatchSet3DEncoderAdapter, PrimusEncoderAdapter, TapCTEncoderAdapter)
 from feature_sim.cost import measure_encode_cost                   # noqa: E402
 from feature_sim.labels import grid_labels, sample_points          # noqa: E402
 from feature_sim.metrics import (                                  # noqa: E402
@@ -57,7 +57,14 @@ def _maybe_compile(adapter, model, cfg):
     if prim is not None and hasattr(prim, "eva"):
         prim.eva = torch.compile(prim.eva, dynamic=True)
         done.append("frozen eva")
-    print(f"  torch.compile (dynamic=True) on: {', '.join(done) or '(nothing)'} — first batch slow")
+    # frozen tap-ct: compile the whole HF ViT. The adapter always encodes one volume at a
+    # time (pixel_values (1,1,T,T,T), fixed T), so shapes are static -> dynamic=False. The
+    # SDPA-patched attention compiles fine (F.scaled_dot_product_attention). See tap_ct_compile.py.
+    if cfg.eval.model == "tap_ct" and getattr(adapter, "model", None) is not None:
+        mode = cfg.eval.get("tapct", {}).get("compile_mode", "default")
+        adapter.model = torch.compile(adapter.model, mode=mode, dynamic=False)
+        done.append(f"tap_ct ViT ({mode})")
+    print(f"  torch.compile on: {', '.join(done) or '(nothing)'} — first batch slow")
 
 
 def plan_sweep(tiers, resolutions, budget, R):
@@ -117,11 +124,22 @@ def _primus_spec(cfg):
     return weights, pk, preproc
 
 
+def _tapct_spec(cfg):
+    """Resolve TapCTEncoderAdapter kwargs from eval.tapct (all optional) + data.image_size."""
+    t = cfg.eval.get("tapct") or {}
+    return dict(precision=t.get("precision", "bf16"),
+                to_lps=bool(t.get("to_lps", True)),
+                resize_native=bool(t.get("resize_native", True)),
+                pad_hu=t.get("pad_hu"),
+                max_layers=t.get("max_layers"),
+                image_size=int(cfg.data.image_size[-1]))
+
+
 def build_adapter(cfg):
     """Dispatch on cfg.eval.model -> (adapter, model_or_none).
 
     model_or_none is the PatchSet3D used for real_dice (a segmenter); None for a generic
-    frozen encoder (Primus/CoLiPri), whose study reports intrinsic metrics only."""
+    frozen encoder (Primus/CoLiPri/tap_ct), whose study reports intrinsic metrics only."""
     which = cfg.eval.model
     if which == "patchset3d":
         m = _load_patchset(cfg)
@@ -133,7 +151,11 @@ def build_adapter(cfg):
         return PrimusEncoderAdapter(weights_path=weights, primus_kwargs=pk,
                                     preproc=preproc, device=DEVICE.type,
                                     autocast=bool(cfg.eval.get("autocast", True))), None
-    raise ValueError(f"unknown eval.model {which!r} (expected patchset3d | primus)")
+    if which == "tap_ct":
+        # Frozen tap-ct-b-3d: self-preprocesses (de-norm/reorient/TAP processor) and
+        # self-autocasts via precision. tiers=[backbone] only. See TapCTEncoderAdapter.
+        return TapCTEncoderAdapter(device=DEVICE.type, **_tapct_spec(cfg)), None
+    raise ValueError(f"unknown eval.model {which!r} (expected patchset3d | primus | tap_ct)")
 
 
 def _rows_for_task(adapter, model, item, cfg, plan, input_res, gen):

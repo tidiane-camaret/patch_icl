@@ -1,0 +1,38 @@
+# @package _global_
+# Experiment 40 — larger downstream transformer ("large head") on the frozen CoLiPri encoder.
+# Builds on experiment 35 (native-grid, 8-block, 128³ @ resolution 16) and:
+#   - widens/deepens the transformer: l=4 blocks, e=768, h=3072, a=12 heads (vs 35's l=2/e=512),
+#     testing whether head capacity — not the frozen features — bounds Dice.
+#   - full train class set (data.train_classes=all) + class-balanced sampling so small anatomy
+#     is seen as often as large (the size↔Dice stall lives in the small classes).
+#   - crop_spacing_mm=1.5 (finer physical cell than 35's 2 mm), mask_occupancy_thr=0.1 (keep thin
+#     masks alive under the 8× occupancy pooling), raw_ct=true (lossless native HU reads).
+#   - spacing-aware stack (both stages): encoder RoPE + transformer RoPE scaled by voxel spacing.
+# Equivalent to:
+#   python experiments/3d/train.py experiment=35_colipri_enc_8_i_128 \
+#     data.train_classes=all data.crop_spacing_mm=1.5 data.mask_occupancy_thr=0.1 \
+#     data.class_balanced=true data.raw_ct=true arch.encoder_spacing_aware=true \
+#     arch.l=4 arch.e=768 arch.h=3072 arch.a=12 \
+#     +arch.transformer_rope=true +arch.rope_theta=100.0
+# Run with:
+#   python experiments/3d/train.py experiment=40_colipri_large_head
+# Decoder/head ceiling probe (trivial-matching sanity): add data.self_context=true.
+defaults:
+  - 35_colipri_enc_8_i_128
+  - _self_
+
+data:
+  train_classes: all
+  crop_spacing_mm: 1.5
+  mask_occupancy_thr: 0.1
+  class_balanced: true
+  raw_ct: true
+
+arch:
+  encoder_spacing_aware: true
+  l: 4
+  e: 768
+  h: 3072
+  a: 12
+  transformer_rope: true
+  rope_theta: 100.0

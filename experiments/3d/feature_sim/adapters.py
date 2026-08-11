@@ -455,3 +455,216 @@ class PrimusEncoderAdapter(EncoderAdapter):
 
         x = torch.zeros(1, 1, *self.input_shape, device=self.device)
         return _EncodeFwd().to(self.device), (x,)
+
+
+# ---------------------------------------------------------------------------
+# Frozen fomofo/tap-ct-b-3d 3D ViT adapter (weights fixed on HF).
+# Native token grid is ANISOTROPIC (T/4, T/8, T/8) from patch (4,8,8); we encode
+# once at the native grid, inverse-reorient it back to the loader's RAS frame so it
+# aligns with grid_labels, cache it, and _down_to(res) for the sweep. See
+# experiments/encoders/tapct_features.py for the dataloader->TAP bridge.
+# ---------------------------------------------------------------------------
+
+
+class TapCTEncoderAdapter(EncoderAdapter):
+    """Frozen tap-ct-b-3d ViT as a feature source for the similarity study.
+
+    tiers=['backbone']. Preprocessing bridges the loader's z-scored-HU / RAS tensor to
+    TAP's raw-HU / LPS input (de-norm, reorient, TAP processor). The LPS-frame token grid
+    is inverse-reoriented back to RAS so it aligns with grid_labels (which pools the mask
+    in the loader frame). Encoded once at native res, cached (storage ptr, shape), then
+    _down_to(res) — "compute at native anisotropic, resample to res^3".
+    """
+
+    def __init__(self, precision="bf16", to_lps=True, resize_native=True,
+                 pad_hu=None, image_size=224, max_layers=None, device="cuda"):
+        import sys
+        import pathlib
+        enc_dir = pathlib.Path(__file__).resolve().parents[2] / "encoders"
+        if str(enc_dir) not in sys.path:
+            sys.path.insert(0, str(enc_dir))
+        from tapct_features import (load_model, make_processor, dense_features,
+                                     item_to_tap_input)
+        self._dense_features = dense_features
+        self._item_to_tap = item_to_tap_input
+        T = int(image_size)
+        assert T % 8 == 0, f"tap_ct needs image_size divisible by 8, got {T}"
+        self.T = T
+        self.device = device
+        self.precision = precision
+        self.to_lps = bool(to_lps)
+        self.pad_hu = pad_hu
+        self.model = load_model(torch.device(device), use_sdpa=True)
+        self.proc = make_processor(T)
+        if not resize_native:
+            self.proc.resize_dims = (224, 224)      # stock in-plane upsample
+        self._native_cache = {}
+        # Truncate the transformer to the first `max_layers` blocks to cut compute (the block
+        # loop always runs every block, so `n` alone doesn't save FLOPs -> physically drop the
+        # tail + update n_blocks, else get_intermediate_layers' count assert fails). Mid-stack
+        # (~7/12) often gives the best correspondence AND ~40% less compute (see docs/logs.md).
+        vit = getattr(self.model, "model", self.model)
+        total = getattr(vit, "n_blocks", None) or len(vit.blocks)
+        if max_layers is not None and 0 < int(max_layers) < total:
+            if getattr(vit, "chunked_blocks", False):
+                print("  [tap_ct] chunked_blocks=True; skipping max_layers truncation")
+            else:
+                k = int(max_layers)
+                vit.blocks = nn.ModuleList(list(vit.blocks)[:k])
+                vit.n_blocks = k
+                print(f"  [tap_ct] truncated to first {k}/{total} transformer blocks")
+        # transformer depth (for the backbone_layers tier); robust to attribute path.
+        self.n_blocks = getattr(vit, "n_blocks", None) or len(vit.blocks)
+
+    _DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+    @property
+    def R(self):
+        return self.T // 8                          # in-plane native grid res (coarse axis)
+
+    @property
+    def n_layers(self):
+        return self.n_blocks
+
+    def tiers(self):
+        return ["backbone", "backbone_layers"]
+
+    def native_res(self, tier, input_res):
+        assert tier in ("backbone", "backbone_layers"), f"unknown tap_ct tier {tier!r}"
+        return self.T // 8
+
+    def reset_cache(self):
+        self._native_cache.clear()
+
+    def _inv_reorient(self, g):
+        """Inverse of tapct_features.ras_to_lps_axial_first on a (C, gS,gP,gL) grid:
+        flip the (P,L) grid axes then transpose(2,1,0) -> (C, gR,gA,gS) RAS order, so the
+        grid aligns with grid_labels' RAS-frame mask pooling."""
+        return g.flip(2, 3).permute(0, 3, 2, 1).contiguous()
+
+    def _tokens_to_grid(self, tokens):
+        """(1, N, C) patch tokens (row-major gS,gP,gL) -> (C, gR,gA,gS) native grid in RAS
+        frame. In-plane grid = resize_dims/8 (patch 8); depth = N/(gh*gw) (patch 4)."""
+        rh, rw = self.proc.resize_dims
+        gh, gw = rh // 8, rw // 8
+        n, c = tokens.shape[1], tokens.shape[2]
+        g = tokens[0].float().reshape(n // (gh * gw), gh, gw, c).permute(3, 0, 1, 2)
+        return self._inv_reorient(g) if self.to_lps else g
+
+    def _to_res(self, f, res):
+        """Resample an anisotropic native grid (B,C,·,·,·) to res^3 (cell-centered, matching
+        grid_labels' RAS pooling). _down_to can't be used — it keys off shape[-1] only."""
+        if tuple(f.shape[-3:]) == (res, res, res):
+            return f
+        return F.interpolate(f, size=(res, res, res), mode="trilinear", align_corners=False)
+
+    @torch.no_grad()
+    def _encode_native(self, volumes):
+        """(B,1,D,H,W) loader tensor -> (B, C, gR,gA,gS) native grid in RAS frame, cached.
+
+        Key on the ORIGINAL caller-retained tensor's storage ptr (not a `.to(device)`
+        temporary, whose storage is freed and reused across target/context calls -> cache
+        collisions returning the wrong volume's features). dense_features moves data to the
+        device internally, so volumes may stay on CPU here.
+        """
+        key = (volumes.untyped_storage().data_ptr(), tuple(volumes.shape))
+        cached = self._native_cache.get(key)
+        if cached is not None:
+            return cached
+        dev = torch.device(self.device)
+        grids = []
+        for b in range(volumes.shape[0]):
+            rows, gd = self._dense_features(self.model, self.proc, volumes[b], dev,
+                                            to_lps=self.to_lps, precision=self.precision)
+            g = rows.reshape(*gd, -1).permute(3, 0, 1, 2)      # (C, g0,g1,g2)
+            if self.to_lps:
+                g = self._inv_reorient(g)                      # LPS grid -> RAS order
+            grids.append(g.float())
+        # dense_features/embed return CPU tensors; keep the grid on-device so the downstream
+        # cosine metrics run on GPU (else run.py's TAP rows fall back to slow CPU matmuls).
+        f = torch.stack(grids, 0).to(dev)                      # (B, C, ·, ·, ·)
+        self._native_cache[key] = f
+        return f
+
+    @torch.no_grad()
+    def features(self, volumes, tier, res):
+        assert tier == "backbone", f"unknown tap_ct tier {tier!r}"
+        return self._to_res(self._encode_native(volumes), res)
+
+    def _grid_sample(self, f, coords):
+        xyz = coords.to(self.device).flip(-1).view(coords.shape[0], coords.shape[1], 1, 1, 3)
+        s = F.grid_sample(f, xyz, mode="bilinear", align_corners=True)   # (B,C,N,1,1)
+        return s.squeeze(-1).squeeze(-1).transpose(1, 2)                 # (B,N,C)
+
+    @torch.no_grad()
+    def sample_features(self, volumes, tier, coords):
+        """coords (B,N,3) normalized in (z,y,x)=(d,h,w) RAS order -> (B,N,C)."""
+        assert tier == "backbone", f"unknown tap_ct tier {tier!r}"
+        return self._grid_sample(self._encode_native(volumes), coords)
+
+    # -- per-layer (backbone_layers tier) ---------------------------------
+    @torch.no_grad()
+    def _encode_native_layers(self, volumes):
+        """(B,1,D,H,W) -> list (len n_blocks) of (B, C, gR,gA,gS) native grids in RAS frame,
+        one per transformer block, cached. Uses model(output_hidden_states=True) so a single
+        forward yields every block's token grid."""
+        key = ("layers", volumes.untyped_storage().data_ptr(), tuple(volumes.shape))
+        cached = self._native_cache.get(key)
+        if cached is not None:
+            return cached
+        dev = torch.device(self.device)
+        prec = self.precision
+        actx = (contextlib.nullcontext() if prec == "fp32"
+                else torch.autocast("cuda", dtype=self._DTYPES[prec]))
+        per_vol = []                                       # per_vol[b] = list over layers
+        for b in range(volumes.shape[0]):
+            pix = self._item_to_tap(volumes[b], self.proc, to_lps=self.to_lps,
+                                    pad_hu=self.pad_hu).to(dev)
+            with actx:
+                hs = self.model(pix, output_hidden_states=True).hidden_states  # tuple (1,N,C)
+            per_vol.append([self._tokens_to_grid(h) for h in hs])
+        n_l = len(per_vol[0])
+        grids = [torch.stack([per_vol[b][l] for b in range(len(per_vol))], 0).to(dev)
+                 for l in range(n_l)]                      # list (n_l) of (B,C,·,·,·)
+        self._native_cache[key] = grids
+        return grids
+
+    @torch.no_grad()
+    def features_per_layer(self, volumes, res):
+        """List (len n_blocks) of (B, C, res, res, res) — one entry per transformer block."""
+        return [self._to_res(g, res) for g in self._encode_native_layers(volumes)]
+
+    @torch.no_grad()
+    def sample_features_per_layer(self, volumes, coords):
+        """coords (B,N,3) in (z,y,x) RAS order -> list (len n_blocks) of (B,N,C)."""
+        return [self._grid_sample(g, coords) for g in self._encode_native_layers(volumes)]
+
+    def cost_target(self, input_res):
+        """Encode-cost probe: the TAP forward on a native-size pixel_values built from a zero
+        (de-norms to a constant HU) volume. FLOPs via count_encode_flops (fvcore can't trace
+        SDPA); timing/VRAM measured by the caller."""
+        from tapct_features import item_to_tap_input
+        adapter = self
+        zero = torch.zeros(1, self.T, self.T, self.T)
+        pix = item_to_tap_input(zero, self.proc, to_lps=self.to_lps,
+                                pad_hu=self.pad_hu).to(self.device)
+
+        class _EncodeFwd(nn.Module):
+            def forward(self, x):
+                return adapter.model(x).last_hidden_state
+
+        return _EncodeFwd().to(self.device), (pix,)
+
+    def count_encode_flops(self, module, inputs):
+        """GFLOPs of one encode via torch FlopCounterMode, which counts SDPA/flash kernels
+        that fvcore can't trace (and doesn't flood stdout). Counted on eager fp32 — FLOPs are
+        precision/compile-independent."""
+        try:
+            from torch.utils.flop_counter import FlopCounterMode
+            fc = FlopCounterMode(display=False)
+            with torch.no_grad(), fc:
+                module(*inputs)
+            return fc.get_total_flops() / 1e9
+        except Exception as e:                             # honest None on failure
+            print(f"  [tap_ct] FLOP count failed: {type(e).__name__}: {e}")
+            return None

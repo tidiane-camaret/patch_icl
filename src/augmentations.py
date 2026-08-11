@@ -161,6 +161,46 @@ def apply_task_aug(
     return images, masks
 
 
+def apply_per_image_aug(image, mask, cfg):
+    """Per-IMAGE geometric aug: an INDEPENDENT flip/affine/elastic on ONE volume.
+
+    Unlike apply_task_aug — which draws ONE shared transform for all K+1 volumes so the
+    target/context correspondence is preserved — this draws its own random transform for a
+    single (image, mask), so the volume's pose changes relative to the others. Used to jitter
+    a self-context copy's pose independently of the target (pose-invariance training lever).
+    `cfg` mirrors the task schema: cfg.flip / cfg.affine / cfg.elastic. Shapes preserved:
+    image (1, D, H, W), mask (D, H, W)."""
+    img = image.unsqueeze(0)        # (1, 1, D, H, W)
+    msk = mask.unsqueeze(0)         # (1, D, H, W)
+
+    fcfg = cfg.flip
+    for vol_dim, mask_dim, p in [(2, 1, fcfg.p_d), (3, 2, fcfg.p_h), (4, 3, fcfg.p_w)]:
+        if random.random() < p:
+            img = img.flip(vol_dim); msk = msk.flip(mask_dim)
+
+    acfg = cfg.affine
+    if random.random() < acfg.p:
+        max_rad = acfg.max_angle_deg * math.pi / 180.0
+        rx, ry, rz = (random.uniform(-max_rad, max_rad) for _ in range(3))
+        scale = random.uniform(acfg.scale_min, acfg.scale_max)
+        tx, ty, tz = (random.uniform(-acfg.max_translate, acfg.max_translate) for _ in range(3))
+        theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)
+        grid = F.affine_grid(theta, img.shape, align_corners=False)
+        img, msk = _apply_grid(img, msk, grid)
+
+    ecfg = cfg.elastic
+    if random.random() < ecfg.p:
+        _, _, D, H, W = img.shape
+        gs = max(ecfg.grid_scale, 2)
+        sd, sh, sw = max(D // gs, 2), max(H // gs, 2), max(W // gs, 2)
+        disp = F.interpolate(torch.randn(1, 3, sd, sh, sw) * ecfg.alpha, size=(D, H, W),
+                             mode="trilinear", align_corners=False).permute(0, 2, 3, 4, 1)
+        base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), img.shape, align_corners=False)
+        img, msk = _apply_grid(img, msk, (base + disp).clamp(-1.0, 1.0))
+
+    return img.squeeze(0), msk.squeeze(0)   # (1, D, H, W), (D, H, W)
+
+
 # ---------------------------------------------------------------------------
 # Within-task (intensity, independent per volume)
 # ---------------------------------------------------------------------------

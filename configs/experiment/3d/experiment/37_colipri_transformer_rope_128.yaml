@@ -1,0 +1,18 @@
+# @package _global_
+# Experiment 37 — spacing-aware 3D RoPE in the downstream transformer.
+# Builds on experiment 36 (spacing-aware frozen CoLiPri encoder, train_spacing_range=[1,4]) and
+# gives the transformer the SAME positional scheme as the encoder:
+#   - arch.transformer_rope=true: 3D axial RoPE on the sample (cross-cell) axis, replacing the
+#     spacing-blind additive Fourier PE (RoPE-only). Positions are scaled by spacing/2mm exactly
+#     like the encoder, so a fixed anatomical distance -> a fixed rotary phase across 1-4 mm.
+# At 2 mm the RoPE positions are identity integers 0..15 (theta=100 valid); 1 mm interpolates,
+# 4 mm extrapolates — matching the encoder's regime. Now BOTH stages are spacing-aware.
+# Run with:
+#   python experiments/3d/train.py experiment=37_colipri_transformer_rope_128
+defaults:
+  - 36_colipri_spacing_aware_128
+  - _self_
+
+arch:
+  transformer_rope: true
+  rope_theta: 100.0

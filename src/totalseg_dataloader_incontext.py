@@ -48,8 +48,12 @@ from src.totalseg_dataset import (
     _build_label_volume,
     _iso_size,
     _resize_volume,
+    normalize_ct,
+    normalize_mri,
 )
-from src.augmentations import apply_task_aug, apply_intensity_aug, apply_synth_aug
+from src.augmentations import (
+    apply_task_aug, apply_intensity_aug, apply_synth_aug, apply_per_image_aug,
+)
 
 
 def _to_ns(obj):
@@ -222,10 +226,34 @@ class TotalSegInContextDataset(Dataset):
         n_synth_merge_min: int = 1,
         n_synth_merge_max: int = 1,
         eval_seed: Optional[int] = None,
+        raw_ct: bool = False,
+        modality: str = "ct",
+        self_context: float = 0.0,
+        self_context_intensity: bool = False,
+        self_context_per_image: bool = False,
     ):
         self.root = Path(root)
         self.classes = list(classes)
         self.image_size = image_size
+        # raw_ct: read native ct_raw.npy (raw intensities) and normalise the CROP on the fly
+        # instead of the pre-normalised ct.npy. Affects only native-resolution reads (use_crop
+        # + synth crop + slow nii path); the pre-resized fast path keeps its normalised
+        # ct_{size}.npy (derived + already lossy from downsampling). For CT the normalisation is
+        # a global pointwise transform, so crop==whole; for MRI it uses per-volume stats from
+        # ct_stats.json (whole-volume, so crops stay consistent). See src.totalseg_dataset.
+        assert modality in ("ct", "mri"), modality
+        self.raw_ct = bool(raw_ct)
+        self.modality = modality
+        # self_context: PROBABILITY (0..1; True->1.0) that an item's K contexts are replaced by
+        # clones of the (augmented) target. 1.0 = always (the decoder/matching ceiling probe:
+        # every query token has an identical support twin -> trivial matching, pure reconstruction,
+        # leakage by design). self_context_{intensity,per_image} independently re-augment each clone
+        # (per_image = geometric pose jitter via aug_cfg.per_image; intensity = appearance jitter via
+        # aug_cfg.intensity) so target != context by a controlled amount — the pose/appearance-
+        # invariance training levers, each toggleable for clean A/B isolation. 0.0 = cross-subject.
+        self.self_context_p = float(self_context)
+        self.self_context_intensity = bool(self_context_intensity)
+        self.self_context_per_image = bool(self_context_per_image)
         self._size_str = (
             f"{image_size[0]}x{image_size[1]}x{image_size[2]}"
             if image_size is not None else None
@@ -319,6 +347,13 @@ class TotalSegInContextDataset(Dataset):
         # Loaded once from spacings.json at the dataset root; falls back to 1mm
         # isotropic for subjects not present (pre-existing data without spacing info).
         self._spacings = self._load_spacings()
+
+        # Per-volume MRI normalisation stats (ct_stats.json), needed only for raw_ct MRI.
+        self._ct_stats = (self._load_ct_stats()
+                          if self.raw_ct and self.modality == "mri" else {})
+        if self.raw_ct:
+            print(f"raw_ct path ON (modality={self.modality}): native reads use ct_raw.npy "
+                  f"+ on-the-fly normalisation", flush=True)
 
         # Synth path: build SV-ID cache for fast __getitem__ sampling
         if synth_method is not None:
@@ -574,6 +609,40 @@ class TotalSegInContextDataset(Dataset):
             result[subj] = sp
         return result
 
+    def _load_ct_stats(self) -> dict[str, dict]:
+        """Load per-volume MRI normalisation stats (ct_stats.json) written by
+        convert_to_npy --store-raw --modality mri. Returns {} if absent."""
+        path = self.root / "ct_stats.json"
+        if not path.exists():
+            return {}
+        with open(path) as f:
+            return json.load(f)
+
+    def _normalize_native(self, subj: str, arr: np.ndarray) -> np.ndarray:
+        """Normalise a raw native array (or a crop of it) to model input space.
+
+        CT: global pointwise transform (crop == whole). MRI: per-volume stats from
+        ct_stats.json (whole-volume, so every crop of a subject normalises identically)."""
+        if self.modality == "mri":
+            st = self._ct_stats.get(subj)
+            if st is None:
+                raise KeyError(
+                    f"raw_ct MRI: no ct_stats.json entry for {subj!r} — run "
+                    f"convert_to_npy.py --store-raw --modality mri to build it")
+            return normalize_mri(arr, st)
+        return normalize_ct(arr)
+
+    def _load_native_ct_mmap(self, subj_dir: Path):
+        """mmap the native CT array for the crop path: ct_raw.npy (raw) when raw_ct, else the
+        pre-normalised ct.npy. Guards against feeding raw HU as if it were normalised."""
+        if self.raw_ct:
+            arr = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
+            if self.modality == "ct":
+                assert arr.dtype == np.int16, (
+                    f"ct_raw.npy for {subj_dir.name} is {arr.dtype}, expected int16 raw HU")
+            return arr
+        return np.load(subj_dir / "ct.npy", mmap_mode="r")
+
     def _get_spacing(self, subj: str) -> torch.Tensor:
         """Return effective spacing (3,) for subject, defaulting to 1mm isotropic."""
         return self._spacings.get(subj, torch.ones(3, dtype=torch.float32))
@@ -689,7 +758,7 @@ class TotalSegInContextDataset(Dataset):
         if self.use_crop:
             # Native-res crop centred on union of all picked supervoxels
             T     = self.image_size[0]
-            ct_mm = np.load(subj_dir / "ct.npy",          mmap_mode="r")
+            ct_mm = self._load_native_ct_mmap(subj_dir)
             sv_mm = np.load(subj_dir / self._synth_fname, mmap_mode="r")
             D, H, W = sv_mm.shape
 
@@ -720,6 +789,8 @@ class TotalSegInContextDataset(Dataset):
             crop_ct = ct_mm[d0:d0+T, h0:h0+T, w0:w0+T]
             crop_sv = sv_mm[d0:d0+T, h0:h0+T, w0:w0+T]
             s       = crop_ct.shape
+            if self.raw_ct:
+                crop_ct = self._normalize_native(subj, np.ascontiguousarray(crop_ct))
 
             img_arr = np.zeros((T, T, T), dtype=np.float32)
             msk_arr = np.zeros((T, T, T), dtype=np.uint8)
@@ -794,6 +865,8 @@ class TotalSegInContextDataset(Dataset):
             "context_in":  torch.stack([it[0] for it in items[1:]]),  # (K, 1, D, H, W)
             "context_out": torch.stack(ctx_masks),                     # (K, D, H, W) int64
             "subject":     subj,
+            # synth contexts are K aug-copies of the SAME subject's supervoxel -> same case id
+            "context_subjects": [subj for _ in range(self.context_size)],
             "label_name":  f"sv_{sv_groups[0][0]}",
             "spacing":     self._reported_spacing(subj),               # (3,) mm/voxel of output tensor
         }
@@ -860,6 +933,7 @@ class TotalSegInContextDataset(Dataset):
         # shuffle-then-take; the exact per-seed picks differ from the old full-shuffle.)
         context_in:  list[torch.Tensor] = []
         context_out: list[torch.Tensor] = []
+        ctx_subjects: list[str] = []          # case id each context came from (self-context detect)
         for ctx_subj in _lazy_shuffle(self._cur_rng, candidates):
             if len(context_in) >= self.context_size:
                 break
@@ -867,6 +941,7 @@ class TotalSegInContextDataset(Dataset):
                 ctx_img, ctx_lbl = load_ctx(ctx_subj)
                 context_in.append(ctx_img)
                 context_out.append(ctx_lbl)
+                ctx_subjects.append(ctx_subj)
             except Exception:
                 continue
 
@@ -880,10 +955,12 @@ class TotalSegInContextDataset(Dataset):
             )
             context_in.append(image_t.clone())
             context_out.append(label_t.clone())
+            ctx_subjects.append(subj)
         while len(context_in) < self.context_size:
             i = self._cur_rng.randrange(len(context_in))
             context_in.append(context_in[i].clone())
             context_out.append(context_out[i].clone())
+            ctx_subjects.append(ctx_subjects[i])
 
         # --- Augmentation + coloring (shared by both paths) ----------------
         if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0:
@@ -897,12 +974,37 @@ class TotalSegInContextDataset(Dataset):
             context_in  = list(all_images[1:])
             context_out = list(all_masks[1:])
 
+        # self_context: with prob self_context_p, replace the K contexts with clones of the FINAL
+        # (post-aug) target. Bit-identical -> trivial matching (ceiling probe). The two toggles
+        # re-augment each clone INDEPENDENTLY so the context differs from the target by a controlled
+        # amount, each isolatable: self_context_per_image = geometric pose jitter (aug_cfg.per_image;
+        # NB per_image not task — task shares one transform across all K+1 volumes and must NOT be
+        # applied per-image); self_context_intensity = appearance jitter (aug_cfg.intensity). Both
+        # off -> exact clone. No-op when aug is disabled (eval).
+        if self.self_context_p > 0 and self._cur_rng.random() < self.self_context_p:
+            context_in  = [image_t.clone() for _ in range(self.context_size)]
+            context_out = [label_t.clone() for _ in range(self.context_size)]
+            ctx_subjects = [subj for _ in range(self.context_size)]   # self-context: ctx case == target
+            do_augs = self.self_context_intensity or self.self_context_per_image
+            if do_augs and self.aug_cfg is not None and self.aug_cfg.enabled:
+                pi_cfg = getattr(self.aug_cfg, "per_image", None)
+                aug_in, aug_out = [], []
+                for ci, cm in zip(context_in, context_out):
+                    if self.self_context_per_image and pi_cfg is not None:
+                        ci, cm = apply_per_image_aug(ci, cm, pi_cfg)
+                    if self.self_context_intensity:
+                        ci = apply_intensity_aug(ci, self.aug_cfg.intensity)
+                    aug_in.append(ci)
+                    aug_out.append(cm)
+                context_in, context_out = aug_in, aug_out
+
         item = {
             "image":       image_t,
             "label":       label_t,                   # (D, H, W) int64 always
             "context_in":  torch.stack(context_in),   # (K, 1, D, H, W)
             "context_out": torch.stack(context_out),  # (K, D, H, W) int64 always
             "subject":     subj,
+            "context_subjects": ctx_subjects,          # list[str] len K: per-context case id
             "label_name":  label_name,
             "spacing":     self._reported_spacing(subj),   # (3,) mm/voxel of output tensor
         }
@@ -963,9 +1065,12 @@ class TotalSegInContextDataset(Dataset):
             starts.append(self._cur_rng.randint(lo, hi))
         d0, h0, w0 = starts
 
-        ct_mm = np.load(subj_dir / "ct.npy", mmap_mode="r")
+        ct_mm = self._load_native_ct_mmap(subj_dir)
         crop_ct  = ct_mm   [d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
         crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
+        if self.raw_ct:
+            # normalise only the crop (CT: crop==whole; MRI: whole-volume stats from sidecar)
+            crop_ct = self._normalize_native(subj_dir.name, np.ascontiguousarray(crop_ct))
 
         # Object extent inside T³ = crop_sizes scaled by T/target_sizes (same ratio the old
         # pad-then-resize produced); a short axis maps to <T voxels and is centre-padded
@@ -1190,6 +1295,8 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         "subjects":    [b["subject"]    for b in batch],
         "label_names": [b["label_name"] for b in batch],
     }
+    if "context_subjects" in batch[0]:
+        out["context_subjects"] = [b["context_subjects"] for b in batch]  # (B) list[list[str]]
     if "label_palette" in batch[0]:
         out["label_palette"] = torch.stack([b["label_palette"] for b in batch])  # (B, L+1, 3)
     if "meta" in batch[0]:
@@ -1224,6 +1331,8 @@ def get_incontext_loader(
     num_labels_per_sample: int = 1,
     n_synth_merge_min: int = 1,
     n_synth_merge_max: int = 1,
+    raw_ct: bool = False,
+    modality: str = "ct",
 ) -> DataLoader:
     ds = TotalSegInContextDataset(
         root=root,
@@ -1245,6 +1354,8 @@ def get_incontext_loader(
         num_labels_per_sample=num_labels_per_sample,
         n_synth_merge_min=n_synth_merge_min,
         n_synth_merge_max=n_synth_merge_max,
+        raw_ct=raw_ct,
+        modality=modality,
     )
     return DataLoader(
         ds,

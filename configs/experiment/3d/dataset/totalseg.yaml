@@ -18,10 +18,18 @@ data:
   p_synth: 1
   class_balanced: true
   use_crop: true
-  crop_spacing_mm: 1.5          # output mm/voxel of use_crop crops (FOV = image_size*this); 2.0 = CoLiPri native
-  spacing_range: null           # [lo, hi] mm: per-batch log-uniform crop spacing (variable-spacing training); null = fixed crop_spacing_mm
+  raw_ct: false                 # true: read native ct_raw.npy (raw HU) + normalise the crop on the fly (needs convert_to_npy.py --store-raw). Only affects native/use_crop reads; pre-resized fast path stays normalised. Lossless vs the float16 ct.npy, storage-neutral
+  crop_spacing_mm: 1.5          # output mm/voxel of use_crop crops (FOV = image_size*this); 2.0 = CoLiPri native. Eval spacing ALWAYS, and the train spacing when train_spacing_range is null
+  train_spacing_range: null     # [lo, hi] mm: TRAIN-ONLY per-batch log-uniform crop spacing (variable-spacing training via SpacingBatchSampler); null = fixed crop_spacing_mm. Eval ignores this
   mask_downsample: nearest      # nearest | occupancy (area-pool + threshold; keeps thin masks under heavy downsampling)
   mask_occupancy_thr: 0.5       # occupancy foreground-fraction threshold: ->0 keeps every touched voxel, 0.5 = majority
+  self_context:                 # contexts = clones of the (augmented) target (trivial-matching / decoder ceiling probe, leakage by design)
+    p:                          # PROBABILITY (0..1) a sample uses self-context; split-specific so you can train self-context but eval on real cross-subject contexts
+      train: 0.0                # TRAIN prob (1.0 = always self-context; 0.0 = normal cross-subject)
+      eval: 0.0                 # VAL/TEST prob (0.0 = different-case cross-subject eval; 1.0 = ceiling probe)
+    augs:                       # when self-context fires, re-augment each clone INDEPENDENTLY (each toggle isolatable for clean A/B). No-op when aug is off (eval)
+      per_image: false          # geometric pose jitter via augmentations.per_image (set augmentations.per_image.affine.p>0 to actually warp)
+      intensity: false          # appearance jitter via augmentations.intensity (brightness/gamma/noise/blur), independent of the target's own intensity aug
   random_coloring: false
   num_labels_per_sample: 1
   train_classes: not_benchmark

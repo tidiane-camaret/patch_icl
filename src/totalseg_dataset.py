@@ -41,6 +41,40 @@ CT_NORM_MAX: float = (CT_CLIP_MAX - CT_MEAN) / CT_STD   # ≈ +3.441
 # Volume helpers
 # -------------------------------------------------------------------------
 
+def normalize_ct(vol: np.ndarray) -> np.ndarray:
+    """Global CT normalization: clip to the HU window, then dataset z-score.
+
+    Pointwise with fixed dataset-fingerprint constants — so normalizing a crop is identical
+    to normalizing the whole volume (no need to load the full volume for stats). This is the
+    shared helper used by convert_to_npy (writing ct.npy) and the raw-CT loader path."""
+    vol = np.clip(vol.astype(np.float32), CT_CLIP_MIN, CT_CLIP_MAX)
+    return (vol - CT_MEAN) / CT_STD
+
+
+def mri_stats(vol: np.ndarray) -> dict:
+    """Per-volume MRI normalization stats from the WHOLE volume: foreground percentile clip
+    bounds + foreground mean/std. Computed once (at convert time) and stored in a sidecar so
+    a crop can be normalized with whole-volume stats — crop-local stats would be inconsistent
+    across target/context and across crops of the same subject."""
+    fg = vol[vol > 0]
+    if fg.size == 0:
+        return {"clip_lo": 0.0, "clip_hi": 0.0, "mean": 0.0, "std": 1.0}
+    lo = float(np.percentile(fg, 0.5))
+    hi = float(np.percentile(fg, 99.5))
+    clipped = np.clip(vol, lo, hi)
+    fg2 = clipped[clipped > 0]
+    mean, std = float(fg2.mean()), float(fg2.std())
+    if std < 1e-6:
+        std = 1.0
+    return {"clip_lo": lo, "clip_hi": hi, "mean": mean, "std": std}
+
+
+def normalize_mri(vol: np.ndarray, stats: dict) -> np.ndarray:
+    """Apply precomputed whole-volume MRI stats (from mri_stats) to a volume or crop."""
+    vol = np.clip(vol.astype(np.float32), stats["clip_lo"], stats["clip_hi"])
+    return (vol - stats["mean"]) / stats["std"]
+
+
 def _load_ct(path: Path, jitter: float = 0) -> np.ndarray:
     """Load CT, clip HU and z-score normalise.  Returns float32 (D,H,W).
     Prefers a pre-converted ct.npy next to the .nii.gz for fast loading.

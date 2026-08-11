@@ -33,7 +33,12 @@ def measure_encode_cost(adapter, input_res, device, n_warmup=3, n_timed=10) -> d
     module, inputs = adapter.cost_target(input_res)
     module = module.eval()
 
-    row["encode_gflops"] = count_gflops(module, inputs)
+    # FLOPs: an adapter may supply its own counter (tap_ct uses torch FlopCounterMode, which
+    # counts SDPA/flash that fvcore can't trace and doesn't flood stdout); else use fvcore.
+    if hasattr(adapter, "count_encode_flops"):
+        row["encode_gflops"] = adapter.count_encode_flops(module, inputs)
+    else:
+        row["encode_gflops"] = count_gflops(module, inputs)
 
     if device.type == "cuda":
         torch.cuda.empty_cache()

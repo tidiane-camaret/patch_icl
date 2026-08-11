@@ -80,6 +80,35 @@ def build_3d_rope_freqs(
     return cos, sin
 
 
+def build_3d_rope_freqs_from_positions(
+    head_dim:  int,
+    positions: torch.Tensor,
+    theta:     float = 100.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cos/sin tables for 3D axial RoPE from explicit per-token positions.
+
+    Unlike build_3d_rope_freqs (which generates an integer grid internally), this takes
+    arbitrary float positions — so spacing-scaled coordinates and unlocated tokens (e.g.
+    thinking rows at (0,0,0)) work directly. positions: (N, 3) [d,h,w]; returns cos, sin
+    each (N, head_dim). Consistent with the grid builder when positions is a row-major
+    integer lattice.
+    """
+    d_dim, h_dim, w_dim = _axis_splits(head_dim)
+
+    def _cossin(pos: torch.Tensor, dim: int):
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=pos.device).float() / head_dim))
+        freqs = torch.outer(pos.float(), inv_freq)      # (N, dim/2)
+        freqs = torch.cat([freqs, freqs], dim=-1)       # (N, dim) — rotate_half
+        return freqs.cos(), freqs.sin()
+
+    cd, sd = _cossin(positions[:, 0], d_dim)
+    ch, sh = _cossin(positions[:, 1], h_dim)
+    cw, sw = _cossin(positions[:, 2], w_dim)
+    cos = torch.cat([cd, ch, cw], dim=-1)               # (N, head_dim)
+    sin = torch.cat([sd, sh, sw], dim=-1)
+    return cos, sin
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     return torch.cat([-x[..., d:], x[..., :d]], dim=-1)

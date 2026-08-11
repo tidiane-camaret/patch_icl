@@ -122,14 +122,26 @@ def _cached_encode(encode_fn, x, key_fn, cache: _EncodeCache):
 
 
 class PrimusEncoder(nn.Module):
+    # arch.encoder_precision -> the autocast dtype the frozen ViT forward runs at,
+    # overriding the ambient train/eval autocast for the encoder region only. "fp32"
+    # disables autocast so the fp32 params compute in fp32 (the clean control for
+    # "is bf16 rounding of the frozen features costing signal?").
+    _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+               "fp16": torch.float16, "float16": torch.float16,
+               "fp32": None, "float32": None}
+
     def __init__(self, sidecar_path, resolution, frozen=True, device="cuda",
                  cache_max=4096, encoder_stage=None, native_grid=False,
-                 spacing_aware=False):
+                 spacing_aware=False, precision="bf16"):
         super().__init__()
         from dynamic_network_architectures.architectures.primus import Primus
         with open(sidecar_path) as f:
             meta = json.load(f)
         kw = dict(meta["primus_kwargs"])
+        self.precision = str(precision).lower()
+        if self.precision not in self._DTYPES:
+            raise ValueError(f"unknown encoder_precision {precision!r} "
+                             f"({'|'.join(self._DTYPES)})")
         self.input_shape = tuple(kw["input_shape"])
         self.patch_size = int(kw["patch_embed_size"][0])
         # spacing_aware scales RoPE by physical voxel spacing (variable-spacing training);
@@ -247,14 +259,27 @@ class PrimusEncoder(nn.Module):
             x = x[:, p.register_tokens.shape[1]:]
         return x.transpose(1, 2).reshape(B, self.out_ch, W, H, D)
 
+    def _autocast_ctx(self):
+        """Autocast context for the ViT forward, from self.precision. Overrides the ambient
+        train/eval autocast for the encoder region only: fp32 disables autocast (fp32 params
+        -> fp32 compute); bf16/fp16 force that dtype. Off-cuda is always a no-op."""
+        dev = next(self.primus.parameters()).device
+        if dev.type != "cuda":
+            return torch.autocast(device_type="cpu", enabled=False)
+        dt = self._DTYPES[self.precision]
+        if dt is None:                       # fp32: disable ambient autocast for this region
+            return torch.autocast(device_type="cuda", enabled=False)
+        return torch.autocast(device_type="cuda", dtype=dt, enabled=True)
+
     def _encode_batch(self, x, spacing=None):
         """(B,1,D,H,W) -> (B,out_ch,R,R,R), grad only when trainable."""
         v = self._preprocess(x)
-        if self.frozen:
-            with torch.no_grad():
+        with self._autocast_ctx():
+            if self.frozen:
+                with torch.no_grad():
+                    f = self._encode(v, spacing)
+            else:
                 f = self._encode(v, spacing)
-        else:
-            f = self._encode(v, spacing)
         return _down_to(f.float(), self.resolution)
 
     def forward(self, x, spacing=None):

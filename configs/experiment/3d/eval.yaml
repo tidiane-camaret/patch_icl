@@ -41,6 +41,8 @@ eval:
   medverse_ckpt: null         # override Medverse.ckpt path; null = adapter default
   sw_roi_size: null           # sliding-window ROI; null = adapter default (128³)
   checkpoint: null            # trained best.pt (required for native_*/multilevel/nninteractive)
+  feat_norm: null             # patchset3d only: override the checkpoint's feature-norm mode
+                              # at eval (weight-free) -> sweep context|self|none on one ckpt
 wandb:
   project: patch_icl_3d_eval  # null to disable
   name: null

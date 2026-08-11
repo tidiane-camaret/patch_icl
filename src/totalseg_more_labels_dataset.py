@@ -82,6 +82,7 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
         use_crop: bool = False,
         crop_spacing_mm: float = 1.5,
         crop_jitter: Optional[int] = None,
+        raw_ct: bool = False,
     ):
         root = Path(root)
         # Read the global index BEFORE super().__init__: the overridden
@@ -114,6 +115,8 @@ class TotalSegMoreLabelsDataset(TotalSegInContextDataset):
             crop_jitter=crop_jitter,
             num_labels_per_sample=1,
             eval_seed=eval_seed,
+            raw_ct=raw_ct,
+            modality="ct",
         )
 
     # --- overrides -----------------------------------------------------------

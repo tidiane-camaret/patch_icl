@@ -138,3 +138,56 @@ def label_transfer(target_feats, target_labels, ctx_feats, ctx_labels,
     return {"transfer_dice": (2 * inter / (pred.sum() + g.sum() + eps)).item(),
             "transfer_precision": (inter / (pred.sum() + eps)).item(),
             "transfer_recall": (inter / (g.sum() + eps)).item()}
+
+
+def transfer_metrics(target_feats, target_labels, ctx_feats, ctx_labels,
+                     thr=0.5, chunk=2048, eps=1e-8):
+    """1-NN feature label transfer scored BOTH soft and hard, in one nearest-neighbour pass.
+
+    Soft: prediction and GT are occupancy FRACTIONS in [0,1] — threshold-free overlap
+    (matches the model's soft-Dice target; nothing depends on cell size). Hard: context
+    labels, prediction and GT are all binarised at `thr`, giving a real set-overlap Dice.
+    A thin structure whose coarse cells never reach `thr` yields an empty hard GT -> nan,
+    which itself flags under-resolution (see labels.grid_labels).
+
+    retrieval_at1 is folded in (fraction of target-FG cells whose nearest context cell is
+    FG, threshold-free). Returns soft_/hard_ {dice,precision,recall} + retrieval_at1; the
+    corresponding dice is nan when that GT has no foreground. (chunk x M) cosine bounds mem."""
+    keys = ("retrieval_at1", "soft_dice", "soft_precision", "soft_recall",
+            "hard_dice", "hard_precision", "hard_recall")
+    g = target_labels.float().clamp(0, 1)               # soft GT occupancy
+    if g.sum() <= 0:
+        return {k: float("nan") for k in keys}
+    gh = (g >= thr).float()                             # hard GT
+    fg = g > 0                                          # FG cells for retrieval@1
+    tn, cn = l2norm(target_feats), l2norm(ctx_feats)
+    cl = ctx_labels.float().clamp(0, 1)                 # soft ctx occupancy
+    clh = (cl >= thr).float()                           # hard ctx
+    ps = target_feats.new_zeros(tn.shape[0])            # soft prediction (copied fraction)
+    ph = target_feats.new_zeros(tn.shape[0])            # hard prediction (copied 0/1)
+    ret_hits = ret_tot = 0.0
+    for s in range(0, tn.shape[0], chunk):
+        idx = (tn[s:s + chunk] @ cn.T).argmax(1)        # nearest ctx cell per target cell
+        ps[s:s + chunk] = cl[idx]
+        ph[s:s + chunk] = clh[idx]
+        fc = fg[s:s + chunk]
+        if fc.any():
+            ret_hits += (cl[idx][fc] > 0).sum().item()
+            ret_tot += float(fc.sum().item())
+
+    def dpr(p, t):
+        inter = (p * t).sum()
+        return {"dice": (2 * inter / (p.sum() + t.sum() + eps)).item(),
+                "precision": (inter / (p.sum() + eps)).item(),
+                "recall": (inter / (t.sum() + eps)).item()}
+
+    soft, hard = dpr(ps, g), (dpr(ph, gh) if gh.sum() > 0 else
+                              {"dice": float("nan"), "precision": float("nan"),
+                               "recall": float("nan")})
+    return {
+        "retrieval_at1": ret_hits / ret_tot if ret_tot else float("nan"),
+        "soft_dice": soft["dice"], "soft_precision": soft["precision"],
+        "soft_recall": soft["recall"],
+        "hard_dice": hard["dice"], "hard_precision": hard["precision"],
+        "hard_recall": hard["recall"],
+    }

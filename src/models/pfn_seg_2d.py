@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.rope import apply_rope
+
 
 def patchify(x: torch.Tensor, P: int, out: int | None = None,
              mode: str = "bilinear") -> torch.Tensor:
@@ -158,7 +160,8 @@ class TransformerEncoderLayer(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
 
     def forward(self, src: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
-                full_attn: bool = False) -> torch.Tensor:
+                full_attn: bool = False,
+                rope: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         b, r, c, e = src.shape
         a, d = self.a, self.d
 
@@ -191,6 +194,15 @@ class TransformerEncoderLayer(nn.Module):
         x = self.norm2(x)
         qkv = self.qkv_row(x).reshape(b * c, r, 3, a, d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+        if rope is not None:
+            # 3D axial RoPE on the sample (row) axis: rotate q,k by each row's grid
+            # position before the k[:sep] slice below. cos/sin are (r, d) -> broadcast
+            # over the b*c batch and a heads. v is left unrotated (standard RoPE).
+            cos, sin = rope
+            cos = cos.to(q.dtype)[None, None]
+            sin = sin.to(q.dtype)[None, None]
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
         if attn_mask is not None:
             x = batched_sdpa(q, k, v, attn_mask=attn_mask)
         elif full_attn:
@@ -212,10 +224,11 @@ class TransformerEncoderStack(nn.Module):
         self.blocks = nn.ModuleList([TransformerEncoderLayer(a, e, h) for _ in range(l)])
 
     def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
-                full_attn: bool = False) -> torch.Tensor:
+                full_attn: bool = False,
+                rope: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         for i, block in enumerate(self.blocks):
             x = x * (self.residual_decay ** i)
-            x = block(x, sep, attn_mask=attn_mask, full_attn=full_attn)
+            x = block(x, sep, attn_mask=attn_mask, full_attn=full_attn, rope=rope)
         return x
 
 

@@ -1,0 +1,53 @@
+# @package _global_
+# Frozen tap-ct-b-3d feature transfer-Dice benchmark (experiments/encoders/tapct_benchmark.py).
+# 1-NN label transfer over BENCHMARK_CLASSES: each subject-class crop is encoded once
+# (crop_jitter=0), then round-robin paired with the next K subjects as context.
+#
+#   python experiments/encoders/tapct_benchmark.py
+#   python experiments/encoders/tapct_benchmark.py data.crop_spacing_mm=1.0
+#   python experiments/encoders/tapct_benchmark.py encoder.precision=fp32 encoder.to_lps=false
+#   python experiments/encoders/tapct_benchmark.py 'data.classes=[liver,spleen]' data.n_subjects=10
+defaults:
+  - cluster: nfs
+  - _self_
+hydra:
+  searchpath:
+    - file://${oc.env:PWD}/configs
+
+data:
+  root: ${paths.totalseg}
+  classes: benchmark          # benchmark | all | explicit list e.g. [liver,spleen]
+  split: test                 # test | train | val | null (all subjects)
+  n_subjects: 20              # subject-pool cap (max_subjects); >=2 per class needed
+  image_size: 224             # cube side T (divisible by 8; by 4 for depth)
+  use_crop: true              # native organ-centred crop (vs pre-resized fast path)
+  crop_spacing_mm: 1.5        # feature cell = 8*spacing in-plane, 4*spacing depth (mm)
+  crop_jitter: 0              # 0 = deterministic centred crop -> encode each once
+  context_size: 1             # K context subjects pooled per target (round-robin)
+  mask_downsample: occupancy    # nearest | occupancy (native mask resize; GT occ is area-pooled)
+  mask_occupancy_thr: 0.5
+  eval_seed: 0
+
+encoder:
+  precision: bf16             # fp32 | bf16 | fp16 (~8x speedup for bf16; FLOPs unchanged)
+  compile: true              # torch.compile the model (slow 1st call; helps many small fwds)
+  compile_mode: default       # default | reduce-overhead | max-autotune
+  to_lps: true                # RAS->LPS axial-first reorientation (matches TAP training frame)
+  resize_native: true         # processor resize_dims=(T,T); false = stock 224^2 in-plane upsample
+  pad_hu: null                # reset normalized-0 pad voxels to this HU (air=-1024); null = off
+
+metric:
+  # 1-NN transfer scored BOTH soft (fractional occupancy overlap, threshold-free) and
+  # hard (ctx/pred/GT binarised at thr -> real set-overlap Dice). thr also thresholds the
+  # plotted pred overlay. Thin structures whose coarse cells never reach thr -> hard nan.
+  thr: 0.5
+
+out:
+  csv: ${paths.results}/3d_encoders/tap_ct_transfer.csv   # per-class rows; parent auto-created
+  wandb_project: patch_icl_feature_similarity         # null disables W&B (CSV always written)
+  wandb_name: null
+
+plot:
+  n_per_task: 0               # >0 saves this many QC figures per class (target/context/pred)
+  dir: ${paths.results}/3d_encoders/tap_ct_plots
+  thr: 0.5                    # occupancy threshold for the predicted-mask overlay

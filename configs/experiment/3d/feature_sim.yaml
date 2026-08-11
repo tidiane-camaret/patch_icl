@@ -24,7 +24,7 @@ hydra:
   searchpath:
     - file://${oc.env:PWD}/configs
 eval:
-  model: patchset3d           # patchset3d | primus (frozen nnUNet ViT, e.g. CoLiPri backbone)
+  model: patchset3d           # patchset3d | primus (frozen nnUNet ViT, e.g. CoLiPri) | tap_ct (frozen tap-ct-b-3d)
   split: test
   n_subjects: null
   batch_size: 16
@@ -43,6 +43,16 @@ eval:
   primus_sidecar: results/checkpoints/primus_colipri.json        # JSON: {primus_kwargs, preproc, weights}
   primus_kwargs: null         # inline alternative to the sidecar
   preproc: null               # {clip_min,clip_max,mean,std} HU re-normalisation
+  # model=tap_ct: frozen fomofo/tap-ct-b-3d (weights on HF). tiers: backbone (final) or
+  # backbone_layers (per-block bb:L{i} depth sweep). Needs data.image_size divisible by 8.
+  # See TapCTEncoderAdapter / experiments/encoders/tapct_features.py.
+  tapct:
+    precision: bf16           # fp32 | bf16 | fp16
+    to_lps: true              # RAS->LPS axial-first reorientation (matches TAP training frame)
+    resize_native: true       # processor resize_dims=(T,T); false = stock 224^2 upsample
+    pad_hu: null              # reset normalized-0 pad voxels to this HU (air=-1024); null=off
+    compile_mode: default     # torch.compile mode when eval.compile=true (default|reduce-overhead|max-autotune)
+    max_layers: null          # keep only the first N of 12 transformer blocks (cuts compute); null=all. ~7 often best
 feature_sim:
   tiers: [stage:0, stage:1, stage:2, concat, img_embed, transformer_layers]
   resolutions: [16, 32, 48]     # >48^3 auto-switches to point mode

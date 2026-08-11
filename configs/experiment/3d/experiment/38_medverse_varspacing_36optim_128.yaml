@@ -2,7 +2,7 @@
 # Experiment 38 — exp 37 (medverse, variable-spacing, no injection) but with exp 36's EXACT
 # train/optim recipe instead of the medverse-native one. A "just trying" variant: does
 # medverse survive the patchset3d optimizer? Inherits everything from exp 37 (medverse model,
-# exp 36 data/aug, spacing_range=[1,4]) and swaps only the optim knobs to match exp 36:
+# exp 36 data/aug, train_spacing_range=[1,4]) and swaps only the optim knobs to match exp 36:
 #   adam 3e-5 / wd 0  ->  adamw 1e-4 / wd 0.01   (loss/scheduler/warmup/dice_weight/batch_size/
 #   epochs/grad_clip already equal exp 36 via exp 37); eval_every 1 -> 10 to match exp 36.
 # Two params intentionally NOT copied from exp 36, with reasons:

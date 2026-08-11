@@ -11,7 +11,7 @@
 # checkpoint=orig_weights, gentle Adam(3e-5, wd 0), bce_dice, oob_weight=10 (medverse's
 # unbounded conv head diverges to NaN under adamw/1e-4 or smooth_l1; see docs/logs.md
 # 2026-07-29). On top of 31 it layers exp 36's data + augmentation deltas:
-#   - data.spacing_range=[1,4]: per-batch log-uniform crop spacing (SpacingBatchSampler),
+#   - data.train_spacing_range=[1,4]: per-batch log-uniform crop spacing (SpacingBatchSampler),
 #     the whole point — medverse sees the same 4x FOV range at fixed 128³.
 #   - data.mask_downsample=occupancy @0.5, train_classes=balanced: match exp 35/36 exactly.
 #   - augmentations.task elastic/affine: the exp 35 task-aug tweaks (36 inherits them).
@@ -26,7 +26,7 @@ data:
   train_classes: balanced
   mask_downsample: occupancy
   mask_occupancy_thr: 0.5
-  spacing_range: [1.0, 4.0]
+  train_spacing_range: [1.0, 4.0]
 
 augmentations:
   task:

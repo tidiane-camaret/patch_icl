@@ -100,9 +100,9 @@ def _sample_detail(meta: dict | None) -> str:
 # The sample-table columns are fixed (medverse is a native-resolution model, so there is
 # no coarse-grid / refine family like 2D's patchset_cnn). One row per eval case, carrying
 # the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
-_SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "dice", "soft_dice", "loss",
-                      "time_ms", "tgt_size", "tgt_occ", "ctx_size", "ctx_occ", "spacing",
-                      "detail"]
+_SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "ctx_cases", "self_ctx",
+                      "dice", "soft_dice", "loss", "time_ms", "tgt_size", "tgt_occ",
+                      "ctx_size", "ctx_occ", "spacing", "detail"]
 
 
 def build_sample_table(cases: list[dict], epoch: int | None = None, train_classes=None):
@@ -122,7 +122,8 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
     table = wandb.Table(columns=_SAMPLE_TABLE_COLS + fs_cols)
     for c in cases:
         in_train = c["class"] in train_set if train_set is not None else None
-        table.add_data(ep, c["class"], in_train, c["subject"], c["dice"],
+        table.add_data(ep, c["class"], in_train, c["subject"],
+                       c.get("ctx_cases", ""), c.get("self_ctx", None), c["dice"],
                        c.get("soft_dice", float("nan")), c.get("loss", float("nan")),
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
@@ -392,6 +393,7 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         context_masks = batch["context_out"]
         label         = batch["label"]
         subjects      = batch.get("subjects", [None] * target_img.shape[0])
+        ctx_subjects  = batch.get("context_subjects")   # (B) list[list[str]] or None
         label_names   = batch["label_names"]
         metas         = batch.get("meta")
 
@@ -457,9 +459,13 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                     title=f"{cls}  {subj}  dice={dice_binary(pred[i], label[i]):.3f}",
                 )
                 figs_saved.add(cls)
+            cids = ctx_subjects[i] if ctx_subjects is not None else None
             case = {
                 "class":   cls,
                 "subject": subjects[i],
+                # per-context case ids + self-context flag (all ctx == target case)
+                "ctx_cases": ";".join(map(str, cids)) if cids else "",
+                "self_ctx":  bool(cids and all(c == subjects[i] for c in cids)),
                 "dice":    round(dice_binary(pred[i], label[i]), 4),
                 "time_ms": round(per_sample_ms, 1),
                 "detail":  _sample_detail(metas[i] if metas is not None else None),
