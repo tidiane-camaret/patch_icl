@@ -1,5 +1,15 @@
 # Change log
 
+## 2026-08-11 — PatchSet3D random token masking
+
+Added SimMIM-style in-place token masking to `PatchSet3D` (`src/models/patchset3d.py`):
+`arch.token_mask_ratio_support` / `arch.token_mask_ratio_query` (both default 0.0 = off)
+randomly replace whole tokens (image + mask columns) with a learned `mask_token` during
+training only (`self.training`), keeping the R³ token count so the compiled transformer and
+RoPE are unaffected. `forward` now also returns `mask_support` / `mask_query` (None when off)
+as the hook for a future auxiliary reconstruction loss. Eval/predict never mask.
+Spec: docs/superpowers/specs/2026-08-11-patchset3d-token-masking-design.md.
+
 ## 2026-08-11 — self-context ceiling probe + exp40 large-head config (CoLiPri size-stall study)
 Investigating why the frozen-CoLiPri in-context run stalls at val Dice ~0.60 with Dice strongly
 correlated to object size (small anatomy → low Dice). Established via `plot_dataset_items` +

@@ -259,6 +259,8 @@ def build_model(cfg: DictConfig):
             "transformer_rope": a.get("transformer_rope", False),
             "rope_theta": a.get("rope_theta", 100.0),
             "feat_norm": a.get("feat_norm", "context"),
+            "token_mask_ratio_support": a.get("token_mask_ratio_support", 0.0),
+            "token_mask_ratio_query": a.get("token_mask_ratio_query", 0.0),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")

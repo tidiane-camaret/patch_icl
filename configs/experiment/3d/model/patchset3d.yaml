@@ -29,6 +29,10 @@ arch:
   feat_norm: context           # encoder-feature norm before img_embed: context (per-channel
                                # z-score by SUPPORT stats, applied to both — TabPFN/ICL default) |
                                # self (each side by its own stats — query decoupled) | none
+  token_mask_ratio_support: 0.0   # fraction of K·N context tokens masked per step (SimMIM,
+                                  # train only). 0.0 = off (identical to no masking).
+  token_mask_ratio_query: 0.0     # fraction of N target tokens masked per step (train only).
+                                  # Masked query cells are still segmented from context.
   img_embed_mlp: false         # true = MLP img_embed (Linear(oc,oc)->GELU->Linear(oc,e));
                                # helps when encoder out_ch >> e (e.g. primus 864 -> 256)
   h: 512
