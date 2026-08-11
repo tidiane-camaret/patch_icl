@@ -1,0 +1,16 @@
+# @package _global_
+# ChemoTox cohort, body-composition tissues (muscle/sat/vat/imat). Eval-only.
+# Served by ChemoToxBCDataset over bc.npy in the same 1.5mm-iso cache.
+defaults:
+  - override /augmentations: multiverseg_v2
+data:
+  source: chemotox_bc
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  crop_spacing_mm: 1.5
+  raw_ct: false
+  num_labels_per_sample: 1
+  max_val_subjects: null
+  val_classes: [muscle, sat, vat, imat]
+  train_classes: [muscle, sat, vat, imat]
