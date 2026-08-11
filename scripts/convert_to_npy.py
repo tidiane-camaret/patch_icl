@@ -23,6 +23,7 @@ Usage
 """
 
 import argparse
+import csv
 import json
 import multiprocessing as mp
 import os
@@ -39,12 +40,18 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.totalseg_classes import ALL_CLASSES
+from data.totalseg_total_map import remap_ts_total
 from src.totalseg_dataset import (
     CT_CLIP_MIN, CT_CLIP_MAX, CT_MEAN, CT_STD,
     normalize_ct, mri_stats, normalize_mri,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+COHORT_JSON = ROOT / "experiments/3d/universal_coords/coords_paths_chemotox.json"
+
+# label channels each source emits (written as {name}.npy; "label" is the primary mask)
+SOURCE_LABELS = {"totalseg": ["label"], "chemotox": ["label", "bc"]}
 
 
 def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True,
@@ -106,8 +113,46 @@ assert CT_CLIP_MIN == -1007.0 and CT_CLIP_MAX == 1573.0, "unexpected CT clip con
 _normalise_ct = normalize_ct
 
 
-def convert_subject(args: tuple) -> tuple[str, str, list | None, list | None, dict | None]:
-    """Convert one subject.
+def enumerate_subjects(source: str, data, out, limit=None) -> list[dict]:
+    """Return a list of per-subject task dicts (subj_id, out_dir, inputs)."""
+    tasks: list[dict] = []
+    if source == "totalseg":
+        for s in sorted(p for p in Path(data).iterdir() if p.is_dir()):
+            tasks.append({"subj_id": s.name, "out_dir": str(Path(out) / s.name),
+                          "inputs": {"subj_dir": str(s)}})
+    elif source == "chemotox":
+        cohort = json.load(open(data)) if str(data).endswith(".json") else json.load(open(COHORT_JSON))
+        for key, rec in cohort.items():
+            subj_id = key.replace("#", "_")
+            tasks.append({"subj_id": subj_id, "out_dir": str(Path(out) / subj_id),
+                          "inputs": {"img": rec["img"], "totalseg": rec["totalseg"],
+                                     "bclabels": rec["bclabels"]}})
+    else:
+        raise ValueError(f"unknown source {source!r}")
+    if limit is not None:
+        tasks = tasks[:limit]
+    return tasks
+
+
+def load_raw(task: dict):
+    """(raw_ct f32, native_spacing [3], {label_name: array}) for a chemotox subject.
+
+    All three volumes share one native grid, so no canonicalization is needed — read
+    raw dataobj and take spacing from the img affine. (The totalseg source does its own
+    CT+segmentations reading inside _convert_totalseg to stay byte-identical.)"""
+    assert task["source"] == "chemotox", "load_raw serves the chemotox source only"
+    p = task["inputs"]
+    img = nib.load(p["img"])
+    raw = np.asanyarray(img.dataobj).astype(np.float32)
+    sp = [abs(float(x)) for x in nib.affines.voxel_sizes(img.affine)[:3]]
+    ts = np.asanyarray(nib.load(p["totalseg"]).dataobj)
+    label = remap_ts_total(ts)
+    bc = np.asanyarray(nib.load(p["bclabels"]).dataobj)[..., 0].astype(np.uint8)
+    return raw, sp, {"label": label, "bc": bc}
+
+
+def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, dict | None]:
+    """Convert one TotalSegmentator subject.
 
     Returns (subject_id, status, native_spacing, native_shape, mri_stats).
     native_spacing and native_shape are None when the NIfTI was not read
@@ -115,8 +160,11 @@ def convert_subject(args: tuple) -> tuple[str, str, list | None, list | None, di
     mri_stats is the per-volume MRI normalisation stats dict (for ct_stats.json) when
     store_raw + modality=mri, else None.
     """
-    subj_dir, overwrite, size, modality, store_raw = args
-    subj_dir = Path(subj_dir)
+    subj_dir = Path(task["inputs"]["subj_dir"])
+    overwrite = task["overwrite"]
+    size = task["size"]
+    modality = task["modality"]
+    store_raw = task["store_raw"]
     subj = subj_dir.name
 
     ct_out    = subj_dir / "ct.npy"
@@ -198,6 +246,49 @@ def convert_subject(args: tuple) -> tuple[str, str, list | None, list | None, di
     return subj, "ok", native_spacing, native_shape, stats
 
 
+def _convert_chemotox(task: dict):
+    """Convert one chemotox subject to the out tree. Returns (subj_id, status, sp, shape, None)."""
+    subj_id = task["subj_id"]
+    out_dir = Path(task["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
+    overwrite = task["overwrite"]; size = task["size"]; target_sp = task["target_spacing"]
+    label_names = SOURCE_LABELS["chemotox"]
+    ct_out = out_dir / "ct.npy"
+    label_outs = {n: out_dir / f"{n}.npy" for n in label_names}
+    if (ct_out.exists() and all(p.exists() for p in label_outs.values())
+            and not overwrite and size is None):
+        return subj_id, "skip", None, None, None
+    try:
+        raw, native_sp, labels = load_raw(task)
+        vol = _normalise_ct(raw)
+        if target_sp is not None:
+            vol = _resample_to_spacing(vol, native_sp, target_sp, order=1)
+            labels = {n: _resample_to_spacing(a, native_sp, target_sp, order=0)
+                      for n, a in labels.items()}
+            out_sp = [float(target_sp)] * 3
+        else:
+            out_sp = native_sp
+        out_shape = list(vol.shape)
+        np.save(ct_out, vol.astype(np.float16))
+        for n, a in labels.items():
+            np.save(label_outs[n], a.astype(np.uint8))
+        if size is not None:  # optional fixed-cube sized variants (primary label only)
+            size_str = f"{size[0]}x{size[1]}x{size[2]}"
+            sp = tuple(out_sp)
+            np.save(out_dir / f"ct_{size_str}.npy",
+                    _iso_resize(vol.astype(np.float32), size, order=1, aa=True, spacing=sp).astype(np.float16))
+            np.save(out_dir / f"label_{size_str}.npy",
+                    _iso_resize(labels["label"], size, order=0, aa=False, spacing=sp))
+    except Exception:
+        return subj_id, traceback.format_exc(), None, None, None
+    return subj_id, "ok", out_sp, out_shape, None
+
+
+def convert_subject(task: dict):
+    if task["source"] == "totalseg":
+        return _convert_totalseg(task)
+    return _convert_chemotox(task)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default=None,
@@ -227,73 +318,59 @@ def main():
                         help="convert only the first N subjects (smoke test)")
     args = parser.parse_args()
 
-    data_dir = Path(args.data) if args.data else Path(_default_data_dir())
-    subjects = sorted(p for p in data_dir.iterdir() if p.is_dir())
+    data_dir = args.data
+    if data_dir is None:
+        data_dir = str(COHORT_JSON) if args.source == "chemotox" else _default_data_dir()
+    out_root = Path(args.out) if args.out else Path(data_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    subjects = enumerate_subjects(args.source, data_dir, out_root, args.limit)
     total = len(subjects)
     size = tuple(args.size) if args.size else None
-    size_str = f"{size[0]}x{size[1]}x{size[2]}" if size else "native only"
-    print(f"Found {total} subjects  |  workers={args.workers}"
-          f"  |  overwrite={args.overwrite}  |  size={size_str}  |  modality={args.modality}")
+    for t in subjects:
+        t.update(overwrite=args.overwrite, size=size, target_spacing=args.target_spacing,
+                 source=args.source, modality=args.modality, store_raw=args.store_raw)
+    print(f"source={args.source} | {total} subjects | out={out_root} | "
+          f"target_spacing={args.target_spacing} | size={size}")
 
-    tasks = [(str(s), args.overwrite, size, args.modality, args.store_raw) for s in subjects]
-
-    # spacings.json: {"s0000": {"spacing": [dx,dy,dz], "shape": [D,H,W]}, ...}
-    # Merged with any existing entries so incremental runs stay consistent.
-    spacings_path = data_dir / "spacings.json"
-    spacings: dict = {}
-    if spacings_path.exists():
-        with open(spacings_path) as f:
-            spacings = json.load(f)
-
-    # ct_stats.json: {"s0000": {clip_lo, clip_hi, mean, std}} — per-volume MRI norm stats,
-    # only written by --store-raw --modality mri. Merged with any existing entries.
-    stats_path = data_dir / "ct_stats.json"
-    ct_stats: dict = {}
-    if stats_path.exists():
-        with open(stats_path) as f:
-            ct_stats = json.load(f)
+    spacings_path = out_root / "spacings.json"
+    spacings = json.load(open(spacings_path)) if spacings_path.exists() else {}
+    stats_path = out_root / "ct_stats.json"
+    ct_stats = json.load(open(stats_path)) if stats_path.exists() else {}
 
     done = ok = skipped = errors = 0
     t0 = time.time()
-
     with mp.Pool(processes=args.workers) as pool:
-        for subj, status, native_spacing, native_shape, subj_stats in pool.imap_unordered(
-            convert_subject, tasks, chunksize=1
+        for subj, status, sp, shape, subj_stats in pool.imap_unordered(
+            convert_subject, subjects, chunksize=1
         ):
             done += 1
             if status == "ok":
                 ok += 1
-                if native_spacing is not None and native_shape is not None:
-                    spacings[subj] = {"spacing": native_spacing, "shape": native_shape}
+                if sp is not None and shape is not None:
+                    spacings[subj] = {"spacing": sp, "shape": shape}
                 if subj_stats is not None:
                     ct_stats[subj] = subj_stats
             elif status == "skip":
                 skipped += 1
             else:
-                errors += 1
-                print(f"\n[ERROR] {subj}:\n{status}")
-
-            elapsed = time.time() - t0
-            rate = done / elapsed
-            eta = (total - done) / rate if rate > 0 else 0
-            print(
-                f"\r  {done}/{total}  ok={ok}  skip={skipped}  err={errors}"
-                f"  {rate:.1f} subj/s  ETA {eta/60:.0f}m",
-                end="", flush=True,
-            )
+                errors += 1; print(f"\n[ERROR] {subj}:\n{status}")
+            elapsed = time.time() - t0; rate = done / elapsed if elapsed else 0
+            print(f"\r  {done}/{total} ok={ok} skip={skipped} err={errors} "
+                  f"{rate:.1f} subj/s", end="", flush=True)
 
     if spacings:
-        with open(spacings_path, "w") as f:
-            json.dump(spacings, f)
-        print(f"\nSpacings written to {spacings_path}  ({len(spacings)} subjects)")
-
+        json.dump(spacings, open(spacings_path, "w"))
+        print(f"\nSpacings -> {spacings_path} ({len(spacings)})")
     if ct_stats:
-        with open(stats_path, "w") as f:
-            json.dump(ct_stats, f)
-        print(f"MRI norm stats written to {stats_path}  ({len(ct_stats)} subjects)")
-
-    elapsed = time.time() - t0
-    print(f"\nDone in {elapsed/60:.1f} min  —  ok={ok}  skipped={skipped}  errors={errors}")
+        json.dump(ct_stats, open(stats_path, "w"))
+    # meta.csv for sources with no native split (chemotox): all subjects -> test
+    if args.source == "chemotox":
+        with open(out_root / "meta.csv", "w", newline="") as f:
+            w = csv.writer(f, delimiter=";"); w.writerow(["image_id", "split"])
+            for s in sorted(spacings): w.writerow([s, "test"])
+        print(f"meta.csv -> {out_root / 'meta.csv'} ({len(spacings)} test)")
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min — ok={ok} skip={skipped} err={errors}")
 
 
 if __name__ == "__main__":
