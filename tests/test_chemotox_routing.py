@@ -3,7 +3,6 @@ import numpy as np
 from omegaconf import OmegaConf
 from experiments_common_shim import build_dataset  # see Step 3 note
 from src.chemotox_dataset import ChemoToxBCDataset, BC_NAMES
-from src.totalseg_dataloader_incontext import TotalSegInContextDataset
 
 
 def _make_bc_tree(root, D=48):

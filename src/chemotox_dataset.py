@@ -104,6 +104,3 @@ class ChemoToxBCDataset(TotalSegInContextDataset):
         label_t = self._place_label(
             self._resample_binary(crop_lbl == local_id, tuple(out_sizes)), out_sizes, pad_lo)
         return image_t, label_t
-
-    def _load(self, subj: str, cls: str):
-        return self._load_crop(subj, cls)
