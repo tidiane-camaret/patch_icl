@@ -367,23 +367,13 @@ def enumerate_subjects(source: str, data, out, limit=None) -> list[dict]:
 
 
 def load_raw(task: dict):
-    """(raw_ct f32, native_spacing [3], {label_name: array}) for one subject."""
-    source, p = task["source"], task["inputs"]
-    if source == "totalseg":
-        modality = task.get("modality", "ct")
-        img_fname = "mri.nii.gz" if modality == "mri" else "ct.nii.gz"
-        ct_img = nib.as_closest_canonical(nib.load(str(Path(p["subj_dir"]) / img_fname)))
-        sp = [float(x) for x in nib.affines.voxel_sizes(ct_img.affine)[:3]]
-        raw = ct_img.get_fdata(dtype=np.float32)
-        seg_dir = Path(p["subj_dir"]) / "segmentations"
-        label = np.zeros(raw.shape, dtype=np.uint8)
-        for cls, idx in _CLASS_TO_IDX.items():
-            mp = seg_dir / f"{cls}.nii.gz"
-            if mp.exists():
-                m = nib.as_closest_canonical(nib.load(str(mp))).get_fdata(dtype=np.float32) > 0
-                label[m] = idx
-        return raw, sp, {"label": label}
-    # chemotox: all three volumes share one grid; no canonicalization, raw dataobj.
+    """(raw_ct f32, native_spacing [3], {label_name: array}) for a chemotox subject.
+
+    All three volumes share one native grid, so no canonicalization is needed — read
+    raw dataobj and take spacing from the img affine. (The totalseg source does its own
+    CT+segmentations reading inside _convert_totalseg to stay byte-identical.)"""
+    assert task["source"] == "chemotox", "load_raw serves the chemotox source only"
+    p = task["inputs"]
     img = nib.load(p["img"])
     raw = np.asanyarray(img.dataobj).astype(np.float32)
     sp = [abs(float(x)) for x in nib.affines.voxel_sizes(img.affine)[:3]]
@@ -393,48 +383,51 @@ def load_raw(task: dict):
     return raw, sp, {"label": label, "bc": bc}
 ```
 
-Rewrite `convert_subject` to consume a task dict (keep MRI/store_raw handling for the
-totalseg source; only that source sets `modality`):
+**Preserve the totalseg path byte-identically via source dispatch.** Do NOT fold
+totalseg into a new generalized body — that would drop `ct_raw.npy`/`--store-raw` and
+the granular native/raw/sized skip logic, violating the "totalseg byte-identical"
+Global Constraint. Instead:
+
+1. **Rename the EXISTING `convert_subject` body to `_convert_totalseg(task: dict)`**,
+   changing ONLY how it reads its inputs at the top (from the task dict instead of the
+   old tuple). Everything else — `need_native`/`need_raw`/`need_sized`, `ct_raw.npy`
+   int16/float16, `ct_stats.json` MRI stats, sized variants, skip logic, the returned
+   `(subj, status, native_spacing, native_shape, stats)` tuple — stays verbatim. Read:
+   `subj_dir = Path(task["inputs"]["subj_dir"])`, `overwrite = task["overwrite"]`,
+   `size = task["size"]`, `modality = task["modality"]`, `store_raw = task["store_raw"]`.
+   It writes in place to `subj_dir` exactly as today (totalseg ignores `--out`).
+
+2. **Add `_convert_chemotox(task: dict)`** — the new multi-label / target-spacing path
+   (no `ct_raw`, no MRI, writes a fresh tree to `out_dir`):
 
 ```python
-def convert_subject(task: dict):
-    """Convert one subject. Returns (subj_id, status, spacing, shape, stats)."""
+def _convert_chemotox(task: dict):
+    """Convert one chemotox subject to the out tree. Returns (subj_id, status, sp, shape, None)."""
     subj_id = task["subj_id"]
     out_dir = Path(task["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    overwrite = task["overwrite"]; size = task["size"]
-    target_sp = task["target_spacing"]; source = task["source"]
-    label_names = SOURCE_LABELS[source]
-
+    overwrite = task["overwrite"]; size = task["size"]; target_sp = task["target_spacing"]
+    label_names = SOURCE_LABELS["chemotox"]
     ct_out = out_dir / "ct.npy"
     label_outs = {n: out_dir / f"{n}.npy" for n in label_names}
-    size_str = f"{size[0]}x{size[1]}x{size[2]}" if size else None
-
-    outputs_exist = ct_out.exists() and all(p.exists() for p in label_outs.values())
-    if outputs_exist and not overwrite and size is None:
+    if (ct_out.exists() and all(p.exists() for p in label_outs.values())
+            and not overwrite and size is None):
         return subj_id, "skip", None, None, None
-
     try:
         raw, native_sp, labels = load_raw(task)
-        stats = None
-        if source == "totalseg" and task.get("modality") == "mri":
-            stats = mri_stats(raw); vol = normalize_mri(raw, stats)
-        else:
-            vol = _normalise_ct(raw)
-
+        vol = _normalise_ct(raw)
         if target_sp is not None:
             vol = _resample_to_spacing(vol, native_sp, target_sp, order=1)
             labels = {n: _resample_to_spacing(a, native_sp, target_sp, order=0)
                       for n, a in labels.items()}
             out_sp = [float(target_sp)] * 3
-            out_shape = list(vol.shape)
         else:
-            out_sp, out_shape = native_sp, list(vol.shape)
-
+            out_sp = native_sp
+        out_shape = list(vol.shape)
         np.save(ct_out, vol.astype(np.float16))
         for n, a in labels.items():
             np.save(label_outs[n], a.astype(np.uint8))
-
         if size is not None:  # optional fixed-cube sized variants (primary label only)
+            size_str = f"{size[0]}x{size[1]}x{size[2]}"
             sp = tuple(out_sp)
             np.save(out_dir / f"ct_{size_str}.npy",
                     _iso_resize(vol.astype(np.float32), size, order=1, aa=True, spacing=sp).astype(np.float16))
@@ -442,8 +435,21 @@ def convert_subject(task: dict):
                     _iso_resize(labels["label"], size, order=0, aa=False, spacing=sp))
     except Exception:
         return subj_id, traceback.format_exc(), None, None, None
-    return subj_id, "ok", out_sp, out_shape, stats
+    return subj_id, "ok", out_sp, out_shape, None
 ```
+
+3. **Add the dispatcher** `convert_subject`:
+
+```python
+def convert_subject(task: dict):
+    if task["source"] == "totalseg":
+        return _convert_totalseg(task)
+    return _convert_chemotox(task)
+```
+
+Note: `load_raw`'s totalseg branch is used only by `_convert_chemotox`'s counterpart
+tests; `_convert_totalseg` keeps its own original inline CT+segmentations reading so
+its output stays byte-identical (do not reroute it through `load_raw`).
 
 - [ ] **Step 4: Run the load_raw test to verify it passes**
 
