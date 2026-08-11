@@ -52,3 +52,39 @@ def test_predict_and_train_forward_native_shape():
     pred = m.predict(img, cin, cout)
     assert pred.shape == (2, 16, 16, 16)
     assert set(torch.unique(pred).tolist()) <= {0.0, 1.0}
+
+
+def test_token_masking_noop_when_ratios_zero():
+    """Default ratios (0.0): masks are None even in train mode; logit shape unchanged."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    m.train()
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    assert out["mask_support"] is None and out["mask_query"] is None
+
+
+def test_token_masking_active_in_train():
+    """ratio>0 under train(): masks have right shape, ~right fraction, grad flows to mask_token."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   token_mask_ratio_support=0.5, token_mask_ratio_query=0.5)
+    m.train()
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)   # N=64, support M=128, query M=64
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    assert out["mask_support"].shape == (2, 128) and out["mask_support"].dtype == torch.bool
+    assert out["mask_query"].shape == (2, 64)
+    assert abs(out["mask_support"].float().mean().item() - 0.5) < 0.15
+    out["final_logit"].mean().backward()
+    assert m.mask_token.grad is not None and torch.isfinite(m.mask_token.grad).all()
+
+
+def test_token_masking_off_in_eval():
+    """Even with ratio>0, eval mode never masks (eval/predict reproducibility)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   token_mask_ratio_support=0.5, token_mask_ratio_query=0.5)
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["mask_support"] is None and out["mask_query"] is None

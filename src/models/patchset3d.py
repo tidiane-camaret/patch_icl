@@ -117,6 +117,8 @@ class PatchSet3D(nn.Module):
         transformer_rope: bool = False,
         rope_theta: float = 100.0,
         feat_norm: str = "context",
+        token_mask_ratio_support: float = 0.0,
+        token_mask_ratio_query: float = 0.0,
     ):
         super().__init__()
         self.resolution = resolution
@@ -181,6 +183,15 @@ class PatchSet3D(nn.Module):
         #   none    = no extra norm (rely on encoder LN + learned img_embed)
         assert feat_norm in ("context", "self", "none"), feat_norm
         self.feat_norm = feat_norm
+        # SimMIM-style in-place token masking (training only; both default 0.0 = off). A masked
+        # cell has BOTH its image and mask/occupancy columns replaced by mask_token, keeping the
+        # R³ token count intact (compiled transformer + RoPE-by-index unaffected) and leaving the
+        # cell in the sequence for a future reconstruction loss. See
+        # docs/superpowers/specs/2026-08-11-patchset3d-token-masking-design.md.
+        self.token_mask_ratio_support = float(token_mask_ratio_support)
+        self.token_mask_ratio_query = float(token_mask_ratio_query)
+        self.mask_token = nn.Parameter(torch.zeros(2, e))   # row 0 = image col, row 1 = mask col
+        nn.init.normal_(self.mask_token, std=0.02)
         self.head_dim = e // a
         self.rope_train_mm = float(getattr(self.encoder, "train_spacing_mm", 2.0))
         self.pos = None if self.transformer_rope else FourierPositionalEncoding(e, fourier_bands, n_axes=3)
@@ -222,12 +233,21 @@ class PatchSet3D(nn.Module):
                                             self.resolution, p) for k in range(K)], dim=1)
         return tiles.reshape(B, K * self.N, p ** 3)
 
-    def _tokens(self, feat, occ, ijk):
+    def _tokens(self, feat, occ, ijk, mask=None):
         img = self.img_embed(feat)
         msk = self.mask_embed(occ)
+        if mask is not None:                                # SimMIM in-place [MASK] replacement
+            m = mask.unsqueeze(-1)                          # (B,M,1) bool
+            img = torch.where(m, self.mask_token[0], img)
+            msk = torch.where(m, self.mask_token[1], msk)
+        else:
+            # Keep mask_token in the compute graph (zero contribution) so it always
+            # receives a gradient — required for optimizers that track all parameters.
+            img = img + self.mask_token[0].sum() * 0.0
+            msk = msk + self.mask_token[1].sum() * 0.0
         if self.pos is not None:                            # additive Fourier PE (non-RoPE mode)
             pos = self.pos(ijk, self.resolution)
-            img = img + pos
+            img = img + pos                                 # masked token keeps its position
             msk = msk + pos
         return torch.stack([img, msk], dim=2)               # (B,M,2,e)
 
@@ -275,16 +295,26 @@ class PatchSet3D(nn.Module):
         qsig = qry_feat.std(dim=1, keepdim=True) + 1e-8
         return self._zscore(sup_feat, mu, sig), self._zscore(qry_feat, qmu, qsig)
 
+    def _sample_mask(self, B, M, ratio, device):
+        """Random per-cell boolean mask (B,M) at the given ratio; None when not training or
+        ratio<=0. Independent Bernoulli per cell (in-place SimMIM masking, not token-dropping)."""
+        if not self.training or ratio <= 0.0:
+            return None
+        return torch.rand(B, M, device=device) < ratio
+
     def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None):
         B, N = sup_feat.shape[0], self.N
+        dev = sup_feat.device
+        mask_support = self._sample_mask(B, K * N, self.token_mask_ratio_support, dev)
+        mask_query = self._sample_mask(B, N, self.token_mask_ratio_query, dev)
         qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)
         qry_ijk = self.ijk_base.unsqueeze(0).expand(B, N, 3)
 
         sup_feat, qry_feat = self._feat_norm(sup_feat, qry_feat)
 
-        sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk)   # (B,S,2,e)
-        qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk)   # (B,Q,2,e)
+        sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk, mask=mask_support)   # (B,S,2,e)
+        qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk, mask=mask_query)     # (B,Q,2,e)
 
         if self.context_id_embed:
             assert K <= self.max_context, f"context_size {K} exceeds max_context {self.max_context}"
@@ -305,7 +335,8 @@ class PatchSet3D(nn.Module):
         rope = self._rope(K, spacing, x.device) if self.transformer_rope else None
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn, rope=rope)
         q = x[:, sep_t:, 0, :]                               # (B,Q,e) query img-col
-        return self._tile_logits(self.decoder(q))           # (B,1,Rd,Rd,Rd)
+        logit = self._tile_logits(self.decoder(q))          # (B,1,Rd,Rd,Rd)
+        return logit, mask_support, mask_query
 
     def forward(self, image, context_in, context_out, mode="train", spacing=None):
         B, K = context_in.shape[0], context_in.shape[1]
@@ -314,8 +345,9 @@ class PatchSet3D(nn.Module):
         T = imgs.shape[1]
         feat_map = self._encode(imgs.reshape(B * T, 1, D, H, W), spacing)  # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        logit = self._attn(sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing)
-        return {"final_logit": logit}
+        logit, mask_support, mask_query = self._attn(
+            sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing)
+        return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query}
 
     def _encode(self, x, spacing):
         """Dispatch to the encoder, passing per-batch `spacing` only when it accepts it
