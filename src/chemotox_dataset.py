@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import torch
 
 from src.totalseg_dataloader_incontext import TotalSegInContextDataset
 
@@ -96,7 +95,8 @@ class ChemoToxBCDataset(TotalSegInContextDataset):
         local_id = BC_ID[cls]
         label_mm = np.load(subj_dir / "bc.npy", mmap_mode="r")
         D, H, W = label_mm.shape
-        center = self._bbox_cache.get(subj, {}).get(cls) or (D // 2, H // 2, W // 2)
+        center = self._bbox_cache.get(subj, {}).get(cls)
+        center = center if center is not None else (D // 2, H // 2, W // 2)
         sp = self._get_spacing(subj).tolist()
         crop_ct, crop_lbl, out_sizes, pad_lo = self._organ_crop_arrays(
             subj_dir, label_mm, center, sp)

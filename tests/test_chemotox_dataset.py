@@ -31,6 +31,7 @@ def test_bc_dataset_items(tmp_path):
     assert item["image"].shape == (1, 32, 32, 32)
     assert item["label"].shape == (32, 32, 32)
     assert item["context_in"].shape == (1, 1, 32, 32, 32)
+    assert item["context_out"].shape == (1, 32, 32, 32)
     assert set(torch.unique(item["label"]).tolist()) <= {0, 1}
     assert item["label"].sum() > 0        # foreground present for the cropped tissue
     assert item["label_name"] in BC_NAMES
