@@ -3,6 +3,7 @@
 
 See docs/superpowers/specs/2026-08-12-nifti-incontext-cascade-inference-design.md.
 """
+import random
 import sys
 import warnings
 from pathlib import Path
@@ -26,8 +27,9 @@ from common import DEVICE
 
 
 def load_nifti(path):
-    """Load a nifti -> (array, affine). Array is the stored data with scaling applied."""
-    img = nib.load(str(path))
+    """Load a nifti -> (array, affine), reoriented to closest-canonical (RAS) to match
+    the training preprocessing (scripts/convert_to_npy.py uses nib.as_closest_canonical)."""
+    img = nib.as_closest_canonical(nib.load(str(path)))
     return np.asanyarray(img.dataobj), img.affine
 
 
@@ -52,7 +54,6 @@ def prep_target(ct, sp, center, *, T, crop_mm):
 
     No target label, so ct doubles as the label array for organ_crop_arrays (its
     crop_lbl output is discarded). rng is unused at jitter=0 (centred crop)."""
-    import random
     crop_ct, _, out_sizes, pad_lo, geom = organ_crop_arrays(
         ct, ct, center, sp, image_size=(T, T, T), crop_mm=crop_mm,
         jitter=0, rng=random.Random(0))
@@ -61,7 +62,6 @@ def prep_target(ct, sp, center, *, T, crop_mm):
 
 def prep_context(ct, mask, sp, center, *, T, crop_mm, mask_downsample, occ_thr):
     """Native (CT, binary mask) + centre -> (img_t (1,T,T,T), mask_t (T,T,T) long)."""
-    import random
     assert ct.shape == mask.shape, f"context ct {ct.shape} != mask {mask.shape}"
     crop_ct, crop_mask, out_sizes, pad_lo, _ = organ_crop_arrays(
         ct, mask, center, sp, image_size=(T, T, T), crop_mm=crop_mm,
@@ -90,6 +90,8 @@ def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
     context_pairs  : list[(image_path, binary_mask_path)] for the same organ (K = len).
     gt_path        : optional target GT (binary) .nii.gz -> Dice + coarse-only Dice.
     out_path       : optional -> write the predicted mask as .nii.gz on the target grid.
+                     NOTE: the output mask is in canonical (RAS) space because all inputs
+                     are reoriented via load_nifti -> nib.as_closest_canonical.
 
     Returns {"pred", "affine", "dice", "coarse_only_dice", "pred_path"}.
     """
@@ -124,6 +126,8 @@ def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
 
     for i, s in enumerate(spacings):
         if i > 0:
+            # Hard-predict centroid (not soft prob like eval's cascade) — one forward per
+            # pass, model-agnostic; intentional divergence documented in the design spec.
             c = _predicted_native_center(
                 torch.from_numpy(prev_pred.astype(np.float32)),
                 torch.from_numpy(prev_geom.astype(np.int64)))

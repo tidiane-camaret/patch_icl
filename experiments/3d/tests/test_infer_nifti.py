@@ -60,6 +60,26 @@ def test_prep_context_shapes():
     assert mask_t.sum() > 0                    # organ survives into the crop
 
 
+def test_load_nifti_canonicalizes():
+    """load_nifti must reorient to closest-canonical (RAS) regardless of stored orientation."""
+    import tempfile, os
+    # Build a non-canonical affine: flip the first axis (L instead of R).
+    non_canon_aff = np.diag([-1.0, 1.0, 1.0, 1.0])
+    arr = np.arange(4 * 5 * 6, dtype=np.int16).reshape(4, 5, 6)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "noncanon.nii.gz"
+        nib.save(nib.Nifti1Image(arr, non_canon_aff), str(p))
+        got_arr, got_aff = load_nifti(p)
+    # The returned affine must be closest-canonical.
+    canon_img = nib.as_closest_canonical(nib.Nifti1Image(arr, non_canon_aff))
+    assert np.allclose(got_aff, canon_img.affine), (
+        f"affine not canonical: axcodes={nib.aff2axcodes(got_aff)}")
+    # Axis codes must be ('R','A','S') or equivalent positive-canonical.
+    axcodes = nib.aff2axcodes(got_aff)
+    assert axcodes == ('R', 'A', 'S'), f"expected RAS axcodes, got {axcodes}"
+    assert got_arr.shape == canon_img.shape
+
+
 from omegaconf import OmegaConf  # noqa: E402
 
 
