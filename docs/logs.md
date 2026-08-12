@@ -65,6 +65,16 @@ unaffected. This is a latent bug in the shared train/eval data path (independent
 feature); the `spacing_1_to_4` checkpoint was trained with the buggy coarse crops, so re-eval /
 retrain implications are the user's call.
 
+## 2026-08-12 — nifti in-context cascade inference
+
+Added `experiments/3d/infer_nifti.py::predict_nifti(cfg, target_path, context_pairs,
+gt_path=None, out_path=None)`: runs the 4mm->1.5mm in-context cascade on arbitrary
+nifti files (GT-free target; coarse crops on the volume centre, fine recenters on the
+coarse prediction centroid). Reuses eval._build_model + evaluate._write_native /
+_predicted_native_center + the newly extracted crop helpers (organ_crop_arrays /
+place_image / place_label / resample_binary, refactored out of TotalSegInContextDataset,
+behaviour-preserving). Returns the native-grid mask + optional Dice and coarse-only Dice.
+
 ## 2026-08-11 — PatchSet3D random token masking
 
 Added SimMIM-style in-place token masking to `PatchSet3D` (`src/models/patchset3d.py`):

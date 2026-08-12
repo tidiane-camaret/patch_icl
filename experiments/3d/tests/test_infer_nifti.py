@@ -58,3 +58,70 @@ def test_prep_context_shapes():
     assert img_t.shape == (1, 8, 8, 8)
     assert mask_t.shape == (8, 8, 8)
     assert mask_t.sum() > 0                    # organ survives into the crop
+
+
+from omegaconf import OmegaConf  # noqa: E402
+
+
+class _StubModel:
+    """Minimal model with .predict: emits a centred cube in the T³ grid (independent of
+    input), so the cascade wiring/stitch/metrics can be exercised without a checkpoint."""
+    spacing_aware = False
+
+    def predict(self, target_img, context_imgs, context_masks, **kw):
+        B, _, T, _, _ = target_img.shape
+        out = torch.zeros(B, T, T, T)
+        q = T // 4
+        out[:, q:T - q, q:T - q, q:T - q] = 1.0
+        return out
+
+
+def _cfg():
+    return OmegaConf.create({
+        "data": {"image_size": [16, 16, 16], "crop_spacing_mm": 1.5,
+                 "use_crop": True, "mask_downsample": "occupancy",
+                 "mask_occupancy_thr": 0.1, "source": "totalseg"},
+        "eval": {"model": "stub", "checkpoint": None, "spacing_sweep": [4, 1.5]},
+    })
+
+
+def test_predict_nifti_end_to_end(tmp_path, monkeypatch):
+    import infer_nifti
+    # Bypass the real model builder + drift warning (no checkpoint in the test).
+    monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+
+    shape = (32, 32, 32)
+    ct = np.zeros(shape, dtype=np.int16)
+    organ = np.zeros(shape, dtype=np.uint8)
+    organ[12:20, 12:20, 12:20] = 1
+    aff = np.diag([1.5, 1.5, 1.5, 1.0])
+    tgt = tmp_path / "tgt.nii.gz"; nib.save(nib.Nifti1Image(ct, aff), str(tgt))
+    cimg = tmp_path / "cimg.nii.gz"; nib.save(nib.Nifti1Image(ct, aff), str(cimg))
+    cmsk = tmp_path / "cmsk.nii.gz"; nib.save(nib.Nifti1Image(organ, aff), str(cmsk))
+    gt = tmp_path / "gt.nii.gz"; nib.save(nib.Nifti1Image(organ, aff), str(gt))
+    out = tmp_path / "pred.nii.gz"
+
+    res = infer_nifti.predict_nifti(
+        _cfg(), tgt, [(cimg, cmsk)], gt_path=gt, out_path=out)
+
+    assert res["pred"].shape == shape
+    assert res["pred"].dtype == bool
+    assert res["pred"].any()                    # stub emits a non-empty cube
+    assert 0.0 <= res["dice"] <= 1.0
+    assert 0.0 <= res["coarse_only_dice"] <= 1.0
+    assert out.exists()
+    loaded, _ = load_nifti(out)
+    assert loaded.shape == shape
+
+
+def test_predict_nifti_requires_context(tmp_path, monkeypatch):
+    import infer_nifti
+    monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    ct = np.zeros((8, 8, 8), dtype=np.int16)
+    aff = np.eye(4)
+    tgt = tmp_path / "t.nii.gz"; nib.save(nib.Nifti1Image(ct, aff), str(tgt))
+    import pytest
+    with pytest.raises(ValueError, match="context"):
+        infer_nifti.predict_nifti(_cfg(), tgt, [])
