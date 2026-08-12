@@ -1,5 +1,70 @@
 # Change log
 
+## 2026-08-12 — coarse->fine cascade eval (spacing_cascade)
+
+Added a real coarse->fine cascade to the 3D spacing sweep, complementing the existing
+geometry-only `spacing_locator` containment metric (which never re-ran the model). New flag
+`eval.spacing_cascade=true` (on top of `eval.spacing_sweep=[4,1.5]`): for each descending
+consecutive pair, the coarse pass's soft prediction centroid is mapped back to native voxels
+and used as the TARGET crop centre for a second, finer-spacing pass — measuring real Dice on
+the crop the model itself localized. Reported alongside the GT-centred fine pass (oracle) so
+the cascade->oracle gap isolates localization loss. Empty coarse predictions fall back to the
+volume centre. Needs `model.train_forward` (soft prob); totalseg / use_crop / descending
+sweep only (same guards as the locator). Adds one extra fine pass per descending pair.
+
+Changes:
+- `src/totalseg_dataloader_incontext.py`: `_pred_centers` override dict `{(subj,cls): center}`
+  consulted by the TARGET load only (contexts stay GT-centred); `"volume_center"` sentinel for
+  empty coarse preds. `_organ_crop_arrays` now stashes `_last_crop_geom` (starts, crop_sizes,
+  out_sizes, pad_lo); the single-label crop path attaches it to the item as `crop_geom` (4,3),
+  collated to `(B,4,3)` — the grid<->native map needed to invert a prediction.
+- `experiments/3d/evaluate.py`: `_predicted_native_center` (prob centroid -> native voxels via
+  crop_geom; empty -> "volume_center"); `evaluate_classes(pred_centers_out=...)` fills it on the
+  coarse pass; `evaluate_spacing_sweep(cascade=True)` runs the extra predicted-crop fine pass
+  (injecting `ds._pred_centers` before the loader iterates), tagging rows/cases `cascade_from`.
+- `experiments/3d/eval.py`: `spacing_cascade` flag, validation, wandb/CSV columns, and a cascade
+  summary block. Cascade rows are kept out of the base mean / per-spacing curve to avoid
+  double-counting classes.
+
+Cascade Dice is scored END-TO-END on the ORIGINAL native volume, not as an average of per-crop
+Dice: the coarse pred is composited into the native volume (label.npy grid) and the fine pred
+overwrites its region (finer replaces coarser), then Dice'd against the native GT
+(`_stitched_native_dice`; per-sample preds captured bit-packed via
+`evaluate_classes(pred_geom_out=)`, composited by `_write_native` = inverse of the crop). Each
+cascade row also reports `coarse_only_dice` (same native score from the coarse pred alone) as the
+no-refinement baseline; the printed/logged `mean_dice_cascade` + `mean_cascade_gain` use these.
+Smoke (spleen/liver, jitter=0): cascade 0.90 vs coarse-only 0.70–0.81, gain +0.09…+0.20.
+
+Cascade figures (`eval.cascade_figures=true`, needs spacing_cascade + save_figures): one 2x5
+coarse->fine panel per class under `<out_dir>/figures/cascade/`. Columns (top=target,
+bottom=1st context): (1) coarse img+GT, (2) coarse img + coarse pred + fine/oracle bboxes,
+(3) fine img+GT, (4) fine img + fine pred, (5) coarse img + fine pred REFITTED into the coarse
+frame + GT.
+- `experiments/3d/evaluate.py`: `save_cascade_figure` (masked-foreground overlays + bbox
+  rectangles), `_grid_centroid`, `_refit_into_coarse` (fine->native->coarse affine remap from
+  both crop geometries — grids are centre-padded so a plain resize misaligns; `_refit_into_box`
+  is the no-geometry fallback), `_save_cascade_pair` (pairs the two passes' caches per class +
+  prints a geometry guardrail: refit(fine GT) vs coarse GT Dice, ~0.9 when correct);
+  `evaluate_classes(figure_cache=, figure_classes=)` stashes one case's arrays per class (first
+  seen, keyed (subj,cls)) including `crop_geom`; `evaluate_spacing_sweep(cascade_figures=)` runs
+  the coarse+fine captures and emits the panels. Dummy driver: `experiments/3d/cascade_fig_demo.py`.
+
+### 2026-08-12 — crop start clamp bug (found via cascade-figure geometry check)
+`_organ_crop_arrays` (`src/totalseg_dataloader_incontext.py`) computed the crop start as
+`lo=max(0, ideal-j); hi=max(lo, min(s-cs, ideal+j))` — it never capped `lo` at `s-cs`, so when
+the organ centroid sits high on a near-full axis (`ideal > s-cs`, e.g. `cs==s`) the start
+exceeded `s-cs`; the numpy slice `[start:start+cs]` then silently clipped short (organ cut off,
+that axis stretched at resample, and the recorded `crop_sizes` no longer matched the real slice).
+Fixed by clamping start into `[0, s-cs]` (`smax=max(0,s-cs); lo=min(max(0,ideal-j),smax);
+hi=min(max(0,ideal+j),smax)`). This matches the documented "take what exists and pad" intent and
+made the cascade refit's geometry guardrail jump from ~0.04 to ~0.9. IMPACT: triggers whenever
+an organ centroid is in the upper half of an axis the crop spans fully (`cs==s`), which at COARSE
+spacing (4mm, 512mm FOV ≥ most volumes) is the common case, not an edge case — so it pervasively
+shifted/stretched large-FOV crops. Finer crops (1.5mm) are smaller than the volume so are mostly
+unaffected. This is a latent bug in the shared train/eval data path (independent of the cascade
+feature); the `spacing_1_to_4` checkpoint was trained with the buggy coarse crops, so re-eval /
+retrain implications are the user's call.
+
 ## 2026-08-11 — PatchSet3D random token masking
 
 Added SimMIM-style in-place token masking to `PatchSet3D` (`src/models/patchset3d.py`):
@@ -4073,3 +4138,13 @@ forward + predict shapes correct, encoder no-grad while img_embed trains; eval c
 ## 2026-08-11 — plot_dataset_items.py: per-context case id + self-context markers
 - Uses the new batch['context_subjects']: each context cell gets a badge with its case id; when a context's case id == the target case (self-context / leaked clone) the badge turns crimson with "SELF" + a crimson cell border, and the row ylabel gains [SELF-CTX] (or [part-self n/K] when only some contexts are self). No-op when the source doesn't emit context_subjects. Verified on totalseg train: self_context.p.train=1.0 -> all SELF; =0.0 -> distinct cross-subject ids, no markers (results/3d/dataset_items_{selfctx,cross}.png).
 - GAP found: only augmentations/nnunet.yaml has the per_image block; the totalseg default preset (multiverseg_v2) lacks it, so data.self_context.augs.per_image=true silently no-ops there (and augmentations.per_image.* overrides raise struct errors). Needs per_image added to multiverseg_v2 (mirror nnunet) for the pose-jitter lever to work on the default preset.
+
+## 2026-08-12 — chemotox converter: affine-based label resampling (fix zero-size crop crash)
+- BUG: `python experiments/3d/eval.py dataset=chemotox ...` crashed in a DataLoader worker — `F.interpolate ... input (D:0, ...)` inside `_place_image`. Root cause: 13/366 chemotox subjects have `ct.npy` and `label.npy`/`bc.npy` on DIFFERENT shapes (e.g. 16258784 ct (259,259,218) vs label (517,517,304)). The crop path (`_organ_crop_arrays`) derives voxel crop indices from `label.npy.shape` then slices `ct.npy` at them → out-of-range → empty (0-length) crop → interpolate crash.
+- WHY: the img and the totalseg/bclabels masks are NOT on one native grid. Inspecting affines: they differ in shape, spacing AND origin (16258784: img 0.758mm origin z=194 vs ts 0.424mm origin z=-119; 20813849 origins 343mm apart). They relate only through world coordinates. The old converter read ONE spacing from the img affine and per-axis `ndi.zoom`-resampled every label with it → misaligned/wrong-shaped labels for those subjects.
+- FIX (scripts/convert_to_npy.py, chemotox path only; totalseg byte-identical): `load_raw` now returns nibabel IMAGES (each label carrying its own affine). `_convert_chemotox` resamples the CT to the target 1.5mm grid via `nibabel.processing.resample_to_output` (order=1), then resamples every label onto that exact grid via `resample_from_to((ct.shape, ct.affine), order=0)` — world-aligned, guaranteed same shape as ct. Removed the now-dead `_resample_to_spacing` helper. Verified on the 4 offenders + 1 good subject: ct/label/bc shapes all equal and every labeled voxel lands inside the CT body (lbl_in_body_frac=1.00). NB: CT shapes shift slightly (canonical RAS grid) vs the old ndi.zoom cache — internally consistent.
+- DEFENSE-IN-DEPTH (totalseg_dataloader_incontext.py `_organ_crop_arrays`): assert ct_mm.shape == label_mm.shape with the culprit subject name — converts silent misalignment/interpolate-crash into a loud, actionable error.
+- Dataloader smoke: instantiated TotalSegInContextDataset over the re-converted 5 subjects (incl. all offenders), iterated every crop item, all image/label 128^3, no crash. Tests updated (test_convert_chemotox = nib-image contract; test_convert_generalize = labels-on-different-native-grid resample-onto-ct-grid alignment); 9/9 chemotox+converter tests pass.
+- OPERATOR ACTION REQUIRED: re-run the chemotox conversion with --overwrite (the on-disk cache still holds the old misaligned data), then delete the stale scan/bbox caches so they rebuild:
+  `python scripts/convert_to_npy.py --source chemotox --out <chemotox> --target-spacing 1.5 --workers 32 --overwrite`
+  `rm <chemotox>/.scan_cache_*.pkl <chemotox>/.bbox_cache_*.pkl <chemotox>/.bc_centroid_cache_*.pkl`

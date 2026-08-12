@@ -29,11 +29,15 @@ def test_load_raw_chemotox_remaps_and_takes_bc_channel0(tmp_path):
             "inputs": {"img": str(tmp_path / "img.nii"),
                        "totalseg": str(tmp_path / "ts.nii"),
                        "bclabels": str(tmp_path / "bc.nii")}}
-    raw, sp, labels = load_raw(task)
+    img_nib, sp, labels = load_raw(task)
 
-    assert raw.shape == D and raw.dtype == np.float32
+    # load_raw now returns nibabel images (each label carries its own affine) so the
+    # converter can resample labels onto the CT grid via world coordinates.
+    assert img_nib.shape == D
     assert sp == pytest.approx([1.5, 1.5, 3.0])
     assert set(labels) == {"label", "bc"}
-    assert labels["label"][0, 0, 0] == _CLASS_TO_IDX["liver"]
-    assert labels["bc"][1, 1, 1] == 1
-    assert labels["bc"].max() == 1          # channel 1's 9999 must not leak in
+    lab = np.asanyarray(labels["label"].dataobj)
+    bc = np.asanyarray(labels["bc"].dataobj)
+    assert lab[0, 0, 0] == _CLASS_TO_IDX["liver"]
+    assert bc[1, 1, 1] == 1
+    assert bc.ndim == 3 and bc.max() == 1   # channel 0 only; channel 1's 9999 must not leak in

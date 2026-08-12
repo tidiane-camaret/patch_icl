@@ -54,8 +54,21 @@ train/eval drift on the fidelity keys vs the checkpoint's stored `data`.
   `evaluate_spacing_sweep`'s job). This is a single-target predict.
 - No support for the resized (`use_crop=false`) path — the method is
   cascade-only.
-- No new model types; whatever `eval._build_model(cfg)` produces (patchset3d,
-  medverse, native_resenc, …) is used as-is via its `.predict`.
+- No new model types. The intended/tested model is **patchset3d**
+  (`eval.model=patchset3d`, the test checkpoint), built via
+  `eval._build_model(cfg)`; the method only needs the model's `.predict`, so any
+  model `_build_model` produces (medverse, native_resenc, …) also works.
+
+### Recenter uses the hard `predict` mask centroid
+
+The eval cascade drives the coarse→fine recenter from `model.train_forward`'s
+soft probability. This method instead reuses the **hard `predict` mask** it
+already computes for the coarse pass: its centroid (via `_predicted_native_center`,
+which weights by whatever array it's given — a 0/1 mask yields the plain
+centroid) is the fine target crop centre. That keeps it to **one forward per
+pass** and model-agnostic (no `train_forward` dependency). A minor, deliberate
+deviation from eval's soft-prob cascade; geometrically equivalent for
+localization.
 
 ## Public interface
 
@@ -150,8 +163,9 @@ For each pass at spacing `s` (coarse `s0=4`, fine `s1=1.5`):
    `context_in (K,1,T,T,T)`, `context_out (K,T,T,T)`.
 3. **Target crop**:
    - coarse (`s0`): centre = target **volume centre**.
-   - fine (`s1`): centre = `_predicted_native_center(coarse_prob, coarse_geom)`
-     (or volume centre if `"volume_center"`).
+   - fine (`s1`): centre = `_predicted_native_center(coarse_pred, coarse_geom)`
+     where `coarse_pred` is the coarse pass's hard `predict` mask (or volume
+     centre if it returns `"volume_center"`).
    Keep the target `crop_geom` for stitching.
 4. **Predict**: `model.predict(target_img[None], context_in[None],
    context_out[None])` → `(1,T,T,T)` → squeeze to `(T,T,T)` hard mask.

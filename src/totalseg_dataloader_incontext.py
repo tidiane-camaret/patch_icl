@@ -287,6 +287,16 @@ class TotalSegInContextDataset(Dataset):
         # (idx, spacing) index by the spacing batch sampler; None → fixed crop_spacing_mm.
         # Instance state is safe: a worker processes one item at a time (cf. _cur_rng).
         self._cur_crop_spacing = None
+        # Coarse->fine cascade eval: {(subject, class): native center} overriding the
+        # GT-centroid target crop with a previous-spacing predicted center. Only the TARGET
+        # load consults it (contexts stay GT-centred); a value of "volume_center" means the
+        # coarse prediction was empty -> centre on the volume. Empty {} disables the override.
+        # See experiments/3d/evaluate.py:evaluate_spacing_sweep(cascade=True).
+        self._pred_centers: dict = {}
+        # Crop geometry (starts, crop_sizes, out_sizes, pad_lo) of the most recent
+        # _organ_crop_arrays call — stashed so __getitem__ can attach the TARGET crop's
+        # geometry to the item (inverts a grid-space prediction back to native voxels).
+        self._last_crop_geom = None
         # Mask downsampling mode (all resize call sites: crop paths + synth slow path):
         #   "nearest"   — point-sample one native voxel per output voxel (default; thin
         #                 structures can vanish under heavy downsampling, e.g. 4mm crops).
@@ -893,6 +903,7 @@ class TotalSegInContextDataset(Dataset):
             return self._get_synth_item()
 
         # --- Subject and class selection ------------------------------------
+        tgt_crop_geom = None                # set by the single-label crop path (cascade eval)
         if self.num_labels_per_sample > 1:
             # Multi-label: pick a primary class (balanced), then add up to
             # num_labels_per_sample-1 extra classes present in the same subject.
@@ -921,7 +932,11 @@ class TotalSegInContextDataset(Dataset):
                 subj, cls = self.samples[idx]
             label_name = cls
 
-            image_t, label_t = self._load(subj, cls)
+            # Cascade eval: crop the TARGET on a previous-spacing predicted centre when one
+            # was injected for this (subject, class); contexts always stay GT-centred.
+            pred_center = self._pred_centers.get((subj, cls)) if self._pred_centers else None
+            image_t, label_t = self._load(subj, cls, pred_center=pred_center)
+            tgt_crop_geom = self._last_crop_geom            # geometry of the target crop
             candidates = [s for s in self.label_to_subjects[cls] if s != subj]
             load_ctx = lambda s: self._load(s, cls)
 
@@ -1008,6 +1023,8 @@ class TotalSegInContextDataset(Dataset):
             "label_name":  label_name,
             "spacing":     self._reported_spacing(subj),   # (3,) mm/voxel of output tensor
         }
+        if tgt_crop_geom is not None:
+            item["crop_geom"] = tgt_crop_geom              # (4,3): starts, crop_sizes, out_sizes, pad_lo
         if self.random_coloring and len(context_out) > 0:
             item["label_palette"] = self._sample_palette(
                 label_t, context_out, self.num_labels_per_sample
@@ -1059,13 +1076,24 @@ class TotalSegInContextDataset(Dataset):
         j = self.crop_jitter
         starts = []
         for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
+            # Start must keep the [start, start+cs) slice inside [0, s): clamp to [0, s-cs].
+            # Without capping lo at s-cs, a high organ centroid on a near-full axis (ideal >
+            # s-cs) gave start=ideal > s-cs, so the numpy slice silently clipped short (organ
+            # cut off, axis stretched, recorded crop_sizes wrong). See docs/logs.md 2026-08-12.
+            smax = max(0, s - cs)
             ideal = c - cs // 2
-            lo = max(0, ideal - j)
-            hi = max(lo, min(max(0, s - cs), ideal + j))
+            lo = min(max(0, ideal - j), smax)
+            hi = min(max(0, ideal + j), smax)
             starts.append(self._cur_rng.randint(lo, hi))
         d0, h0, w0 = starts
 
         ct_mm = self._load_native_ct_mmap(subj_dir)
+        # Crop indices are derived from the label grid, so ct.npy and label.npy MUST be
+        # voxel-aligned (same shape); a mismatch yields empty/shifted crops (silent for the
+        # label, an interpolate crash for the CT). Fail loud with the culprit subject.
+        assert ct_mm.shape == label_mm.shape, (
+            f"{subj_dir.name}: ct.npy {ct_mm.shape} != label.npy {label_mm.shape} — "
+            f"conversion must resample labels onto the CT grid (see convert_to_npy chemotox)")
         crop_ct  = ct_mm   [d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
         crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
         if self.raw_ct:
@@ -1078,6 +1106,10 @@ class TotalSegInContextDataset(Dataset):
         out_sizes = [max(1, min(T, round(cs / t * T)))
                      for cs, t in zip(crop_sizes, target_sizes)]
         pad_lo    = [(T - o) // 2 for o in out_sizes]
+        # Record the grid<->native mapping so a grid-space prediction can be inverted:
+        # native[a] = starts[a] + (g[a] - pad_lo[a]) / out_sizes[a] * crop_sizes[a].
+        self._last_crop_geom = torch.tensor(
+            [starts, list(crop_sizes), out_sizes, pad_lo], dtype=torch.long)   # (4, 3)
         return crop_ct, crop_lbl, out_sizes, pad_lo
 
     def _place_image(self, crop_ct: np.ndarray, out_sizes, pad_lo) -> torch.Tensor:
@@ -1143,13 +1175,16 @@ class TotalSegInContextDataset(Dataset):
         t = torch.from_numpy(np.ascontiguousarray(label_np, dtype=np.float32))[None, None]
         return F.interpolate(t, size=size, mode="nearest")[0, 0].long()
 
-    def _load_crop(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load_crop(self, subj: str, cls: str, pred_center=None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Load native ct.npy + label.npy and return an organ-centred crop resized to T³.
 
         Physical extent is fixed at T*crop_spacing_mm, so after resampling to T³ the
         output is crop_spacing_mm/voxel isotropic for every subject.  See
         _organ_crop_arrays for how thin-FOV axes are padded (not stretched).
+
+        `pred_center` overrides the crop centre (cascade eval): a native (d,h,w) tuple,
+        "volume_center" for an empty coarse prediction, or None for the GT centroid.
         """
         subj_dir = self.root / subj
         T = self.image_size[0]
@@ -1157,8 +1192,13 @@ class TotalSegInContextDataset(Dataset):
         label_mm = np.load(subj_dir / "label.npy", mmap_mode="r")
         D, H, W = label_mm.shape
 
-        center = self._bbox_cache.get(subj, {}).get(cls)
-        center = center if center is not None else (D // 2, H // 2, W // 2)
+        if pred_center == "volume_center":
+            center = (D // 2, H // 2, W // 2)
+        elif pred_center is not None:
+            center = tuple(int(c) for c in pred_center)
+        else:
+            center = self._bbox_cache.get(subj, {}).get(cls)
+            center = center if center is not None else (D // 2, H // 2, W // 2)
 
         sp = self._get_spacing(subj).tolist()   # native mm/voxel (3,)
         crop_ct, crop_lbl, out_sizes, pad_lo = self._organ_crop_arrays(
@@ -1242,18 +1282,22 @@ class TotalSegInContextDataset(Dataset):
             label_t[lbl > 0] = i
         return image_t, label_t
 
-    def _load(self, subj: str, cls: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load(self, subj: str, cls: str, pred_center=None) -> tuple[torch.Tensor, torch.Tensor]:
         """Load one (image, binary_mask) pair for a single class.
 
         Crop path  (use_crop=True): load native ct.npy/label.npy and extract an
         organ-centred random crop — no interpolation, native resolution detail.
         Fast path  (default): use pre-resized ct_{size}.npy + label_{size}.npy.
         Slow path  (fallback): native .nii.gz → resize on the fly.
+
+        `pred_center` (crop path only) overrides the GT-centroid crop centre for a
+        cascade eval target — a native (d,h,w) tuple, or "volume_center" for an empty
+        coarse prediction. None keeps the GT centroid (see _load_crop).
         """
         subj_dir = self.root / subj
 
         if self.use_crop:
-            return self._load_crop(subj, cls)
+            return self._load_crop(subj, cls, pred_center=pred_center)
 
         if self._size_str is not None:
             ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
@@ -1301,6 +1345,8 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         out["label_palette"] = torch.stack([b["label_palette"] for b in batch])  # (B, L+1, 3)
     if "meta" in batch[0]:
         out["meta"] = [b["meta"] for b in batch]  # per-sample provenance (sample-table detail)
+    if "crop_geom" in batch[0]:
+        out["crop_geom"] = torch.stack([b["crop_geom"] for b in batch])  # (B, 4, 3) cascade inversion
     return out
 
 

@@ -83,6 +83,106 @@ def save_eval_figure(target_img, gt, pred, ctx_img, ctx_gt, out_path: Path, titl
     plt.close(fig)
 
 
+def _norm2d(sl):
+    mn, mx = float(sl.min()), float(sl.max())
+    return (sl - mn) / (mx - mn + 1e-6)
+
+
+def _overlay(ax, base2d, layers, box_specs=()):
+    """Grayscale `base2d` with colored foreground `layers` and optional bboxes.
+
+    layers    : list of (mask2d | None, color, alpha) — only foreground (mask>0.5) is tinted.
+    box_specs : list of (cx, cy, w, h, color, label) rectangles in imshow (x=col, y=row) coords.
+    """
+    import matplotlib.colors as mcolors
+    from matplotlib.patches import Rectangle
+    ax.imshow(_norm2d(base2d), cmap="gray")
+    for m, color, a in layers:
+        if m is None:
+            continue
+        sel = np.asarray(m) > 0.5
+        rgba = np.zeros((*sel.shape, 4), dtype=float)
+        rgba[sel] = mcolors.to_rgba(color)
+        rgba[..., 3] = np.where(sel, a, 0.0)
+        ax.imshow(rgba)
+    for cx, cy, w, h, color, label in box_specs:
+        ax.add_patch(Rectangle((cx - w / 2, cy - h / 2), w, h, fill=False,
+                               edgecolor=color, lw=1.5, label=label))
+    ax.axis("off")
+
+
+def _box_inplane(center, size):
+    """(center(3,), size(3,)) voxel box -> (cx, cy, w, h) for an axis-0 slice (x=W, y=H)."""
+    return float(center[2]), float(center[1]), float(size[2]), float(size[1])
+
+
+def save_cascade_figure(out_path: Path, *,
+                        tgt_coarse, gt_coarse, pred_coarse, ctx_coarse, ctx_gt_coarse,
+                        tgt_fine, gt_fine, pred_fine, ctx_fine, ctx_gt_fine,
+                        refit_pred_coarse, refit_gt_coarse=None,
+                        fine_box=None, oracle_box=None,
+                        spacings=(None, None), title="") -> None:
+    """Save the 2x5 coarse->fine cascade panel (top row target, bottom row 1st context).
+
+    All volumes are (D,H,W); a representative axis-0 slice is picked per frame. Columns:
+      1. coarse (s0) img + GT overlay
+      2. coarse img + coarse target pred + fine/oracle bboxes (from pred/GT centroids)
+      3. fine (s1) img + GT overlay
+      4. fine img + fine target pred
+      5. coarse img + fine pred REFITTED back into the coarse frame + coarse GT
+    Boxes are (center(3,), size(3,)) in coarse-grid voxels. GT=lime, pred=red,
+    fine box=yellow, oracle box=cyan. The context row's cols 2/4 repeat the prompt (GT),
+    col 5 is blank (target-only refit)."""
+    s0, s1 = spacings
+    GT, PR = "lime", "red"
+    zc  = _best_slice(np.asarray(gt_coarse))
+    zf  = _best_slice(np.asarray(gt_fine))
+    zcc = _best_slice(np.asarray(ctx_gt_coarse))
+    zcf = _best_slice(np.asarray(ctx_gt_fine))
+
+    boxes = []
+    if fine_box is not None:
+        boxes.append((*_box_inplane(*fine_box), "yellow", "fine box"))
+    if oracle_box is not None:
+        boxes.append((*_box_inplane(*oracle_box), "cyan", "oracle box"))
+
+    fig, ax = plt.subplots(2, 5, figsize=(20, 8),
+                           gridspec_kw={"wspace": 0.04, "hspace": 0.06})
+    # ── target row ───────────────────────────────────────────────────────────
+    _overlay(ax[0, 0], np.asarray(tgt_coarse)[zc], [(np.asarray(gt_coarse)[zc], GT, 0.45)])
+    _overlay(ax[0, 1], np.asarray(tgt_coarse)[zc], [(np.asarray(pred_coarse)[zc], PR, 0.45)],
+             box_specs=boxes)
+    _overlay(ax[0, 2], np.asarray(tgt_fine)[zf],   [(np.asarray(gt_fine)[zf], GT, 0.45)])
+    _overlay(ax[0, 3], np.asarray(tgt_fine)[zf],   [(np.asarray(pred_fine)[zf], PR, 0.45)])
+    _overlay(ax[0, 4], np.asarray(tgt_coarse)[zc],
+             [(refit_gt_coarse[zc] if refit_gt_coarse is not None else np.asarray(gt_coarse)[zc], GT, 0.4),
+              (np.asarray(refit_pred_coarse)[zc], PR, 0.5)])
+    col_titles = [
+        f"1. coarse{f' @{s0:g}mm' if s0 else ''}: img+GT",
+        "2. coarse: pred + fine/oracle bbox",
+        f"3. fine{f' @{s1:g}mm' if s1 else ''}: img+GT",
+        "4. fine: pred",
+        "5. coarse: refit fine pred + GT",
+    ]
+    for j, t in enumerate(col_titles):
+        ax[0, j].set_title(t, fontsize=8)
+    # ── 1st-context row (prompt) ───────────────────────────────────────────────
+    _overlay(ax[1, 0], np.asarray(ctx_coarse)[zcc], [(np.asarray(ctx_gt_coarse)[zcc], GT, 0.45)])
+    _overlay(ax[1, 1], np.asarray(ctx_coarse)[zcc], [(np.asarray(ctx_gt_coarse)[zcc], GT, 0.45)])
+    _overlay(ax[1, 2], np.asarray(ctx_fine)[zcf],   [(np.asarray(ctx_gt_fine)[zcf], GT, 0.45)])
+    _overlay(ax[1, 3], np.asarray(ctx_fine)[zcf],   [(np.asarray(ctx_gt_fine)[zcf], GT, 0.45)])
+    ax[1, 4].axis("off")
+    for j, lab in enumerate(["ctx (coarse)", "ctx (coarse)", "ctx (fine)", "ctx (fine)", ""]):
+        if lab:
+            ax[1, j].set_title(lab, fontsize=7)
+    if boxes:
+        ax[0, 1].legend(loc="lower right", fontsize=6, framealpha=0.6)
+    fig.suptitle(title, fontsize=10)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _sample_detail(meta: dict | None) -> str:
     """One compact per-sample string for the sample table's `detail` column, adapting
     to the data source (mirrors experiments/2d/evaluate.py:_sample_detail). omniSynth3D
@@ -344,10 +444,44 @@ def _locator_containment(prob, label, ratio):
     return containment, containment_oracle, locator_empty, loc_err_vox
 
 
+def _predicted_native_center(prob, geom):
+    """Invert a grid-space prediction back to a native crop centre for the cascade.
+
+    prob : (D,H,W) soft probability in the coarse crop's T³ grid.
+    geom : (4,3) long tensor — the crop's [starts, crop_sizes, out_sizes, pad_lo]
+           (from TotalSegInContextDataset._organ_crop_arrays).
+    Returns the prob-weighted centroid mapped to native voxels (d,h,w), or the string
+    "volume_center" when the prediction is empty (caller crops on the volume centre).
+    """
+    p = prob.detach().float().cpu().numpy()
+    s = float(p.sum())
+    if s < 1e-6:
+        return "volume_center"
+    T = p.shape
+    idx = np.indices(T, dtype=float)
+    g = [(idx[a] * p).sum() / s for a in range(3)]                    # grid centroid
+    starts, crop_sizes, out_sizes, pad_lo = (geom[r].tolist() for r in range(4))
+    native = [int(round(starts[a] + (g[a] - pad_lo[a]) / max(1, out_sizes[a]) * crop_sizes[a]))
+              for a in range(3)]
+    return tuple(max(0, c) for c in native)
+
+
+def _grid_centroid(arr):
+    """Weighted centroid of a (D,H,W) array over its own grid; None if empty."""
+    a = np.asarray(arr, dtype=float)
+    s = float(a.sum())
+    if s < 1e-6:
+        return None
+    idx = np.indices(a.shape, dtype=float)
+    return np.array([(idx[k] * a).sum() / s for k in range(3)])
+
+
 def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = None,
                      loader=None, logits_fn=None, loss_fn=None, grid_res=None,
                      output_is_prob=False, autocast=False, reuse_logits=False,
-                     locator_ratio: float | None = None):
+                     locator_ratio: float | None = None, pred_centers_out: dict | None = None,
+                     figure_cache: dict | None = None, figure_classes=None,
+                     pred_geom_out: dict | None = None):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -488,6 +622,17 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 case["containment_oracle"] = round(float(cont_orc), 4)
                 case["locator_empty"] = bool(loc_empty)
                 case["loc_err_mm"] = round(loc_err_vox * sp_c, 2)
+            if pred_centers_out is not None and prob is not None and "crop_geom" in batch:
+                # Cascade: record this coarse pass's predicted crop centre (native voxels) so
+                # the next-finer pass can re-crop the target on it (see evaluate_spacing_sweep).
+                pred_centers_out[(subjects[i], cls)] = _predicted_native_center(
+                    prob[i, 0], batch["crop_geom"][i])
+            if pred_geom_out is not None and "crop_geom" in batch:
+                # Stitched-cascade metric: keep every sample's hard pred (bit-packed) + its crop
+                # geometry so the coarse & fine passes can be composited into the native volume.
+                pred_geom_out[(subjects[i], cls)] = (
+                    np.packbits(pred[i].numpy().astype(bool)),
+                    tuple(pred[i].shape), batch["crop_geom"][i].numpy())
             if prob is not None:
                 case["soft_dice"] = round(soft_dice_binary(prob[i, 0], label[i]), 4)
                 if sample_loss is not None:
@@ -498,6 +643,25 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                     case["dice_ds_soft"] = round(float(soft_sum(pr, gt)[0]), 4)
                     case["cossim"] = round(float(cos_sum(pr, gt)[0]), 4)
             cases_by_class[cls].append(case)
+            # Cascade-figure capture: stash one case's arrays per requested class (first seen,
+            # keyed (subj,cls)). The coarse and cascade-fine passes walk the same sample order,
+            # so both caches key the same (subj,cls) per class -> pairable in save_cascade_figure.
+            if (figure_cache is not None and (figure_classes is None or cls in figure_classes)
+                    and cls not in figure_cache.get("_done", set())):
+                figure_cache.setdefault("_done", set()).add(cls)
+                figure_cache[(subjects[i], cls)] = {
+                    "img":     target_img[i, 0].cpu().numpy(),      # (D,H,W)
+                    "gt":      label[i].numpy(),
+                    "pred":    pred[i].numpy(),
+                    "ctx_img": context_imgs[i, 0].squeeze(0).cpu().numpy(),
+                    "ctx_gt":  context_masks[i, 0].numpy(),
+                    "prob":    prob[i, 0].numpy() if prob is not None else None,
+                    "spacing": (round(float(batch["spacing"][i, 0]), 4)
+                                if "spacing" in batch else None),
+                    # Crop geometry [starts, crop_sizes, out_sizes, pad_lo] for the exact
+                    # fine->coarse refit (grids are padded, so a plain resize misaligns).
+                    "geom":    (batch["crop_geom"][i].numpy() if "crop_geom" in batch else None),
+                }
 
     rows, all_cases = [], []
     for cls in classes:
@@ -508,8 +672,136 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     return rows, all_cases
 
 
+def _refit_into_coarse(pred_fine, geom_c, geom_f):
+    """Map a fine-spacing prediction back into the coarse T³ frame via both crop geometries.
+
+    Each crop resamples a native slice [starts, starts+crop_sizes) into a T³ grid region
+    [pad_lo, pad_lo+out_sizes) (see _organ_crop_arrays). Composing fine grid -> native ->
+    coarse grid is affine per axis: g_c = A*g_f + B. Because the grids are centre-padded
+    (out_sizes<T on thin axes), a plain resize+recenter misaligns — this uses the actual
+    offsets. Inverse-sampled (nearest) so no gaps. Returns a (T,T,T) 0/1 array."""
+    T = pred_fine.shape[0]
+    gc, gf = np.asarray(geom_c, float), np.asarray(geom_f, float)
+    (starts_c, crop_c, out_c, pad_c), (starts_f, crop_f, out_f, pad_f) = gc, gf
+    scale_f = crop_f / np.maximum(1, out_f)          # native voxels per fine-grid voxel
+    scale_c = out_c / np.maximum(1, crop_c)          # coarse-grid voxels per native voxel
+    A = scale_f * scale_c
+    B = pad_c + (starts_f - starts_c - pad_f * scale_f) * scale_c
+    ax = np.meshgrid(*[np.arange(T) for _ in range(3)], indexing="ij")
+    fidx, valid = [], np.ones((T, T, T), bool)
+    for a in range(3):
+        f = (ax[a] - B[a]) / A[a]                    # coarse -> fine coordinate
+        valid &= (f >= 0) & (f <= T - 1)
+        fidx.append(np.clip(np.round(f), 0, T - 1).astype(np.intp))
+    sampled = np.asarray(pred_fine)[fidx[0], fidx[1], fidx[2]] > 0.5
+    return (valid & sampled).astype(np.float32)
+
+
+def _refit_into_box(pred_fine, center, side, T):
+    """Fallback refit (no crop geometry): resize the fine pred to the `side³` fine box and
+    centre it at `center` in the coarse grid. Correct only when the crops aren't padded."""
+    side = max(1, min(side, T))
+    lo = [max(0, min(int(round(center[a] - side / 2)), T - side)) for a in range(3)]
+    t = torch.from_numpy(np.ascontiguousarray(pred_fine, dtype=np.float32))[None, None]
+    small = F.interpolate(t, size=(side, side, side), mode="nearest")[0, 0].numpy()
+    out = np.zeros((T, T, T), dtype=np.float32)
+    out[lo[0]:lo[0] + side, lo[1]:lo[1] + side, lo[2]:lo[2] + side] = (small > 0.5)
+    return out
+
+
+def _write_native(native, pred, geom):
+    """Composite a crop-grid prediction into the native volume at its crop location.
+
+    Inverse of the crop: the grid region [pad_lo, pad_lo+out_sizes) resamples from native
+    [starts, starts+crop_sizes), so extract the object sub-block, upsample it to crop_sizes
+    (nearest), and write it in. Later (finer) writes overwrite earlier (coarser) ones."""
+    starts, crop, out, pad = (geom[r].astype(int) for r in range(4))
+    sub = pred[pad[0]:pad[0] + out[0], pad[1]:pad[1] + out[1], pad[2]:pad[2] + out[2]]
+    if sub.size == 0:
+        return
+    t = torch.from_numpy(np.ascontiguousarray(sub, dtype=np.float32))[None, None]
+    small = F.interpolate(t, size=(int(crop[0]), int(crop[1]), int(crop[2])),
+                          mode="nearest")[0, 0].numpy() > 0.5
+    D, H, W = native.shape
+    d0, h0, w0 = int(starts[0]), int(starts[1]), int(starts[2])
+    de, he, we = min(d0 + small.shape[0], D), min(h0 + small.shape[1], H), min(w0 + small.shape[2], W)
+    native[d0:de, h0:he, w0:we] = small[:de - d0, :he - h0, :we - w0]
+
+
+def _unpack_pred(entry):
+    packed, shape, geom = entry
+    return np.unpackbits(packed)[:int(np.prod(shape))].reshape(shape).astype(bool), geom
+
+
+def _stitched_native_dice(base_pg, over_pg, root):
+    """Dice on the full native volume of GT vs the stitched multi-scale prediction.
+
+    Builds a native-resolution prediction from the coarse (`base_pg`) pass, then overwrites
+    each sample's fine (`over_pg`) region on top (finer replaces coarser), and scores it
+    against the native GT (label.npy == class index). `over_pg` empty -> coarse-only baseline.
+    Returns {(subj,cls): dice} over the keys in `over_pg` (or `base_pg` when `over_pg` empty)."""
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+    keys = over_pg or base_pg
+    out = {}
+    for key in keys:
+        subj, cls = key
+        idx = _ALL_CLASSES_IDX.get(cls)
+        if idx is None or key not in base_pg:
+            continue
+        gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
+        native = np.zeros(gt.shape, dtype=bool)
+        bp, bgeom = _unpack_pred(base_pg[key]);  _write_native(native, bp, bgeom)
+        if key in over_pg:
+            op, ogeom = _unpack_pred(over_pg[key]);  _write_native(native, op, ogeom)
+        inter = 2.0 * np.logical_and(native, gt).sum()
+        denom = int(native.sum()) + int(gt.sum())
+        out[key] = inter / denom if denom > 0 else 1.0
+    return out
+
+
+def _save_cascade_pair(coarse_cache, fine_cache, s_coarse, s_fine, out_dir):
+    """Emit one save_cascade_figure per class present in both passes' figure caches."""
+    def by_cls(cache):
+        return {k[1]: (k[0], v) for k, v in cache.items() if isinstance(k, tuple)}
+    cc, fc = by_cls(coarse_cache), by_cls(fine_cache)
+    ratio = s_fine / s_coarse
+    for cls, (subj, c) in cc.items():
+        if cls not in fc:
+            continue
+        _, f = fc[cls]
+        T = c["gt"].shape[0]
+        side = max(1, round(T * ratio))
+        # Box centres: coarse pred centroid (soft prob if available) and the GT centroid (oracle).
+        pc = _grid_centroid(c["prob"] if c["prob"] is not None else c["pred"])
+        gc = _grid_centroid(c["gt"])
+        if pc is None:
+            pc = np.array([T / 2.0] * 3)                # empty coarse pred -> volume centre
+        fine_box   = (pc, np.array([side] * 3))
+        oracle_box = (gc, np.array([side] * 3)) if gc is not None else None
+        # Exact fine->coarse remap when both crop geometries are available (grids are padded);
+        # else the plain resize-and-centre fallback.
+        if c.get("geom") is not None and f.get("geom") is not None:
+            refit = _refit_into_coarse(f["pred"], c["geom"], f["geom"])
+            # Geometry guardrail: refitting the fine GT should reproduce the coarse GT (high
+            # Dice, capped by the coarse resolution). A low value flags a bad affine remap.
+            refit_gt = _refit_into_coarse(f["gt"], c["geom"], f["geom"])
+            gd = dice_binary(torch.from_numpy(refit_gt), torch.from_numpy(c["gt"].astype("float32")))
+            print(f"    [cascade-fig] {cls} ({subj}): refit(fine GT) vs coarse GT dice={gd:.3f}")
+        else:
+            refit = _refit_into_box(f["pred"], pc, side, T)
+        save_cascade_figure(
+            out_dir / f"{cls}_{s_coarse:g}to{s_fine:g}mm.png",
+            tgt_coarse=c["img"], gt_coarse=c["gt"], pred_coarse=c["pred"],
+            ctx_coarse=c["ctx_img"], ctx_gt_coarse=c["ctx_gt"],
+            tgt_fine=f["img"], gt_fine=f["gt"], pred_fine=f["pred"],
+            ctx_fine=f["ctx_img"], ctx_gt_fine=f["ctx_gt"],
+            refit_pred_coarse=refit, refit_gt_coarse=c["gt"],
+            fine_box=fine_box, oracle_box=oracle_box, spacings=(s_coarse, s_fine),
+            title=f"{cls}  cascade {s_coarse:g}->{s_fine:g}mm  (subj {subj})")
+
+
 def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir=None,
-                           locator=False):
+                           locator=False, cascade=False, cascade_figures=False):
     """Run evaluate_classes once per physical crop spacing; tag rows with their spacing.
 
     Builds a constant-spacing eval loader per `s` (make_eval_loader(..., spacing=s)) and
@@ -524,16 +816,39 @@ def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir
     back to the hard predicted mask centroid (a one-time warning). The finest spacing has
     no successor, so it runs the plain single-predict path with no extra forward.
 
+    When cascade=True, each coarse pass that has a next-finer spacing additionally runs a
+    REAL coarse->fine pass: the coarse soft prediction's centroid (mapped back to native
+    voxels via _predicted_native_center) becomes the TARGET crop centre for a second,
+    finer-spacing eval. The cascade Dice is then scored END-TO-END on the ORIGINAL native
+    volume (not per-crop): the coarse prediction is composited into the native volume and the
+    fine prediction overwrites its region (finer replaces coarser), then Dice'd against the
+    native GT (see _stitched_native_dice). Each cascade row also carries `coarse_only_dice`
+    (the same native score from the coarse pred alone) as the no-refinement baseline. Empty
+    coarse predictions crop on the volume centre. Cascade rows/cases carry `cascade_from`.
+    Both locator and cascade need model.train_forward (a soft prob); if absent, cascade is
+    skipped with a warning.
+
+    When cascade_figures=True (requires cascade and fig_dir), one 2x5 coarse->fine panel per
+    class is saved under fig_dir/cascade/ (see save_cascade_figure): coarse img/GT/pred +
+    bboxes, fine img/GT/pred, and the fine pred refitted into the coarse frame.
+
     Returns (rows, cases): rows are per-(class, spacing); cases are all passes concatenated.
+    Cascade rows are extra rows at the finer spacing, tagged `cascade_from`.
     """
     from common import make_eval_loader  # local import: common/evaluate are siblings
 
+    root = None
+    if cascade:
+        from common import _source_root  # native GT (label.npy) for the stitched-cascade dice
+        _, root, _ = _source_root(cfg)
+
     lf = op = None
-    if locator:
+    if locator or cascade:
         lf = getattr(model, "train_forward", None)
         if lf is None:
-            print("  [warn] model has no train_forward; locator uses the hard predicted "
-                  "mask centroid (no soft prob).")
+            what = "locator/cascade" if (locator and cascade) else ("cascade" if cascade else "locator")
+            print(f"  [warn] model has no train_forward; {what} needs a soft prob. "
+                  "Locator falls back to the hard predicted mask centroid; cascade is skipped.")
         else:
             from train import model_output_is_prob  # local import: sibling module
             op = model_output_is_prob(cfg)
@@ -543,17 +858,71 @@ def evaluate_spacing_sweep(model, cfg, classes, spacings, *, split=None, fig_dir
         ratio = None
         if locator and i + 1 < len(spacings) and spacings[i + 1] < s:
             ratio = spacings[i + 1] / s
+        # Capture predicted native centres on this pass when a finer successor exists and a
+        # soft prob is available -> feeds the cascade fine pass below.
+        want_centers = (cascade and lf is not None
+                        and i + 1 < len(spacings) and spacings[i + 1] < s)
+        centers_out = {} if want_centers else None
+        # Capture coarse-pass arrays for the cascade panel only when this pass feeds a fine one.
+        coarse_cache = {} if (cascade_figures and fig_dir and want_centers) else None
+        # Capture every coarse pred + geom to composite into the native volume for the
+        # stitched-cascade dice (finer overwrites coarser). Only when this pass feeds a fine one.
+        coarse_pg = {} if want_centers else None
         loader = make_eval_loader(cfg, classes, split=split or cfg.eval.split, spacing=s)
         rows_s, cases_s = evaluate_classes(
             model, cfg, classes, loader=loader,
             fig_dir=fig_dir if i == 0 else None,
-            logits_fn=(lf if ratio is not None else None),
+            logits_fn=(lf if (ratio is not None or want_centers) else None),
             output_is_prob=bool(op),
-            locator_ratio=ratio)
+            locator_ratio=ratio,
+            pred_centers_out=centers_out,
+            figure_cache=coarse_cache,
+            pred_geom_out=coarse_pg)
         for r in rows_s:
             r["spacing"] = s
             if ratio is not None:
                 r["locator_to"] = spacings[i + 1]
         rows.extend(rows_s)
         cases.extend(cases_s)
+
+        # Cascade fine pass: re-crop the finer spacing's TARGETS on this pass's predicted
+        # centres (injected via ds._pred_centers), then score the STITCHED native volume.
+        if want_centers and centers_out:
+            fine_s = spacings[i + 1]
+            fine_loader = make_eval_loader(cfg, classes, split=split or cfg.eval.split, spacing=fine_s)
+            fine_loader.dataset._pred_centers = centers_out  # set before workers fork (lazy on iter)
+            fine_cache = {} if coarse_cache is not None else None
+            fine_pg = {}
+            rows_c, cases_c = evaluate_classes(model, cfg, classes, loader=fine_loader,
+                                               figure_cache=fine_cache, pred_geom_out=fine_pg)
+            # End-to-end native dice: coarse composited + fine overwrite vs native GT, plus the
+            # coarse-only baseline. Replaces the per-crop fine dice as the headline cascade score.
+            casc = _stitched_native_dice(coarse_pg, fine_pg, root)
+            base = _stitched_native_dice(coarse_pg, {}, root)
+            for c in cases_c:
+                key = (c["subject"], c["class"])
+                c["dice_crop"] = c["dice"]                      # keep per-crop for reference
+                if key in casc:
+                    c["dice"] = round(casc[key], 4)            # headline = stitched native dice
+                c["coarse_only_dice"] = round(base[key], 4) if key in base else float("nan")
+                c["cascade_from"] = s
+            # Re-summarise per class from the stitched dice (n stays, mean/std now native).
+            cbcls: dict[str, list] = {}
+            for c in cases_c:
+                cbcls.setdefault(c["class"], []).append(c)
+            rows_c = []
+            for cls in classes:
+                cs = cbcls.get(cls)
+                if not cs:
+                    continue
+                r = _summarize(cls, cs)
+                r["spacing"], r["cascade_from"] = fine_s, s
+                bo = [c["coarse_only_dice"] for c in cs if not np.isnan(c["coarse_only_dice"])]
+                r["coarse_only_dice"] = round(sum(bo) / len(bo), 4) if bo else float("nan")
+                rows_c.append(r)
+            rows.extend(rows_c)
+            cases.extend(cases_c)
+            if coarse_cache is not None and fine_cache is not None:
+                _save_cascade_pair(coarse_cache, fine_cache, s, fine_s,
+                                   fig_dir / "cascade")
     return rows, cases

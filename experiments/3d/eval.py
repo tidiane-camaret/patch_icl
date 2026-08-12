@@ -89,12 +89,13 @@ def _assert_sweep_supported(cfg: DictConfig) -> None:
             f"eval.spacing_sweep is unsupported for data.source={source!r} (routed through "
             "build_dataset with no per-item spacing override). Supported: totalseg (direct "
             "build) and totalseg_more_labels (a TotalSegInContextDataset subclass).")
-    if cfg.eval.get("spacing_locator"):
+    if cfg.eval.get("spacing_locator") or cfg.eval.get("spacing_cascade"):
+        which = "spacing_locator" if cfg.eval.get("spacing_locator") else "spacing_cascade"
         sweep = cfg.eval.get("spacing_sweep")
         sl = list(sweep) if sweep else []
         if len(sl) < 2 or not any(sl[i + 1] < sl[i] for i in range(len(sl) - 1)):
             raise ValueError(
-                f"eval.spacing_locator requires eval.spacing_sweep with at least one "
+                f"eval.{which} requires eval.spacing_sweep with at least one "
                 f"descending step (e.g. [4, 2]); got {sl!r}.")
 
 
@@ -211,6 +212,14 @@ def main(cfg: DictConfig) -> None:
     # `_global_`-packaged group selections leave no key in cfg; log Hydra's runtime choices
     # so dataset=/augmentations=/... are visible in wandb (cf. train.py).
     from hydra.core.hydra_config import HydraConfig
+    # val_classes is the spec (e.g. "benchmark" or an explicit list); keep it alongside the
+    # resolved `classes` so the wandb run records which eval regime produced the numbers.
+    val_classes = cfg.data.get("val_classes")
+    if isinstance(val_classes, (DictConfig, ListConfig)):
+        val_classes = OmegaConf.to_container(val_classes, resolve=True)
+    spacing_sweep = cfg.eval.get("spacing_sweep")
+    if isinstance(spacing_sweep, (DictConfig, ListConfig)):
+        spacing_sweep = OmegaConf.to_container(spacing_sweep, resolve=True)
     run = wandb.init(
         project=cfg.wandb.project, name=cfg.wandb.name,
         mode="online" if wb_on else "disabled",
@@ -218,6 +227,14 @@ def main(cfg: DictConfig) -> None:
                 "split": cfg.eval.split, "K": K, "image_size": list(image_size),
                 "n_subjects": cfg.eval.n_subjects, "classes": list(classes),
                 "gflops": round(gflops, 2),
+                # Eval-fidelity knobs that change what the model sees / how Dice is scored.
+                "val_classes": val_classes,
+                "mask_downsample": cfg.data.get("mask_downsample"),
+                "mask_occupancy_thr": cfg.data.get("mask_occupancy_thr"),
+                "crop_spacing_mm": cfg.data.get("crop_spacing_mm"),
+                "spacing_sweep": spacing_sweep,
+                "spacing_locator": bool(cfg.eval.get("spacing_locator")),
+                "spacing_cascade": bool(cfg.eval.get("spacing_cascade")),
                 "hydra_choices": dict(HydraConfig.get().runtime.choices)},
     )
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
@@ -241,13 +258,17 @@ def main(cfg: DictConfig) -> None:
     # so eval leaves `soft_dice`/`loss` empty and reports only the timed model.predict Dice.
     sweep = cfg.eval.get("spacing_sweep")
     locator = bool(cfg.eval.get("spacing_locator"))
+    cascade = bool(cfg.eval.get("spacing_cascade"))
     if sweep:
         _assert_sweep_supported(cfg)
         spacings = list(sweep)
-        tag = "  (+ coarse->fine locator)" if locator else ""
+        tag = ("  (+ coarse->fine locator)" if locator else "") + \
+              ("  (+ coarse->fine cascade)" if cascade else "")
         print(f"  Spacing sweep: {spacings} mm  ({len(spacings)}x eval time){tag}\n")
+        cascade_figures = cascade and bool(cfg.eval.get("cascade_figures", False))
         rows, all_cases = evaluate_spacing_sweep(model, cfg, classes, spacings,
-                                                 fig_dir=fig_dir, locator=locator)
+                                                 fig_dir=fig_dir, locator=locator,
+                                                 cascade=cascade, cascade_figures=cascade_figures)
     else:
         rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
     # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
@@ -257,8 +278,12 @@ def main(cfg: DictConfig) -> None:
     for row in rows:
         cls = row["class"]
         sp = row.get("spacing")
+        casc = row.get("cascade_from")
         sp_str = f" @{sp:g}mm" if sp is not None else ""
-        sp_key = f"@{sp:g}" if sp is not None else ""
+        sp_str += f" (cascade<-{casc:g}mm)" if casc is not None else ""
+        # Distinct wandb key for cascade rows so they don't overwrite the GT-centred fine pass
+        # at the same spacing.
+        sp_key = (f"@{sp:g}" if sp is not None else "") + (f"_casc{casc:g}" if casc is not None else "")
         if "error" in row:
             print(f"  {cls:<35s}{sp_str}  ERROR: {row['error']}")
             continue
@@ -268,14 +293,17 @@ def main(cfg: DictConfig) -> None:
         print(f"  {cls:<35s}{sp_str}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
               f"  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}")
         if wb_on:
-            wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"],
-                       f"class/{cls}/std_dice{sp_key}": row["std_dice"],
-                       f"class/{cls}/mean_time_ms{sp_key}": row["mean_time_ms"]})
+            # Only mean_dice per class; std_dice / mean_time_ms are inferable from the
+            # per-sample `cases` table, so we don't duplicate them as scalar series.
+            wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"]})
             if "mean_containment" in row:
                 wandb.log({f"class/{cls}/containment{sp_key}": row["mean_containment"],
                            f"class/{cls}/containment_oracle{sp_key}": row["mean_containment_oracle"]})
 
-    valid = [r for r in rows if "mean_dice" in r]
+    # Cascade rows are extra (predicted-crop) fine passes; keep them out of the base mean and
+    # per-spacing curve so they don't double-count classes, then summarise them separately.
+    valid = [r for r in rows if "mean_dice" in r and r.get("cascade_from") is None]
+    cascade_rows = [r for r in rows if "mean_dice" in r and r.get("cascade_from") is not None]
     if valid:
         mean_dice = sum(r["mean_dice"] for r in valid) / len(valid)
         mean_ms   = sum(r["mean_time_ms"] for r in valid) / len(valid)
@@ -285,7 +313,7 @@ def main(cfg: DictConfig) -> None:
             wandb.log({"mean_dice": round(mean_dice, 4), "mean_time_ms": round(mean_ms, 1),
                        "gflops": round(gflops, 2), "cases": case_table})
         if sweep:
-            # Aggregate curve: mean Dice over classes at each spacing.
+            # Aggregate curve: mean Dice over classes at each spacing (GT-centred passes).
             print("  spacing -> mean_dice:")
             for s in spacings:
                 vs = [r["mean_dice"] for r in valid if r.get("spacing") == s]
@@ -302,6 +330,29 @@ def main(cfg: DictConfig) -> None:
                     print(f"    {r['class']:<28s} {r['spacing']:g}->{r['locator_to']:g}mm : "
                           f"{r['mean_containment']:.3f}  (orc {r['mean_containment_oracle']:.3f}, "
                           f"gap {gap:.3f}, n={r['n_locator']}, empty={r['n_locator_empty']})")
+        if cascade_rows:
+            # Stitched-native cascade Dice (coarse composited + fine overwrite, vs native GT)
+            # against the coarse-only native baseline; the gain isolates the fine refinement.
+            print("  cascade (coarse->fine, STITCHED native dice) : mean_dice (coarse-only, gain):")
+            casc_dices, gains = [], []
+            for r in cascade_rows:
+                co = r.get("coarse_only_dice")
+                has_co = co is not None and co == co  # not None / not NaN
+                gain_str = f", gain {r['mean_dice'] - co:+.3f}" if has_co else ""
+                co_str = f"{co:.3f}" if has_co else "n/a"
+                print(f"    {r['class']:<28s} {r['cascade_from']:g}->{r['spacing']:g}mm : "
+                      f"{r['mean_dice']:.3f}  (coarse-only {co_str}{gain_str}, n={r['n_samples']})")
+                casc_dices.append(r["mean_dice"])
+                if has_co:
+                    gains.append(r["mean_dice"] - co)
+            if casc_dices:
+                mcd = sum(casc_dices) / len(casc_dices)
+                gain_txt = f"  |  mean gain over coarse-only: {sum(gains)/len(gains):+.4f}" if gains else ""
+                print(f"    mean cascade Dice (stitched native): {mcd:.4f}{gain_txt}")
+                if wb_on:
+                    wandb.log({"mean_dice_cascade": round(mcd, 4)})
+                    if gains:
+                        wandb.log({"mean_cascade_gain": round(sum(gains) / len(gains), 4)})
 
     # ── save outputs ─────────────────────────────────────────────────────────
     (out_dir / "eval.json").write_text(json.dumps(
@@ -309,12 +360,14 @@ def main(cfg: DictConfig) -> None:
          "rows": rows}, indent=2))
     sweep_col = ",spacing" if sweep else ""
     loc_col = ",locator_to,mean_containment,mean_containment_oracle,mean_loc_err_mm" if locator else ""
-    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}{loc_col}"]
+    casc_col = ",cascade_from,coarse_only_dice" if cascade else ""
+    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}{loc_col}{casc_col}"]
     csv += [f"{model_name},{r['class']},{r['mean_dice']},{r['std_dice']},"
             f"{r.get('mean_time_ms','')},{r.get('gflops','')},{r['n_samples']}"
             + (f",{r.get('spacing','')}" if sweep else "")
             + (f",{r.get('locator_to','')},{r.get('mean_containment','')},"
                f"{r.get('mean_containment_oracle','')},{r.get('mean_loc_err_mm','')}" if locator else "")
+            + (f",{r.get('cascade_from','')},{r.get('coarse_only_dice','')}" if cascade else "")
             for r in rows if "mean_dice" in r]
     (out_dir / "eval.csv").write_text("\n".join(csv) + "\n")
     print(f"  Saved -> {out_dir}")

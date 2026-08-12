@@ -35,6 +35,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import scipy.ndimage as ndi
+from nibabel.processing import resample_from_to, resample_to_output
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -87,16 +88,6 @@ def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True,
     return out
 
 
-def _resample_to_spacing(vol: np.ndarray, native_sp, target_sp: float,
-                         order: int = 1) -> np.ndarray:
-    """Resample `vol` from native voxel spacing (mm, per axis) to `target_sp` mm
-    isotropic. order=1 (trilinear) for images, order=0 (nearest) for label maps.
-    out_shape[i] = round(shape[i] * native_sp[i] / target_sp)."""
-    zoom = [float(ns) / float(target_sp) for ns in native_sp]
-    out = ndi.zoom(vol, zoom, order=order)
-    return out.astype(vol.dtype, copy=False)
-
-
 def _default_data_dir() -> str:
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(config_name="config")
@@ -136,20 +127,25 @@ def enumerate_subjects(source: str, data, out, limit=None) -> list[dict]:
 
 
 def load_raw(task: dict):
-    """(raw_ct f32, native_spacing [3], {label_name: array}) for a chemotox subject.
+    """(img_nib, native_spacing [3], {label_name: nib_image}) for a chemotox subject.
 
-    All three volumes share one native grid, so no canonicalization is needed — read
-    raw dataobj and take spacing from the img affine. (The totalseg source does its own
+    The img and the totalseg/bclabels masks are NOT guaranteed to share a native grid:
+    across the cohort ~4% of subjects have masks on a different shape/spacing/origin than
+    the image (they only relate through world coordinates). So we return each label as a
+    nibabel image (carrying its own affine); the converter resamples it onto the CT's
+    output grid via the affines. A per-axis zoom with the img's spacing would misalign
+    those subjects (empty/shifted crops downstream). (The totalseg source does its own
     CT+segmentations reading inside _convert_totalseg to stay byte-identical.)"""
     assert task["source"] == "chemotox", "load_raw serves the chemotox source only"
     p = task["inputs"]
     img = nib.load(p["img"])
-    raw = np.asanyarray(img.dataobj).astype(np.float32)
     sp = [abs(float(x)) for x in nib.affines.voxel_sizes(img.affine)[:3]]
-    ts = np.asanyarray(nib.load(p["totalseg"]).dataobj)
-    label = remap_ts_total(ts)
-    bc = np.asanyarray(nib.load(p["bclabels"]).dataobj)[..., 0].astype(np.uint8)
-    return raw, sp, {"label": label, "bc": bc}
+    ts_img = nib.load(p["totalseg"])
+    label_img = nib.Nifti1Image(remap_ts_total(np.asanyarray(ts_img.dataobj)), ts_img.affine)
+    bc_src = nib.load(p["bclabels"])
+    bc_arr = np.asanyarray(bc_src.dataobj)[..., 0].astype(np.uint8)  # channel 0 = tissue map
+    bc_img = nib.Nifti1Image(bc_arr, bc_src.affine)
+    return img, sp, {"label": label_img, "bc": bc_img}
 
 
 def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, dict | None]:
@@ -259,15 +255,23 @@ def _convert_chemotox(task: dict):
             and not overwrite and size is None):
         return subj_id, "skip", None, None, None
     try:
-        raw, native_sp, labels = load_raw(task)
-        vol = _normalise_ct(raw)
+        raw_img, native_sp, label_imgs = load_raw(task)
+        # Normalise CT in HU, then resample to the output grid. Labels are resampled onto
+        # that exact grid via the affines (world coords) so ct.npy and every label are the
+        # same shape and voxel-aligned — regardless of the label's native geometry.
+        ct_img = nib.Nifti1Image(_normalise_ct(np.asanyarray(raw_img.dataobj).astype(np.float32)),
+                                 raw_img.affine)
         if target_sp is not None:
-            vol = _resample_to_spacing(vol, native_sp, target_sp, order=1)
-            labels = {n: _resample_to_spacing(a, native_sp, target_sp, order=0)
-                      for n, a in labels.items()}
+            ct_res = resample_to_output(ct_img, [float(target_sp)] * 3, order=1)
             out_sp = [float(target_sp)] * 3
         else:
+            ct_res = ct_img
             out_sp = native_sp
+        vol = np.asanyarray(ct_res.dataobj).astype(np.float32)
+        labels = {n: np.asanyarray(
+                      resample_from_to(li, (ct_res.shape, ct_res.affine), order=0).dataobj
+                  ).astype(np.uint8)
+                  for n, li in label_imgs.items()}
         out_shape = list(vol.shape)
         np.save(ct_out, vol.astype(np.float16))
         for n, a in labels.items():
