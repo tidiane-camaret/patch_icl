@@ -1,0 +1,27 @@
+# Minimal conda env `patchset` for nifti in-context inference (experiments/3d/infer_nifti.py).
+# Runs the patchset3d spacing_cascade on Ampere nodes: nero (A4000), thor/loki (A6000).
+# Blackwell (odin, sm_120) is NOT covered — it needs a cu128 torch build instead.
+#
+# Build:
+#   conda create -n patchset python=3.11 -y
+#   conda activate patchset
+#   pip install "torch==2.6.0" "torchvision==0.21.0" --extra-index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements-patchset-infer.txt
+#
+# GOTCHA (why versions are pinned): `dynamic_network_architectures` (needed by the primus
+# encoder) has no torch pin, so a bare `pip install` pulls the latest torch (2.13, cu13) and a
+# cu13 cuDNN wheel. A cu13 cuDNN loaded inside a cu124 torch throws
+# CUDNN_STATUS_NOT_INITIALIZED on the primus 8^3-kernel patch-embed conv3d (small 3x3 convs
+# still work, which is why it looks intermittent). Install torch FIRST, then dna with --no-deps,
+# to keep the cu124 cuDNN 9.1.0.70 that torch 2.6 ships with.
+dynamic_network_architectures==0.4.4  # install with: pip install --no-deps dynamic_network_architectures==0.4.4 einops timm
+einops
+timm
+numpy>=1.26,<2.5
+scipy
+nibabel
+matplotlib
+tqdm
+hydra-core>=1.3
+omegaconf>=2.3
+wandb

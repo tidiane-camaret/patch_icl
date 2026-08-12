@@ -5,8 +5,8 @@
 #       eval.checkpoint=results/checkpoints/<run>/best.pt eval.split=test
 # Frozen pretrained encoder (no training, intrinsic metrics only, real_dice empty):
 #   python experiments/3d/feature_sim/run.py eval.model=primus \
-#       eval.primus_sidecar=results/checkpoints/primus_colipri.json \
 #       'feature_sim.tiers=[backbone]' 'feature_sim.resolutions=[8,16]'
+#   (eval.primus_sidecar defaults to ${paths.colipri}/primus_colipri.json)
 # Per eva-block depth sweep (one row per layer, tier bb:L{i}):
 #       'feature_sim.tiers=[backbone_layers]'
 defaults:
@@ -40,7 +40,7 @@ eval:
   # model=primus: supply weights + arch via a sidecar written by
   # scripts/extract_colipri_backbone.py, or inline primus_kwargs/preproc below.
   weights: null               # plain Primus state_dict (.pt); null = random-init floor
-  primus_sidecar: results/checkpoints/primus_colipri.json        # JSON: {primus_kwargs, preproc, weights}
+  primus_sidecar: ${paths.colipri}/primus_colipri.json        # JSON: {primus_kwargs, preproc, weights}
   primus_kwargs: null         # inline alternative to the sidecar
   preproc: null               # {clip_min,clip_max,mean,std} HU re-normalisation
   # model=tap_ct: frozen fomofo/tap-ct-b-3d (weights on HF). tiers: backbone (final) or

@@ -16,8 +16,8 @@ Arch + preprocessing are read from the repo's Hydra configs (config.yaml / backb
 
 Run (.venv_thor):
     python scripts/extract_colipri_backbone.py \
-        --out results/checkpoints/primus_colipri.pt \
-        --sidecar results/checkpoints/primus_colipri.json
+        --out /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/colipri/primus_colipri.pt \
+        --sidecar /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/colipri/primus_colipri.json
 """
 import argparse
 import json
@@ -59,8 +59,10 @@ def build_spec():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="results/checkpoints/primus_colipri.pt")
-    ap.add_argument("--sidecar", default="results/checkpoints/primus_colipri.json")
+    _COLIPRI = ("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation"
+                "/ANALYSIS_20251122/checkpoints/colipri")
+    ap.add_argument("--out", default=f"{_COLIPRI}/primus_colipri.pt")
+    ap.add_argument("--sidecar", default=f"{_COLIPRI}/primus_colipri.json")
     args = ap.parse_args()
 
     primus_kwargs, preproc = build_spec()

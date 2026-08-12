@@ -3,7 +3,7 @@
 # Same data/optim recipe as experiment 22, but swaps the trainable conv encoder for the
 # FROZEN CoLiPri Primus ViT and runs at 192³ on organ-centered crops. Equivalent to:
 #   python experiments/3d/train.py experiment=22_totalseg_train_test model=patchset3d \
-#     arch.encoder=primus arch.primus_sidecar=results/checkpoints/primus_colipri.json \
+#     arch.encoder=primus 'arch.primus_sidecar=${paths.colipri}/primus_colipri.json' \
 #     arch.l=2 arch.e=512 arch.resolution=24 arch.img_embed_mlp=true \
 #     data.image_size=[192,192,192] data.use_crop=true
 # Run with:
@@ -26,7 +26,7 @@ defaults:
 arch:
   encoder: primus
   encoder_frozen: true
-  primus_sidecar: results/checkpoints/primus_colipri.json
+  primus_sidecar: ${paths.colipri}/primus_colipri.json
   resolution: 24
   e: 512
   l: 2

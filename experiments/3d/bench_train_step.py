@@ -10,7 +10,7 @@ compute-only loop (one batch reused) so you can read off the data-vs-compute spl
     .venv_blackwell/bin/python experiments/3d/bench_train_step.py \
         --workers 16 --steps 40 -- \
         model=patchset3d arch.encoder=primus \
-        arch.primus_sidecar=results/checkpoints/primus_colipri.json \
+        'arch.primus_sidecar=${paths.colipri}/primus_colipri.json' \
         arch.l=2 arch.resolution=24 data.image_size=[192,192,192] data.use_crop=true
 """
 import argparse

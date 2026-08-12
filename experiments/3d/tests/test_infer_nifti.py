@@ -135,6 +135,39 @@ def test_predict_nifti_end_to_end(tmp_path, monkeypatch):
     assert loaded.shape == shape
 
 
+def test_predict_nifti_output_matches_target_orientation(tmp_path, monkeypatch):
+    """Output mask must be saved on the TARGET's on-disk grid, not the RAS-canonical grid.
+
+    Target is stored LAS (first axis flipped) while the context is RAS; the model runs in
+    canonical space but the written/returned mask must be reoriented back to the target's
+    orientation + affine so it overlays the input CT voxel-for-voxel."""
+    import infer_nifti
+    monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+
+    shape = (32, 32, 32)
+    ct = np.zeros(shape, dtype=np.int16)
+    organ = np.zeros(shape, dtype=np.uint8); organ[12:20, 12:20, 12:20] = 1
+    las_aff = np.diag([-1.5, 1.5, 1.5, 1.0])   # non-canonical target (L instead of R)
+    ras_aff = np.diag([1.5, 1.5, 1.5, 1.0])
+    tgt = tmp_path / "tgt.nii.gz"; nib.save(nib.Nifti1Image(ct, las_aff), str(tgt))
+    cimg = tmp_path / "cimg.nii.gz"; nib.save(nib.Nifti1Image(ct, ras_aff), str(cimg))
+    cmsk = tmp_path / "cmsk.nii.gz"; nib.save(nib.Nifti1Image(organ, ras_aff), str(cmsk))
+    out = tmp_path / "pred.nii.gz"
+
+    res = infer_nifti.predict_nifti(_cfg(), tgt, [(cimg, cmsk)], out_path=out)
+
+    # Returned affine + saved affine must be the target's original (LAS), not canonical RAS.
+    assert np.allclose(res["affine"], las_aff)
+    saved = nib.load(str(out))
+    assert np.allclose(saved.affine, las_aff)
+    assert nib.aff2axcodes(saved.affine) == ('L', 'A', 'S')
+    # Re-canonicalising the saved mask reproduces the canonical prediction the model made:
+    # the round-trip preserved content, only the grid orientation changed.
+    recanon = np.asanyarray(nib.as_closest_canonical(saved).dataobj) > 0
+    assert recanon.shape == shape and recanon.any()
+
+
 def test_predict_nifti_requires_context(tmp_path, monkeypatch):
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())

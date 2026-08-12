@@ -9,6 +9,7 @@ paths:
   nako:        /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/nako
   nnunet:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
   results:     /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl
+  colipri:     /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/colipri  # frozen CoLiPri Primus encoder (sidecar json + weights)
   omniglot:    /home/dpxuser/repos/omniglot/python   # no cluster-specific copy; reuse dev path
   ckpt_nnint:  /home/dpxuser/model_checkpoints/nnint/nnInteractive_v1.0
   ckpt_3dino: /home/dpxuser/model_checkpoints/3DINO/3dino_vit_weights.pth

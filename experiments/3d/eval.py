@@ -146,6 +146,12 @@ def _build_model(cfg: DictConfig):
             fn = cfg.eval.get("feat_norm")
             if fn is not None:
                 cfg.arch.feat_norm = fn
+            # Redirect the frozen-encoder sidecar to a config path (weight-free arch metadata):
+            # checkpoints bake in a CWD-relative results/checkpoints/... path, but the CoLiPri
+            # weights live on shared NFS. Only redirect an EXISTING sidecar (primus checkpoints).
+            sc = cfg.eval.get("primus_sidecar")
+            if sc is not None and cfg.arch.get("primus_sidecar") is not None:
+                cfg.arch.primus_sidecar = sc
         model, _ = build_model(cfg)
         model = model.to(DEVICE)
         sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}

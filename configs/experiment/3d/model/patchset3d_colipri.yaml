@@ -9,7 +9,7 @@ model: patchset3d
 arch:
   encoder: primus
   encoder_frozen: true
-  primus_sidecar: results/checkpoints/primus_colipri.json
+  primus_sidecar: ${paths.colipri}/primus_colipri.json
   resolution: 24               # map CoLiPri's 24^3 ViT tokens 1:1 to PatchSet3D cells
   enc_dims: [32, 32, 32, 32]   # ignored when encoder=primus (kept for schema parity)
   e: 256

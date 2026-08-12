@@ -55,6 +55,10 @@ eval:
   checkpoint: null            # trained best.pt (required for native_*/multilevel/nninteractive)
   feat_norm: null             # patchset3d only: override the checkpoint's feature-norm mode
                               # at eval (weight-free) -> sweep context|self|none on one ckpt
+  # patchset3d primus-encoder checkpoints bake in a CWD-relative sidecar path
+  # (results/checkpoints/primus_colipri.json); redirect it to the shared NFS copy so eval /
+  # inference run from any directory. Weight-free arch override, applied in _build_model.
+  primus_sidecar: ${paths.colipri}/primus_colipri.json
 wandb:
   project: patch_icl_3d_eval  # null to disable
   name: null

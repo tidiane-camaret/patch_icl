@@ -12,7 +12,7 @@ model: patchset3d
 arch:
   encoder: conv                # conv (ConvEncoder3D, trainable) | primus (frozen CoLiPri ViT)
   encoder_frozen: true         # only used when encoder=primus
-  primus_sidecar: null         # required when encoder=primus: results/checkpoints/primus_colipri.json
+  primus_sidecar: null         # required when encoder=primus: ${paths.colipri}/primus_colipri.json
   encoder_stage: null          # primus early-exit: keep first N of 16 EVA blocks (null=full).
                                # latency/compute ≈ N/16; later blocks are never computed.
   encoder_native_grid: false   # native_grid: ViT tokenizes at image_size/8 (encoder FLOPs

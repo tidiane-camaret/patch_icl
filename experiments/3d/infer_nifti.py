@@ -80,6 +80,20 @@ def _resample_gt(gt, shape):
     return (torch.nn.functional.interpolate(t, size=shape, mode="nearest")[0, 0] > 0.5).numpy()
 
 
+def _to_original_orientation(pred_canon, target_path):
+    """Reorient a canonical-space (RAS) prediction back to target_path's on-disk orientation.
+
+    load_nifti feeds the model RAS-canonical arrays (to match training), so predictions come
+    out on the RAS grid. This inverts that reorientation using the target's original affine,
+    returning (array, affine) whose voxel grid + affine match the input target file exactly —
+    so the saved mask overlays the original image by voxel index, not just in world space.
+    A target that is already RAS makes the transform the identity (no-op)."""
+    orig = nib.load(str(target_path))
+    ras_ornt = nib.orientations.axcodes2ornt(("R", "A", "S"))
+    transform = nib.orientations.ornt_transform(ras_ornt, nib.io_orientation(orig.affine))
+    return nib.orientations.apply_orientation(pred_canon, transform), orig.affine
+
+
 def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
     """Run the coarse->fine in-context cascade on nifti files (GT-free target).
 
@@ -90,8 +104,10 @@ def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
     context_pairs  : list[(image_path, binary_mask_path)] for the same organ (K = len).
     gt_path        : optional target GT (binary) .nii.gz -> Dice + coarse-only Dice.
     out_path       : optional -> write the predicted mask as .nii.gz on the target grid.
-                     NOTE: the output mask is in canonical (RAS) space because all inputs
-                     are reoriented via load_nifti -> nib.as_closest_canonical.
+                     The model runs in RAS-canonical space (load_nifti canonicalises to match
+                     training), but the returned/saved mask is reoriented back to the target
+                     file's original orientation + affine, so it overlays the input by voxel
+                     index (see _to_original_orientation).
 
     Returns {"pred", "affine", "dice", "coarse_only_dice", "pred_path"}.
     """
@@ -155,12 +171,7 @@ def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
             coarse_native = native.copy()
         prev_pred, prev_geom = pred, geom_np
 
-    # --- output + metrics -------------------------------------------------------
-    pred_path = None
-    if out_path is not None:
-        nib.save(nib.Nifti1Image(native.astype(np.uint8), affine), str(out_path))
-        pred_path = Path(out_path)
-
+    # --- metrics (canonical space; both pred and GT are RAS so Dice is orientation-safe) ---
     dice = coarse_only = None
     if gt_path is not None:
         gt, _ = load_nifti(gt_path)
@@ -169,5 +180,14 @@ def predict_nifti(cfg, target_path, context_pairs, gt_path=None, out_path=None):
         dice = float(dice_binary(torch.from_numpy(native), gt_t))
         coarse_only = float(dice_binary(torch.from_numpy(coarse_native), gt_t))
 
-    return {"pred": native, "affine": affine, "dice": dice,
+    # --- output on the ORIGINAL target grid -------------------------------------
+    # Reorient the RAS prediction back to the target file's stored orientation + affine so
+    # the mask shares the input image's voxel grid (not a permuted RAS grid).
+    pred_native, out_affine = _to_original_orientation(native, target_path)
+    pred_path = None
+    if out_path is not None:
+        nib.save(nib.Nifti1Image(pred_native.astype(np.uint8), out_affine), str(out_path))
+        pred_path = Path(out_path)
+
+    return {"pred": pred_native, "affine": out_affine, "dice": dice,
             "coarse_only_dice": coarse_only, "pred_path": pred_path}

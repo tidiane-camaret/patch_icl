@@ -1,5 +1,60 @@
 # Change log
 
+## 2026-08-12 — CoLiPri frozen encoder moved to shared NFS + config-referenced
+
+The primus (CoLiPri) sidecar json + weights were loaded from a **CWD-relative** path
+(`results/checkpoints/primus_colipri.{json,pt}`) baked into patchset3d checkpoints — so eval /
+inference only worked when launched from the repo root, and not at all for users without the
+repo. Moved both files to shared NFS `…/ANALYSIS_20251122/checkpoints/colipri/` (weights path
+inside the json rewritten to absolute NFS) and referenced them from config:
+- `cluster/nfs.yaml`: new `paths.colipri`.
+- `eval.yaml`: `eval.primus_sidecar: ${paths.colipri}/primus_colipri.json`.
+- `eval.py._build_model`: redirects an existing (primus) checkpoint's `arch.primus_sidecar`
+  to `eval.primus_sidecar` — weight-free override, same pattern as `feat_norm`.
+- Train/feature_sim configs (`model/patchset3d*.yaml`, `experiment/30`, `feature_sim.yaml`)
+  and the producer `scripts/extract_colipri_backbone.py` now point at `${paths.colipri}` /
+  the absolute NFS dir. Repo copies deleted.
+
+Verified: `infer_cli.py` run from `/tmp` with the repo copies removed loads the encoder from
+NFS and reproduces Dice 0.8546 (bladder, s0000/s0001).
+
+Also added `experiments/3d/infer_cli.py`: a general argparse CLI (`--target`, `--context IMAGE
+MASK` repeatable, `--checkpoint`, `--out`, `--gt`, `--crop-spacings`) that composes the eval cfg
+internally (pins PWD so eval.yaml's `hydra.searchpath` resolves from any dir) and calls
+predict_nifti.
+
+Shared-env packaging (`scripts/sync_patchset_env.sh`): the repo is on a personal path other
+users can't read, so the code is snapshotted into the shared `patchset` env. The script rsyncs
+source files (py/yaml/json, ~3.6M) into `$ENV/share/patchset_infer/` preserving the tree (flat
+sibling imports + __file__ logic resolve unchanged) and writes a `$ENV/bin/patchset-infer`
+launcher that runs the env Python on the bundled CLI. Any env user then does
+`conda activate patchset && patchset-infer --target … --context IMG MASK --checkpoint …`.
+Re-run the sync script after code changes (no editable install possible — source is unreadable
+to others). Verified from /tmp with PYTHONPATH unset: loads code from the bundle (not the repo),
+encoder from NFS, reproduces Dice 0.8546.
+
+## 2026-08-12 — `patchset` conda env for nifti inference + first real run
+
+Created a minimal conda env `patchset` (python 3.11, torch 2.6.0+cu124) to run
+`experiments/3d/infer_nifti.py` on the Ampere nodes (nero/thor/loki). Recipe pinned in
+`requirements-patchset-infer.txt`. Key gotcha: `dynamic_network_architectures` (primus encoder
+dep) has no torch pin, so a naive install pulls torch 2.13 + a cu13 cuDNN wheel; a cu13 cuDNN
+inside cu124 torch raises `CUDNN_STATUS_NOT_INITIALIZED` specifically on the primus 8^3-kernel
+patch-embed conv3d (small convs still pass, so it masquerades as a flaky GPU/env bug). Fix:
+install torch first, then dna with `--no-deps`, keeping torch 2.6's bundled cuDNN 9.1.0.70.
+
+First real run (`run_infer_heart.py`, s0000 target / s0001 context, +organ=urinary_bladder —
+heart is out-of-FOV for these pelvic scans): Dice 0.8546, coarse-only 0.6733, cascade gain
++0.18. Confirms the nifti cascade path reproduces the eval accuracy path end-to-end.
+
+Orientation fix: `load_nifti` canonicalises every input to RAS (to match training), which
+previously meant the saved mask carried the RAS-canonical affine/grid — misaligned by voxel
+index with a non-canonical input CT. Added `_to_original_orientation`: the model still runs in
+RAS, but the returned/saved mask is reoriented back to the target file's stored orientation +
+affine (no-op when the target is already RAS). Metrics stay in canonical space (Dice is
+orientation-invariant). New test `test_predict_nifti_output_matches_target_orientation` uses an
+LAS target to prove the round-trip.
+
 ## 2026-08-12 — coarse->fine cascade eval (spacing_cascade)
 
 Added a real coarse->fine cascade to the 3D spacing sweep, complementing the existing
