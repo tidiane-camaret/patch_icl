@@ -155,6 +155,72 @@ def _bbox_for_subject(root: Path, subj: str) -> tuple[str, dict | None]:
         return subj, None
 
 
+def organ_crop_arrays(ct_mm, label_mm, center, sp, *, image_size, crop_mm, jitter, rng):
+    """Pure array-level organ crop. Returns (crop_ct, crop_lbl, out_sizes, pad_lo, crop_geom).
+
+    Slices a centre crop of fixed physical extent (T*crop_mm/axis) from ct_mm/label_mm
+    (same shape), records where it lands in the final T³ grid. Behaviour extracted verbatim
+    from TotalSegInContextDataset._organ_crop_arrays; `rng` supplies the crop jitter."""
+    T = image_size[0]
+    cd, ch, cw = center
+    D, H, W = label_mm.shape
+    phys_ref = T * crop_mm
+    target_sizes = [max(1, round(phys_ref / spi)) for spi in sp]
+    crop_sizes = [min(dim, t) for t, dim in zip(target_sizes, (D, H, W))]
+    starts = []
+    for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
+        smax = max(0, s - cs)
+        ideal = c - cs // 2
+        lo = min(max(0, ideal - jitter), smax)
+        hi = min(max(0, ideal + jitter), smax)
+        starts.append(rng.randint(lo, hi))
+    d0, h0, w0 = starts
+    crop_ct = ct_mm[d0:d0 + crop_sizes[0], h0:h0 + crop_sizes[1], w0:w0 + crop_sizes[2]]
+    crop_lbl = label_mm[d0:d0 + crop_sizes[0], h0:h0 + crop_sizes[1], w0:w0 + crop_sizes[2]]
+    out_sizes = [max(1, min(T, round(cs / t * T))) for cs, t in zip(crop_sizes, target_sizes)]
+    pad_lo = [(T - o) // 2 for o in out_sizes]
+    crop_geom = torch.tensor([starts, list(crop_sizes), out_sizes, pad_lo], dtype=torch.long)
+    return crop_ct, crop_lbl, out_sizes, pad_lo, crop_geom
+
+
+def place_image(crop_ct, out_sizes, pad_lo, T):
+    """Resample the native CT slice to out_sizes (trilinear) and centre it in an
+    air-filled T³ tensor. Returns (1, T, T, T)."""
+    img_small = F.interpolate(
+        torch.from_numpy(crop_ct.astype(np.float32))[None, None],
+        size=tuple(out_sizes), mode="trilinear", align_corners=False)[0]
+    if all(o == T for o in out_sizes):
+        return img_small
+    image_t = torch.full((1, T, T, T), float(crop_ct.min()), dtype=torch.float32)
+    sl = (slice(None),) + tuple(slice(p, p + o) for p, o in zip(pad_lo, out_sizes))
+    image_t[sl] = img_small
+    return image_t
+
+
+def place_label(label_small, out_sizes, pad_lo, T):
+    """Centre an already-resampled label (spatial dims out_sizes, long) in a
+    background-0 T³ tensor. Returns (T, T, T)."""
+    if all(o == T for o in out_sizes):
+        return label_small
+    label_t = torch.zeros(T, T, T, dtype=torch.long)
+    sl = tuple(slice(p, p + o) for p, o in zip(pad_lo, out_sizes))
+    label_t[sl] = label_small
+    return label_t
+
+
+def resample_binary(bin_np, size, *, mode, occ_thr):
+    """Resize a binary mask to `size` -> long (0/1). "occupancy" area-pools + thresholds
+    (thin structures survive; non-empty input never returns empty); "nearest" point-samples."""
+    t = torch.from_numpy(np.ascontiguousarray(bin_np, dtype=np.float32))[None, None]
+    if mode == "occupancy":
+        frac = F.interpolate(t, size=size, mode="area")[0, 0]
+        out = frac >= occ_thr
+        if not bool(out.any()) and bin_np.any():
+            out.view(-1)[int(frac.argmax())] = True
+        return out.long()
+    return (F.interpolate(t, size=size, mode="nearest")[0, 0] > 0.5).long()
+
+
 class TotalSegInContextDataset(Dataset):
     """
     In-context segmentation dataset over TotalSegmentator 3-D volumes.
@@ -1042,118 +1108,29 @@ class TotalSegInContextDataset(Dataset):
         center: tuple[int, int, int],
         sp: list[float],
     ) -> tuple[np.ndarray, np.ndarray, list[int], list[int]]:
-        """Slice an organ-centred crop of fixed physical extent (T*crop_spacing_mm/axis)
-        and describe where it lands in the final T³ grid.
-
-        The crop covers a fixed extent so that, after resampling to T³, every axis is
-        crop_spacing_mm/voxel isotropic regardless of native FOV.  When an axis has fewer
-        native voxels than that extent (a thin/limited-FOV scan), the slice is clamped to
-        what exists and the shortfall is symmetrically padded — air for the CT, background
-        0 for the label.  Padding (rather than stretching the short axis to T³) keeps the
-        object's true aspect ratio; stretching would elongate it (see docs/logs.md).
-
-        The padding is applied to the *output* T³ grid by the callers (_place_image /
-        _place_label), NOT to this native-resolution slice: padding here would inflate the
-        array handed to F.interpolate up to (T*crop_spacing_mm/sp)³ voxels — e.g. 512³ at
-        crop_spacing_mm=4 — and the resample of that mostly-padding cube dominates
-        dataloading. Resampling only the real slice to its scaled extent and centre-padding
-        the small T³ output is geometrically equivalent to sub-voxel level (docs/logs.md
-        2026-08-01).
-
-        Returns (crop_ct, crop_lbl, out_sizes, pad_lo):
-          crop_ct/crop_lbl : native-res slice, shape crop_sizes (unpadded mmap views)
-          out_sizes        : per-axis size the slice maps to inside T³ (the object extent)
-          pad_lo           : per-axis low offset that centres out_sizes within T³
-        """
-        T = self.image_size[0]
-        cd, ch, cw = center
-        D, H, W = label_mm.shape
-
-        phys_ref = T * self._crop_mm
-        target_sizes = [max(1, round(phys_ref / spi)) for spi in sp]      # fixed extent
-        crop_sizes   = [min(dim, t) for t, dim in zip(target_sizes, (D, H, W))]  # available
-
-        j = self.crop_jitter
-        starts = []
-        for c, s, cs in zip((cd, ch, cw), (D, H, W), crop_sizes):
-            # Start must keep the [start, start+cs) slice inside [0, s): clamp to [0, s-cs].
-            # Without capping lo at s-cs, a high organ centroid on a near-full axis (ideal >
-            # s-cs) gave start=ideal > s-cs, so the numpy slice silently clipped short (organ
-            # cut off, axis stretched, recorded crop_sizes wrong). See docs/logs.md 2026-08-12.
-            smax = max(0, s - cs)
-            ideal = c - cs // 2
-            lo = min(max(0, ideal - j), smax)
-            hi = min(max(0, ideal + j), smax)
-            starts.append(self._cur_rng.randint(lo, hi))
-        d0, h0, w0 = starts
-
+        """See module-level organ_crop_arrays. Adds the disk CT load, shape assert,
+        raw_ct crop normalisation, and records self._last_crop_geom."""
         ct_mm = self._load_native_ct_mmap(subj_dir)
-        # Crop indices are derived from the label grid, so ct.npy and label.npy MUST be
-        # voxel-aligned (same shape); a mismatch yields empty/shifted crops (silent for the
-        # label, an interpolate crash for the CT). Fail loud with the culprit subject.
         assert ct_mm.shape == label_mm.shape, (
             f"{subj_dir.name}: ct.npy {ct_mm.shape} != label.npy {label_mm.shape} — "
             f"conversion must resample labels onto the CT grid (see convert_to_npy chemotox)")
-        crop_ct  = ct_mm   [d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
-        crop_lbl = label_mm[d0:d0+crop_sizes[0], h0:h0+crop_sizes[1], w0:w0+crop_sizes[2]]
+        crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+            ct_mm, label_mm, center, sp, image_size=self.image_size,
+            crop_mm=self._crop_mm, jitter=self.crop_jitter, rng=self._cur_rng)
         if self.raw_ct:
-            # normalise only the crop (CT: crop==whole; MRI: whole-volume stats from sidecar)
             crop_ct = self._normalize_native(subj_dir.name, np.ascontiguousarray(crop_ct))
-
-        # Object extent inside T³ = crop_sizes scaled by T/target_sizes (same ratio the old
-        # pad-then-resize produced); a short axis maps to <T voxels and is centre-padded
-        # downstream, preserving the true aspect ratio (no stretch to T³).
-        out_sizes = [max(1, min(T, round(cs / t * T)))
-                     for cs, t in zip(crop_sizes, target_sizes)]
-        pad_lo    = [(T - o) // 2 for o in out_sizes]
-        # Record the grid<->native mapping so a grid-space prediction can be inverted:
-        # native[a] = starts[a] + (g[a] - pad_lo[a]) / out_sizes[a] * crop_sizes[a].
-        self._last_crop_geom = torch.tensor(
-            [starts, list(crop_sizes), out_sizes, pad_lo], dtype=torch.long)   # (4, 3)
+        self._last_crop_geom = geom
         return crop_ct, crop_lbl, out_sizes, pad_lo
 
     def _place_image(self, crop_ct: np.ndarray, out_sizes, pad_lo) -> torch.Tensor:
-        """Resample the native CT slice to out_sizes (trilinear) and centre it in an
-        air-filled T³ tensor. Returns (1, T, T, T)."""
-        T = self.image_size[0]
-        img_small = F.interpolate(
-            torch.from_numpy(crop_ct.astype(np.float32))[None, None],
-            size=tuple(out_sizes), mode="trilinear", align_corners=False,
-        )[0]  # (1, *out_sizes)
-        if all(o == T for o in out_sizes):
-            return img_small
-        image_t = torch.full((1, T, T, T), float(crop_ct.min()), dtype=torch.float32)  # air
-        sl = (slice(None),) + tuple(slice(p, p + o) for p, o in zip(pad_lo, out_sizes))
-        image_t[sl] = img_small
-        return image_t
+        return place_image(crop_ct, out_sizes, pad_lo, self.image_size[0])
 
     def _place_label(self, label_small: torch.Tensor, out_sizes, pad_lo) -> torch.Tensor:
-        """Centre an already-resampled label (spatial dims out_sizes, long) in a
-        background-0 T³ tensor. Returns (T, T, T)."""
-        T = self.image_size[0]
-        if all(o == T for o in out_sizes):
-            return label_small
-        label_t = torch.zeros(T, T, T, dtype=torch.long)
-        sl = tuple(slice(p, p + o) for p, o in zip(pad_lo, out_sizes))
-        label_t[sl] = label_small
-        return label_t
+        return place_label(label_small, out_sizes, pad_lo, self.image_size[0])
 
     def _resample_binary(self, bin_np: np.ndarray, size) -> torch.Tensor:
-        """Resize a binary mask to `size` and return a long (0/1) tensor.
-
-        mask_downsample="nearest" point-samples (thin structures can vanish under heavy
-        downsampling); "occupancy" area-pools to the foreground fraction per output voxel
-        and thresholds at mask_occupancy_thr, so sub-voxel structures survive. In occupancy
-        mode a non-empty input never returns empty — the densest output voxel is kept.
-        """
-        t = torch.from_numpy(np.ascontiguousarray(bin_np, dtype=np.float32))[None, None]
-        if self.mask_downsample == "occupancy":
-            frac = F.interpolate(t, size=size, mode="area")[0, 0]   # area = avg-pool = fg fraction
-            out = frac >= self.mask_occupancy_thr
-            if not bool(out.any()) and bin_np.any():
-                out.view(-1)[int(frac.argmax())] = True
-            return out.long()
-        return (F.interpolate(t, size=size, mode="nearest")[0, 0] > 0.5).long()
+        return resample_binary(bin_np, size, mode=self.mask_downsample,
+                               occ_thr=self.mask_occupancy_thr)
 
     def _resample_multiclass(self, label_np: np.ndarray, size, n_classes: int) -> torch.Tensor:
         """Resize an integer multi-label map (values 0..n_classes) to `size` (long tensor).
