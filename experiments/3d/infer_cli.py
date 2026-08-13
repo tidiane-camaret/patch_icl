@@ -62,7 +62,17 @@ def build_parser():
     ap.add_argument("--out", type=Path, default=None,
                     help="write the predicted mask here (.nii.gz, on the target grid)")
     ap.add_argument("--gt", type=Path, default=None,
-                    help="optional target GT mask .nii.gz -> report Dice + coarse-only Dice")
+                    help="optional target GT mask .nii.gz -> report Dice + coarse-only Dice "
+                         "(binary in single-organ mode, id-valued when --labels is given)")
+    ap.add_argument("--labels", default=None,
+                    help="multi-label mode: read each --context MASK as an id-valued "
+                         "TotalSegmentator mask and segment these ids (comma-separated, "
+                         "e.g. 1,2,5) or 'all' for every non-zero id present. Omit for the "
+                         "default single binary-mask mode. Output is one id-valued mask "
+                         "(smaller organs win overlaps).")
+    ap.add_argument("--batch-size", dest="batch_size", type=int, default=8,
+                    help="label-tasks per model forward in multi-label mode (default 8; "
+                         "lower it if the GPU runs out of memory)")
     ap.add_argument("--crop-spacings", dest="crop_spacings", default="4,1.5",
                     help="comma-separated coarse->fine CROP resolutions in mm/voxel — the "
                          "cascade's field-of-view schedule (T*mm per pass), NOT the input's "
@@ -90,12 +100,29 @@ def main(argv=None):
     print(f"model      : {args.model}   crop_spacings=[{args.crop_spacings}]   "
           f"checkpoint={args.checkpoint}\n")
 
-    cfg = _build_cfg(args)
-    res = predict_nifti(cfg, args.target, contexts,
-                        gt_path=args.gt, out_path=args.out)
+    label_ids = None
+    if args.labels:
+        label_ids = ("all" if args.labels.strip().lower() == "all"
+                     else [int(x) for x in args.labels.split(",") if x.strip()])
+        print(f"labels     : {label_ids}   batch_size={args.batch_size}")
 
-    print(f"\n  pred nonzero voxels : {int(res['pred'].sum())}  shape={res['pred'].shape}")
-    if res["dice"] is not None:
+    cfg = _build_cfg(args)
+    res = predict_nifti(cfg, args.target, contexts, label_ids=label_ids,
+                        batch_size=args.batch_size, gt_path=args.gt, out_path=args.out)
+
+    print(f"\n  pred nonzero voxels : {int((res['pred'] > 0).sum())}  shape={res['pred'].shape}")
+    if res.get("labels") is not None:                       # multi-label
+        names = res.get("label_names") or {}
+        print(f"  labels segmented    : {res['labels']}")
+        if names:
+            print(f"  label table         : {', '.join(f'{k}={names[k]}' for k in res['labels'] if k in names)}")
+        if res["dice"] is not None:
+            for lab in res["labels"]:
+                nm = f" ({names[lab]})" if lab in names else ""
+                print(f"    label {lab:>3}{nm} : dice={res['dice'][lab]:.4f}  "
+                      f"coarse={res['coarse_only_dice'][lab]:.4f}")
+            print(f"  macro dice          : {res['macro_dice']:.4f}")
+    elif res["dice"] is not None:                           # single-organ
         print(f"  dice                : {res['dice']:.4f}")
         print(f"  coarse_only_dice    : {res['coarse_only_dice']:.4f}")
         print(f"  gain (fine-coarse)  : {res['dice'] - res['coarse_only_dice']:+.4f}")
