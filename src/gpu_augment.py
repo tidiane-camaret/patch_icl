@@ -242,3 +242,52 @@ def _geometric(vols, masks, group_size, cfg, gen):
     m = F.grid_sample(masks.unsqueeze(1).float(), grid, mode="nearest",
                       padding_mode="zeros", align_corners=False)
     return vols, m.squeeze(1).long()
+
+
+class GpuAugmentor:
+    def __init__(self, aug_cfg, self_context_per_image: bool = False, seed: int = 0):
+        self.cfg = aug_cfg
+        self.self_context_per_image = bool(self_context_per_image)
+        self._seed = seed
+        self._step = 0
+
+    @torch.no_grad()
+    def __call__(self, batch: dict, training: bool) -> dict:
+        cfg = self.cfg
+        if (not training) or cfg is None or not getattr(cfg, "enabled", False):
+            return batch
+        vols, masks, B, T = _stack_task(batch)
+        device = vols.device
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self._seed + self._step)
+        self._step += 1
+
+        modes = batch.get("aug_mode", torch.zeros(B, dtype=torch.long, device=device))
+        modes = modes.to(device)
+        for mode in (REAL, SYNTH, SELF_CONTEXT):
+            task_sel = (modes == mode).nonzero(as_tuple=True)[0]
+            if task_sel.numel() == 0:
+                continue
+            # volume indices for the selected tasks
+            vidx = (task_sel.view(-1, 1) * T + torch.arange(T, device=device)).reshape(-1)
+            v, m = vols[vidx], masks[vidx]
+
+            if mode == SYNTH:
+                v, m = _geometric(v, m, group_size=1, cfg=cfg.synth, gen=gen)
+                v = _batched_intensity(v, cfg.synth, gen)
+            else:  # REAL or SELF_CONTEXT
+                v, m = _geometric(v, m, group_size=T, cfg=cfg.task, gen=gen)
+                v = _batched_intensity(v, cfg.intensity, gen)
+                if mode == SELF_CONTEXT and self.self_context_per_image:
+                    # extra independent geo jitter on the K context volumes only
+                    G = task_sel.numel()
+                    ctx_local = torch.tensor([g * T + t for g in range(G) for t in range(1, T)],
+                                             device=device)
+                    cv, cm = _geometric(v[ctx_local], m[ctx_local],
+                                        group_size=1, cfg=cfg.per_image, gen=gen)
+                    v[ctx_local], m[ctx_local] = cv, cm
+
+            vols[vidx], masks[vidx] = v, m
+
+        _unstack_task(vols, masks, B, T, batch)
+        return batch

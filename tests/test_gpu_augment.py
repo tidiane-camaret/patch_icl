@@ -130,3 +130,67 @@ def test_intensity_invokes_gin_when_configured():
     gen = torch.Generator().manual_seed(6)
     out = _batched_intensity(vols.clone(), cfg, gen)
     assert not torch.allclose(out, vols)             # gin fired even with others off
+
+
+def _full_cfg():
+    return SimpleNamespace(
+        enabled=True,
+        task=_geo_cfg(affine_p=1.0),
+        per_image=_geo_cfg(affine_p=1.0),
+        synth=SimpleNamespace(**vars(_geo_cfg(affine_p=1.0)), **{
+            "brightness_contrast": SimpleNamespace(p=1.0, brightness=0.1, contrast_range=[0.8, 1.2]),
+            "gamma": SimpleNamespace(p=1.0, range=[0.8, 1.2]),
+            "gaussian_noise": SimpleNamespace(p=1.0, mean_range=[0.0, 0.05], std_range=[0.0, 0.05]),
+            "gaussian_blur": SimpleNamespace(p=0.0, sigma_range=[0.5, 1.0]),
+        }),
+        intensity=_int_cfg(),
+    )
+
+
+def test_eval_is_identity():
+    from src.gpu_augment import GpuAugmentor
+    b = _fake_batch()
+    ref = {k: v.clone() for k, v in b.items()}
+    aug = GpuAugmentor(_full_cfg())
+    out = aug(b, training=False)
+    for k in ("image", "context_in"):
+        assert torch.allclose(out[k], ref[k])
+
+
+def test_real_mode_shares_geometry_across_task():
+    from src.gpu_augment import GpuAugmentor
+    # target and its contexts identical -> shared geo keeps their geometry aligned
+    B, K, D = 1, 3, 8
+    base = torch.randn(1, 1, D, D, D)
+    b = {
+        "image": base.clone(),
+        "label": torch.zeros(B, D, D, D, dtype=torch.long),
+        "context_in": base.view(1, 1, 1, D, D, D).repeat(1, K, 1, 1, 1, 1),
+        "context_out": torch.zeros(B, K, D, D, D, dtype=torch.long),
+        "aug_mode": torch.tensor([0]),
+    }
+    cfg = _full_cfg()
+    for kk in ("brightness_contrast", "gamma", "gaussian_noise", "gaussian_blur"):
+        getattr(cfg.intensity, kk).p = 0.0            # isolate geometry
+    aug = GpuAugmentor(cfg)
+    out = aug(b, training=True)
+    # target and each context underwent the SAME geometric transform
+    for k in range(K):
+        assert torch.allclose(out["image"][0, 0], out["context_in"][0, k, 0], atol=1e-5)
+
+
+def test_mixed_modes_route_and_preserve_shape():
+    from src.gpu_augment import GpuAugmentor
+    B, K, D = 3, 2, 8
+    b = {
+        "image": torch.rand(B, 1, D, D, D),
+        "label": torch.zeros(B, D, D, D, dtype=torch.long),
+        "context_in": torch.rand(B, K, 1, D, D, D),
+        "context_out": torch.zeros(B, K, D, D, D, dtype=torch.long),
+        "aug_mode": torch.tensor([0, 1, 2]),          # real, synth, self_context
+    }
+    aug = GpuAugmentor(_full_cfg(), self_context_per_image=True)
+    out = aug(b, training=True)
+    assert out["image"].shape == (B, 1, D, D, D)
+    assert out["context_in"].shape == (B, K, 1, D, D, D)
+    assert out["context_out"].dtype == torch.long
