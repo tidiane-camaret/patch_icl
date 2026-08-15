@@ -98,6 +98,8 @@ def _batched_intensity(vols, cfg, gen):
     bl = getattr(cfg, "gaussian_blur", None)
     if bl is not None and bl.p > 0:
         mask = _per_vol_mask(gen, N, device, bl.p)
+        # NOTE: blur sigma is one draw per batched call (per-volume sigma would need
+        # per-volume kernels) — intentional batching simplification.
         s0, s1 = bl.sigma_range
         sigma = _uniform(gen, device, s0, s1)
         aug = _grouped_gaussian_blur(vols, sigma)
@@ -106,18 +108,23 @@ def _batched_intensity(vols, cfg, gen):
     nc = getattr(cfg, "gaussian_noise", None)
     if nc is not None and nc.p > 0:
         mask = _per_vol_mask(gen, N, device, nc.p)
-        if hasattr(nc, "max_std"):
-            std = _uniform(gen, device, 0.0, nc.max_std); mean = 0.0
-        else:                                                   # synth schema
-            mean = _uniform(gen, device, *nc.mean_range)
-            std = _uniform(gen, device, *nc.std_range)
-        noise = mean + std * torch.randn(vols.shape, generator=gen, device=device)
+        if hasattr(nc, "max_std"):                       # intensity schema
+            std = nc.max_std * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+            mean = 0.0
+        else:                                            # synth schema
+            m0, m1 = nc.mean_range
+            s0, s1 = nc.std_range
+            mean = m0 + (m1 - m0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+            std = s0 + (s1 - s0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+        noise = mean + std * torch.randn(vols.shape, generator=gen, device=device, dtype=vols.dtype)
         aug = (vols + noise).clamp(CT_NORM_MIN, CT_NORM_MAX)
         vols = torch.where(mask, aug, vols)
 
     lr = getattr(cfg, "simulate_low_resolution", None)
     if lr is not None and lr.p > 0:
         mask = _per_vol_mask(gen, N, device, lr.p)
+        # NOTE: low-res scale is shared per call (per-volume scale isn't batchable —
+        # differing output shapes) — intentional batching simplification.
         D, H, W = vols.shape[-3:]
         scale = _uniform(gen, device, lr.scale_min, lr.scale_max)
         small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
