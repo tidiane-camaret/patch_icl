@@ -1,7 +1,7 @@
 import sys; sys.path.insert(0, ".")
 import torch
 from types import SimpleNamespace
-from src.gpu_augment import _stack_task, _unstack_task, _geometric, _batched_intensity
+from src.gpu_augment import _stack_task, _unstack_task, _geometric, _batched_intensity, _batched_gin_ipa
 from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
 
 
@@ -83,6 +83,12 @@ def _int_cfg():
     )
 
 
+def _gin_cfg(mode="ipa"):
+    return SimpleNamespace(p=1.0, mode=mode, n_layer=4, interm_channel=2,
+                           scale_pool=[1, 3], out_norm="frob",
+                           ipa_copies=2, ipa_control_points=3)
+
+
 def test_intensity_shape_range_and_changes():
     span = CT_NORM_MAX - CT_NORM_MIN
     vols = torch.rand(5, 1, 8, 8, 8) * span + CT_NORM_MIN
@@ -101,3 +107,26 @@ def test_intensity_p_zero_is_noop():
     gen = torch.Generator().manual_seed(4)
     out = _batched_intensity(vols.clone(), cfg, gen)
     assert torch.allclose(out, vols)
+
+
+def test_gin_ipa_shape_range_changes():
+    span = CT_NORM_MAX - CT_NORM_MIN
+    vols = torch.rand(4, 1, 8, 8, 8) * span + CT_NORM_MIN
+    gen = torch.Generator().manual_seed(5)
+    for mode in ("gin", "ipa"):
+        out = _batched_gin_ipa(vols.clone(), _gin_cfg(mode), gen)
+        assert out.shape == vols.shape
+        assert out.min() >= CT_NORM_MIN - 1e-4 and out.max() <= CT_NORM_MAX + 1e-4
+        assert not torch.allclose(out, vols)
+
+
+def test_intensity_invokes_gin_when_configured():
+    span = CT_NORM_MAX - CT_NORM_MIN
+    vols = torch.rand(3, 1, 8, 8, 8) * span + CT_NORM_MIN
+    cfg = _int_cfg()
+    for k in ("brightness_contrast", "gamma", "gaussian_noise", "gaussian_blur"):
+        getattr(cfg, k).p = 0.0
+    cfg.gin = _gin_cfg("gin")
+    gen = torch.Generator().manual_seed(6)
+    out = _batched_intensity(vols.clone(), cfg, gen)
+    assert not torch.allclose(out, vols)             # gin fired even with others off

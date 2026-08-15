@@ -64,6 +64,54 @@ def _grouped_gaussian_blur(vols, sigma):
     return x
 
 
+def _gin_once(vols, cfg, gen):
+    """One GIN warp per volume via grouped conv (groups=N, fresh random kernels)."""
+    N = vols.shape[0]
+    device, dtype = vols.device, vols.dtype
+    scale_pool = list(getattr(cfg, "scale_pool", (1, 3)))
+    n_layer = int(getattr(cfg, "n_layer", 4))
+    interm = int(getattr(cfg, "interm_channel", 2))
+    x = vols                                          # (N,1,D,H,W)
+    ch_in = 1
+    for li in range(n_layer):
+        out_ch = 1 if li == n_layer - 1 else interm
+        k = scale_pool[torch.randint(len(scale_pool), (1,), generator=gen).item()]
+        ker = torch.randn(N * out_ch, ch_in, k, k, k, generator=gen, device=device, dtype=dtype)
+        shift = torch.randn(N * out_ch, 1, 1, 1, generator=gen, device=device, dtype=dtype)
+        xg = x.reshape(1, N * ch_in, *x.shape[-3:])
+        xg = F.conv3d(xg, ker, padding=k // 2, groups=N) + shift.reshape(1, N * out_ch, 1, 1, 1)
+        x = xg.reshape(N, out_ch, *x.shape[-3:])
+        if li < n_layer - 1:
+            x = F.leaky_relu(x)
+        ch_in = out_ch
+    alpha = torch.rand(N, 1, 1, 1, 1, generator=gen, device=device, dtype=dtype)
+    mixed = alpha * x + (1.0 - alpha) * vols
+    if getattr(cfg, "out_norm", "frob") == "frob":
+        in_f = torch.norm(vols.reshape(N, -1), dim=1).view(N, 1, 1, 1, 1)
+        self_f = torch.norm(mixed.reshape(N, -1), dim=1).view(N, 1, 1, 1, 1)
+        mixed = mixed * (in_f / (self_f + 1e-5))
+    return mixed
+
+
+def _batched_gin_ipa(vols, cfg, gen):
+    """GIN or IPA warp: per-volume grouped conv with optional smooth field blending."""
+    if getattr(cfg, "mode", "gin") != "ipa":
+        out = _gin_once(vols, cfg, gen)
+    else:
+        copies = [_gin_once(vols, cfg, gen) for _ in range(max(2, int(getattr(cfg, "ipa_copies", 2))))]
+        N, _, D, H, W = vols.shape
+        cp = max(2, int(getattr(cfg, "ipa_control_points", 4)))
+        field = torch.randn(N, 1, cp, cp, cp, generator=gen, device=vols.device, dtype=vols.dtype)
+        field = F.interpolate(field, size=(D, H, W), mode="trilinear", align_corners=False)
+        fmin = field.amin(dim=(2, 3, 4), keepdim=True)
+        fmax = field.amax(dim=(2, 3, 4), keepdim=True)
+        field = (field - fmin) / (fmax - fmin + 1e-20)
+        out = copies[0]
+        for c in copies[1:]:
+            out = out * (1.0 - field) + c * field
+    return out.clamp(CT_NORM_MIN, CT_NORM_MAX)
+
+
 def _batched_intensity(vols, cfg, gen):
     N = vols.shape[0]
     device = vols.device
@@ -130,6 +178,12 @@ def _batched_intensity(vols, cfg, gen):
         small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
         down = F.interpolate(vols, size=small, mode="trilinear", align_corners=False)
         aug = F.interpolate(down, size=(D, H, W), mode="trilinear", align_corners=False)
+        vols = torch.where(mask, aug, vols)
+
+    gin = getattr(cfg, "gin", None)
+    if gin is not None and getattr(gin, "p", 0) > 0:
+        mask = _per_vol_mask(gen, N, device, gin.p)
+        aug = _batched_gin_ipa(vols, gin, gen)
         vols = torch.where(mask, aug, vols)
 
     return vols
