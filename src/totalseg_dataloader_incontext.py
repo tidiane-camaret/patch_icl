@@ -50,6 +50,8 @@ from src.totalseg_dataset import (
     _resize_volume,
     normalize_ct,
     normalize_mri,
+    CT_MEAN,
+    CT_STD,
 )
 from src.augmentations import (
     apply_task_aug, apply_intensity_aug, apply_synth_aug, apply_per_image_aug,
@@ -89,6 +91,57 @@ def _lazy_shuffle(rng, x):
         j = rng.randrange(i, n)
         x[i], x[j] = x[j], x[i]
         yield x[i]
+
+def _rand_rotation(rng) -> np.ndarray:
+    """3x3 rotation matrix from three uniform Euler angles (intrinsic ZYX)."""
+    a, b, c = (rng.uniform(0.0, 2.0 * math.pi) for _ in range(3))
+    ca, sa, cb, sb, cc, sc = (math.cos(a), math.sin(a), math.cos(b),
+                              math.sin(b), math.cos(c), math.sin(c))
+    rz = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]], dtype=np.float32)
+    ry = np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]], dtype=np.float32)
+    rx = np.array([[1, 0, 0], [0, cc, -sc], [0, sc, cc]], dtype=np.float32)
+    return rz @ ry @ rx
+
+
+def make_ellipsoid_label(image, spacing, rng, min_mm=1.0, max_mm=50.0,
+                         body_thresh=-0.46, max_tries=64):
+    """Random rotated-ellipsoid binary label on the grid of `image` (1,D,H,W or D,H,W,
+    normalised CT). Per-axis radii ~ U(min_mm, max_mm) mm are converted to voxels via
+    `spacing` (mm/voxel, len 3); the centroid is rejection-sampled inside the body
+    (image > body_thresh, i.e. not air). Returns (label (D,H,W) uint8 tensor, centroid
+    (d,h,w) ints, radii_mm (3,) float — the sampled per-axis radii in mm, i.e. the generative
+    size independent of body clipping). Never empty — the centroid voxel is always set (guards a
+    sub-voxel radius). `rng` is `random` or a seeded random.Random (eval determinism preserved)."""
+    img = image[0] if image.ndim == 4 else image
+    D, H, W = img.shape
+    body = img > body_thresh
+    ctr = None
+    for _ in range(max_tries):
+        d, h, w = rng.randrange(D), rng.randrange(H), rng.randrange(W)
+        if bool(body[d, h, w]):
+            ctr = (d, h, w)
+            break
+    if ctr is None:
+        ctr = (D // 2, H // 2, W // 2)
+    cd, ch, cw = ctr
+    sp = np.array([float(s) for s in spacing], dtype=np.float32)
+    radii_mm = np.array([rng.uniform(min_mm, max_mm) for _ in range(3)], dtype=np.float32)
+    radii = np.maximum(radii_mm / np.maximum(sp, 1e-3), 0.5)     # voxels, >= half a voxel
+    rot = _rand_rotation(rng)
+    rmax = int(math.ceil(float(radii.max()))) + 1
+    d0, d1 = max(0, cd - rmax), min(D, cd + rmax + 1)
+    h0, h1 = max(0, ch - rmax), min(H, ch + rmax + 1)
+    w0, w1 = max(0, cw - rmax), min(W, cw + rmax + 1)
+    zz, yy, xx = np.meshgrid(np.arange(d0, d1) - cd, np.arange(h0, h1) - ch,
+                             np.arange(w0, w1) - cw, indexing="ij")
+    offs = np.stack([zz.ravel(), yy.ravel(), xx.ravel()]).astype(np.float32)  # (3, N)
+    local = rot.T @ offs                                        # into the ellipsoid frame
+    inside = (((local / radii[:, None]) ** 2).sum(0) <= 1.0).reshape(zz.shape)
+    label = np.zeros((D, H, W), dtype=np.uint8)
+    label[d0:d1, h0:h1, w0:w1][inside] = 1                       # basic-slice view: writes through
+    label[cd, ch, cw] = 1
+    return torch.from_numpy(label), ctr, radii_mm
+
 
 # Inverse map: orig label index → class name (covers all 117 classes)
 _IDX_TO_CLASS: dict[int, str] = {v: k for k, v in _ALL_CLASSES_IDX.items()}
@@ -297,6 +350,7 @@ class TotalSegInContextDataset(Dataset):
         self_context: float = 0.0,
         self_context_intensity: bool = False,
         self_context_per_image: bool = False,
+        self_context_synth: dict | None = None,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -320,6 +374,30 @@ class TotalSegInContextDataset(Dataset):
         self.self_context_p = float(self_context)
         self.self_context_intensity = bool(self_context_intensity)
         self.self_context_per_image = bool(self_context_per_image)
+        # self_context_synth: when self-context fires, with probability `p` replace the real
+        # target label with a freshly-generated synthetic mask (a random rotated ellipsoid placed
+        # on the body of the real CT) — a purely-geometric in-context task with no real anatomy.
+        # {p, ellipse_min_mm, ellipse_max_mm, body_hu}. body_hu is the CT air/body threshold in HU
+        # (mapped to normalised space via the dataset CT_MEAN/CT_STD). None/{} → disabled.
+        sc_synth = dict(self_context_synth or {})
+        self.self_context_synth_p = float(sc_synth.get("p", 0.0))
+        # sources: which synthetic-label generators the synth branch samples from (uniformly)
+        # each time it fires. "ellipse" = random rotated ellipsoid (make_ellipsoid_label);
+        # "supervoxel" = a supervoxel group from this subject's label_synth_{method} volume,
+        # cropped onto the target grid (see _supervoxel_label_on_grid), falling back to an
+        # ellipsoid when the subject has no usable supervoxel. Default [ellipse] keeps the
+        # prior behaviour. Requires data.synth_method set for the supervoxel source.
+        self.sc_synth_sources = list(sc_synth.get("sources", ["ellipse"])) or ["ellipse"]
+        assert all(s in ("ellipse", "supervoxel") for s in self.sc_synth_sources), \
+            f"self_context.synth_masks.sources must be ellipse/supervoxel, got {self.sc_synth_sources}"
+        self.sc_synth_min_mm = float(sc_synth.get("ellipse_min_mm", 1.0))
+        self.sc_synth_max_mm = float(sc_synth.get("ellipse_max_mm", 50.0))
+        # Air/body threshold in normalised CT units (body voxels sit above it).
+        self.sc_synth_body_thresh = (float(sc_synth.get("body_hu", -400.0)) - CT_MEAN) / CT_STD
+        # supervoxel source: merge randint(min,max) face-adjacent supervoxels into one label.
+        _sv_src = dict(sc_synth.get("supervoxel", {}) or {})
+        self.sc_sv_merge_min = int(_sv_src.get("n_merge_min", 1))
+        self.sc_sv_merge_max = int(_sv_src.get("n_merge_max", 1))
         self._size_str = (
             f"{image_size[0]}x{image_size[1]}x{image_size[2]}"
             if image_size is not None else None
@@ -431,17 +509,22 @@ class TotalSegInContextDataset(Dataset):
             print(f"raw_ct path ON (modality={self.modality}): native reads use ct_raw.npy "
                   f"+ on-the-fly normalisation", flush=True)
 
-        # Synth path: build SV-ID cache for fast __getitem__ sampling
+        # Synth path: build SV-ID cache for fast __getitem__ sampling. Supervoxel labels
+        # feed both the old p_synth path (_get_synth_item) and the self_context synth_masks
+        # "supervoxel" source, so the effective merge depth is the max the two request.
+        _sv_source = "supervoxel" in self.sc_synth_sources
+        _eff_merge_max = max(n_synth_merge_max, self.sc_sv_merge_max if _sv_source else 1)
         if synth_method is not None:
-            # n_synth_merge_max > 1 → always load base labels and merge on-the-fly
-            suffix = "" if n_synth_merge_max > 1 else ("_union" if synth_unions else "")
+            # merge_max > 1 → always load base labels and merge on-the-fly
+            suffix = "" if _eff_merge_max > 1 else ("_union" if synth_unions else "")
             self._synth_fname = f"label_synth_{synth_method}{suffix}.npy"
             self._synth_subjects, self._synth_sv_ids = \
                 self._load_or_build_synth_cache(subjects)
             print(f"Synth path: method={synth_method} "
                   f"n_synth_merge=[{n_synth_merge_min},{n_synth_merge_max}] "
-                  f"p_synth={p_synth} | {len(self._synth_subjects)} subjects", flush=True)
-            if n_synth_merge_max > 1:
+                  f"p_synth={p_synth} | sc_sources={self.sc_synth_sources} "
+                  f"| {len(self._synth_subjects)} subjects", flush=True)
+            if _eff_merge_max > 1:
                 self._adj_cache = self._load_or_build_adj_cache()
             else:
                 self._adj_cache = {}
@@ -740,6 +823,79 @@ class TotalSegInContextDataset(Dataset):
         if self.use_crop:
             return torch.full((3,), self._crop_mm, dtype=torch.float32)
         return self._get_spacing(subj)
+
+    def _synth_native_coord(self, subj, centroid, item_shape, crop_geom):
+        """Anatomical coords.npy value (3,) at a synthetic label's centroid, or None if the
+        subject has no coords.npy. `centroid` is an item-grid (d,h,w); `item_shape` its (D,H,W).
+        Maps the item voxel back to the native coords grid — through the crop geometry when
+        use_crop (crop_geom = [starts, crop_sizes, out_sizes, pad_lo]), else by shape ratio.
+        O(1): mmaps coords.npy and reads a single voxel."""
+        cpath = self.root / subj / "coords.npy"
+        if not cpath.exists():
+            return None
+        coords = np.load(cpath, mmap_mode="r")            # (Dn, Hn, Wn, 3) native
+        nat = coords.shape[:3]
+        if crop_geom is not None:
+            starts, crop_sizes, out_sizes, pad_lo = (crop_geom[i].tolist() for i in range(4))
+            idx = []
+            for a in range(3):
+                q = centroid[a] - pad_lo[a]               # into the resampled-crop grid
+                q = min(max(q, 0), out_sizes[a] - 1)      # clamp out of the zero-pad border
+                nvox = starts[a] + int(round(q * crop_sizes[a] / max(out_sizes[a], 1)))
+                idx.append(min(max(nvox, 0), nat[a] - 1))
+        else:
+            idx = [min(int(round(centroid[a] * nat[a] / item_shape[a])), nat[a] - 1)
+                   for a in range(3)]
+        return torch.from_numpy(np.asarray(coords[idx[0], idx[1], idx[2]], dtype=np.float32))
+
+    def _supervoxel_label_on_grid(self, subj, crop_geom):
+        """Synthetic target label built from `subj`'s supervoxel volume, placed on the SAME
+        grid as the already-loaded target crop so it pairs with the real target image in
+        self-context (the self_context.synth_masks "supervoxel" source). A supervoxel group
+        present in the crop is picked (merging sc_sv_merge_[min,max] face-adjacent SVs) and
+        rasterised as a binary label. crop_geom (4,3 long: starts, crop_sizes, out_sizes,
+        pad_lo) is the target crop geometry (use_crop); None → the full pre-resized grid.
+        Returns a (T,T,T) long tensor, or None when this subject has no usable supervoxel
+        (caller falls back to an ellipsoid)."""
+        if not self._synth_subjects or subj not in self._synth_sv_ids:
+            return None
+        sv_path = self.root / subj / self._synth_fname
+        if not sv_path.exists():
+            return None
+        adj = self._adj_cache.get(subj, {})
+
+        if crop_geom is not None:
+            starts, crop_sizes, out_sizes, pad_lo = (crop_geom[i].tolist() for i in range(4))
+            d0, h0, w0 = starts
+            cs0, cs1, cs2 = crop_sizes
+            sv_mm = np.load(sv_path, mmap_mode="r")
+            crop_sv = np.ascontiguousarray(sv_mm[d0:d0 + cs0, h0:h0 + cs1, w0:w0 + cs2])
+            ids = [int(i) for i in np.unique(crop_sv) if i != 0]
+            if not ids:
+                return None
+            # merge over the full-volume adjacency, then keep only SVs present in the crop
+            group = [g for g in self._sample_merged_svs(
+                ids, adj, self.sc_sv_merge_min, self.sc_sv_merge_max) if g in ids]
+            if not group:
+                return None
+            binary = np.isin(crop_sv, group).astype(np.uint8)
+            lbl_small = self._resample_multiclass(binary, tuple(out_sizes), 1)
+            return place_label(lbl_small, out_sizes, pad_lo, self.image_size[0]).long()
+
+        # fast path: the pre-resized supervoxel grid matches the pre-resized target image
+        sized = (self.root / subj / self._synth_fname.replace(".npy", f"_{self._size_str}.npy")
+                 if self._size_str else None)
+        if sized is None or not sized.exists():
+            return None
+        sv_vol = np.ascontiguousarray(np.load(sized, mmap_mode="r"))
+        ids = [int(i) for i in np.unique(sv_vol) if i != 0]
+        if not ids:
+            return None
+        group = [g for g in self._sample_merged_svs(
+            ids, adj, self.sc_sv_merge_min, self.sc_sv_merge_max) if g in ids]
+        if not group:
+            return None
+        return torch.from_numpy(np.isin(sv_vol, group).astype(np.int64))
 
     def _get_subjects(self, split, meta_csv, max_subjects) -> list[str]:
         all_subjects = sorted(p.name for p in self.root.iterdir() if p.is_dir())
@@ -1062,7 +1218,36 @@ class TotalSegInContextDataset(Dataset):
         # NB per_image not task — task shares one transform across all K+1 volumes and must NOT be
         # applied per-image); self_context_intensity = appearance jitter (aug_cfg.intensity). Both
         # off -> exact clone. No-op when aug is disabled (eval).
+        synth_coord = synth_radii = None
         if self.self_context_p > 0 and self._cur_rng.random() < self.self_context_p:
+            # self_context_synth: replace the real target label with a purely synthetic mask (a
+            # random rotated ellipsoid on the real CT's body) before cloning — a geometric
+            # in-context task with no real anatomy. The image is untouched; only the label is
+            # synthetic. coords.npy records the placed object's anatomical position (synth_coord).
+            if (self.self_context_synth_p > 0
+                    and self._cur_rng.random() < self.self_context_synth_p):
+                # Pick a synth source (uniform); the supervoxel source falls back to an
+                # ellipsoid when this subject has no usable supervoxel in the crop.
+                source = self._cur_rng.choice(self.sc_synth_sources)
+                sv_label = (self._supervoxel_label_on_grid(subj, tgt_crop_geom)
+                            if source == "supervoxel" else None)
+                label_name = "synth"                             # generic (shape logged in detail)
+                if sv_label is not None:
+                    label_t = sv_label                           # real image ↔ plausible blob label
+                    fg = torch.nonzero(label_t, as_tuple=False)
+                    if len(fg):
+                        ctr = tuple(int(c) for c in fg.float().mean(0).round().tolist())
+                        synth_coord = self._synth_native_coord(
+                            subj, ctr, label_t.shape, tgt_crop_geom)
+                else:
+                    label_t, centroid, radii_mm = make_ellipsoid_label(
+                        image_t, self._reported_spacing(subj), self._cur_rng,
+                        min_mm=self.sc_synth_min_mm, max_mm=self.sc_synth_max_mm,
+                        body_thresh=self.sc_synth_body_thresh)
+                    label_t = label_t.long()
+                    synth_radii = torch.from_numpy(radii_mm)      # (3,) generative size (mm)
+                    synth_coord = self._synth_native_coord(
+                        subj, centroid, label_t.shape, tgt_crop_geom)
             context_in  = [image_t.clone() for _ in range(self.context_size)]
             context_out = [label_t.clone() for _ in range(self.context_size)]
             ctx_subjects = [subj for _ in range(self.context_size)]   # self-context: ctx case == target
@@ -1091,6 +1276,10 @@ class TotalSegInContextDataset(Dataset):
         }
         if tgt_crop_geom is not None:
             item["crop_geom"] = tgt_crop_geom              # (4,3): starts, crop_sizes, out_sizes, pad_lo
+        if synth_radii is not None:
+            item["synth_radii_mm"] = synth_radii           # (3,) sampled ellipsoid radii (mm)
+        if synth_coord is not None:
+            item["synth_coord"] = synth_coord              # (3,) anatomical coords of the synth object
         if self.random_coloring and len(context_out) > 0:
             item["label_palette"] = self._sample_palette(
                 label_t, context_out, self.num_labels_per_sample
@@ -1324,6 +1513,16 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         out["meta"] = [b["meta"] for b in batch]  # per-sample provenance (sample-table detail)
     if "crop_geom" in batch[0]:
         out["crop_geom"] = torch.stack([b["crop_geom"] for b in batch])  # (B, 4, 3) cascade inversion
+    # Per-item NaN-pad so mixed synth+real batches still log radii/coords for their synth items
+    # (an all()-gate dropped both keys whenever a single real sample shared the batch).
+    if any("synth_radii_mm" in b for b in batch):
+        nan3 = torch.full((3,), float("nan"))
+        out["synth_radii_mm"] = torch.stack(  # (B, 3) mm; NaN rows are real (non-synth) samples
+            [b["synth_radii_mm"].float() if "synth_radii_mm" in b else nan3 for b in batch])
+    if any("synth_coord" in b for b in batch):
+        nan3 = torch.full((3,), float("nan"))
+        out["synth_coord"] = torch.stack(  # (B, 3); NaN when the synth object's subject lacks coords.npy
+            [b["synth_coord"].float() if "synth_coord" in b else nan3 for b in batch])
     return out
 
 

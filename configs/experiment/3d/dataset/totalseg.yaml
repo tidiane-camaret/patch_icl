@@ -30,6 +30,13 @@ data:
     augs:                       # when self-context fires, re-augment each clone INDEPENDENTLY (each toggle isolatable for clean A/B). No-op when aug is off (eval)
       per_image: false          # geometric pose jitter via augmentations.per_image (set augmentations.per_image.affine.p>0 to actually warp)
       intensity: false          # appearance jitter via augmentations.intensity (brightness/gamma/noise/blur), independent of the target's own intensity aug
+    synth_masks:                # when self-context fires, replace the real target label with a PURELY SYNTHETIC mask (random rotated ellipsoid on the real CT body) -> geometric in-context task, no real anatomy
+      p:                        # PROBABILITY (0..1), given self-context fired, of a synthetic ellipse instead of the real target label; split-specific (scalar = both splits). Pure-synth training: self_context.p.train=1.0 + this train=1.0
+        train: 0.0              # TRAIN prob
+        eval: 0.0               # VAL/TEST prob (self-context eval must also fire, i.e. self_context.p.eval>0)
+      ellipse_min_mm: 1.0       # min per-axis ellipsoid radius (mm; converted to voxels via the item spacing)
+      ellipse_max_mm: 50.0      # max per-axis ellipsoid radius (mm)
+      body_hu: -400.0           # air/body HU threshold: the ellipsoid centroid is placed on a voxel above this (mapped to normalised CT units internally)
   random_coloring: false
   num_labels_per_sample: 1
   train_classes: not_benchmark

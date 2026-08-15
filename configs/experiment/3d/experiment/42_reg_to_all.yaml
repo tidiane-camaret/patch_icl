@@ -1,0 +1,105 @@
+# @package _global_
+
+defaults:
+  - 35_colipri_enc_8_i_128
+  - _self_
+
+data:
+  train_spacing_range: [1.0,4.0]
+  self_context: 
+    p: 
+      train: 1
+      eval: 0.5
+    synth_masks:
+      p:
+        train: 1
+      sources: [ellipse, supervoxel]   # uniform pick per firing; supervoxel uses data.synth_method
+      supervoxel:
+        n_merge_min: 1
+        n_merge_max: 2
+    augs:
+      per_image: true
+      intensity: true
+  p_synth: 0
+  synth_method: seeds3d
+  train_classes: all
+  val_classes: benchmark
+  crop_spacing_mm: 1.5
+  mask_occupancy_thr: 0.1
+  class_balanced: true
+  raw_ct: true
+
+augmentations:
+
+  task:
+    affine:
+      p: 0.2
+    elastic:
+      p: 0.2
+    flip:
+      p_d: 0.5
+      p_h: 0.5
+      p_w: 0.5
+  per_image:
+    affine: 
+      p: 0.8
+      max_angle_deg: 45
+      scale_min: 1
+      scale_max: 1
+      max_translate: 0.4
+    elastic: 
+      p: 0
+      alpha: 0.02
+  intensity: 
+    brightness_contrast:
+      p: 0.5
+      brightness_limit: 0.2
+      contrast_limit: 0.2
+    gaussian_blur:
+      p: 0.5
+      sigma_min: 0.1
+      sigma_max: 1.0
+    gaussian_noise:
+      p: 0.5
+      var_limit: 0.01
+    sharpness:
+      p: 0.5
+      alpha_min: 0.1
+      alpha_max: 1.0
+  synth:
+    affine:
+      p: 0.8
+      scale_min: 0.9
+      scale_max: 1.1
+      max_translate: 0.3
+      max_angle_deg: 45
+    brightness_contrast:
+      p: 0
+    elastic:
+      p: 0
+    flip_d: 0
+    flip_h: 0
+    flip_w: 0
+    gaussian_blur:
+      p: 0
+    gaussian_noise:
+      p: 0
+    sharpness:
+      p: 0
+
+
+arch:
+  encoder_spacing_aware: true
+  l: 4
+  e: 768
+  h: 3072
+  a: 12
+  transformer_rope: true
+  rope_theta: 100.0
+  feat_norm: self
+  token_mask_ratio_support: 0.25
+  token_mask_ratio_query: 0.50
+  full_attn: false 
+  register_routed: true 
+  thinking_rows: 64 
+  register_flex: false

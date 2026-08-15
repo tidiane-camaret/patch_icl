@@ -115,6 +115,47 @@ def batched_sdpa(q, k, v, attn_mask=None):
     )
 
 
+# FlexAttention path for structured sample-axis masks (patchset3d register_routed). A
+# block-diagonal + register-border connectivity is dense-masked SDPA's worst case: O(r²)
+# score memory, no flash kernel. flex_attention with a BlockMask skips the fully-masked
+# off-diagonal image blocks, restoring flash-like memory and ~T× less work. It is compiled
+# because its eager path materializes the score tensor (defeating the point). Guarded so
+# CPU / a torch without flex fall back to the dense bool-mask SDPA branch.
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention_raw, create_block_mask as _create_block_mask)
+    flex_attention = torch.compile(_flex_attention_raw, dynamic=False)
+    HAS_FLEX = True
+except Exception:                                  # pragma: no cover - torch/platform dependent
+    _create_block_mask = None
+    flex_attention = None
+    HAS_FLEX = False
+
+
+# Escape hatch: FlopCounterMode / other TorchDispatchModes disable dynamo, so the compiled
+# flex kernel can't run there (it falls to an uncountable eager HOP that also warns). Setting
+# this False makes build_register_block_mask return None -> the dense bool-mask SDPA path,
+# which IS countable/traceable. measure_flops toggles it; the training loop leaves it True.
+_FLEX_ENABLED = True
+
+
+def build_register_block_mask(n_t: int, N: int, T: int, device):
+    """BlockMask for register_routed sample-axis attention over r = n_t + T·N rows.
+
+    Registers (first n_t rows) are all-to-all; each of the T image blocks (N rows) attends
+    only within its own block. Returns None when flex is unavailable so the caller falls
+    back to a dense r×r bool mask (identical connectivity, no block-skipping)."""
+    if not HAS_FLEX or not _FLEX_ENABLED:
+        return None
+    r = n_t + T * N
+
+    def mask_mod(b, h, q, kv):
+        # keep iff either endpoint is a register, or both sit in the same image block
+        return (q < n_t) | (kv < n_t) | (((q - n_t) // N) == ((kv - n_t) // N))
+
+    return _create_block_mask(mask_mod, None, None, r, r, device=device, _compile=True)
+
+
 class LowerPrecisionRMSNorm(nn.RMSNorm):
     """RMSNorm that upcasts to fp32 when the input is bf16/fp16."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -161,7 +202,8 @@ class TransformerEncoderLayer(nn.Module):
 
     def forward(self, src: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
                 full_attn: bool = False,
-                rope: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+                rope: tuple[torch.Tensor, torch.Tensor] | None = None,
+                block_mask=None) -> torch.Tensor:
         b, r, c, e = src.shape
         a, d = self.a, self.d
 
@@ -203,7 +245,10 @@ class TransformerEncoderLayer(nn.Module):
             sin = sin.to(q.dtype)[None, None]
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-        if attn_mask is not None:
+        if block_mask is not None:
+            # register_routed: block-diagonal + register border via flex (skips masked blocks).
+            x = flex_attention(q, k, v, block_mask=block_mask)
+        elif attn_mask is not None:
             x = batched_sdpa(q, k, v, attn_mask=attn_mask)
         elif full_attn:
             x = batched_sdpa(q, k, v)
@@ -225,10 +270,12 @@ class TransformerEncoderStack(nn.Module):
 
     def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
                 full_attn: bool = False,
-                rope: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+                rope: tuple[torch.Tensor, torch.Tensor] | None = None,
+                block_mask=None) -> torch.Tensor:
         for i, block in enumerate(self.blocks):
             x = x * (self.residual_decay ** i)
-            x = block(x, sep, attn_mask=attn_mask, full_attn=full_attn, rope=rope)
+            x = block(x, sep, attn_mask=attn_mask, full_attn=full_attn, rope=rope,
+                      block_mask=block_mask)
         return x
 
 

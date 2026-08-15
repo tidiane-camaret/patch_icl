@@ -50,6 +50,21 @@ augmentations:
   # -----------------------------------------------------------------------
   intensity:
     hu_jitter: 0
+
+    # GIN / IPA appearance transform (Ouyang et al., causality-inspired DG).
+    # Randomly-weighted nonlinear conv warps intensities; mode=ipa additionally
+    # blends independent copies with a smooth field. Independent per volume.
+    # Default OFF (p=0) → no-op for existing runs.
+    gin:
+      p: 0.0
+      mode: ipa                  # gin | ipa
+      n_layer: 4
+      interm_channel: 2
+      scale_pool: [1, 3]
+      out_norm: frob
+      ipa_copies: 2
+      ipa_control_points: 4
+
     brightness_contrast:
       p: 0.15
       brightness: 0.0

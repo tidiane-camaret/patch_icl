@@ -38,7 +38,8 @@ arch:
   h: 512
   l: 6
   a: 4
-  thinking_rows: 8
+  thinking_rows: 8             # number of register tokens (learned rows prepended to the set;
+                               #  the sole cross-image bus under register_routed)
   residual_decay: 0.95
   fourier_bands: 8
   mask_patch_size: 8           # 1 = scalar avg-pool occupancy per cell; p>1 = shaped p³ tile
@@ -47,6 +48,13 @@ arch:
   max_context: 16
   full_attn: true
   query_self_attn: true       # KEEP false at dense R=16 — the r×r attn mask is prohibitive there
+  register_routed: false      # thinking rows are the only cross-image bus (each image self-attends
+                              #  + reads registers); blocks ctx→tgt matching. Uses a FlexAttention
+                              #  BlockMask (skips masked blocks → flash-like mem, ~T× cheaper)
+  register_flex: true         # register_routed kernel: true = FlexAttention (fast once compiled).
+                              #  Set false to force the dense r×r bool-mask SDPA — needed on nodes
+                              #  where flex's Triton kernel hangs in ptxas on a COLD compile cache
+                              #  (Blackwell/cu13). Dense is fine at small K, heavy at large K.
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:

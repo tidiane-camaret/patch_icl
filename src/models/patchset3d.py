@@ -16,7 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
-from src.models.pfn_seg_2d import ThinkingRows, TransformerEncoderStack
+from src.models.pfn_seg_2d import (
+    ThinkingRows, TransformerEncoderStack, build_register_block_mask)
 from src.rope import build_3d_rope_freqs_from_positions
 
 
@@ -105,6 +106,8 @@ class PatchSet3D(nn.Module):
         max_context: int = 16,
         full_attn: bool = False,
         query_self_attn: bool = False,
+        register_routed: bool = False,
+        register_flex: bool = True,
         image_size=None,
         encoder: str = "conv",
         encoder_frozen: bool = True,
@@ -128,6 +131,16 @@ class PatchSet3D(nn.Module):
         assert self.mask_patch_size >= 1 and self.mask_patch_decode_size >= 1
         self.full_attn = full_attn
         self.query_self_attn = query_self_attn
+        # register_routed: each image attends only within its own N-cell block; the thinking
+        # rows are the sole cross-image bus (registers read all tokens, all tokens read
+        # registers). No direct ctx<->tgt token attention -> blocks the ctx->tgt feature
+        # -matching shortcut. Needs an explicit r x r mask (disables flash SDPA).
+        self.register_routed = register_routed
+        # register_flex: use the FlexAttention BlockMask (skips masked blocks -> flash-like mem,
+        # ~T× cheaper). Set False to force the dense r×r bool-mask SDPA instead — needed on nodes
+        # where flex's Triton kernel hangs in ptxas on a cold compile cache (Blackwell/cu13 seen
+        # to stall >10 min). Dense is fine at small K; heavy at large K (see bench_attn_pattern.py).
+        self.register_flex = register_flex
         self.context_id_embed = context_id_embed
         self.max_context = max_context
         self.image_size = image_size          # metadata only (unused in forward)
@@ -329,13 +342,32 @@ class PatchSet3D(nn.Module):
         x = torch.cat([sup_tok, qry_tok], dim=1)
         x, sep_t = self.thinking(x, sep)
         attn_mask = None
-        if self.query_self_attn and not self.full_attn:
+        block_mask = None
+        if not self.full_attn and self.register_routed:
+            # Registers (thinking rows) are the only cross-image path: they read every token
+            # and every token reads them; each image otherwise attends only within its own
+            # N-cell block (K support blocks + 1 query block), so there is no direct ctx<->tgt
+            # token attention to short-circuit into feature matching. flex_attention skips the
+            # masked off-diagonal blocks; a dense r×r bool mask is the fallback without flex.
+            n_t = self.thinking.n
+            block_mask = (build_register_block_mask(n_t, N, K + 1, x.device)
+                          if self.register_flex else None)
+            if block_mask is None:
+                r = x.shape[1]
+                attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
+                attn_mask[:n_t, :] = True                     # registers read all tokens
+                attn_mask[:, :n_t] = True                     # all tokens read registers
+                for m in range(K + 1):
+                    s = n_t + m * N
+                    attn_mask[s:s + N, s:s + N] = True        # within-image self-attention
+        elif not self.full_attn and self.query_self_attn:
             r = x.shape[1]
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
             attn_mask[:, :sep_t] = True
             attn_mask[sep_t:, sep_t:] = True
         rope = self._rope(K, spacing, x.device) if self.transformer_rope else None
-        x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn, rope=rope)
+        x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
+                             rope=rope, block_mask=block_mask)
         q = x[:, sep_t:, 0, :]                               # (B,Q,e) query img-col
         logit = self._tile_logits(self.decoder(q))          # (B,1,Rd,Rd,Rd)
         return logit, mask_support, mask_query

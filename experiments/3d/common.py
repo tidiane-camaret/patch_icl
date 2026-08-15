@@ -55,23 +55,39 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     return source, root, source == "totalsegmri"
 
 
-def _self_context(d, split: str) -> tuple[float, bool, bool]:
-    """Parse data.self_context -> (p, intensity, per_image) for `split`. Accepts the
-    nested {p:{train, eval}, augs:{intensity, per_image}} form; p may also be a bare
-    scalar (both splits), and the whole block a bare scalar/bool (p only). split=='train'
-    reads p.train; any other split (val/test) reads p.eval. augs apply to both splits."""
+def _split_scalar(v, split: str, default: float = 0.0) -> float:
+    """Resolve a possibly split-specific probability: a bare scalar applies to both splits,
+    else read v.train (split=='train') or v.eval (val/test)."""
+    if isinstance(v, (int, float, bool)):
+        return float(v)
+    return float(v.get("train" if split == "train" else "eval", default))
+
+
+def _self_context(d, split: str) -> tuple[float, bool, bool, dict | None]:
+    """Parse data.self_context -> (p, intensity, per_image, synth_masks) for `split`. Accepts
+    the nested {p:{train, eval}, augs:{intensity, per_image}, synth_masks:{p:{train,eval}, ...}}
+    form; every `p` may also be a bare scalar (both splits), and the whole block a bare
+    scalar/bool (p only). split=='train' reads p.train; any other split (val/test) reads p.eval.
+    augs apply to both splits. synth_masks (dict or None, with its own split-specific p already
+    resolved to a scalar for `split`) drives the synthetic target label: its `sources`
+    (ellipse/supervoxel) and per-source params are forwarded verbatim to the dataset."""
     sc = d.get("self_context", 0.0)
     if isinstance(sc, (int, float, bool)):
-        return float(sc), False, False
-    p = sc.get("p", 0.0)
-    if isinstance(p, (int, float, bool)):
-        p_val = float(p)
-    else:
-        p_val = float(p.get("train" if split == "train" else "eval", 0.0))
+        return float(sc), False, False, None
+    p_val = _split_scalar(sc.get("p", 0.0), split)
     augs = sc.get("augs", {}) or {}
+    sm = sc.get("synth_masks", None)
+    if sm is not None:
+        from omegaconf import OmegaConf, DictConfig
+        if isinstance(sm, DictConfig):
+            sm = OmegaConf.to_container(sm, resolve=True)
+        else:
+            sm = dict(sm)
+        sm["p"] = _split_scalar(sm.get("p", 0.0), split)   # collapse split-specific p -> scalar
     return (p_val,
             bool(augs.get("intensity", False)),
-            bool(augs.get("per_image", False)))
+            bool(augs.get("per_image", False)),
+            sm)
 
 
 def resolve_anchor_classes(anchor_cfg, root):
@@ -189,7 +205,7 @@ def build_dataset(cfg, split: str):
             crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
         )
     d = cfg.data
-    _sc_p, _sc_int, _sc_pi = _self_context(d, split)
+    _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     _, root, is_mri = _source_root(cfg)
     class_spec = d.train_classes if split == "train" else d.val_classes
     classes = resolve_classes(class_spec, root, is_mri=is_mri)
@@ -220,6 +236,7 @@ def build_dataset(cfg, split: str):
         self_context=_sc_p,
         self_context_intensity=_sc_int,
         self_context_per_image=_sc_pi,
+        self_context_synth=_sc_synth,
     )
 
 
@@ -303,7 +320,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     TotalSegInContextDataset subclass) honours it too. None = fixed-crop_spacing_mm pass.
     """
     d, e = cfg.data, cfg.eval
-    _sc_p, _sc_int, _sc_pi = _self_context(d, split)
+    _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
                             "chemotox_bc"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
@@ -357,6 +374,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         self_context=_sc_p,
         self_context_intensity=_sc_int,
         self_context_per_image=_sc_pi,
+        self_context_synth=_sc_synth,
     )
     nw = int(e.get("workers", 4))
     common = dict(

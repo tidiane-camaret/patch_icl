@@ -48,13 +48,24 @@ def _merge_batches(batches: list[dict]) -> dict:
     Tensors are cat'd along the batch dim; list values (subjects, label_names)
     are flattened. Lets us gather N items that were each drawn with their own
     per-batch spacing by SpacingBatchSampler(batch_size=1).
+
+    Optional per-item keys (e.g. synth_radii_mm/synth_coord, present only for
+    ellipse-synth items, absent for supervoxel/real ones) are kept: batches
+    missing a tensor key are padded (NaN for float, 0 otherwise) so batch dims
+    still line up — mirroring incontext_collate_fn's mixed-batch handling.
     """
+    keys = {k for b in batches for k in b}
     out: dict = {}
-    for k, v in batches[0].items():
-        if torch.is_tensor(v):
-            out[k] = torch.cat([b[k] for b in batches], dim=0)
+    for k in keys:
+        present = next(b[k] for b in batches if k in b)
+        if torch.is_tensor(present):
+            fill = float("nan") if present.is_floating_point() else 0
+            out[k] = torch.cat(
+                [b[k] if k in b else torch.full_like(present, fill) for b in batches],
+                dim=0,
+            )
         else:
-            out[k] = [x for b in batches for x in b[k]]
+            out[k] = [x for b in batches if k in b for x in b[k]]
     return out
 
 

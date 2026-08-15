@@ -202,7 +202,7 @@ def _sample_detail(meta: dict | None) -> str:
 # the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
 _SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "ctx_cases", "self_ctx",
                       "dice", "soft_dice", "loss", "time_ms", "tgt_size", "tgt_occ",
-                      "ctx_size", "ctx_occ", "spacing", "detail"]
+                      "ctx_size", "ctx_occ", "spacing", "synth_size", "detail"]
 
 
 def build_sample_table(cases: list[dict], epoch: int | None = None, train_classes=None):
@@ -228,7 +228,8 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
                        c.get("ctx_size", float("nan")), c.get("ctx_occ", float("nan")),
-                       c.get("spacing", float("nan")), c.get("detail", ""),
+                       c.get("spacing", float("nan")),
+                       c.get("synth_size", float("nan")), c.get("detail", ""),
                        *[c.get(k, float("nan")) for k in fs_cols])
     return table
 
@@ -263,6 +264,12 @@ def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> dic
     dummy_target  = torch.zeros(1, 1, D, H, W, device=device)
     dummy_ctx_img = torch.zeros(1, K, 1, D, H, W, device=device)
     dummy_ctx_msk = torch.zeros(1, K, D, H, W, dtype=torch.long, device=device)
+    # FlopCounterMode disables dynamo, so patchset3d's register_routed flex kernel can't run
+    # under it (uncountable eager HOP + a spurious "flex called without compile" warning). Force
+    # the dense bool-mask equivalent for the count (traceable); it overstates register_routed's
+    # true cost — the sparse figure is in experiments/3d/bench_attn_pattern.py. No-op otherwise.
+    import src.models.pfn_seg_2d as _pfn
+    _flex_prev, _pfn._FLEX_ENABLED = _pfn._FLEX_ENABLED, False
     try:
         with FlopCounterMode(display=False) as fc:
             model.predict(dummy_target, dummy_ctx_img, dummy_ctx_msk)
@@ -280,6 +287,8 @@ def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> dic
     except Exception as exc:  # noqa: BLE001
         print(f"    [FLOPs] Could not count: {exc}")
         return {"total": 0.0, "encoder": None, "transformer": None}
+    finally:
+        _pfn._FLEX_ENABLED = _flex_prev
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +620,17 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
             # spacing (spacing key missing) -> the column stays NaN.
             if "spacing" in batch:
                 case["spacing"] = round(float(batch["spacing"][i, 0]), 4)
+            # Synthetic-mask samples (data.self_context.synth_masks, label_name 'synth'): write the
+            # object's shape — per-axis radii (mm) + anatomical coords.npy position — into the
+            # detail column. Only for synth samples; other samples keep their provenance detail.
+            if "synth_radii_mm" in batch and not torch.isnan(batch["synth_radii_mm"][i, 0]).item():
+                r = batch["synth_radii_mm"][i].tolist()
+                shape = f"ellipse {r[0]:.0f}x{r[1]:.0f}x{r[2]:.0f}mm"
+                if "synth_coord" in batch and not torch.isnan(batch["synth_coord"][i, 0]).item():
+                    c = batch["synth_coord"][i].tolist()
+                    shape += f" @({c[0]:.0f},{c[1]:.0f},{c[2]:.0f})"
+                case["detail"] = shape
+                case["synth_size"] = round(sum(r) / 3 * 2, 1)   # mean diameter (mm), plottable
             if locator_ratio is not None:
                 # Locate a fine-spacing box from the coarse prediction and measure how much
                 # GT it contains. Soft prob when available (logits_fn), else the hard mask.
@@ -664,7 +684,13 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 }
 
     rows, all_cases = [], []
-    for cls in classes:
+    # Summarize the requested classes, then any EXTRA classes that showed up in the cases but
+    # weren't requested. data.self_context.synth_masks relabels every target 'synth', which is
+    # not a benchmark class — without this those cases (the whole val set under a pure-synth
+    # eval) would be dropped and the mean val Dice would be nan (all requested classes get
+    # 'no samples'). Normal eval has label_name in classes, so `extra` is empty.
+    extra = [c for c in cases_by_class if c not in set(classes)]
+    for cls in list(classes) + extra:
         cases = cases_by_class.get(cls, [])
         all_cases.extend(cases)
         rows.append(_summarize(cls, cases) if cases

@@ -211,6 +211,29 @@ def apply_intensity_aug(
 ) -> torch.Tensor:
     """Intensity augmentations sampled independently for each volume."""
 
+    # --- GIN / IPA appearance transform ----------------------------------
+    # Randomly-weighted nonlinear conv (GIN), optionally spatially blended
+    # across independent copies (IPA). Applied first so downstream intensity
+    # ops act on the warped appearance. Independent per volume (this fn runs
+    # per volume), so target and its K contexts get different warps.
+    gincfg = getattr(cfg, "gin", None)
+    if gincfg is not None and random.random() < gincfg.p:
+        scale_pool = tuple(getattr(gincfg, "scale_pool", (1, 3)))
+        n_layer    = getattr(gincfg, "n_layer", 4)
+        interm     = getattr(gincfg, "interm_channel", 2)
+        out_norm   = getattr(gincfg, "out_norm", "frob")
+        if getattr(gincfg, "mode", "gin") == "ipa":
+            image = _ipa_blend_3d(
+                image,
+                n_copies=getattr(gincfg, "ipa_copies", 2),
+                control_points=getattr(gincfg, "ipa_control_points", 4),
+                n_layer=n_layer, interm_channel=interm,
+                scale_pool=scale_pool, out_norm=out_norm,
+            )
+        else:
+            image = _gin_transform_3d(image, n_layer, interm, scale_pool, out_norm)
+        image = image.clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
     # --- Brightness / contrast -------------------------------------------
     bccfg = cfg.brightness_contrast
     if random.random() < bccfg.p:
@@ -302,6 +325,79 @@ def _simulate_bias_field(image: torch.Tensor, magnitude: float, coarse: int = 4)
     field = torch.randn(1, 1, coarse, coarse, coarse) * magnitude
     field = F.interpolate(field, size=(D, H, W), mode="trilinear", align_corners=False)
     return (image * field.squeeze(0).exp()).clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
+
+def _gin_transform_3d(
+    image: torch.Tensor,          # (1, D, H, W)
+    n_layer: int = 4,
+    interm_channel: int = 2,
+    scale_pool: Tuple[int, ...] = (1, 3),
+    out_norm: str = "frob",
+) -> torch.Tensor:
+    """GIN (Global Intensity Non-linear) appearance transform.
+
+    A stack of `n_layer` conv3d layers with FRESH random kernels + shifts drawn
+    each call (no learned state), leaky-relu between layers. The warped image is
+    blended with the original via a random alpha, then Frobenius-norm matched to
+    the input so overall energy is preserved. Adapted from GINGroupConv3D
+    (Ouyang et al., causality-inspired domain generalization) — ported to CPU,
+    single-channel, functional. Returns (1, D, H, W)."""
+    x_in = image.unsqueeze(0)                      # (1, 1, D, H, W)
+    with torch.no_grad():
+        x = x_in
+        ch_in = 1
+        for li in range(n_layer):
+            out_ch = 1 if li == n_layer - 1 else interm_channel
+            k = scale_pool[random.randrange(len(scale_pool))]
+            ker = torch.randn(out_ch, ch_in, k, k, k)
+            shift = torch.randn(out_ch, 1, 1, 1)
+            x = F.conv3d(x, ker, stride=1, padding=k // 2) + shift
+            if li < n_layer - 1:
+                x = F.leaky_relu(x)
+            ch_in = out_ch                          # (1, 1, D, H, W) after last layer
+
+        alpha = random.random()
+        mixed = alpha * x + (1.0 - alpha) * x_in
+        if out_norm == "frob":
+            in_frob   = torch.norm(x_in.reshape(-1), p="fro")
+            self_frob = torch.norm(mixed.reshape(-1), p="fro")
+            mixed = mixed * (in_frob / (self_frob + 1e-5))
+    return mixed.squeeze(0)                          # (1, D, H, W)
+
+
+def _ipa_blend_3d(
+    image: torch.Tensor,          # (1, D, H, W)
+    n_copies: int = 2,
+    control_points: int = 4,
+    n_layer: int = 4,
+    interm_channel: int = 2,
+    scale_pool: Tuple[int, ...] = (1, 3),
+    out_norm: str = "frob",
+) -> torch.Tensor:
+    """IPA (Inter-instance Pseudo-correlation Augmentation) — spatial blend.
+
+    Generates `n_copies` independent GIN warps of the SAME volume and mixes them
+    with a smooth random spatial field, so different regions take appearances
+    from different copies (breaking spurious appearance correlations across the
+    volume). Adapted from ginipa.py — the reference's AdvBias field is replaced
+    by a coarse control-point field upsampled trilinearly (AdvBias is used there
+    purely as a random smooth-field source). Returns (1, D, H, W)."""
+    copies = [
+        _gin_transform_3d(image, n_layer, interm_channel, scale_pool, out_norm)
+        for _ in range(max(2, n_copies))
+    ]
+    _, D, H, W = image.shape
+    cp = max(2, control_points)
+    field = torch.randn(1, 1, cp, cp, cp)
+    field = F.interpolate(field, size=(D, H, W), mode="trilinear",
+                          align_corners=False).squeeze(0)          # (1, D, H, W)
+    fmin, fmax = field.amin(), field.amax()
+    field = (field - fmin) / (fmax - fmin + 1e-20)                 # → [0, 1]
+
+    out = copies[0]
+    for c in copies[1:]:
+        out = out * (1.0 - field) + c * field
+    return out
 
 
 def _gaussian_smooth_3d_field(field: torch.Tensor, sigma: float) -> torch.Tensor:
