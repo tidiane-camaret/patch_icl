@@ -1,7 +1,8 @@
 import sys; sys.path.insert(0, ".")
 import torch
 from types import SimpleNamespace
-from src.gpu_augment import _stack_task, _unstack_task, _geometric
+from src.gpu_augment import _stack_task, _unstack_task, _geometric, _batched_intensity
+from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
 
 
 def _fake_batch(B=2, K=3, D=6, H=6, W=6):
@@ -71,3 +72,32 @@ def test_geometric_mask_follows_image():
     # where the mask is 1, the image is high (they co-moved)
     m = om[0] == 1
     assert m.sum() > 0 and out[0, 0][m].mean() > 0.3
+
+
+def _int_cfg():
+    return SimpleNamespace(
+        brightness_contrast=SimpleNamespace(p=1.0, brightness=0.1, contrast_range=[0.8, 1.2]),
+        gamma=SimpleNamespace(p=1.0, range=[0.8, 1.3]),
+        gaussian_noise=SimpleNamespace(p=1.0, max_std=0.1),
+        gaussian_blur=SimpleNamespace(p=1.0, sigma_range=[0.5, 1.0]),
+    )
+
+
+def test_intensity_shape_range_and_changes():
+    span = CT_NORM_MAX - CT_NORM_MIN
+    vols = torch.rand(5, 1, 8, 8, 8) * span + CT_NORM_MIN
+    gen = torch.Generator().manual_seed(3)
+    out = _batched_intensity(vols.clone(), _int_cfg(), gen)
+    assert out.shape == vols.shape
+    assert out.min() >= CT_NORM_MIN - 1e-4 and out.max() <= CT_NORM_MAX + 1e-4
+    assert not torch.allclose(out, vols)
+
+
+def test_intensity_p_zero_is_noop():
+    cfg = _int_cfg()
+    for k in ("brightness_contrast", "gamma", "gaussian_noise", "gaussian_blur"):
+        getattr(cfg, k).p = 0.0
+    vols = torch.rand(3, 1, 8, 8, 8)
+    gen = torch.Generator().manual_seed(4)
+    out = _batched_intensity(vols.clone(), cfg, gen)
+    assert torch.allclose(out, vols)

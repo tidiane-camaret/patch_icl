@@ -46,6 +46,88 @@ def _uniform(gen, device, lo, hi):
     return (lo + (hi - lo) * torch.rand((), generator=gen, device=device)).item()
 
 
+def _per_vol_mask(gen, N, device, p):
+    """(N,1,1,1,1) bool: which volumes this op fires on."""
+    return (torch.rand(N, generator=gen, device=device) < p).view(N, 1, 1, 1, 1)
+
+
+def _grouped_gaussian_blur(vols, sigma):
+    """Separable 3D gaussian blur, same sigma for all volumes in `vols` (N,1,D,H,W)."""
+    radius = max(1, int(math.ceil(2.0 * sigma)))
+    size = 2 * radius + 1
+    coords = torch.arange(-radius, radius + 1, dtype=vols.dtype, device=vols.device)
+    k = torch.exp(-0.5 * (coords / sigma) ** 2); k = k / k.sum()
+    x = vols
+    for dim, view in ((2, (1, 1, size, 1, 1)), (3, (1, 1, 1, size, 1)), (4, (1, 1, 1, 1, size))):
+        pad = [0, 0, 0]; pad[dim - 2] = radius
+        x = F.conv3d(x, k.view(view), padding=(pad[0], pad[1], pad[2]))
+    return x
+
+
+def _batched_intensity(vols, cfg, gen):
+    N = vols.shape[0]
+    device = vols.device
+    span = CT_NORM_MAX - CT_NORM_MIN
+
+    bc = getattr(cfg, "brightness_contrast", None)
+    if bc is not None and bc.p > 0:
+        mask = _per_vol_mask(gen, N, device, bc.p)
+        bright = (-bc.brightness + 2 * bc.brightness *
+                  torch.rand(N, 1, 1, 1, 1, generator=gen, device=device))
+        c0, c1 = bc.contrast_range
+        contrast = c0 + (c1 - c0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+        aug = (vols * contrast + bright).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        vols = torch.where(mask, aug, vols)
+
+    gc = getattr(cfg, "gamma", None)
+    if gc is not None and gc.p > 0:
+        mask = _per_vol_mask(gen, N, device, gc.p)
+        g0, g1 = gc.range
+        gamma = g0 + (g1 - g0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+        norm = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma)
+        aug = norm * span + CT_NORM_MIN
+        vols = torch.where(mask, aug, vols)
+
+    sc = getattr(cfg, "sharpness", None)
+    if sc is not None and getattr(sc, "p", 0) > 0:
+        mask = _per_vol_mask(gen, N, device, sc.p)
+        blur = _grouped_gaussian_blur(vols, sigma=1.0)
+        aug = (vols + sc.factor * (vols - blur)).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        vols = torch.where(mask, aug, vols)
+
+    bl = getattr(cfg, "gaussian_blur", None)
+    if bl is not None and bl.p > 0:
+        mask = _per_vol_mask(gen, N, device, bl.p)
+        s0, s1 = bl.sigma_range
+        sigma = _uniform(gen, device, s0, s1)
+        aug = _grouped_gaussian_blur(vols, sigma)
+        vols = torch.where(mask, aug, vols)
+
+    nc = getattr(cfg, "gaussian_noise", None)
+    if nc is not None and nc.p > 0:
+        mask = _per_vol_mask(gen, N, device, nc.p)
+        if hasattr(nc, "max_std"):
+            std = _uniform(gen, device, 0.0, nc.max_std); mean = 0.0
+        else:                                                   # synth schema
+            mean = _uniform(gen, device, *nc.mean_range)
+            std = _uniform(gen, device, *nc.std_range)
+        noise = mean + std * torch.randn(vols.shape, generator=gen, device=device)
+        aug = (vols + noise).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        vols = torch.where(mask, aug, vols)
+
+    lr = getattr(cfg, "simulate_low_resolution", None)
+    if lr is not None and lr.p > 0:
+        mask = _per_vol_mask(gen, N, device, lr.p)
+        D, H, W = vols.shape[-3:]
+        scale = _uniform(gen, device, lr.scale_min, lr.scale_max)
+        small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
+        down = F.interpolate(vols, size=small, mode="trilinear", align_corners=False)
+        aug = F.interpolate(down, size=(D, H, W), mode="trilinear", align_corners=False)
+        vols = torch.where(mask, aug, vols)
+
+    return vols
+
+
 def _geometric(vols, masks, group_size, cfg, gen):
     """Shared (group_size=T) or independent (group_size=1) flip/affine/elastic."""
     N = vols.shape[0]
