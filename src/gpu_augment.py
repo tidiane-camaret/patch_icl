@@ -51,6 +51,7 @@ def _geometric(vols, masks, group_size, cfg, gen):
     N = vols.shape[0]
     device = vols.device
     G = N // group_size                              # number of groups
+    assert N % group_size == 0, f"N={N} must be divisible by group_size={group_size}"
     D, H, W = vols.shape[-3:]
 
     # --- flips: one decision per group, per axis ---
@@ -92,6 +93,7 @@ def _geometric(vols, masks, group_size, cfg, gen):
                 sl = slice(g * group_size, (g + 1) * group_size)
                 grid[sl] = (grid[sl] + disp).clamp(-1.0, 1.0)
 
+    grid = grid.to(vols.dtype)
     vols = F.grid_sample(vols, grid, mode="bilinear", padding_mode="border",
                          align_corners=False)
     m = F.grid_sample(masks.unsqueeze(1).float(), grid, mode="nearest",
