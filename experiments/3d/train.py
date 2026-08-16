@@ -643,9 +643,10 @@ def main(cfg: DictConfig) -> None:
 
     from src.gpu_augment import GpuAugmentor
     if cfg.augmentations.get("gpu", False):
-        _, _, _sc_pi, _ = _self_context(cfg.data, "train")
+        _, _sc_int, _sc_pi, _ = _self_context(cfg.data, "train")
         gpu_aug = GpuAugmentor(cfg.augmentations,
                                self_context_per_image=bool(_sc_pi),
+                               self_context_intensity=bool(_sc_int),
                                seed=int(cfg.get("seed", 0)))
     else:
         gpu_aug = None

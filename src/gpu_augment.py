@@ -245,9 +245,11 @@ def _geometric(vols, masks, group_size, cfg, gen):
 
 
 class GpuAugmentor:
-    def __init__(self, aug_cfg, self_context_per_image: bool = False, seed: int = 0):
+    def __init__(self, aug_cfg, self_context_per_image: bool = False,
+                 self_context_intensity: bool = False, seed: int = 0):
         self.cfg = aug_cfg
         self.self_context_per_image = bool(self_context_per_image)
+        self.self_context_intensity = bool(self_context_intensity)
         self._seed = seed
         self._step = 0
 
@@ -277,7 +279,8 @@ class GpuAugmentor:
                 v = _batched_intensity(v, cfg.synth, gen)
             else:  # REAL or SELF_CONTEXT
                 v, m = _geometric(v, m, group_size=T, cfg=cfg.task, gen=gen)
-                v = _batched_intensity(v, cfg.intensity, gen)
+                if mode == REAL or self.self_context_intensity:
+                    v = _batched_intensity(v, cfg.intensity, gen)
                 if mode == SELF_CONTEXT and self.self_context_per_image:
                     # extra independent geo jitter on the K context volumes only
                     G = task_sel.numel()

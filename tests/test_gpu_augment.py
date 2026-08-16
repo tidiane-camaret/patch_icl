@@ -198,6 +198,86 @@ def test_mixed_modes_route_and_preserve_shape():
 
 
 # ---------------------------------------------------------------------------
+# Finding 1: self_context_intensity gate
+# ---------------------------------------------------------------------------
+def test_self_context_per_image_does_not_touch_target():
+    """per_image jitter must not alter the target (t=0); only context clones (t>=1) change."""
+    from src.gpu_augment import GpuAugmentor
+    B, K, D = 2, 3, 8
+    base = {
+        "image": torch.randn(B, 1, D, D, D),
+        "label": torch.zeros(B, D, D, D, dtype=torch.long),
+        "context_in": torch.randn(B, K, 1, D, D, D),
+        "context_out": torch.zeros(B, K, D, D, D, dtype=torch.long),
+        "aug_mode": torch.tensor([2, 2]),
+    }
+    clone = {k: v.clone() for k, v in base.items()}
+
+    # intensity off so only geometry distinguishes the two runs
+    cfg = _full_cfg()
+    for kk in ("brightness_contrast", "gamma", "gaussian_noise", "gaussian_blur"):
+        getattr(cfg.intensity, kk).p = 0.0
+
+    aug_true  = GpuAugmentor(cfg, self_context_per_image=True,  self_context_intensity=False, seed=0)
+    aug_false = GpuAugmentor(cfg, self_context_per_image=False, self_context_intensity=False, seed=0)
+
+    out_true  = aug_true(base,  training=True)
+    out_false = aug_false(clone, training=True)
+
+    # Both runs see the same shared geometric for the whole task (same seed, same REAL branch),
+    # so the target (t=0) must come out identical.
+    assert torch.allclose(out_true["image"], out_false["image"]), \
+        "per_image flag must not touch the target volume (t=0)"
+
+
+def test_self_context_intensity_gate():
+    """With self_context_intensity=False identical clones must stay identical after augmentation.
+    With self_context_intensity=True they must diverge (intensity ops make them differ)."""
+    from src.gpu_augment import GpuAugmentor
+    B, K, D = 1, 3, 8
+
+    def _make_batch():
+        img = torch.randn(B, 1, D, D, D)
+        # context clones are identical copies of the target image
+        ctx = img.unsqueeze(1).expand(B, K, 1, D, D, D).clone()
+        return {
+            "image": img.clone(),
+            "label": torch.zeros(B, D, D, D, dtype=torch.long),
+            "context_in": ctx,
+            "context_out": torch.zeros(B, K, D, D, D, dtype=torch.long),
+            "aug_mode": torch.tensor([2]),
+        }
+
+    cfg_off = _full_cfg()
+    # disable per_image geo jitter so only intensity (or lack thereof) distinguishes volumes
+    cfg_off.per_image = _geo_cfg(affine_p=0.0, flip_p=0.0, elastic_p=0.0)
+    # confirm _full_cfg intensity has at least one op with p>0 (brightness_contrast.p=1.0)
+    assert cfg_off.intensity.brightness_contrast.p > 0, \
+        "_full_cfg must have at least one intensity op with p>0 for this test to be meaningful"
+
+    # Case A: intensity gated OFF — all K+1 volumes share the same geometric, no intensity →
+    # every volume should remain identical to the target after augmentation.
+    aug_off = GpuAugmentor(cfg_off, self_context_per_image=False, self_context_intensity=False, seed=0)
+    out_off = aug_off(_make_batch(), training=True)
+    for k in range(K):
+        assert torch.allclose(out_off["context_in"][:, k, 0], out_off["image"][:, 0], atol=1e-5), \
+            f"context {k} diverged from target despite self_context_intensity=False"
+
+    # Case B: intensity gated ON — per-volume intensity randomness should make at least one
+    # context differ from the target.
+    cfg_on = _full_cfg()
+    cfg_on.per_image = _geo_cfg(affine_p=0.0, flip_p=0.0, elastic_p=0.0)
+    aug_on = GpuAugmentor(cfg_on, self_context_per_image=False, self_context_intensity=True, seed=0)
+    out_on = aug_on(_make_batch(), training=True)
+    any_differ = any(
+        not torch.allclose(out_on["context_in"][:, k, 0], out_on["image"][:, 0], atol=1e-5)
+        for k in range(K)
+    )
+    assert any_differ, \
+        "with self_context_intensity=True at least one context should differ from the target"
+
+
+# ---------------------------------------------------------------------------
 # Task 6: collate aug_mode
 # ---------------------------------------------------------------------------
 from src.totalseg_dataloader_incontext import incontext_collate_fn
