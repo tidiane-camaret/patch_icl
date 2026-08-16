@@ -1,5 +1,9 @@
 # Change log
 
+## 2026-08-15 — GPU augmentation pipeline (batched, replaces CPU per-item augs)
+- NEW `src/gpu_augment.py::GpuAugmentor` — batched on-device aug run in the train loop after batch.to(device), before model(). Own torch ops (no deps), non-differentiable. `_geometric` (shared per task group_size=T, or independent group_size=1), `_batched_intensity` (brightness/contrast/gamma/noise/blur/sharpness/low-res), `_batched_gin_ipa` (grouped conv, groups=N). Mode dispatch on `aug_mode` (0 real, 1 synth, 2 self_context).
+- Dataset `defer_aug_to_gpu` (from `augmentations.gpu`): __getitem__/_get_synth_item skip apply_*_aug, emit RAW volumes + aug_mode; collate stacks aug_mode. train.py moves batch to device once + augments. Behind `augmentations.gpu` (default false → CPU path unchanged). Exact CPU repro is a non-goal; tests assert shape/range/K+1-sharing/eval-identity. See docs/superpowers/specs/2026-08-15-gpu-augmentation-pipeline-design.md.
+
 ## 2026-08-15 — GIN / IPA CPU aug cost benchmark
 - NEW: `experiments/3d/bench_cpu_aug.py` — times the per-item training aug path (apply_task_aug + apply_intensity_aug×N) at experiment-42 shapes (image_size 128³, context_size 3 → N=4), loading the real resolved aug config (nnunet base ⊕ exp-42 overrides). Compares GIN off / gin / ipa; single torch thread by default (mimics one worker in a saturated 16-worker pool). `--size/--n/--iters/--threads`.
 - RESULT (N=4, 128³, 1 thread, 30 iters): full per-item aug mean **off 438.6 ms → gin 1110.8 (+672) → ipa 1623.0 (+1184)**. Isolated intensity (only gin/ipa): gin 572 ms (~143/vol), ipa 975 ms (~244/vol; ≈2× gin = 2 GIN copies + blend). Baseline "off" bimodal (median 278 ≪ mean 439: task affine/elastic at p=0.2); gin/ipa rows forced p=1 so tight — median deltas +818/+1312 ms.

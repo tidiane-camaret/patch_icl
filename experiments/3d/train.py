@@ -61,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from the 2D trainer
 
 from data.totalseg_classes import resolve_classes
-from common import DEVICE, _source_root, train_loader, make_eval_loader
+from common import DEVICE, _source_root, train_loader, make_eval_loader, _self_context
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
@@ -273,7 +273,7 @@ def build_model(cfg: DictConfig):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-                is_patchset=False):
+                is_patchset=False, gpu_aug=None):
     """optimizers is a list: [AdamW] for medverse, [AdamW, Muon] for patchset3d (the
     scheduler drives AdamW = optimizers[0]; Muon is unscheduled, cf. experiments/2d/train.py)."""
     net = getattr(model, "model", model)
@@ -301,7 +301,14 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         if prof:
             tsum["data"] += (time.perf_counter() - t_prev) * 1000
             prof_items += batch["image"].shape[0]      # per-item = per-step ÷ batch size
-        lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
+        if gpu_aug is not None:
+            for k in ("image", "label", "context_in", "context_out", "aug_mode", "spacing"):
+                if k in batch:
+                    batch[k] = batch[k].to(DEVICE, non_blocking=True)
+            batch = gpu_aug(batch, training=True)
+            lbl = batch["label"].float()
+        else:
+            lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         with _autocast():
@@ -311,10 +318,10 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 # when not spacing-aware (encoder falls back to the train-pitch identity grid).
                 spacing = (float(batch["spacing"][0, 0])
                            if getattr(net, "spacing_aware", False) and "spacing" in batch else None)
-                out = model(batch["image"].to(DEVICE, non_blocking=True),
-                            context_in=batch["context_in"].to(DEVICE, non_blocking=True),
-                            context_out=batch["context_out"].to(DEVICE, non_blocking=True),
-                            mode="train", spacing=spacing)
+                img_in = batch["image"] if gpu_aug is not None else batch["image"].to(DEVICE, non_blocking=True)
+                cin = batch["context_in"] if gpu_aug is not None else batch["context_in"].to(DEVICE, non_blocking=True)
+                cout = batch["context_out"] if gpu_aug is not None else batch["context_out"].to(DEVICE, non_blocking=True)
+                out = model(img_in, context_in=cin, context_out=cout, mode="train", spacing=spacing)
                 logits = out["final_logit"].float()                    # (B,1,Rd,Rd,Rd)
                 target = target_like(lbl.unsqueeze(1), logits)         # GT pooled to grid
             else:
@@ -634,12 +641,21 @@ def main(cfg: DictConfig) -> None:
     ckpt_path = out_dir / "best.pt"
     print(f"Checkpoints -> {ckpt_path}")
 
+    from src.gpu_augment import GpuAugmentor
+    if cfg.augmentations.get("gpu", False):
+        _, _, _sc_pi, _ = _self_context(cfg.data, "train")
+        gpu_aug = GpuAugmentor(cfg.augmentations,
+                               self_context_per_image=bool(_sc_pi),
+                               seed=int(cfg.get("seed", 0)))
+    else:
+        gpu_aug = None
+
     best = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
         loss, tr_dice, tr_soft, tr_grid = train_epoch(
             model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-            is_patchset=is_patchset)
+            is_patchset=is_patchset, gpu_aug=gpu_aug)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}

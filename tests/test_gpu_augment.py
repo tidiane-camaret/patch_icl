@@ -227,3 +227,26 @@ def test_collate_stacks_aug_mode():
 def test_nnunet_config_has_gpu_flag():
     cfg = OmegaConf.load("configs/augmentations/nnunet.yaml")
     assert cfg.augmentations.gpu is False
+
+
+# ---------------------------------------------------------------------------
+# Task 8: end-to-end train-loop smoke
+# ---------------------------------------------------------------------------
+def test_augmentor_end_to_end_batch_smoke():
+    # emulate the train-loop call: raw batch -> to(device) -> augmentor -> shapes intact
+    from src.gpu_augment import GpuAugmentor
+    B, K, D = 2, 3, 8
+    b = {
+        "image": torch.rand(B, 1, D, D, D),
+        "label": torch.zeros(B, D, D, D, dtype=torch.long),
+        "context_in": torch.rand(B, K, 1, D, D, D),
+        "context_out": torch.zeros(B, K, D, D, D, dtype=torch.long),
+        "aug_mode": torch.tensor([2, 2]),
+        "spacing": torch.ones(B, 3),
+    }
+    aug = GpuAugmentor(_full_cfg(), self_context_per_image=True)
+    out = aug(b, training=True)
+    assert out["image"].shape == (B, 1, D, D, D)
+    assert out["context_in"].shape == (B, K, 1, D, D, D)
+    assert torch.isfinite(out["image"]).all()
+    assert torch.isfinite(out["context_in"]).all()
