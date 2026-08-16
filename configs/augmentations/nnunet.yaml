@@ -1,6 +1,10 @@
 # @package _global_
 augmentations:
   enabled: true
+  # Run augmentation on GPU in the training loop (src/gpu_augment.GpuAugmentor)
+  # instead of per-item on CPU workers. When true the dataset emits raw volumes
+  # + aug_mode and skips apply_*_aug. Default false (CPU path).
+  gpu: false
 
   # -----------------------------------------------------------------------
   # Task augmentations  —  nnUNet-style geometric transforms

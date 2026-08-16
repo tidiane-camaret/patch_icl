@@ -219,6 +219,7 @@ def build_dataset(cfg, split: str):
         context_size=d.context_size,
         max_subjects=(d.max_train_subjects if is_train else d.max_val_subjects),
         aug_cfg=(cfg.augmentations if is_train else None),
+        defer_aug_to_gpu=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
         synth_method=((d.synth_method or None) if is_train else None),
         synth_unions=d.synth_unions,
         p_synth=(d.p_synth if is_train else 0.0),

@@ -1,6 +1,7 @@
 import sys; sys.path.insert(0, ".")
 import torch
 from types import SimpleNamespace
+from omegaconf import OmegaConf
 from src.gpu_augment import _stack_task, _unstack_task, _geometric, _batched_intensity, _batched_gin_ipa
 from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
 
@@ -218,3 +219,11 @@ def test_collate_stacks_aug_mode():
     assert "aug_mode" in out
     assert out["aug_mode"].tolist() == [0, 2]
     assert out["aug_mode"].dtype == torch.long
+
+
+# ---------------------------------------------------------------------------
+# Task 7: config flag
+# ---------------------------------------------------------------------------
+def test_nnunet_config_has_gpu_flag():
+    cfg = OmegaConf.load("configs/augmentations/nnunet.yaml")
+    assert cfg.augmentations.gpu is False
