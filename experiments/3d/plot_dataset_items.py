@@ -166,6 +166,23 @@ def main():
         loader = DataLoader(ds, batch_size=N, shuffle=True, num_workers=0,
                             collate_fn=incontext_collate_fn)
         batch = next(iter(loader))
+
+    # When augmentations.gpu=true the dataset DEFERS aug (emits raw volumes + aug_mode) and the
+    # aug runs in the train loop, not here — so without this the plot would show unaugmented
+    # items. Apply the same GpuAugmentor the trainer uses so the figure shows the ACTUAL result.
+    if (args.split == "train" and cfg.augmentations.get("enabled", False)
+            and cfg.augmentations.get("gpu", False)):
+        from src.gpu_augment import GpuAugmentor
+        from common import _self_context
+        _, sc_int, sc_pi, _ = _self_context(cfg.data, "train")
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        for k in ("image", "label", "context_in", "context_out", "aug_mode", "spacing"):
+            if k in batch and torch.is_tensor(batch[k]):
+                batch[k] = batch[k].to(dev)
+        batch = GpuAugmentor(cfg.augmentations, self_context_per_image=bool(sc_pi),
+                             self_context_intensity=bool(sc_int))(batch, training=True)
+        batch = {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in batch.items()}
+
     has_palette  = "label_palette" in batch
     has_spacing  = "spacing" in batch
     has_ctx_subj = "context_subjects" in batch   # per-context case ids (self-context detect)
