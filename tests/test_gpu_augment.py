@@ -194,3 +194,27 @@ def test_mixed_modes_route_and_preserve_shape():
     assert out["image"].shape == (B, 1, D, D, D)
     assert out["context_in"].shape == (B, K, 1, D, D, D)
     assert out["context_out"].dtype == torch.long
+
+
+# ---------------------------------------------------------------------------
+# Task 6: collate aug_mode
+# ---------------------------------------------------------------------------
+from src.totalseg_dataloader_incontext import incontext_collate_fn
+
+def _item(mode, K=2, D=6):
+    return {
+        "image": torch.randn(1, D, D, D),
+        "label": torch.zeros(D, D, D, dtype=torch.long),
+        "context_in": torch.randn(K, 1, D, D, D),
+        "context_out": torch.zeros(K, D, D, D, dtype=torch.long),
+        "subject": "s0", "label_name": "x",
+        "spacing": torch.ones(3),
+        "context_subjects": ["s1", "s2"],
+        "aug_mode": torch.tensor(mode, dtype=torch.long),
+    }
+
+def test_collate_stacks_aug_mode():
+    out = incontext_collate_fn([_item(0), _item(2)])
+    assert "aug_mode" in out
+    assert out["aug_mode"].tolist() == [0, 2]
+    assert out["aug_mode"].dtype == torch.long

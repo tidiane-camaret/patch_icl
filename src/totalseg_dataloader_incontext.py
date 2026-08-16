@@ -351,6 +351,7 @@ class TotalSegInContextDataset(Dataset):
         self_context_intensity: bool = False,
         self_context_per_image: bool = False,
         self_context_synth: dict | None = None,
+        defer_aug_to_gpu: bool = False,
     ):
         self.root = Path(root)
         self.classes = list(classes)
@@ -374,6 +375,7 @@ class TotalSegInContextDataset(Dataset):
         self.self_context_p = float(self_context)
         self.self_context_intensity = bool(self_context_intensity)
         self.self_context_per_image = bool(self_context_per_image)
+        self.defer_aug = bool(defer_aug_to_gpu)
         # self_context_synth: when self-context fires, with probability `p` replace the real
         # target label with a freshly-generated synthetic mask (a random rotated ellipsoid placed
         # on the body of the real CT) — a purely-geometric in-context task with no real anatomy.
@@ -1080,12 +1082,12 @@ class TotalSegInContextDataset(Dataset):
                     mask_t = torch.from_numpy(mask).long()             # (D, H, W)
 
         # K+1 independent copies, each separately augmented
-        if self.aug_cfg is not None and self.aug_cfg.enabled:
+        if self.aug_cfg is not None and self.aug_cfg.enabled and not self.defer_aug:
             items = [
                 apply_synth_aug(image_t.clone(), mask_t.clone(), self.aug_cfg.synth)
                 for _ in range(self.context_size + 1)
             ]
-        else:
+        else:                                   # defer: emit K+1 RAW clones
             items = [(image_t.clone(), mask_t.clone()) for _ in range(self.context_size + 1)]
 
         image_out, label_out = items[0]
@@ -1101,6 +1103,7 @@ class TotalSegInContextDataset(Dataset):
             "context_subjects": [subj for _ in range(self.context_size)],
             "label_name":  f"sv_{sv_groups[0][0]}",
             "spacing":     self._reported_spacing(subj),               # (3,) mm/voxel of output tensor
+            "aug_mode":    torch.tensor(1, dtype=torch.long),          # synth
         }
         if self.random_coloring:
             item["label_palette"] = self._sample_palette(
@@ -1200,7 +1203,7 @@ class TotalSegInContextDataset(Dataset):
             ctx_subjects.append(ctx_subjects[i])
 
         # --- Augmentation + coloring (shared by both paths) ----------------
-        if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0:
+        if self.aug_cfg is not None and self.aug_cfg.enabled and len(context_in) > 0 and not self.defer_aug:
             all_images = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)],  dim=0)
             all_masks  = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
             all_images, all_masks = apply_task_aug(all_images, all_masks, self.aug_cfg.task)
@@ -1218,8 +1221,10 @@ class TotalSegInContextDataset(Dataset):
         # NB per_image not task — task shares one transform across all K+1 volumes and must NOT be
         # applied per-image); self_context_intensity = appearance jitter (aug_cfg.intensity). Both
         # off -> exact clone. No-op when aug is disabled (eval).
+        self._sc_fired = (self.self_context_p > 0
+                          and self._cur_rng.random() < self.self_context_p)
         synth_coord = synth_radii = None
-        if self.self_context_p > 0 and self._cur_rng.random() < self.self_context_p:
+        if self._sc_fired:
             # self_context_synth: replace the real target label with a purely synthetic mask (a
             # random rotated ellipsoid on the real CT's body) before cloning — a geometric
             # in-context task with no real anatomy. The image is untouched; only the label is
@@ -1252,7 +1257,7 @@ class TotalSegInContextDataset(Dataset):
             context_out = [label_t.clone() for _ in range(self.context_size)]
             ctx_subjects = [subj for _ in range(self.context_size)]   # self-context: ctx case == target
             do_augs = self.self_context_intensity or self.self_context_per_image
-            if do_augs and self.aug_cfg is not None and self.aug_cfg.enabled:
+            if do_augs and self.aug_cfg is not None and self.aug_cfg.enabled and not self.defer_aug:
                 pi_cfg = getattr(self.aug_cfg, "per_image", None)
                 aug_in, aug_out = [], []
                 for ci, cm in zip(context_in, context_out):
@@ -1273,6 +1278,8 @@ class TotalSegInContextDataset(Dataset):
             "context_subjects": ctx_subjects,          # list[str] len K: per-context case id
             "label_name":  label_name,
             "spacing":     self._reported_spacing(subj),   # (3,) mm/voxel of output tensor
+            "aug_mode":    torch.tensor(
+                2 if (self.self_context_p > 0 and self._sc_fired) else 0, dtype=torch.long),
         }
         if tgt_crop_geom is not None:
             item["crop_geom"] = tgt_crop_geom              # (4,3): starts, crop_sizes, out_sizes, pad_lo
@@ -1513,6 +1520,8 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         out["meta"] = [b["meta"] for b in batch]  # per-sample provenance (sample-table detail)
     if "crop_geom" in batch[0]:
         out["crop_geom"] = torch.stack([b["crop_geom"] for b in batch])  # (B, 4, 3) cascade inversion
+    if "aug_mode" in batch[0]:
+        out["aug_mode"] = torch.stack([b["aug_mode"] for b in batch])  # (B,) int64
     # Per-item NaN-pad so mixed synth+real batches still log radii/coords for their synth items
     # (an all()-gate dropped both keys whenever a single real sample shared the batch).
     if any("synth_radii_mm" in b for b in batch):
