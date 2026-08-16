@@ -75,7 +75,7 @@ def _gin_once(vols, cfg, gen):
     ch_in = 1
     for li in range(n_layer):
         out_ch = 1 if li == n_layer - 1 else interm
-        k = scale_pool[torch.randint(len(scale_pool), (1,), generator=gen).item()]
+        k = scale_pool[torch.randint(len(scale_pool), (1,), generator=gen, device=device).item()]
         ker = torch.randn(N * out_ch, ch_in, k, k, k, generator=gen, device=device, dtype=dtype)
         shift = torch.randn(N * out_ch, 1, 1, 1, generator=gen, device=device, dtype=dtype)
         xg = x.reshape(1, N * ch_in, *x.shape[-3:])

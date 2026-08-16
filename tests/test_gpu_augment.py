@@ -330,3 +330,23 @@ def test_augmentor_end_to_end_batch_smoke():
     assert out["context_in"].shape == (B, K, 1, D, D, D)
     assert torch.isfinite(out["image"]).all()
     assert torch.isfinite(out["context_in"]).all()
+
+
+# ---------------------------------------------------------------------------
+# GPU-device regression: GIN/IPA on CUDA. The CPU tests never exercise the
+# cuda generator path; _gin_once's torch.randint must pass device= or it
+# builds a CPU op against a cuda Generator and raises. Skipped without CUDA.
+# ---------------------------------------------------------------------------
+def test_gin_ipa_run_on_cuda():
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("no CUDA device")
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(0)
+    span = CT_NORM_MAX - CT_NORM_MIN
+    vols = (torch.rand(4, 1, 16, 16, 16, device=dev) * span + CT_NORM_MIN)
+    for mode in ("gin", "ipa"):
+        out = _batched_gin_ipa(vols.clone(), _gin_cfg(mode=mode), gen)
+        assert out.shape == vols.shape
+        assert out.device.type == "cuda"
+        assert torch.isfinite(out).all()

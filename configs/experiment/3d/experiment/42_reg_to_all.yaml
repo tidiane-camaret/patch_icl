@@ -22,8 +22,8 @@ data:
       intensity: true
   p_synth: 0
   synth_method: seeds3d
-  train_classes: all
-  val_classes: benchmark
+  train_classes: balanced
+  val_classes: not_balanced
   crop_spacing_mm: 1.5
   mask_occupancy_thr: 0.1
   class_balanced: true
@@ -66,26 +66,7 @@ augmentations:
       p: 0.5
       alpha_min: 0.1
       alpha_max: 1.0
-  synth:
-    affine:
-      p: 0.8
-      scale_min: 0.9
-      scale_max: 1.1
-      max_translate: 0.3
-      max_angle_deg: 45
-    brightness_contrast:
-      p: 0
-    elastic:
-      p: 0
-    flip_d: 0
-    flip_h: 0
-    flip_w: 0
-    gaussian_blur:
-      p: 0
-    gaussian_noise:
-      p: 0
-    sharpness:
-      p: 0
+
 
 
 arch:
