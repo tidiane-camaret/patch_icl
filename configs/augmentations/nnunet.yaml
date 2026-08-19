@@ -27,11 +27,26 @@ augmentations:
       alpha: 0.12
       grid_scale: 8
 
+    # Diffeomorphic deform (SVF + scaling-and-squaring). Guaranteed invertible —
+    # no folding, so masks stay valid (unlike `elastic`). Supersedes elastic;
+    # opt in with deform.p>0 (and set elastic.p=0). Default OFF → no-op.
+    deform:
+      p: 0.0
+      control_points: 6           # velocity grid nodes PER AXIS (a COUNT, not voxels) →
+                                  # correlation length is a fixed fraction of the crop, so it's
+                                  # resolution-invariant across our 128³ crops at 1–4mm.
+      max_disp: 0.15              # velocity std, normalized grid units; calibrated to real
+                                  # inter-case nonrigid deform (RMS med 0.14 at 6 ctrl pts,
+                                  # experiments/3d/deform_stats/assess_svf.py)
+      num_steps: 6                # scaling-and-squaring integration steps (raise to 7-8 if max_disp≥0.2)
+
   # -----------------------------------------------------------------------
   # Per-image geometric augmentations  —  INDEPENDENT transform per volume
   # (unlike `task`, which shares one transform across all K+1 volumes to keep the
-  # target/context correspondence). Consumed by data.self_context.augs.per_image to jitter the
-  # self-context copy's pose. Default OFF (all p=0) → no-op.
+  # target/context correspondence). Applied per-volume in BOTH the real-context path
+  # (after task aug, to target + all K contexts) and the self_context path
+  # (data.self_context.augs.per_image, to jitter the clone's pose). Default OFF
+  # (all p=0) → no-op, so existing runs are unchanged.
   # -----------------------------------------------------------------------
   per_image:
     flip:
@@ -48,6 +63,11 @@ augmentations:
       p: 0.0
       alpha: 0.12
       grid_scale: 8
+    deform:
+      p: 0.0
+      control_points: 6
+      max_disp: 0.15
+      num_steps: 6
 
   # -----------------------------------------------------------------------
   # Intensity augmentations  —  nnUNet defaults (already per-image)
@@ -112,6 +132,12 @@ augmentations:
       p: 0.8
       alpha_range: [1, 10]
       sigma_range: [8, 15]
+
+    deform:
+      p: 0.0                      # opt-in diffeomorphic alternative to synth elastic
+      control_points: 8           # more nodes → more local warp (heavy synth divergence)
+      max_disp: 0.15
+      num_steps: 6
 
     brightness_contrast:
       p: 0.5

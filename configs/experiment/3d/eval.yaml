@@ -60,5 +60,5 @@ eval:
   # inference run from any directory. Weight-free arch override, applied in _build_model.
   primus_sidecar: ${paths.colipri}/primus_colipri.json
 wandb:
-  project: patch_icl_3d_eval  # null to disable
+  project: patchset_eval  # null to disable
   name: null

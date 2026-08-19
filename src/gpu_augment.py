@@ -10,7 +10,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from src.augmentations import _make_affine_theta
+from src.augmentations import _make_affine_theta, _svf_displacement
 from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
 
 REAL, SYNTH, SELF_CONTEXT = 0, 1, 2
@@ -112,11 +112,39 @@ def _batched_gin_ipa(vols, cfg, gen):
     return out.clamp(CT_NORM_MIN, CT_NORM_MAX)
 
 
+def _batched_bias_field(vols, magnitude, coarse, gen):
+    """Per-volume smooth multiplicative log-normal field (batched _simulate_bias_field)."""
+    N, _, D, H, W = vols.shape
+    field = torch.randn(N, 1, coarse, coarse, coarse, generator=gen,
+                        device=vols.device, dtype=vols.dtype) * magnitude
+    field = F.interpolate(field, size=(D, H, W), mode="trilinear", align_corners=False)
+    return (vols * field.exp()).clamp(CT_NORM_MIN, CT_NORM_MAX)
+
+
 def _batched_intensity(vols, cfg, gen):
+    # Canonical intensity order — MUST stay identical to the CPU path
+    # apply_intensity_aug (src/augmentations.py):
+    #   GIN → bias → brightness/contrast → gamma → inverted-gamma → sharpness
+    #        → noise → blur → low-res
     N = vols.shape[0]
     device = vols.device
     span = CT_NORM_MAX - CT_NORM_MIN
 
+    # 1. GIN / IPA appearance warp
+    gin = getattr(cfg, "gin", None)
+    if gin is not None and getattr(gin, "p", 0) > 0:
+        mask = _per_vol_mask(gen, N, device, gin.p)
+        aug = _batched_gin_ipa(vols, gin, gen)
+        vols = torch.where(mask, aug, vols)
+
+    # 2. Bias field
+    bf = getattr(cfg, "bias_field", None)
+    if bf is not None and getattr(bf, "p", 0) > 0:
+        mask = _per_vol_mask(gen, N, device, bf.p)
+        aug = _batched_bias_field(vols, bf.magnitude, int(getattr(bf, "coarse", 4)), gen)
+        vols = torch.where(mask, aug, vols)
+
+    # 3. Brightness / contrast
     bc = getattr(cfg, "brightness_contrast", None)
     if bc is not None and bc.p > 0:
         mask = _per_vol_mask(gen, N, device, bc.p)
@@ -124,18 +152,39 @@ def _batched_intensity(vols, cfg, gen):
                   torch.rand(N, 1, 1, 1, 1, generator=gen, device=device))
         c0, c1 = bc.contrast_range
         contrast = c0 + (c1 - c0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
-        aug = (vols * contrast + bright).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        aug = vols * contrast + bright
+        if getattr(bc, "preserve_range", False):
+            vmin = vols.amin(dim=(1, 2, 3, 4), keepdim=True)
+            vmax = vols.amax(dim=(1, 2, 3, 4), keepdim=True)
+            aug = torch.minimum(torch.maximum(aug, vmin), vmax)
+        else:
+            aug = aug.clamp(CT_NORM_MIN, CT_NORM_MAX)
         vols = torch.where(mask, aug, vols)
 
+    # 4. Gamma
     gc = getattr(cfg, "gamma", None)
     if gc is not None and gc.p > 0:
         mask = _per_vol_mask(gen, N, device, gc.p)
         g0, g1 = gc.range
         gamma = g0 + (g1 - g0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
-        norm = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma)
-        aug = norm * span + CT_NORM_MIN
+        aug = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma) * span + CT_NORM_MIN
+        if getattr(gc, "retain_stats", False):
+            m_in = vols.mean(dim=(1, 2, 3, 4), keepdim=True)
+            s_in = vols.std(dim=(1, 2, 3, 4), keepdim=True)
+            m_out = aug.mean(dim=(1, 2, 3, 4), keepdim=True)
+            s_out = aug.std(dim=(1, 2, 3, 4), keepdim=True)
+            aug = ((aug - m_out) / (s_out + 1e-8) * s_in + m_in).clamp(CT_NORM_MIN, CT_NORM_MAX)
         vols = torch.where(mask, aug, vols)
 
+    # 5. Inverted gamma (darkening pass, gamma forced > 1)
+    if gc is not None and getattr(gc, "inverted_p", 0.0) > 0:
+        mask = _per_vol_mask(gen, N, device, gc.inverted_p)
+        g1 = gc.range[1]
+        gamma = 1.0 + (g1 - 1.0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
+        aug = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma) * span + CT_NORM_MIN
+        vols = torch.where(mask, aug, vols)
+
+    # 6. Sharpness (unsharp masking)
     sc = getattr(cfg, "sharpness", None)
     if sc is not None and getattr(sc, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, sc.p)
@@ -143,16 +192,7 @@ def _batched_intensity(vols, cfg, gen):
         aug = (vols + sc.factor * (vols - blur)).clamp(CT_NORM_MIN, CT_NORM_MAX)
         vols = torch.where(mask, aug, vols)
 
-    bl = getattr(cfg, "gaussian_blur", None)
-    if bl is not None and bl.p > 0:
-        mask = _per_vol_mask(gen, N, device, bl.p)
-        # NOTE: blur sigma is one draw per batched call (per-volume sigma would need
-        # per-volume kernels) — intentional batching simplification.
-        s0, s1 = bl.sigma_range
-        sigma = _uniform(gen, device, s0, s1)
-        aug = _grouped_gaussian_blur(vols, sigma)
-        vols = torch.where(mask, aug, vols)
-
+    # 7. Gaussian noise (before blur so blur correlates it)
     nc = getattr(cfg, "gaussian_noise", None)
     if nc is not None and nc.p > 0:
         mask = _per_vol_mask(gen, N, device, nc.p)
@@ -168,6 +208,18 @@ def _batched_intensity(vols, cfg, gen):
         aug = (vols + noise).clamp(CT_NORM_MIN, CT_NORM_MAX)
         vols = torch.where(mask, aug, vols)
 
+    # 8. Gaussian blur
+    bl = getattr(cfg, "gaussian_blur", None)
+    if bl is not None and bl.p > 0:
+        mask = _per_vol_mask(gen, N, device, bl.p)
+        # NOTE: blur sigma is one draw per batched call (per-volume sigma would need
+        # per-volume kernels) — intentional batching simplification.
+        s0, s1 = bl.sigma_range
+        sigma = _uniform(gen, device, s0, s1)
+        aug = _grouped_gaussian_blur(vols, sigma)
+        vols = torch.where(mask, aug, vols)
+
+    # 9. Simulate low resolution
     lr = getattr(cfg, "simulate_low_resolution", None)
     if lr is not None and lr.p > 0:
         mask = _per_vol_mask(gen, N, device, lr.p)
@@ -178,12 +230,6 @@ def _batched_intensity(vols, cfg, gen):
         small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
         down = F.interpolate(vols, size=small, mode="trilinear", align_corners=False)
         aug = F.interpolate(down, size=(D, H, W), mode="trilinear", align_corners=False)
-        vols = torch.where(mask, aug, vols)
-
-    gin = getattr(cfg, "gin", None)
-    if gin is not None and getattr(gin, "p", 0) > 0:
-        mask = _per_vol_mask(gen, N, device, gin.p)
-        aug = _batched_gin_ipa(vols, gin, gen)
         vols = torch.where(mask, aug, vols)
 
     return vols
@@ -235,6 +281,16 @@ def _geometric(vols, masks, group_size, cfg, gen):
                                      align_corners=False).permute(0, 2, 3, 4, 1)  # (1,D,H,W,3)
                 sl = slice(g * group_size, (g + 1) * group_size)
                 grid[sl] = (grid[sl] + disp).clamp(-1.0, 1.0)
+
+    # --- deform: diffeomorphic SVF per group (guaranteed no folding) ---
+    dc = getattr(cfg, "deform", None)
+    if dc is not None and getattr(dc, "p", 0) > 0:
+        for g in range(G):
+            if _rand(gen, device, 1).item() < dc.p:
+                phi = _svf_displacement((D, H, W), dc.control_points, dc.max_disp,
+                                        dc.num_steps, generator=gen, device=device)
+                sl = slice(g * group_size, (g + 1) * group_size)
+                grid[sl] = (grid[sl] + phi).clamp(-1.0, 1.0)
 
     grid = grid.to(vols.dtype)
     vols = F.grid_sample(vols, grid, mode="bilinear", padding_mode="border",

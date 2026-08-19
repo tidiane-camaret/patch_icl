@@ -1,0 +1,48 @@
+# @package _global_
+# GMM-synth in-context source: cohorts of K+1 similar MAISI-bank masks (CohortSampler)
+# organ-cropped around a shared target class and painted with one cohort-shared per-label
+# Gaussian (SynthSeg) indexed by the shared MAISI id. Served by SynthGmmMaisiDataset.
+# Bank + index built by experiments/3d/synth_task_generation/build_gmm_mask_bank.py.
+#   python experiments/3d/train.py dataset=synth_gmm_maisi
+#   python experiments/3d/plot_dataset_items.py dataset=synth_gmm_maisi --n_samples 4
+paths:
+  gmm_bank: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gmm_bank
+data:
+  source: synth_gmm_maisi
+  image_size: [128, 128, 128]
+  context_size: 1
+  # MAISI class ids (ints) or names, or "all" (every bank class with >= K+1 masks).
+  train_classes: all
+  val_classes: all
+  crop_spacing_mm: 1.5          # organ crop = image_size*this FOV, resampled to image_size^3
+  train_spacing_range: [1.0, 4.0]  # [lo,hi] mm -> randomize crop spacing per TRAIN batch (log-uniform); null -> fixed crop_spacing_mm. eval always uses crop_spacing_mm
+  crop_jitter: null             # train crop-centre jitter (voxels); null -> image_size//4
+  epoch_length: 10000           # nominal TRAIN samples/epoch (generative — no fixed dataset size)
+  max_val_subjects: 100         # cap val samples/epoch (deterministic per idx via eval.seed)
+  gmm:
+    var_max: 5.0                # sigma^2 ~ U(0,var_max); tiny by design (texture = downstream aug)
+    background_mode: zero       # zero (hard air) | component (dark air component)
+  # Cohort sampling (K+1 similar masks) — CohortSampler. Distance = weighted L1 over 4 axes;
+  # NB raw scales differ hugely so weights are NOT the real influence: measured contribution
+  # (full bank) is fov 60% / by_class_size 19% / span 17% / spacing 4% (analyze_cohort_distance.py).
+  # Cohorts cluster by source dataset + FOV. `randomness` is the per-cohort diversity dial.
+  cohort:
+    w_span: 0 # 1.0                 # body-region span [top,bot] (idx units, 0=head..3=pelvis)
+    w_fov: 0 # 0.02                 # field-of-view dim*spacing (mm) — dominates despite small weight
+    w_spacing: 0 # 0.3              # mm/voxel — nearly inert (4%)
+    w_by_class_size: 1 # 3.0        # by-class organ-size vector — intended lead, actually 2nd
+    randomness: 0.3             # PER-COHORT tightness r in [0,1]: 0=k+1 nearest (tight), 1=uniform random.
+                                #   float x   -> fixed r=x every cohort
+                                #   [lo,hi]   -> r ~ U[lo,hi] per cohort (continuous spread)
+                                #   {p_tight: 0.5, tight: 0.0, loose: 1.0} -> bimodal "some similar, some full random" (sweep p_tight for ablations)
+    min_masks_per_class: null   # require >= N masks/class to be usable (null -> k+1)
+    by_class_size_common_frac: 0.75  # by-class-size vector = organs present in >= this frac of masks (shared core, computed at load), after dropping air+body coverage proxies; 0 = all organs
+    by_class_size_mode: fraction     # fraction = relative composition (scale-INVARIANT: ignores patient size); volume = organ physical volume in L (scale-AWARE: separates large/thin patients, big-organ-weighted, use smaller w_by_class_size ~0.5)
+  # Eval-only source override (see common.eval_cfg): TRAIN on synth GMM, VALIDATE on a real
+  # source for the honest OOD signal. Keys here overlay data.* on the val path only; leave
+  # image_size/context_size out (inherited — model input geometry must match). Uncomment:
+  # val:
+  #   source: totalseg
+  #   val_classes: [liver, spleen, kidney_left, kidney_right, pancreas]
+  #   use_crop: true
+  #   crop_spacing_mm: 1.5

@@ -24,6 +24,7 @@ from src.totalseg_dataloader_incontext import (
 )
 from src.totalseg_more_labels_dataset import TotalSegMoreLabelsDataset
 from src.chemotox_dataset import ChemoToxBCDataset, BC_NAMES
+from src.synth_gen_maisi_dataset import SynthGenMaisiDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -53,6 +54,22 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     if root is None:
         raise ValueError(f"cfg.paths.{source} is not set (needed for data.source={source!r})")
     return source, root, source == "totalsegmri"
+
+
+def eval_cfg(cfg):
+    """Return cfg with data.* overlaid by the optional `data.val` block — an eval-only
+    source override so a run can TRAIN on one source and VALIDATE on another (e.g. train
+    synth_gmm_maisi, eval totalseg). No `data.val` block -> cfg unchanged (val = train
+    source). image_size/context_size are inherited from data.* (model input geometry must
+    match), so keep them out of data.val; val-source keys (source, val_classes, use_crop,
+    crop_spacing_mm, paths are shared) win in the merge."""
+    from omegaconf import OmegaConf
+    v = cfg.data.get("val")
+    if not v:
+        return cfg
+    m = cfg.copy()
+    m.data = OmegaConf.merge(cfg.data, v)
+    return m
 
 
 def _split_scalar(v, split: str, default: float = 0.0) -> float:
@@ -204,6 +221,57 @@ def build_dataset(cfg, split: str):
             use_crop=True, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
             crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
         )
+    if cfg.data.get("source") == "synth_gen_maisi":
+        d = cfg.data
+        root = cfg.paths.get("synth_gen_maisi")
+        if root is None:
+            raise ValueError("cfg.paths.synth_gen_maisi is not set "
+                             "(needed for data.source=synth_gen_maisi)")
+        # classes: explicit MAISI-name list from config; "all"/None -> every MAISI class
+        spec = d.get("train_classes") if split == "train" else d.get("val_classes")
+        classes = None if (spec is None or isinstance(spec, str)) else list(spec)
+        return SynthGenMaisiDataset(
+            root=root, classes=classes, image_size=tuple(d.image_size),
+            split=split, context_size=d.context_size,
+            max_subjects=d.get("max_train_subjects" if split == "train" else "max_val_subjects"),
+            aug_cfg=(cfg.get("augmentations") if split == "train" else None),
+            defer_aug_to_gpu=(split == "train" and bool(cfg.get("augmentations", {}).get("gpu", False))),
+            class_balanced=d.get("class_balanced", False),
+            eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))),
+            use_crop=d.get("use_crop", False),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=cfg.get("eval", {}).get("crop_jitter", None) if split != "train" else d.get("crop_jitter"),
+            mask_downsample=d.get("mask_downsample", "nearest"),
+            mask_occupancy_thr=d.get("mask_occupancy_thr", 0.5),
+        )
+
+    if cfg.data.get("source") == "synth_gmm_maisi":
+        from omegaconf import OmegaConf
+        from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
+        d = cfg.data
+        bank = cfg.paths.get("gmm_bank")
+        if bank is None:
+            raise ValueError("cfg.paths.gmm_bank is not set (needed for data.source=synth_gmm_maisi)")
+        spec = d.get("train_classes") if split == "train" else d.get("val_classes")
+        classes = None if (spec is None or isinstance(spec, str)) else list(spec)
+        g = cfg.data.get("gmm", {})
+        # train iterates epoch_length generative samples; val is capped small (deterministic
+        # per idx via eval_seed) — max_val_subjects overrides, default 100.
+        length = (int(d.get("epoch_length", 10000)) if split == "train"
+                  else int(d.get("max_val_subjects") or 100))
+        return SynthGmmMaisiDataset(
+            bank_dir=bank, image_size=tuple(d.image_size), context_size=d.context_size,
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=(cfg.get("eval", {}).get("crop_jitter", None) if split != "train"
+                         else d.get("crop_jitter")),
+            classes=classes, length=length,
+            var_max=float(g.get("var_max", 5.0)),
+            background_mode=g.get("background_mode", "zero"),
+            # to_container -> plain dict/list so CohortSampler's isinstance checks see native
+            # types (a DictConfig/ListConfig randomness spec would slip past dict/list checks).
+            cohort=OmegaConf.to_container(d.get("cohort", {}), resolve=True),
+            eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))))
+
     d = cfg.data
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     _, root, is_mri = _source_root(cfg)
@@ -323,7 +391,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     d, e = cfg.data, cfg.eval
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
-                            "chemotox_bc"):
+                            "chemotox_bc", "synth_gmm_maisi"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool

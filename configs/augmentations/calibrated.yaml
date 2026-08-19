@@ -1,0 +1,115 @@
+# @package _global_
+# ---------------------------------------------------------------------------
+# Calibrated augmentation preset — geometric magnitudes tuned to REAL
+# TotalSegmentator inter-subject/inter-case variability (GT-label study,
+# experiments/3d/deform_stats/{estimate,assess_svf}.py). Select with:
+#   override /augmentations: calibrated
+#
+# Findings baked in:
+#   * Nonrigid deform → diffeomorphic SVF op (no folding / valid masks), NOT the
+#     legacy foldable `elastic`. max_disp=0.15 matches real inter-case nonrigid
+#     deformation (RMS median 0.14, normalized units); control_points=6 is a COUNT
+#     → resolution-invariant across our 128³ crops at 1–4mm.
+#   * Affine scale [0.70,1.40] ≈ real cross-subject ±1sd (0.72–1.38); keep.
+#   * Rotation ±30° (uniform std 17°) ≈ real per-axis major-axis std ~10–18°; keep.
+#   * Translation 0 for `task` — crops are organ-centered, so real inter-case
+#     translation ≈ 0 (don't augment what cropping already normalizes).
+#   * Intensity: nnUNet-style canonical-order chain (unchanged).
+# The `p` values (how OFTEN to fire) are a training lever, not a calibration
+# result — tune deform.p / affine.p per experiment.
+# ---------------------------------------------------------------------------
+augmentations:
+  enabled: true
+  gpu: true
+
+  # ------------------------------------------------------------------ task
+  # Shared transform across all K+1 volumes (keeps target/context correspondence).
+  task:
+    flip:
+      p_d: 0.5
+      p_h: 0.5
+      p_w: 0.5
+
+    affine:                         # calibrated magnitudes (see header)
+      p: 0.2
+      max_angle_deg: 30.0
+      scale_min: 0.90
+      scale_max: 1.10
+      max_translate: 0.1            # organ-centered crop → real translation ≈ 0
+
+    elastic:                        # legacy foldable field — OFF, superseded by deform
+      p: 0.2
+      alpha: 0.12
+      grid_scale: 8
+
+    deform:                         # diffeomorphic SVF (ENABLED) — the calibrated nonrigid op
+      p: 0.2
+      control_points: 6             # count/axis → resolution-invariant correlation length
+      max_disp: 0.15                # ≈ real inter-case nonrigid RMS 0.14 (normalized units)
+      num_steps: 6                  # strictly diffeomorphic at max_disp≤0.15
+
+  # ------------------------------------------------------------- per_image
+  # INDEPENDENT transform per volume (breaks correspondence). OFF by default —
+  # it's a pose-invariance lever (see experiment 42), not part of the realism
+  # calibration. Magnitudes below are the realistic ones for when p>0 is set.
+  per_image:
+    flip:
+      p_d: 0.0
+      p_h: 0.0
+      p_w: 0.0
+    affine:
+      p: 0.5
+      max_angle_deg: 30.0
+      scale_min: 0.90
+      scale_max: 1.10
+      max_translate: 0.1
+    elastic:
+      p: 0.5
+      alpha: 0.12
+      grid_scale: 8
+    deform:
+      p: 0.5
+      control_points: 6
+      max_disp: 0.15
+      num_steps: 6
+
+  # ------------------------------------------------------------- intensity
+  # nnUNet-style canonical order: GIN→bias→brightness/contrast→gamma→inv-gamma
+  # →sharpness→noise→blur→low-res (independent per volume).
+  intensity:
+    hu_jitter: 0
+
+    gin:
+      p: 0.5
+      mode: ipa
+      n_layer: 4
+      interm_channel: 2
+      scale_pool: [1, 3]
+      out_norm: frob
+      ipa_copies: 2
+      ipa_control_points: 4
+
+    brightness_contrast:
+      p: 0.15
+      brightness: 0.0
+      contrast_range: [0.75, 1.25]
+      preserve_range: true
+
+    gamma:
+      p: 0.30
+      range: [0.70, 1.50]
+      retain_stats: true
+
+    gaussian_noise:
+      p: 0.10
+      max_std: 0.316
+
+    gaussian_blur:
+      p: 0.20
+      sigma_range: [0.50, 1.00]
+
+    simulate_low_resolution:
+      p: 0.25
+      scale_min: 0.5
+      scale_max: 1.0
+

@@ -53,19 +53,17 @@ augmentations:
   intensity: 
     brightness_contrast:
       p: 0.5
-      brightness_limit: 0.2
-      contrast_limit: 0.2
+      brightness: 0.2            # was brightness_limit (unread) → base 0.0
+      contrast_range: [0.8, 1.2] # was contrast_limit (unread) → base [0.75,1.25]
     gaussian_blur:
       p: 0.5
-      sigma_min: 0.1
-      sigma_max: 1.0
+      sigma_range: [0.1, 1.0]    # was sigma_min/sigma_max (unread) → base [0.5,1.0]
     gaussian_noise:
       p: 0.5
-      var_limit: 0.01
+      max_std: 0.1               # was var_limit 0.01 (unread) → std √0.01; base was 0.316
     sharpness:
       p: 0.5
-      alpha_min: 0.1
-      alpha_max: 1.0
+      factor: 0.5                # was alpha_min/alpha_max (unread); code has no range, missing factor crashed
 
 
 

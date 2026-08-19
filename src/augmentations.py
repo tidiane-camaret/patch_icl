@@ -80,6 +80,41 @@ def _apply_grid(images: torch.Tensor, masks: torch.Tensor,
     return images, masks_f.squeeze(1).long()
 
 
+def _svf_displacement(shape, control_points, max_disp, num_steps,
+                      generator=None, device=None):
+    """Diffeomorphic displacement field via scaling-and-squaring of a smooth SVF.
+
+    A stationary velocity field is sampled on a coarse grid of `control_points` nodes
+    per axis, upsampled, then integrated by scaling-and-squaring (VoxelMorph VecInt) so
+    the resulting warp is guaranteed invertible — no folding, so masks stay valid.
+    Unlike the legacy `elastic` op it cannot tear labels.
+
+    `control_points` is a COUNT (not a voxel spacing), so the correlation length is a
+    fixed fraction of the volume → resolution-invariant across our fixed-size crops
+    (we take 128³ crops at 1–4mm; smoothness must not depend on the mm spacing).
+    shape: (D, H, W). `max_disp` is the velocity std in normalized [-1, 1] grid units
+    (same semantics as elastic.alpha). Returns (1, D, H, W, 3) displacement in [-1, 1].
+    """
+    D, H, W = shape
+    cp = max(int(control_points), 2)
+    sd, sh, sw = min(cp, D), min(cp, H), min(cp, W)
+    v = torch.randn(1, 3, sd, sh, sw, generator=generator, device=device) * max_disp
+    v = F.interpolate(v, size=(D, H, W), mode="trilinear", align_corners=False)
+    v = v.permute(0, 2, 3, 4, 1)                                    # (1,D,H,W,3) velocity
+
+    base = F.affine_grid(torch.eye(3, 4, device=device).unsqueeze(0),
+                         (1, 1, D, H, W), align_corners=False)      # identity grid
+    phi = v / (2 ** num_steps)
+    for _ in range(num_steps):                                      # phi = phi ∘ (id+phi) + phi
+        # padding_mode="border" handles the (rare) out-of-range sample; no clamp
+        # here — clamping inside the integration would distort the diffeomorphism.
+        warped = F.grid_sample(phi.permute(0, 4, 1, 2, 3), base + phi,
+                               mode="bilinear", padding_mode="border",
+                               align_corners=False).permute(0, 2, 3, 4, 1)
+        phi = phi + warped
+    return phi
+
+
 # ---------------------------------------------------------------------------
 # Task-level (geometric, shared params)
 # ---------------------------------------------------------------------------
@@ -138,25 +173,18 @@ def apply_task_aug(
         grid = (base_grid + disp).clamp(-1.0, 1.0)
         images, masks = _apply_grid(images, masks, grid)
 
-    # --- Independent per-volume elastic -----------------------------------
-    # Applied after shared geometric aug so each volume deforms differently,
-    # creating within-task appearance diversity similar to synth aug's
-    # independent-per-copy design but without decoupling context/query pose.
-    iecfg = getattr(cfg, "instance_elastic", None)
-    if iecfg is not None and iecfg.p > 0:
+    # --- Diffeomorphic deform (SVF, shared field, no folding) ------------
+    dcfg = getattr(cfg, "deform", None)
+    if dcfg is not None and random.random() < dcfg.p:
         _, _, D, H, W = images.shape
-        gs = max(iecfg.grid_scale, 2)
-        sd, sh, sw = max(D // gs, 2), max(H // gs, 2), max(W // gs, 2)
-        for i in range(N):
-            if random.random() < iecfg.p:
-                disp = torch.randn(1, 3, sd, sh, sw) * iecfg.alpha
-                disp = F.interpolate(disp, size=(D, H, W),
-                                     mode="trilinear", align_corners=False)
-                disp = disp.permute(0, 2, 3, 4, 1)               # (1, D, H, W, 3)
-                theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0)
-                base_grid = F.affine_grid(theta_id, (1, 1, D, H, W), align_corners=False)
-                grid = (base_grid + disp).clamp(-1.0, 1.0)
-                images[i:i+1], masks[i:i+1] = _apply_grid(images[i:i+1], masks[i:i+1], grid)
+        phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
+        theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
+        base_grid = F.affine_grid(theta_id, images.shape, align_corners=False)
+        images, masks = _apply_grid(images, masks, (base_grid + phi).clamp(-1.0, 1.0))
+
+    # Independent per-volume geometry (flip/affine/elastic) is applied by the
+    # caller via apply_per_image_aug using cfg.per_image — see the real-context
+    # and self_context paths in the dataloader.
 
     return images, masks
 
@@ -198,6 +226,13 @@ def apply_per_image_aug(image, mask, cfg):
         base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), img.shape, align_corners=False)
         img, msk = _apply_grid(img, msk, (base + disp).clamp(-1.0, 1.0))
 
+    dcfg = getattr(cfg, "deform", None)
+    if dcfg is not None and random.random() < dcfg.p:
+        _, _, D, H, W = img.shape
+        phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
+        base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), img.shape, align_corners=False)
+        img, msk = _apply_grid(img, msk, (base + phi).clamp(-1.0, 1.0))
+
     return img.squeeze(0), msk.squeeze(0)   # (1, D, H, W), (D, H, W)
 
 
@@ -233,6 +268,20 @@ def apply_intensity_aug(
         else:
             image = _gin_transform_3d(image, n_layer, interm, scale_pool, out_norm)
         image = image.clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
+    # Canonical intensity order (kept identical to the GPU path _batched_intensity):
+    #   GIN → bias → brightness/contrast → gamma → inverted-gamma → sharpness
+    #        → noise → blur → low-res
+    # Physical image-formation chain: appearance warp, multiplicative field, global
+    # window transforms, edge/resolution effects, then acquisition noise (before blur
+    # so blur correlates it, matching reconstructed-CT noise texture).
+
+    # --- Bias field (smooth multiplicative log-normal field) -------------
+    # Right after the appearance warp so the window transforms and degradations
+    # act on the field-modulated signal.
+    bfcfg = getattr(cfg, "bias_field", None)
+    if bfcfg is not None and random.random() < bfcfg.p:
+        image = _simulate_bias_field(image, bfcfg.magnitude, getattr(bfcfg, "coarse", 4))
 
     # --- Brightness / contrast -------------------------------------------
     bccfg = cfg.brightness_contrast
@@ -271,11 +320,23 @@ def apply_intensity_aug(
         image = ((image - CT_NORM_MIN) / span).clamp_(0.0, 1.0).pow_(gamma)
         image = image * span + CT_NORM_MIN
 
+    # --- Sharpness (unsharp masking) -------------------------------------
+    scfg = getattr(cfg, "sharpness", None)
+    if scfg is not None and random.random() < scfg.p:
+        blurred = _separable_gaussian_blur_3d(image, sigma=1.0)
+        image   = (image + scfg.factor * (image - blurred)).clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
     # --- Gaussian noise --------------------------------------------------
     ncfg = cfg.gaussian_noise
     if random.random() < ncfg.p:
         std = random.uniform(0.0, ncfg.max_std)
         image = (image + torch.randn_like(image).mul_(std)).clamp_(CT_NORM_MIN, CT_NORM_MAX)
+
+    # --- Gaussian blur (separable 1-D convolutions) ----------------------
+    blcfg = cfg.gaussian_blur
+    if random.random() < blcfg.p:
+        sigma  = random.uniform(blcfg.sigma_range[0], blcfg.sigma_range[1])
+        image  = _separable_gaussian_blur_3d(image, sigma)
 
     # --- Simulate low resolution -----------------------------------------
     # nnUNet SimulateLowResolutionTransform: downsample then upsample trilinear.
@@ -286,17 +347,6 @@ def apply_intensity_aug(
         small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
         x = F.interpolate(image.unsqueeze(0), size=small, mode="trilinear", align_corners=False)
         image = F.interpolate(x, size=(D, H, W), mode="trilinear", align_corners=False).squeeze(0)
-
-    # --- Gaussian blur (separable 1-D convolutions) ----------------------
-    blcfg = cfg.gaussian_blur
-    if random.random() < blcfg.p:
-        sigma  = random.uniform(blcfg.sigma_range[0], blcfg.sigma_range[1])
-        image  = _separable_gaussian_blur_3d(image, sigma)
-
-    # --- Bias field (smooth multiplicative log-normal field) -------------
-    bfcfg = getattr(cfg, "bias_field", None)
-    if bfcfg is not None and random.random() < bfcfg.p:
-        image = _simulate_bias_field(image, bfcfg.magnitude, getattr(bfcfg, "coarse", 4))
 
     return image
 
@@ -483,6 +533,15 @@ def apply_synth_aug(
         base  = F.affine_grid(theta_id, (1, 1, D, H, W), align_corners=False)
         grid  = (base + disp_n).clamp(-1.0, 1.0)
         image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
+        image = image.squeeze(0)
+        mask  = mask.squeeze(0)
+
+    # --- Diffeomorphic deform (SVF, no folding) --------------------------
+    dcfg = getattr(cfg, "deform", None)
+    if dcfg is not None and random.random() < dcfg.p:
+        phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
+        base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), (1, 1, D, H, W), align_corners=False)
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), (base + phi).clamp(-1.0, 1.0))
         image = image.squeeze(0)
         mask  = mask.squeeze(0)
 

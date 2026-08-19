@@ -8,6 +8,7 @@ paths:
   nako_orig:   /nfs/data/nii/data0/GNC/GNC_759
   nako:        /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/nako
   nnunet:      /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/nnunet
+  gmm_bank:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gmm_bank  # MAISI mask bank + index for GMM-synth cohorts
   results:     /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl
   colipri:     /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/colipri  # frozen CoLiPri Primus encoder (sidecar json + weights)
   omniglot:    /home/dpxuser/repos/omniglot/python   # no cluster-specific copy; reuse dev path

@@ -61,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from the 2D trainer
 
 from data.totalseg_classes import resolve_classes
-from common import DEVICE, _source_root, train_loader, make_eval_loader, _self_context
+from common import DEVICE, _source_root, train_loader, make_eval_loader, _self_context, eval_cfg
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
@@ -463,6 +463,35 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     return mean_dice, mean_soft, mean_loss, rows, cases
 
 
+def _resolve_classes_for(cfg, classes_key):
+    """Class-name list for cfg.data.source. `classes_key` ('train_classes'|'val_classes')
+    picks the totalseg spec; the synth/omni/anchor/chemotox sources derive classes from
+    their own pool and ignore it. Call with common.eval_cfg(cfg) to resolve the val source
+    when a `data.val` override is set (cross-source train/eval)."""
+    src = cfg.data.get("source", "totalseg")
+    if src == "anchor_synth3d":
+        from common import anchor_shapes
+        return anchor_shapes(cfg)
+    if src == "omnisynth3d":
+        from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
+        s3 = cfg.synth3d
+        root = s3.get("tiles_root") or cfg.paths.totalseg
+        classes = resolve_classes(s3.get("classes") or (), totalseg_root=cfg.paths.get("totalseg"))
+        bank = get_or_build_totalseg_bank(
+            root, tuple(s3.get("size", cfg.data.image_size)), "val", tuple(classes))
+        return [bank.alphabet(c) for c in bank.task_ids()]
+    if src == "synth_gmm_maisi":
+        from src.gmm_cohort_sampler import CohortSampler
+        from data.maisi_classes import MAISI_IDX_TO_CLASS
+        cs = CohortSampler(cfg.paths.gmm_bank, k=cfg.data.context_size)
+        return [MAISI_IDX_TO_CLASS.get(c, str(c)) for c in cs.classes]
+    if src == "chemotox_bc":
+        from src.chemotox_dataset import BC_NAMES
+        return list(BC_NAMES)
+    _, root, is_mri = _source_root(cfg)
+    return resolve_classes(cfg.data.get(classes_key), root, is_mri=is_mri)
+
+
 @hydra.main(config_path="../../configs/experiment/3d", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     random.seed(cfg.train.seed)
@@ -471,28 +500,15 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")  # TF32 tensor cores for fp32 matmuls
 
-    if cfg.data.get("source") == "anchor_synth3d":
-        # anchor_synth3d groups val by object shape (each item's label_name = its shape).
-        from common import anchor_shapes
-        val_classes = anchor_shapes(cfg)
-    elif cfg.data.get("source", "totalseg") == "omnisynth3d":
-        # omniSynth3D val classes come from the tile-cache pool (the label_names the
-        # dataset emits), not label_stats.csv — mirrors eval.py's resolution.
-        from src.datasets.omniSynth.bank_totalseg import get_or_build_totalseg_bank
-        s3 = cfg.synth3d
-        root = s3.get("tiles_root") or cfg.paths.totalseg
-        classes = resolve_classes(s3.get("classes") or (),
-                                  totalseg_root=cfg.paths.get("totalseg"))
-        bank = get_or_build_totalseg_bank(
-            root, tuple(s3.get("size", cfg.data.image_size)),
-            "val", tuple(classes))
-        val_classes = [bank.alphabet(c) for c in bank.task_ids()]
-    else:
-        _, root, is_mri = _source_root(cfg)
-        val_classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
-    # Set of class names the model trains on — fills the val sample table's `in_train` flag.
-    _, _troot, _is_mri = _source_root(cfg)
-    train_classes = set(resolve_classes(cfg.data.train_classes, _troot, is_mri=_is_mri))
+    # Eval-source view: data.* overlaid by an optional `data.val` block, so a run can TRAIN
+    # on one source and VALIDATE on another (e.g. train synth_gmm_maisi, eval totalseg). No
+    # data.val -> vcfg is cfg (val = train source). See common.eval_cfg.
+    vcfg = eval_cfg(cfg)
+    val_classes = _resolve_classes_for(vcfg, "val_classes")
+    # Class names the model trains on (fills the val table's `in_train` flag) — always the
+    # TRAIN source, so under a cross-source data.val override every val class reads as unseen
+    # (the OOD generalization signal).
+    train_classes = set(_resolve_classes_for(cfg, "train_classes"))
     image_size = tuple(cfg.data.image_size)
     print(f"Device: {DEVICE} | model={cfg.get('model','medverse')} | size={image_size} "
           f"| K={cfg.data.context_size} | loss={cfg.train.get('loss','smooth_l1')} "
@@ -500,7 +516,7 @@ def main(cfg: DictConfig) -> None:
           f"| sched={cfg.train.get('scheduler','plateau')} | val classes={len(val_classes)}")
 
     loader = train_loader(cfg)
-    val_loader = make_eval_loader(cfg, val_classes, split="val")  # built once, reused every eval
+    val_loader = make_eval_loader(vcfg, val_classes, split="val")  # built once, reused every eval
     model, model_name = build_model(cfg)
     is_patchset = model_name == "patchset3d"
     net = getattr(model, "model", model)

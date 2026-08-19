@@ -1207,6 +1207,15 @@ class TotalSegInContextDataset(Dataset):
             all_images = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)],  dim=0)
             all_masks  = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
             all_images, all_masks = apply_task_aug(all_images, all_masks, self.aug_cfg.task)
+            # Independent per-volume geometry (flip/affine/elastic) after the shared
+            # task transform: each of target + K contexts gets its own pose jitter.
+            # Gated by per_image's own p values (default 0 → no-op).
+            pi_cfg = getattr(self.aug_cfg, "per_image", None)
+            if pi_cfg is not None:
+                for i in range(all_images.shape[0]):
+                    img_i, msk_i = apply_per_image_aug(all_images[i], all_masks[i], pi_cfg)
+                    all_images[i] = img_i
+                    all_masks[i] = msk_i
             for i in range(all_images.shape[0]):
                 all_images[i] = apply_intensity_aug(all_images[i], self.aug_cfg.intensity)
             image_t     = all_images[0]
