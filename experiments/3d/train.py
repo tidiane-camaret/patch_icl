@@ -273,7 +273,7 @@ def build_model(cfg: DictConfig):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-                is_patchset=False, gpu_aug=None):
+                is_patchset=False, gpu_aug=None, synth_realizer=None):
     """optimizers is a list: [AdamW] for medverse, [AdamW, Muon] for patchset3d (the
     scheduler drives AdamW = optimizers[0]; Muon is unscheduled, cf. experiments/2d/train.py)."""
     net = getattr(model, "model", model)
@@ -298,6 +298,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     t_prev = time.perf_counter()
     for batch in pbar:
+        if synth_realizer is not None and "native_lbls" in batch:
+            # GPU-realize: occupancy resample + SynthSeg paint on device -> fills
+            # image/label/context_in/context_out before augmentation (replaces the ~15 s/item
+            # CPU occupancy path). Cheap CPU workers just ship native crops + the GMM draw.
+            batch = synth_realizer(batch, DEVICE)
         if prof:
             tsum["data"] += (time.perf_counter() - t_prev) * 1000
             prof_items += batch["image"].shape[0]      # per-item = per-step ÷ batch size
@@ -449,16 +454,23 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # separate predict pass) and run eval under bf16 (matches training, avoids recompiling the
     # compiled encoder/transformer between dtypes). Off for medverse to keep its val byte-identical.
     fast_eval = cfg.get("model", "medverse") == "patchset3d"
+    # Cross-subject-only aggregation when eval self-context is off: p.eval=0 still lets the
+    # context sampler fall back to self-cloning for candidate-less classes (leakage-inflated),
+    # so drop those self_ctx rows from the reported means. p.eval>0 = intentional probe, keep.
+    sc_eval_p, *_ = _self_context(eval_cfg(cfg).data, "val")
+    drop_self_ctx = sc_eval_p == 0.0
     rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
                                    logits_fn=model.train_forward, loss_fn=loss_fn,
                                    grid_res=getattr(model, "grid_size", None),
                                    output_is_prob=model_output_is_prob(cfg),
-                                   autocast=fast_eval, reuse_logits=fast_eval)
+                                   autocast=fast_eval, reuse_logits=fast_eval,
+                                   drop_self_ctx=drop_self_ctx)
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
     soft = [r["mean_soft_dice"] for r in valid if "mean_soft_dice" in r]
     mean_soft = sum(soft) / len(soft) if soft else float("nan")
-    losses = [c["loss"] for c in cases if "loss" in c]
+    losses = [c["loss"] for c in cases
+              if "loss" in c and not (drop_self_ctx and c.get("self_ctx"))]
     mean_loss = sum(losses) / len(losses) if losses else float("nan")
     return mean_dice, mean_soft, mean_loss, rows, cases
 
@@ -667,12 +679,24 @@ def main(cfg: DictConfig) -> None:
     else:
         gpu_aug = None
 
+    # GPU-realize the synth-GMM train batches (native crop -> occupancy resample + paint on
+    # device); train-only, gated on data.gpu_realize. Val is a real source (eval_cfg), so its
+    # loader ships painted volumes and never hits the realizer.
+    if cfg.data.get("source") == "synth_gmm_maisi" and cfg.data.get("gpu_realize", False):
+        from src.gpu_synth_realize import SynthRealizer
+        synth_realizer = SynthRealizer(T=int(cfg.data.image_size[0]),
+                                       occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
+                                       mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
+                                       seed=int(cfg.get("seed", 0)))
+    else:
+        synth_realizer = None
+
     best = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.perf_counter()
         loss, tr_dice, tr_soft, tr_grid = train_epoch(
             model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-            is_patchset=is_patchset, gpu_aug=gpu_aug)
+            is_patchset=is_patchset, gpu_aug=gpu_aug, synth_realizer=synth_realizer)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}

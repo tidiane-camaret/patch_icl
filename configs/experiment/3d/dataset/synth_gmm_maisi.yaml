@@ -16,6 +16,11 @@ data:
   val_classes: all
   crop_spacing_mm: 1.5          # organ crop = image_size*this FOV, resampled to image_size^3
   train_spacing_range: [1.0, 4.0]  # [lo,hi] mm -> randomize crop spacing per TRAIN batch (log-uniform); null -> fixed crop_spacing_mm. eval always uses crop_spacing_mm
+  mask_downsample: occupancy    # crop->grid mask resize: occupancy (area-pool + thr, thin organs survive; matches totalseg training) | nearest (point-sample, thin organs vanish at large FOV). Paint is drawn from the resampled map, so image<->mask stay consistent.
+  mask_occupancy_thr: 0.1       # foreground-fraction threshold for mask_downsample=occupancy
+  gpu_realize: false            # true = worker ships native crops; occupancy resample + GMM paint run batched on GPU in the train loop (src/gpu_synth_realize), ~15s/item CPU occupancy -> GPU. TRAIN-only (val is a real source via eval_cfg). false = CPU paint path.
+  gpu_realize_max_native: 256   # gpu_realize: cap the shipped native crop side (nearest pre-downsample above it) to bound H2D transfer + GPU one-hot memory at large crop FOV; 0 = uncapped. occupancy native->grid still runs on GPU below the cap.
+  class_balanced: true          # target class sampling: true = uniform over usable bank classes (rare organs as often as common; mirrors totalseg data.class_balanced); false = weighted by #bank masks per class (natural anatomical-frequency prior, body/liver/lungs dominate)
   crop_jitter: null             # train crop-centre jitter (voxels); null -> image_size//4
   epoch_length: 10000           # nominal TRAIN samples/epoch (generative — no fixed dataset size)
   max_val_subjects: 100         # cap val samples/epoch (deterministic per idx via eval.seed)

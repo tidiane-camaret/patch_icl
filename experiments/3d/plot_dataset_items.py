@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -137,6 +138,14 @@ def main():
     with initialize_config_dir(config_dir=str(ROOT / "configs" / "experiment" / "3d"),
                                version_base="1.3"):
         cfg = compose(config_name="train", overrides=hydra_overrides)
+
+    # This is a CPU visualization tool: it needs painted image/label items, not the native
+    # crops the synth gpu_realize path ships (those are painted on GPU in the train loop). Force
+    # gpu_realize off so `experiment=43_synth_gmm` plots without a manual data.gpu_realize=false.
+    if cfg.data.get("gpu_realize", False):
+        OmegaConf.set_struct(cfg, False)
+        cfg.data.gpu_realize = False
+        OmegaConf.set_struct(cfg, True)
 
     ds = build_dataset(cfg, args.split)
 

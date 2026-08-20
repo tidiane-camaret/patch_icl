@@ -33,7 +33,7 @@ class SynthGmmMaisiDataset(Dataset):
                  crop_spacing_mm=1.5, crop_jitter=None, classes=None, length=10000,
                  var_max=5.0, background_mode="zero", eval_seed=None, maxid=200,
                  cohort=None, mask_downsample="occupancy", mask_occupancy_thr=0.1,
-                 class_balanced=True):
+                 class_balanced=True, gpu_realize=False, gpu_realize_max_native=256):
         assert image_size[0] == image_size[1] == image_size[2], "cubic crops only"
         self.T = int(image_size[0])
         self.k = int(context_size)
@@ -52,6 +52,15 @@ class SynthGmmMaisiDataset(Dataset):
         assert mask_downsample in ("nearest", "occupancy"), mask_downsample
         self.mask_downsample = mask_downsample
         self.mask_occupancy_thr = float(mask_occupancy_thr)
+        # GPU-realize mode: ship the NATIVE-res multiclass crop (uint8) + placement geometry +
+        # the cohort GMM draw instead of a CPU-painted image, so the ~15 s/item occupancy
+        # area-pool (per present class, native res) and the paint run batched on GPU in the
+        # train loop (src/gpu_synth_realize). gpu_realize_max_native caps the shipped native
+        # side (nearest pre-downsample above it) to bound H2D transfer + GPU memory at large
+        # crop_spacing (FOV); occupancy native->grid still runs on GPU below that cap. 0/None
+        # = uncapped. Only meaningful for the TRAIN split (val is a real source via eval_cfg).
+        self.gpu_realize = bool(gpu_realize)
+        self.gpu_realize_max_native = int(gpu_realize_max_native or 0)
         # cohort-sampling knobs (distance weights + diversity) -> CohortSampler; empty = defaults.
         # class_balanced (uniform-over-classes vs mask-frequency prior) is a top-level knob
         # mirroring totalseg data.class_balanced, passed alongside the cohort dict.
@@ -64,50 +73,73 @@ class SynthGmmMaisiDataset(Dataset):
         assert self.cs.classes, "no usable classes in bank after filtering"
         _md = (self.mask_downsample
                + (f"(thr={self.mask_occupancy_thr})" if self.mask_downsample == "occupancy" else ""))
+        _gr = (f"GPU(cap={self.gpu_realize_max_native or 'off'})" if self.gpu_realize else "CPU")
         print(f"SynthGmmMaisiDataset: {len(self.cs.entries)} masks | "
               f"{len(self.cs.classes)} classes | K={self.k} | T={self.T} | "
               f"crop={self.crop_mm}mm | var_max={self.var_max} | mask={_md} | "
-              f"class_balanced={self.cs.class_balanced} | len={self.length}", flush=True)
+              f"class_balanced={self.cs.class_balanced} | realize={_gr} | "
+              f"len={self.length}", flush=True)
 
     def __len__(self):
         return self.length
 
-    def _resample_multiclass(self, crop_lbl, out_sizes, target_cls):
-        """Resize a native-res multiclass crop (ints) to out_sizes (long tensor).
+    def _resample_paint_mask(self, crop_lbl, out_sizes, target_cls):
+        """Native-res multiclass crop (ints) -> (paint_lab, mask) at out_sizes (long tensors).
 
-        "occupancy": area-pool each present id to its foreground fraction, assign per voxel
-        the argmax id whose fraction clears mask_occupancy_thr (small ids survive, don't lose
-        ties to larger neighbours); a non-empty guard keeps the target class's densest voxel
-        if thresholding erased it (a synth item with an empty target is dead weight).
-        "nearest": point-sample (thin ids can vanish under heavy downsampling)."""
+        The two play different roles, so they resize differently (mask_downsample only ever
+        applied to a downsample that needs small structures preserved is the MASK):
+          paint_lab: full multiclass, NEAREST. It only drives the per-voxel GMM shade, so it is
+                     treated like an IMAGE — no enlargement; each boundary voxel takes one label.
+          mask:      target-class BINARY under `mask_downsample`. "occupancy" area-pools the
+                     target fraction and keeps voxels clearing mask_occupancy_thr, so a low thr
+                     GROWS a small/thin target (matches totalseg resample_binary); "nearest"
+                     point-samples. Non-empty guard. Rim voxels (mask=1 but paint!=target) are
+                     realistic partial-volume hard cases — intentional, not a bug."""
         size = tuple(int(s) for s in out_sizes)
-        if self.mask_downsample != "occupancy":
-            t = torch.from_numpy(np.ascontiguousarray(crop_lbl, np.float32))[None, None]
-            return F.interpolate(t, size=size, mode="nearest")[0, 0].long()
-        out = torch.zeros(size, dtype=torch.long)
-        best = torch.zeros(size)
-        tgt_frac = None
-        for i in (int(v) for v in np.unique(crop_lbl) if v != 0):
-            bi = torch.from_numpy(np.ascontiguousarray(crop_lbl == i, np.float32))
+        paint = F.interpolate(
+            torch.from_numpy(np.ascontiguousarray(crop_lbl, np.float32))[None, None],
+            size=size, mode="nearest")[0, 0].long()
+        if self.mask_downsample == "occupancy":
+            bi = torch.from_numpy(np.ascontiguousarray(crop_lbl == target_cls, np.float32))
             frac = F.interpolate(bi[None, None], size=size, mode="area")[0, 0]
-            take = (frac >= self.mask_occupancy_thr) & (frac > best)
-            out[take] = i
-            best = torch.maximum(best, frac)
-            if i == target_cls:
-                tgt_frac = frac
-        if tgt_frac is not None and not bool((out == target_cls).any()):
-            out.view(-1)[int(tgt_frac.argmax())] = target_cls     # never emit an empty target
-        return out
+            mask = frac >= self.mask_occupancy_thr
+            if not bool(mask.any()) and bool((crop_lbl == target_cls).any()):
+                mask.view(-1)[int(frac.argmax())] = True          # never emit an empty target
+            mask = mask.long()
+        else:
+            mask = (paint == target_cls).long()                   # nearest binary = paint==cls
+        return paint, mask
 
-    def _crop_multiclass(self, e, cls, rng, crop_mm):
-        """Organ-centred T³ multiclass label (long) around class `cls` in mask entry `e`."""
+    def _crop_paint_mask(self, e, cls, rng, crop_mm):
+        """Organ-centred T³ (paint_lab, mask) (both long) around class `cls` in mask entry `e`."""
         arr = np.squeeze(np.load(self.cs.dir / "masks" / e["file"], mmap_mode="r"))
         center = tuple(e["cents"][cls][:3])
         _, crop_lbl, out_sizes, pad_lo, _ = organ_crop_arrays(
             arr, arr, center, e["spacing"], image_size=(self.T,) * 3,
             crop_mm=crop_mm, jitter=self.jitter, rng=rng)
-        small = self._resample_multiclass(np.asarray(crop_lbl), out_sizes, cls)
-        return place_label(small, out_sizes, pad_lo, self.T)          # (T,T,T) multiclass
+        paint, mask = self._resample_paint_mask(np.asarray(crop_lbl), out_sizes, cls)
+        return (place_label(paint, out_sizes, pad_lo, self.T),     # (T,T,T) multiclass (paint)
+                place_label(mask, out_sizes, pad_lo, self.T))      # (T,T,T) binary (supervision)
+
+    def _native_crop(self, e, cls, rng, crop_mm):
+        """GPU-realize worker payload: the NATIVE-res multiclass crop (uint8, ids 0..maxid)
+        around class `cls`, plus placement geometry (out_sizes, pad_lo). No resample/paint —
+        both run on GPU. Caps the native side at gpu_realize_max_native via a cheap nearest
+        pre-downsample so H2D transfer + GPU one-hot memory stay bounded at large crop FOV."""
+        arr = np.squeeze(np.load(self.cs.dir / "masks" / e["file"], mmap_mode="r"))
+        center = tuple(e["cents"][cls][:3])
+        _, crop_lbl, out_sizes, pad_lo, _ = organ_crop_arrays(
+            arr, arr, center, e["spacing"], image_size=(self.T,) * 3,
+            crop_mm=crop_mm, jitter=self.jitter, rng=rng)
+        native = np.ascontiguousarray(crop_lbl, dtype=np.uint8)         # ids 0..maxid<=255
+        cap = self.gpu_realize_max_native
+        if cap and max(native.shape) > cap:                            # bound transfer/mem
+            new = tuple(min(cap, s) for s in native.shape)             # still >= out_sizes (<=T<=cap)
+            native = (F.interpolate(torch.from_numpy(native.astype(np.float32))[None, None],
+                                    size=new, mode="nearest")[0, 0].to(torch.uint8).numpy())
+        return (torch.from_numpy(native),
+                torch.tensor(out_sizes, dtype=torch.long),
+                torch.tensor(pad_lo, dtype=torch.long))
 
     def _paint(self, lab_np, mu, sd, nrng):
         """Flat shared-id GMM: img = mu[lab] + sd[lab]*noise, then fixed 0-255->z bridge."""
@@ -139,14 +171,35 @@ class SynthGmmMaisiDataset(Dataset):
         else:
             mu[0] = nrng.uniform(0.0, 15.0); sd[0] = 0.5 ** 0.5
 
+        name = MAISI_IDX_TO_CLASS.get(cls, str(cls))
+
+        # GPU-realize: ship native crops + geometry + the cohort GMM draw; occupancy
+        # resample + paint happen on GPU (src/gpu_synth_realize.SynthRealizer).
+        if self.gpu_realize:
+            natives, outs, pads = [], [], []
+            for e in cohort:
+                nat, osz, plo = self._native_crop(e, cls, rng, crop_mm)
+                natives.append(nat); outs.append(osz); pads.append(plo)
+            return {
+                "native_lbls": natives,                       # list K+1 uint8 (variable shape)
+                "out_sizes": torch.stack(outs),               # (K+1,3)
+                "pad_lo": torch.stack(pads),                  # (K+1,3)
+                "cls": int(cls),
+                "gmm_mu": torch.from_numpy(mu),               # (maxid+1,) cohort-shared
+                "gmm_sd": torch.from_numpy(sd),               # (maxid+1,)
+                "spacing": torch.full((3,), crop_mm, dtype=torch.float32),
+                "subject": cohort[0]["file"], "label_name": name,
+                "context_subjects": [e["file"] for e in cohort[1:]],
+                "aug_mode": torch.tensor(0, dtype=torch.long),
+            }
+
         imgs, masks = [], []
         for e in cohort:
-            lab = self._crop_multiclass(e, cls, rng, crop_mm)
-            lab_np = lab.numpy().astype(np.int64)
-            img = torch.from_numpy(self._paint(lab_np, mu, sd, nrng))[None]   # (1,T,T,T)
+            paint, mask = self._crop_paint_mask(e, cls, rng, crop_mm)
+            img = torch.from_numpy(                                            # paint drives shade
+                self._paint(paint.numpy().astype(np.int64), mu, sd, nrng))[None]  # (1,T,T,T)
             imgs.append(img.float())
-            masks.append((lab == cls).long())                                 # (T,T,T) binary
-        name = MAISI_IDX_TO_CLASS.get(cls, str(cls))
+            masks.append(mask)                                                # (T,T,T) binary (occupancy)
         return {
             "image": imgs[0], "label": masks[0],
             "context_in": torch.stack(imgs[1:]),          # (K,1,T,T,T)

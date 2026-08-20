@@ -267,9 +267,20 @@ def build_dataset(cfg, split: str):
             classes=classes, length=length,
             var_max=float(g.get("var_max", 5.0)),
             background_mode=g.get("background_mode", "zero"),
+            # match the totalseg training regime: occupancy area-pool + threshold so thin
+            # organs survive the crop->grid downsample (nearest drops them at large FOV).
+            mask_downsample=d.get("mask_downsample", "occupancy"),
+            mask_occupancy_thr=float(d.get("mask_occupancy_thr", 0.1)),
+            # class-uniform target sampling (rare organs as often as common) vs mask-frequency
+            # prior — mirrors totalseg data.class_balanced.
+            class_balanced=bool(d.get("class_balanced", True)),
             # to_container -> plain dict/list so CohortSampler's isinstance checks see native
             # types (a DictConfig/ListConfig randomness spec would slip past dict/list checks).
             cohort=OmegaConf.to_container(d.get("cohort", {}), resolve=True),
+            # gpu_realize: ship native crops + defer occupancy resample + paint to the GPU
+            # train loop (src/gpu_synth_realize). TRAIN only — val is a real source via eval_cfg.
+            gpu_realize=(split == "train" and bool(d.get("gpu_realize", False))),
+            gpu_realize_max_native=int(d.get("gpu_realize_max_native", 256)),
             eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))))
 
     d = cfg.data
@@ -358,7 +369,14 @@ def train_loader(cfg) -> DataLoader:
     bs = int(cfg.train.batch_size)
     base = (RandomSampler(ds, replacement=False, num_samples=min(int(max_len), len(ds)))
             if max_len is not None else RandomSampler(ds))
-    common = dict(num_workers=nw, collate_fn=incontext_collate_fn,
+    # gpu_realize ships variable-shape native crops -> a list-preserving collate; the
+    # SynthRealizer paints them on GPU in the train loop. Otherwise the default stacking collate.
+    if cfg.data.get("source") == "synth_gmm_maisi" and cfg.data.get("gpu_realize", False):
+        from src.gpu_synth_realize import synth_gpu_collate_fn
+        collate = synth_gpu_collate_fn
+    else:
+        collate = incontext_collate_fn
+    common = dict(num_workers=nw, collate_fn=collate,
                   pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
                   prefetch_factor=2 if nw > 0 else None)
     train_spacing_range = cfg.data.get("train_spacing_range", None)

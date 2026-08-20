@@ -36,7 +36,11 @@ from evaluate import measure_flops, evaluate_classes, evaluate_spacing_sweep, bu
 # `arch` from the checkpoint — data.* comes from the eval config — so drift on these keys
 # silently produces plausible-but-wrong numbers instead of an error. Warn on any mismatch.
 _FIDELITY_KEYS = ("image_size", "crop_spacing_mm", "use_crop", "context_size",
-                  "mask_downsample", "mask_occupancy_thr", "source")
+                  "mask_downsample", "mask_occupancy_thr", "source",
+                  # raw_ct changes intensity normalization; self_context changes how the K
+                  # contexts are built (p.eval>0 => self-context leakage). Neither is restored
+                  # from the checkpoint, so both drift silently without this. See docs/logs.md.
+                  "raw_ct", "self_context")
 
 
 def _warn_uninherited_data(cfg: DictConfig) -> None:
@@ -59,9 +63,13 @@ def _warn_uninherited_data(cfg: DictConfig) -> None:
     drift = []
     for k in _FIDELITY_KEYS:
         ev = cfg.data.get(k)
+        tr = train_data.get(k)
+        # Normalize both sides to plain containers so nested keys (self_context) compare by
+        # content, not DictConfig-vs-dict identity (which would flag a spurious mismatch).
         if isinstance(ev, (DictConfig, ListConfig)):
             ev = OmegaConf.to_container(ev, resolve=True)
-        tr = train_data.get(k)
+        if isinstance(tr, (DictConfig, ListConfig)):
+            tr = OmegaConf.to_container(tr, resolve=True)
         if tr != ev:
             drift.append((k, tr, ev))
     if drift:

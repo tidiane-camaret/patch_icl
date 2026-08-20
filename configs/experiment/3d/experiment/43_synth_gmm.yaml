@@ -1,0 +1,103 @@
+# @package _global_
+# Experiment 43 — GMM-synth (MAISI mask-bank) in-context training on the CoLiPri 8-block
+# native-grid encoder @128³ (experiment 35), unfrozen, validated OOD on totalseg.
+#
+# Bundles what used to be a long override string:
+#   experiment=42_reg_to_all dataset=synth_gmm_maisi data.cohort.randomness=[0,1]
+#   +data.val.source=totalseg +data.val.val_classes=balanced +data.val.use_crop=true
+#   +data.val.crop_spacing_mm=1.5 data.self_context.p.eval=0 augmentations=calibrated
+#   arch.encoder_frozen=false arch.register_routed=false arch.full_attn=true
+# but INHERITING 35 instead of 42, so the totalseg-oriented data.* that 42 injected
+# (train_classes=balanced, val_classes=not_balanced, raw_ct=true, p_synth, synth_method,
+# self_context) no longer collides with the synth bank. Self-context is absent from the 35
+# chain, so the totalseg val already runs cross-subject (p.eval defaults to 0) — no override
+# needed. full_attn/register_routed are already the 35 defaults, so only encoder_frozen flips.
+#
+# Run:  python experiments/3d/train.py experiment=43_synth_gmm wandb.name=43_synth_gmm
+defaults:
+  - 35_colipri_enc_8_i_128         # arch (CoLiPri 8-block native-grid @128, l=2/e=512, res=16) + task aug
+  - override /dataset: synth_gmm_maisi
+  - override /augmentations: calibrated
+  - _self_
+
+# --- re-assert the synth data block over 35's totalseg-oriented data.* ---
+# The dataset group merges before the experiment, so 35 clobbers these; restate the synth
+# values here (43's _self_ merges after 35). Everything else in the synth block (source,
+# cohort weights, gmm, mask_downsample, epoch_length, train_spacing_range) survives untouched.
+data:
+  train_classes: all               # 35 forces 'balanced' (a totalseg spec, meaningless for the bank)
+  val_classes: all
+  crop_spacing_mm: 1.5             # 35 uses 2.0 (CoLiPri native); synth crops at 1.5
+  mask_occupancy_thr: 0.1          # 35 uses 0.5 (real CT); painted synth masks want 0.1
+  gpu_realize: true                # defer occupancy resample + GMM paint to GPU (train loop);
+  gpu_realize_max_native: 256      #   native side cap (nearest pre-downsample) to bound H2D/mem
+  train_spacing_range: [1.0, 4.0]
+  class_balanced: true             # 30/35 chain sets false; want class-uniform target sampling
+  max_ds_len_train: 1000           
+  cohort:
+    randomness: [0, 1]             # continuous per-cohort tightness r ~ U[0,1]
+  # Eval OOD on totalseg (overlays data.* on the val path only; see common.eval_cfg).
+  raw_ct: true                     # 35 sets false (totalseg); synth is raw CT
+  val:
+    source: totalseg
+    val_classes: balanced
+    use_crop: true
+    crop_spacing_mm: 1.5
+    mask_downsample: occupancy
+    mask_occupancy_thr: 0.1
+    
+
+arch:
+  l: 4
+  e: 768
+  h: 3072
+  a: 12
+  encoder_frozen: false            # 35 freezes the CoLiPri encoder; unfreeze for this run
+  encoder_spacing_aware: true
+  transformer_rope: true
+  rope_theta: 100.0
+  feat_norm: self
+  token_mask_ratio_support: 0.25
+  token_mask_ratio_query: 0.50
+  full_attn: true 
+  thinking_rows: 64 
+
+
+# 35 overrides calibrated's task.affine/elastic (it merges after the augmentations group);
+# restore the calibrated magnitudes so the preset is authoritative (deform stays from calibrated).
+
+augmentations:
+
+  task:
+    affine:
+      p: 0.2
+    elastic:
+      p: 0.2
+    flip:
+      p_d: 0.5
+      p_h: 0.5
+      p_w: 0.5
+  per_image:
+    affine: 
+      p: 0.8
+      max_angle_deg: 45
+      scale_min: 1
+      scale_max: 1
+      max_translate: 0.4
+    elastic: 
+      p: 0
+      alpha: 0.02
+  intensity: 
+    brightness_contrast:
+      p: 0.5
+      brightness: 0.2            # was brightness_limit (unread) → base 0.0
+      contrast_range: [0.8, 1.2] # was contrast_limit (unread) → base [0.75,1.25]
+    gaussian_blur:
+      p: 0.5
+      sigma_range: [0.1, 1.0]    # was sigma_min/sigma_max (unread) → base [0.5,1.0]
+    gaussian_noise:
+      p: 0.5
+      max_std: 0.1               # was var_limit 0.01 (unread) → std √0.01; base was 0.316
+    sharpness:
+      p: 0.5
+      factor: 0.5                # was alpha_min/alpha_max (unread); code has no range, missing factor crashed

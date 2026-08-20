@@ -490,7 +490,7 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                      output_is_prob=False, autocast=False, reuse_logits=False,
                      locator_ratio: float | None = None, pred_centers_out: dict | None = None,
                      figure_cache: dict | None = None, figure_classes=None,
-                     pred_geom_out: dict | None = None):
+                     pred_geom_out: dict | None = None, drop_self_ctx: bool = False):
     """Eval all `classes` through ONE multi-class loader; return (rows, cases).
 
     Builds a single dataset over every class (via common.make_eval_loader), so the
@@ -509,6 +509,14 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     per-sample `loss`. By default the hard `dice` comes from model.predict (the benchmark
     inference). eval.py passes none of these + leaves autocast/reuse_logits off, so its path
     is byte-identical.
+
+    `drop_self_ctx=True` excludes self-context samples (all K contexts == the target case)
+    from the per-class summary — cross-subject-only eval. This is not just the intentional
+    self_context probe: even with self_context.p.eval=0 the context sampler falls back to
+    cloning the target when a class has no cross-subject candidate (a leakage-inflated
+    sample it warns about), so this guard keeps those out of the reported mean. The dropped
+    cases still appear in the per-sample `cases`/table (flagged self_ctx=True), only the
+    aggregate rows exclude them.
 
     `autocast=True` runs the eval forward(s) under bf16 (matches training; ~4x faster cold
     encode and no compile recompile between train/eval dtypes). `reuse_logits=True` (requires
@@ -692,8 +700,9 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
     extra = [c for c in cases_by_class if c not in set(classes)]
     for cls in list(classes) + extra:
         cases = cases_by_class.get(cls, [])
-        all_cases.extend(cases)
-        rows.append(_summarize(cls, cases) if cases
+        all_cases.extend(cases)                                 # table keeps every sample
+        summ = [c for c in cases if not c.get("self_ctx")] if drop_self_ctx else cases
+        rows.append(_summarize(cls, summ) if summ
                     else {"class": cls, "error": "no samples"})
     return rows, all_cases
 

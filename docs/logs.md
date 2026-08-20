@@ -4551,3 +4551,56 @@ forward + predict shapes correct, encoder no-grad while img_embed trains; eval c
 ## Fix: drop degenerate-spacing masks in full bank
 - Full bank has 6 masks with a degenerate spacing axis (3 all-zero + 3 near-zero ~3e-8) -> ZeroDivisionError / giant target_size in organ_crop_arrays. Not in the 500-subset.
 - CohortSampler now filters entries at load with a 0.05mm physical floor (well below any real CT; keeps legit 0.1-0.25mm high-res), row-aligning size_mat. Dropped: m00733, m02017, m02883, m03711, m03870, m04070. 4135 -> 4129 usable masks.
+
+## Cross-subject-only eval guard (drop_self_ctx)
+- `data.self_context.p.eval=0` stops the intentional self-context probe, but the context sampler still self-clones the target for candidate-less classes (leakage-inflated, warned) -> stray self_ctx=True rows leak into the mean.
+- evaluate_classes gains `drop_self_ctx` (default False): excludes self_ctx=True cases from the per-class summary rows only; the per-sample `cases`/wandb table still logs every sample (flagged). train.py validate_mean auto-enables it when `_self_context(eval_cfg.data,"val")` p==0 (also filters those rows out of the val/loss mean). p.eval>0 (probe) keeps them.
+- eval.py path unaffected (default False). To get honest cross-subject numbers: run with `data.self_context.p.eval=0`.
+
+## eval.py drift check: add raw_ct + self_context to _FIDELITY_KEYS
+- eval.py restores only `arch` from the checkpoint; all data.* comes from the eval config. `raw_ct` (intensity normalization) and `self_context` (how K contexts are built; p.eval>0 = self-context leakage) were NOT in the drift check, so they mismatched training silently. Added both to _FIDELITY_KEYS.
+- _warn_uninherited_data now to_container-normalizes the checkpoint-side value too (nested self_context compares by content, not DictConfig-vs-dict). Still warn-only, never halts.
+- Reminder of what IS auto-restored: model weights + full arch.* (patchset3d, rebuilt from ckpt["arch"]); only weight-free eval.feat_norm / eval.primus_sidecar override it. Everything else (all data.*, eval.* harness knobs) is eval-config authoritative.
+
+## synth_gmm_maisi: occupancy mask downsampling (match totalseg training)
+- SynthGmmMaisiDataset resized the crop->grid multiclass label with plain NEAREST (_crop_multiclass), so thin/small organs vanished at large FOV — a train(synth)/eval(totalseg occupancy thr=0.1) mismatch, and small-object cross-subject Dice was the weakest bucket.
+- Added `mask_downsample` (nearest|occupancy, default occupancy) + `mask_occupancy_thr` (default 0.1). New `_resample_multiclass`: per present-id area-pool to foreground fraction, assign argmax id clearing thr (small ids survive), with a non-empty guard that keeps the TARGET class's densest voxel if thresholding erased it (no dead empty-target items). Paint is drawn FROM the resampled map, so image<->mask stay consistent (image is painted from the label here, unlike real-CT totalseg).
+- Threaded from common.build_dataset (synth_gmm_maisi branch) + config keys in dataset/synth_gmm_maisi.yaml (mask_downsample: occupancy, mask_occupancy_thr: 0.1). Startup print shows the mode.
+
+## synth_gmm_maisi: class_balanced sampling toggle
+- sample_cohort already picked the target class uniformly (implicitly balanced) but had no toggle. Added `class_balanced` (CohortSampler + SynthGmmMaisiDataset + data.class_balanced config, default true), mirroring totalseg.
+- true = uniform over usable bank classes (rare organs as often as common); false = rng.choices weighted by #bank masks per class (natural anatomical-frequency prior). Weights built inline in sample_cohort (not cached) so the dataset's post-init self.cs.classes filter can't stale them.
+- Verified over 4000 draws: balanced hits 125/125 classes (max/mean 1.6 ~ sampling noise); frequency prior 124/125 (max/mean 1.9). Difference is modest because full-body MAISI masks make most classes co-occur — the flag mainly affects the genuinely rare classes.
+
+## configs/experiment/3d/experiment/43_synth_gmm.yaml (collision-free synth-GMM run)
+- Replaces the long override string (experiment=42_reg_to_all dataset=synth_gmm_maisi +data.val.* data.self_context.p.eval=0 augmentations=calibrated arch.*). Inherits 35_colipri_enc_8_i_128 (NOT 42), overrides /dataset=synth_gmm_maisi + /augmentations=calibrated, bakes cohort.randomness=[0,1] + totalseg val override + encoder_frozen=false.
+- Collisions fixed: 42 injected train_classes=balanced / val_classes=not_balanced / raw_ct=true / p_synth / synth_method / self_context (all totalseg-oriented, wrong for the bank). Inheriting 35 drops raw_ct + self_context entirely (val self_context.p.eval defaults to 0 => cross-subject, no override needed). The dataset group merges BEFORE the experiment, so 35 still clobbers train_classes/crop_spacing_mm/mask_occupancy_thr/class_balanced/max_ds_len_train -> 43's _self_ re-asserts the synth values.
+- Silent bug caught: 35 chain sets max_ds_len_train=1000, which caps the synth train epoch to 1000 via RandomSampler(num_samples=min(max_len,len(ds))) despite epoch_length=10000 (10x fewer samples/epoch). 43 sets max_ds_len_train=null.
+- full_attn=true / register_routed=false are already the 35 defaults (those two CLI flags were redundant). 35 overrides calibrated's task.affine/elastic, so 43 restores the calibrated magnitudes (affine 0.90-1.10 p0.2, elastic alpha0.12 grid8; deform survives from calibrated).
+- HEADS-UP: 35 arch = l=2/e=512/h=512/a=4 (small transformer), NOT 42's l=4/e=768/h=3072/a=12. Inheriting 35 is the smaller model by design.
+
+## GPU-realize synth-GMM dataloading (occupancy resample + paint moved to GPU) — 2026-08-19
+
+- Problem: `experiment=43_synth_gmm` (mask_downsample=occupancy) was data-starved. Profiled `SynthGmmMaisiDataset.__getitem__` (T=128, K+1=2): occupancy resample = **15.6 s/item (99.4%)**; load+crop 21 ms, GMM paint 77 ms, nearest resample (ref) 450 ms. So moving PAINT to GPU buys ~0.5% — the whole cost is the occupancy area-pool.
+- Root cause: occupancy area-pools EVERY present label (mean 40, up to 67) of the full native crop (mean 8.9 M vox, up to 33 M) in a per-class Python loop of CPU `F.interpolate(mode="area")`. Totalseg's occupancy is cheap only because it does 1 binary mask/volume; synth pays 40x because paint needs the whole multiclass map. (In `__getitem__` the multiclass map feeds ONLY paint — the supervised mask is `lab==cls`.)
+- Fix (user chose full-GPU): new `gpu_realize` mode. Worker ships the NATIVE uint8 multiclass crop + placement geometry (out_sizes/pad_lo) + the cohort GMM draw (mu/sd) instead of a painted image; occupancy resample + SynthSeg paint run batched on GPU in the train loop. Files:
+  - `src/synth_gmm_maisi_dataset.py`: `gpu_realize` + `gpu_realize_max_native` params; `_native_crop()` (ships native uint8, nearest pre-downsample above the cap to bound H2D/mem at large crop FOV); `__getitem__` GPU branch returns native payload dict.
+  - `src/gpu_synth_realize.py` (NEW): `synth_gpu_collate_fn` (keeps variable-shape native crops as a list-of-lists, stacks the rest) + `_occupancy_to_grid` (verbatim GPU port of `_resample_multiclass`+`place_label`) + `SynthRealizer` (fills image/label/context_in/context_out on device; paint == `_paint`: `(mu[lab]+sd[lab]*noise-128)/74`).
+  - `experiments/3d/common.py`: dataset gets `gpu_realize` (TRAIN split only — val is a real source via eval_cfg) + `gpu_realize_max_native`; `train_loader` selects `synth_gpu_collate_fn` when source=synth_gmm_maisi & gpu_realize.
+  - `experiments/3d/train.py`: builds `SynthRealizer` next to `GpuAugmentor`; `train_epoch` calls it (`if "native_lbls" in batch`) BEFORE GpuAugmentor, so painted volumes flow through geo/intensity aug unchanged.
+- Config: `data.gpu_realize: true`, `gpu_realize_max_native: 256` (2xT) in 43_synth_gmm.yaml; both added (defaults false/256) to configs/.../dataset/synth_gmm_maisi.yaml.
+- Verified: occupancy CPU==GPU bit-exact on the same native crop (target vox 2951==2951); realizer output shapes correct, image finite (bg -1.73), labels non-empty; **45 ms/item on GPU vs 15,600 ms CPU (~346x)**. `gpu_realize_max_native=256` caps native side (seen 39–256) so H2D stays ~16 MB/member even at crop_spacing 4 mm. CPU path unchanged when gpu_realize=false (plot_dataset_items / eval still use it).
+
+### Decouple GMM-paint label (nearest, image-like) from supervised mask (occupancy) — 2026-08-19
+
+- Insight (user): mask_occupancy_thr is low (0.1) specifically to GROW the supervised target mask so small/thin objects survive downsampling — but the multiclass label that drives GMM painting does NOT need enlarging; it can be treated like an image (nearest). Previously both the CPU path and the GPU realizer derived the mask from an all-class occupancy argmax, coupling them and paying a ~40-class occupancy loop.
+- Change: paint and mask now resize by role.
+  - paint_lab: full multiclass, NEAREST (image-like, drives per-voxel `mu[lab]` shade only; no enlargement).
+  - mask: target-class BINARY under mask_downsample — "occupancy" area-pools the target fraction + threshold (low thr enlarges, == totalseg resample_binary), "nearest" = paint==cls. Non-empty guard.
+  - `SynthGmmMaisiDataset._resample_multiclass`/`_crop_multiclass` -> `_resample_paint_mask`/`_crop_paint_mask` (return (paint, mask)); `src/gpu_synth_realize._occupancy_to_grid` -> `_resample_member` (returns (paint, mask)); SynthRealizer gains `mask_downsample` (threaded from cfg.data in train.py).
+- Verified: paint AND mask bit-exact CPU==GPU; small target (native 4943 vox) mask occupancy(thr0.1)=6435 vox > nearest 4398 (grows small objects); 2057 rim voxels where mask=1 but paint!=cls (intended partial-volume hard cases — paint is genuinely decoupled). Realizer GPU work dropped 45->12 ms/item (nearest + 1 binary area-pool vs 40-class loop). CPU fallback ~840 ms/item (was 15.6 s).
+
+### plot_dataset_items auto-disables gpu_realize — 2026-08-19
+
+- `plot_dataset_items.py experiment=43_synth_gmm` crashed with KeyError 'image' in incontext_collate_fn: 43 sets data.gpu_realize=true, so build_dataset(split=train) yields NATIVE crops (painted on GPU in the train loop), which the plot's CPU collate can't stack. (Also: top-level `gpu_realize=false` fails struct validation — the key is nested: `data.gpu_realize=false`.)
+- Fix: plot_dataset_items now force-sets cfg.data.gpu_realize=False before build_dataset (it's a CPU viz tool that needs painted image/label items), so the plot works with no manual override. Added `from omegaconf import OmegaConf`. Confirmed: realize=CPU, saved results/3d/dataset_items.png.
