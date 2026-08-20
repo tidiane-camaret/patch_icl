@@ -1,5 +1,15 @@
 # Change log
 
+## 2026-08-20 — In-context dataloader v2
+
+Added `src/incontext_dataset_v2.py` (`InContextDataset` engine + `LoadRequest`/
+`LoadResult`/`VolumeProvider`) and `src/providers/totalseg.py` (`TotalSegProvider`
++ `crop_and_place`). Generic task-assembly separated from source I/O; single
+raw_ct organ-crop load path; per-item state via dataclasses (no more
+`_cur_rng`/`_last_crop_geom` side-channels). Gated behind `data.loader_v2`; the
+v1 `TotalSegInContextDataset` is untouched. Spec:
+docs/superpowers/specs/2026-08-20-incontext-dataloader-v2-design.md.
+
 ## 2026-08-15 — GPU augmentation pipeline (batched, replaces CPU per-item augs)
 - NEW `src/gpu_augment.py::GpuAugmentor` — batched on-device aug run in the train loop after batch.to(device), before model(). Own torch ops (no deps), non-differentiable. `_geometric` (shared per task group_size=T, or independent group_size=1), `_batched_intensity` (brightness/contrast/gamma/noise/blur/sharpness/low-res), `_batched_gin_ipa` (grouped conv, groups=N). Mode dispatch on `aug_mode` (0 real, 1 synth, 2 self_context).
 - Dataset `defer_aug_to_gpu` (from `augmentations.gpu`): __getitem__/_get_synth_item skip apply_*_aug, emit RAW volumes + aug_mode; collate stacks aug_mode. train.py moves batch to device once + augments. Behind `augmentations.gpu` (default false → CPU path unchanged). Exact CPU repro is a non-goal; tests assert shape/range/K+1-sharing/eval-identity. See docs/superpowers/specs/2026-08-15-gpu-augmentation-pipeline-design.md.
