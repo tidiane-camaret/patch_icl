@@ -214,9 +214,12 @@ today.
 - Engine test: item schema keys + shapes match the current cross-subject path;
   `eval_seed` reproducibility across two `__getitem__` calls; K-padding and
   zero-candidate self-context fallback.
-- Parity spot-check: for a fixed (subject, class) and centroid center, v2's
-  raw_ct crop matches the old `_load_crop` (raw_ct=True) output within
-  resampling tolerance.
+- Spacing divergence note: v2 intentionally sizes crops from the TRUE native
+  spacing stored in `spacings.json` (`m["spacing"]`), whereas v1's `use_crop`
+  path substitutes 1.5mm-isotropic spacing. Bit-parity with v1 is NOT expected
+  for anisotropic subjects — v2 is the corrected behavior. Tests validate v2's
+  own output invariants; comparison against v1 should account for this
+  intentional difference.
 
 ## Risks
 

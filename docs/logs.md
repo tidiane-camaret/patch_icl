@@ -10,6 +10,14 @@ raw_ct organ-crop load path; per-item state via dataclasses (no more
 v1 `TotalSegInContextDataset` is untouched. Spec:
 docs/superpowers/specs/2026-08-20-incontext-dataloader-v2-design.md.
 
+- **Intentional spacing divergence (v1 vs v2):** `TotalSegProvider._load_spacings`
+  returns the TRUE native spacing from `spacings.json` and passes it to
+  `crop_and_place`. v1's `use_crop` path instead substitutes 1.5mm-isotropic
+  spacing for all subjects. As a result, v2 produces DIFFERENT crops than v1 for
+  anisotropic subjects — this is intentional and correct (v1's substitution was a
+  latent shortcut). Consumers comparing v1/v2 outputs or reusing v1-trained
+  checkpoints should expect crop differences on anisotropic data.
+
 ## 2026-08-15 — GPU augmentation pipeline (batched, replaces CPU per-item augs)
 - NEW `src/gpu_augment.py::GpuAugmentor` — batched on-device aug run in the train loop after batch.to(device), before model(). Own torch ops (no deps), non-differentiable. `_geometric` (shared per task group_size=T, or independent group_size=1), `_batched_intensity` (brightness/contrast/gamma/noise/blur/sharpness/low-res), `_batched_gin_ipa` (grouped conv, groups=N). Mode dispatch on `aug_mode` (0 real, 1 synth, 2 self_context).
 - Dataset `defer_aug_to_gpu` (from `augmentations.gpu`): __getitem__/_get_synth_item skip apply_*_aug, emit RAW volumes + aug_mode; collate stacks aug_mode. train.py moves batch to device once + augments. Behind `augmentations.gpu` (default false → CPU path unchanged). Exact CPU repro is a non-goal; tests assert shape/range/K+1-sharing/eval-identity. See docs/superpowers/specs/2026-08-15-gpu-augmentation-pipeline-design.md.

@@ -160,9 +160,13 @@ class TotalSegProvider:
         path = self.root / "spacings.json"
         if not path.exists():
             return {}
-        raw = json.load(open(path))
+        with open(path) as f:
+            raw = json.load(f)
         return {s: tuple(float(x) for x in m["spacing"]) for s, m in raw.items()}
 
     def _load_ct_stats(self):
         path = self.root / "ct_stats.json"
-        return json.load(open(path)) if path.exists() else {}
+        if not path.exists():
+            return {}
+        with open(path) as f:
+            return json.load(f)

@@ -148,7 +148,7 @@ def build_dataset(cfg, split: str):
             split=split, max_subjects=(d.get("max_train_subjects") if is_train
                                        else d.get("max_val_subjects")),
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
-            crop_jitter=(None if is_train else cfg.get("eval", {}).get("crop_jitter", 0)),
+            crop_jitter=(d.get("crop_jitter") if is_train else cfg.get("eval", {}).get("crop_jitter", 0)),
             mask_downsample=d.get("mask_downsample", "occupancy"),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"))

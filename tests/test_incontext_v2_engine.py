@@ -2,7 +2,6 @@
 import json
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 from src.incontext_dataset_v2 import InContextDataset
 from src.providers.totalseg import TotalSegProvider
