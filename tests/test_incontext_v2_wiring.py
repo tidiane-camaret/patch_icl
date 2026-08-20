@@ -36,7 +36,8 @@ def _cfg(root, loader_v2):
                  "val_classes": [_CLS], "train_classes": [_CLS], "use_crop": True,
                  "crop_spacing_mm": 1.5, "class_balanced": False,
                  "max_val_subjects": None, "max_train_subjects": None,
-                 "loader_v2": loader_v2},
+                 "loader_v2": loader_v2,
+                 "synth_unions": False, "synth_method": None, "p_synth": 0.0},
         "paths": {"totalseg": str(root)},
         "eval": {"seed": 0},
     })
