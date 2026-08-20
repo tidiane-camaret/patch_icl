@@ -135,6 +135,31 @@ def build_dataset(cfg, split: str):
     knob (including the newer random_coloring / num_labels_per_sample /
     n_synth_merge_*) is forwarded, so the dataset is identical to training.
     """
+    d = cfg.data
+    if d.get("loader_v2", False) and d.get("source", "totalseg") in _TOTALSEG_SOURCES:
+        from src.incontext_dataset_v2 import InContextDataset
+        from src.providers.totalseg import TotalSegProvider
+        _, root, is_mri = _source_root(cfg)
+        is_train = split == "train"
+        class_spec = d.train_classes if is_train else d.val_classes
+        classes = resolve_classes(class_spec, root, is_mri=is_mri)
+        provider = TotalSegProvider(
+            root=root, classes=classes, image_size=tuple(d.image_size),
+            split=split, max_subjects=(d.get("max_train_subjects") if is_train
+                                       else d.get("max_val_subjects")),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=(None if is_train else cfg.get("eval", {}).get("crop_jitter", 0)),
+            mask_downsample=d.get("mask_downsample", "occupancy"),
+            mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
+            modality=("mri" if is_mri else "ct"))
+        return InContextDataset(
+            provider, context_size=d.context_size,
+            class_balanced=(is_train and d.get("class_balanced", False)),
+            aug_cfg=(cfg.augmentations if is_train else None),
+            defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))))
+
     if cfg.data.get("source", "totalseg") == "omnisynth3d":
         from src.datasets.omniSynth.dataset3d import OmniSynth3DICLDataset
         from src.datasets.omniSynth.config import OmniTotalSegConfig
