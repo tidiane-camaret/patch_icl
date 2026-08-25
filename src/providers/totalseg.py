@@ -45,6 +45,48 @@ def crop_and_place(image_np, label_np, class_idx, center, T, *,
     return image_t, label_t, geom
 
 
+def crop_and_place_cached(img_cache_np, label_np, class_idx, center, T, *,
+                          crop_spacing_mm, native_spacing, cache_spacing_mm, jitter, rng,
+                          mask_downsample, occ_thr, normalize_fn=None):
+    """Same output as `crop_and_place`, but the IMAGE is cropped from a pre-resampled
+    `cache_spacing_mm`-pitch volume (`img_cache_np`) instead of the full-res native CT.
+
+    The MASK is still cropped + occupancy-resampled from the full-res native `label_np`,
+    so label fidelity (occupancy@thr, per-class) is byte-identical to the native path. Only
+    the image path is accelerated: crop geometry is computed once on the native label grid,
+    then the same physical box is mapped into the cache grid and resampled to out_sizes.
+
+    Requires cache_spacing_mm <= out pitch (== crop_spacing_mm here) so the image is
+    downsampled, not upsampled — guaranteed by the provider only using a cache whose pitch
+    equals crop_spacing_mm. See docs/logs.md (6 mm image cache)."""
+    # Geometry from the native label grid (drives out grid + mask). rng consumed once here.
+    _crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+        label_np, label_np, center, list(native_spacing),
+        image_size=(T, T, T), crop_mm=crop_spacing_mm, jitter=jitter, rng=rng)
+    starts = geom[0].tolist()
+    crop_sizes = geom[1].tolist()
+    # Map the native physical crop box -> cache-grid indices (phys = idx * spacing).
+    img_lo, img_sz = [], []
+    for ax in range(3):
+        s0 = int(round(starts[ax] * native_spacing[ax] / cache_spacing_mm))
+        sz = int(round(crop_sizes[ax] * native_spacing[ax] / cache_spacing_mm))
+        s0 = min(max(0, s0), max(0, img_cache_np.shape[ax] - 1))
+        sz = max(1, min(sz, img_cache_np.shape[ax] - s0))
+        img_lo.append(s0)
+        img_sz.append(sz)
+    img_crop = np.ascontiguousarray(
+        img_cache_np[img_lo[0]:img_lo[0] + img_sz[0],
+                     img_lo[1]:img_lo[1] + img_sz[1],
+                     img_lo[2]:img_lo[2] + img_sz[2]])
+    if normalize_fn is not None:
+        img_crop = normalize_fn(img_crop)
+    image_t = place_image(img_crop, out_sizes, pad_lo, T)  # cache->out ~identity when pitches match
+    lbl_small = resample_binary(crop_lbl == class_idx, tuple(out_sizes),
+                                mode=mask_downsample, occ_thr=occ_thr)
+    label_t = place_label(lbl_small, out_sizes, pad_lo, T).long()
+    return image_t, label_t, geom
+
+
 class TotalSegProvider:
     """Source-specific I/O for the totalseg family: scan + bbox caches and a single
     raw_ct organ-crop `load`. Missing ct_raw.npy is a hard error."""
@@ -81,10 +123,6 @@ class TotalSegProvider:
 
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         subj_dir = self.root / subject
-        raw = subj_dir / "ct_raw.npy"
-        if not raw.exists():
-            raise FileNotFoundError(f"{raw} missing (v2 requires ct_raw.npy)")
-        image_np = np.load(raw, mmap_mode="r")
         label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
         center = req.center
         if center is None:
@@ -93,12 +131,31 @@ class TotalSegProvider:
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
         norm = (normalize_ct if self.modality == "ct"
                 else (lambda a: normalize_mri(a, self._ct_stats[subject])))
-        image_t, label_t, geom = crop_and_place(
-            image_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
-            crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,
-            jitter=self.crop_jitter, rng=req.rng,
-            mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
-            normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
+        # Fast path: a pre-resampled `ct_raw_{crop_spacing:g}mm.npy` image cache (whole-body
+        # native CT downsampled to the crop pitch once, offline). Used only when its pitch
+        # equals the requested crop_spacing (so the image is never upsampled); the mask still
+        # comes from the full-res native label so occupancy is unchanged. See docs/logs.md.
+        cache_p = subj_dir / f"ct_raw_{req.crop_spacing_mm:g}mm.npy"
+        if cache_p.exists():
+            img_cache_np = np.load(cache_p, mmap_mode="r")
+            image_t, label_t, geom = crop_and_place_cached(
+                img_cache_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
+                crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,
+                cache_spacing_mm=float(req.crop_spacing_mm),
+                jitter=self.crop_jitter, rng=req.rng,
+                mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
+                normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
+        else:
+            raw = subj_dir / "ct_raw.npy"
+            if not raw.exists():
+                raise FileNotFoundError(f"{raw} missing (v2 requires ct_raw.npy)")
+            image_np = np.load(raw, mmap_mode="r")
+            image_t, label_t, geom = crop_and_place(
+                image_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
+                crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,
+                jitter=self.crop_jitter, rng=req.rng,
+                mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
+                normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
         return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom)
 

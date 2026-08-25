@@ -1,0 +1,70 @@
+# @package _global_
+# 49_abdomen_synth_ceiling — the synth twin of 48_abdomen_ceiling: SAME frozen-CoLiPri /
+# PatchSet3D / calibrated-aug recipe and the SAME 10-abdominal-organ REAL val, but TRAIN
+# exclusively on the GMM-synth MAISI mask bank (10 matching MAISI classes) instead of real
+# TotalSeg. Reads as "how close does synth-only training get to the real abdomen ceiling?"
+#
+#   python experiments/3d/train.py experiment=49_abdomen_synth_ceiling
+#
+# Groups mirror 48 but swap the dataset for the cross-source v2 group (train synth, val real):
+#   dataset=synth_gmm_v2  — synth_gmm cohort-hook TRAIN + real-TotalSeg VAL, loader_v2
+#   model=m1              — PatchSet3D transformer head + Muon recipe
+#   encoder=e1            — frozen Primus/CoLiPri, native-grid, spacing-aware
+defaults:
+  - /encoder: e1
+  - override /dataset: synth_gmm_v2
+  - override /model: m1
+  - override /augmentations: calibrated
+  - _self_
+
+data:
+  # TRAIN: 10 abdominal organs as MAISI names (spaces, not TotalSeg underscores).
+  train_classes: [liver, spleen, pancreas, gallbladder, stomach, duodenum,
+                  right kidney, left kidney, right adrenal gland, left adrenal gland]
+  # Match 48's crop regime so the val ceiling is directly comparable: fixed 2 mm crops.
+  crop_spacing_mm: 2
+  train_spacing_range: null
+  val:
+    # VAL: the identical 10-organ REAL abdomen set 48 evaluates on (TotalSeg names),
+    # at 48's 2 mm / occupancy(0.5) crop regime — the ceiling being compared against.
+    val_classes: [liver, spleen, pancreas, gallbladder, stomach, duodenum,
+                  kidney_right, kidney_left, adrenal_gland_right, adrenal_gland_left]
+    crop_spacing_mm: 2
+    mask_occupancy_thr: 0.5
+
+# calibrated aug, trimmed exactly as 48 (applied on GPU; calibrated sets augmentations.gpu=true).
+augmentations:
+  task:
+    affine:
+      p: 0.5
+      scale_min: 1
+      scale_max: 1
+    elastic:
+      p: 0
+    deform:
+      p: 0
+  per_image:
+    affine:
+      p: 0
+    elastic:
+      p: 0
+    deform:
+      p: 0
+
+arch:
+  encoder_frozen: true
+
+eval:
+  crop_jitter: 0     # centered eval crops for a clean, reproducible ceiling
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  lawa_k: 0
+
+wandb:
+  name: 49_abdomen_synth_ceiling

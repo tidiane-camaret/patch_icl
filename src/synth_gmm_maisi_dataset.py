@@ -160,6 +160,15 @@ class SynthGmmMaisiDataset(Dataset):
             nrng = np.random.default_rng(hash((self.eval_seed, idx, "n")) & 0xFFFFFFFF)
         else:
             rng, nrng = random, np.random.default_rng()
+        return self.assemble(rng, nrng, crop_mm)
+
+    def assemble(self, rng, nrng, crop_mm):
+        """Build one in-context item from an already-chosen (rng, nrng) and physical spacing.
+
+        Split out from __getitem__ so the v2 cohort provider (src/providers/synth_gmm.py)
+        can drive it from the InContextDataset engine's per-item RNG, sharing this single
+        cohort-sample + shared-GMM + crop/paint implementation. `rng` selects the cohort and
+        crops; `nrng` draws the cohort-shared GMM and the paint noise."""
         cls, cohort = self.cs.sample_cohort(rng)
 
         # cohort-shared GMM draw (indexed by shared MAISI id 0..maxid); id 0 = air (fixed)
@@ -213,4 +222,16 @@ class SynthGmmMaisiDataset(Dataset):
 
 def _name_to_id(name):
     from data.maisi_classes import MAISI_CLASS_TO_IDX
-    return MAISI_CLASS_TO_IDX[name]
+    try:
+        return MAISI_CLASS_TO_IDX[name]
+    except KeyError:
+        # Common trap: TotalSeg underscore names (e.g. 'kidney_right') reach the MAISI
+        # synth bank, whose vocabulary uses spaces ('right kidney'). Fail with the likely
+        # fix instead of a bare KeyError. See docs on cross-source class vocabularies.
+        alt = name.replace("_", " ")
+        hint = (f" — did you mean {alt!r}? (MAISI uses space-separated names; "
+                f"'{name}' looks like a TotalSeg class)"
+                if alt in MAISI_CLASS_TO_IDX else
+                f" (valid MAISI names use spaces, e.g. 'right kidney'; "
+                f"pass MAISI ids/names or 'all')")
+        raise KeyError(f"{name!r} is not a MAISI class{hint}") from None

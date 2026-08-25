@@ -161,6 +161,63 @@ BALANCED_CLASSES: list[str] = [
 ]
 
 
+# ── TotalSegmentator part-model class sets (verbatim from the original repo) ──────────────
+# The 5 "total" part models each segment a disjoint subset of the 117 CT classes; together
+# they partition class_map["total"]. Copied EXACTLY (order = the part model's own label ids)
+# from totalsegmentator.map_to_binary.class_map_5_parts so an experiment can target one part's
+# native class list — e.g. exp 52 uses the frozen Dataset291 (part1 organs) encoder, so its
+# faithful eval set is TS_SET_ORGANS. Resolve via resolve_classes("ts_organs" | "ts_vertebrae"
+# | "ts_cardiac" | "ts_muscles" | "ts_ribs").
+TS_SET_ORGANS: list[str] = [   # Dataset291_..._part1_organs (24)
+    "spleen", "kidney_right", "kidney_left", "gallbladder", "liver", "stomach", "pancreas",
+    "adrenal_gland_right", "adrenal_gland_left", "lung_upper_lobe_left", "lung_lower_lobe_left",
+    "lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right", "esophagus",
+    "trachea", "thyroid_gland", "small_bowel", "duodenum", "colon", "urinary_bladder",
+    "prostate", "kidney_cyst_left", "kidney_cyst_right",
+]
+
+TS_SET_VERTEBRAE: list[str] = [   # Dataset292_..._part2_vertebrae (26)
+    "sacrum", "vertebrae_S1", "vertebrae_L5", "vertebrae_L4", "vertebrae_L3", "vertebrae_L2",
+    "vertebrae_L1", "vertebrae_T12", "vertebrae_T11", "vertebrae_T10", "vertebrae_T9",
+    "vertebrae_T8", "vertebrae_T7", "vertebrae_T6", "vertebrae_T5", "vertebrae_T4",
+    "vertebrae_T3", "vertebrae_T2", "vertebrae_T1", "vertebrae_C7", "vertebrae_C6",
+    "vertebrae_C5", "vertebrae_C4", "vertebrae_C3", "vertebrae_C2", "vertebrae_C1",
+]
+
+TS_SET_CARDIAC: list[str] = [   # Dataset293_..._part3_cardiac (18)
+    "heart", "aorta", "pulmonary_vein", "brachiocephalic_trunk", "subclavian_artery_right",
+    "subclavian_artery_left", "common_carotid_artery_right", "common_carotid_artery_left",
+    "brachiocephalic_vein_left", "brachiocephalic_vein_right", "atrial_appendage_left",
+    "superior_vena_cava", "inferior_vena_cava", "portal_vein_and_splenic_vein",
+    "iliac_artery_left", "iliac_artery_right", "iliac_vena_left", "iliac_vena_right",
+]
+
+TS_SET_MUSCLES: list[str] = [   # Dataset294_..._part4_muscles (23)
+    "humerus_left", "humerus_right", "scapula_left", "scapula_right", "clavicula_left",
+    "clavicula_right", "femur_left", "femur_right", "hip_left", "hip_right", "spinal_cord",
+    "gluteus_maximus_left", "gluteus_maximus_right", "gluteus_medius_left",
+    "gluteus_medius_right", "gluteus_minimus_left", "gluteus_minimus_right", "autochthon_left",
+    "autochthon_right", "iliopsoas_left", "iliopsoas_right", "brain", "skull",
+]
+
+TS_SET_RIBS: list[str] = [   # Dataset295_..._part5_ribs (26)
+    "rib_left_1", "rib_left_2", "rib_left_3", "rib_left_4", "rib_left_5", "rib_left_6",
+    "rib_left_7", "rib_left_8", "rib_left_9", "rib_left_10", "rib_left_11", "rib_left_12",
+    "rib_right_1", "rib_right_2", "rib_right_3", "rib_right_4", "rib_right_5", "rib_right_6",
+    "rib_right_7", "rib_right_8", "rib_right_9", "rib_right_10", "rib_right_11", "rib_right_12",
+    "sternum", "costal_cartilages",
+]
+
+# resolve_classes() special-string -> part set. Keys match the `total` sub-model names.
+TS_PART_SETS: dict[str, list[str]] = {
+    "ts_organs": TS_SET_ORGANS,
+    "ts_vertebrae": TS_SET_VERTEBRAE,
+    "ts_cardiac": TS_SET_CARDIAC,
+    "ts_muscles": TS_SET_MUSCLES,
+    "ts_ribs": TS_SET_RIBS,
+}
+
+
 def balanced_ood_tiers() -> dict[str, list[str]]:
     """Split the held-out complement of BALANCED_CLASSES into graded OOD tiers (CT).
 
@@ -199,6 +256,12 @@ def resolve_classes(
       ``"not_benchmark"`` → ALL_CLASSES[:117] / MRI_ALL_CLASSES minus the benchmark set
       ``"balanced"``      → BALANCED_CLASSES (CT only — thickness/category-balanced train set)
       ``"not_balanced"``  → ALL_CLASSES[:117] minus the balanced set (the graded OOD pool)
+      ``"ts_organs"`` / ``"ts_vertebrae"`` / ``"ts_cardiac"`` / ``"ts_muscles"`` / ``"ts_ribs"``
+                          → the verbatim class list of one TotalSegmentator `total` part model
+                            (TS_PART_SETS; CT only). ``ts_organs`` = the 24 classes exp 52's
+                            Dataset291 encoder was trained on (incl. kidney_cyst_left/right,
+                            which are ~absent from standard CT label.npy → drop them in the
+                            config if you want to avoid zero-Dice rows).
     Otherwise read ``{totalseg_root}/label_stats.csv`` and return classes whose
     ``split`` column matches *value* (e.g. ``"train"`` / ``"val"``).
 
@@ -232,6 +295,9 @@ def resolve_classes(
     if value == "not_balanced":
         bal_set = set(BALANCED_CLASSES)
         return [c for c in ALL_CLASSES[:117] if c not in bal_set]
+
+    if value in TS_PART_SETS:                       # TotalSegmentator part-model class sets
+        return list(TS_PART_SETS[value])
 
     if totalseg_root is None:
         raise ValueError("totalseg_root must be provided when train/val_classes is a split name")

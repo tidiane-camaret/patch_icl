@@ -1,0 +1,23 @@
+# @package _global_
+# 51_abdomen_synth_nnunet_ts_3mm — 50 at the encoder's native pitch. IDENTICAL to
+# 50_abdomen_synth_nnunet_ts (frozen TotalSegmentator nnU-Net encoder, GMM-synth train / real
+# abdomen val), but with BOTH train and eval crops at 3 mm to match Dataset297's pretrain
+# spacing, so the frozen conv's receptive fields see in-distribution structure.
+#
+# Trade-off vs 50 (2 mm): FOV grows to 128*3 = 384 mm (near whole-torso), so abdominal organs
+# occupy fewer cells on the 16^3 grid (cell = 8*3 = 24 mm). 50 vs 51 isolates "encoder in-
+# distribution scale" against "target resolution on the grid".
+#
+#   python experiments/3d/train.py experiment=51_abdomen_synth_nnunet_ts_3mm
+defaults:
+  - 50_abdomen_synth_nnunet_ts
+  - _self_
+
+data:
+  crop_spacing_mm: 3          # TRAIN crop pitch = encoder pretrain spacing (Dataset297 = 3 mm)
+  train_spacing_range: null   # fixed 3 mm (no per-batch spacing jitter)
+  val:
+    crop_spacing_mm: 3        # EVAL crop pitch matches train + encoder pretrain
+
+wandb:
+  name: 51_abdomen_synth_nnunet_ts_3mm

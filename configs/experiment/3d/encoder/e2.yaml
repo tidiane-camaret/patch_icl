@@ -1,0 +1,25 @@
+# @package _global_
+# e2 — frozen TotalSegmentator nnU-Net (PlainConvUNet) image encoder. The conv twin of e1
+# (frozen CoLiPri Primus). Selected as a Hydra group: `encoder=e2`. Writes only the
+# encoder-forward `arch.*` keys; the transformer head + optim live in the `model` group
+# (model/m1.yaml). Both merge into one `arch:` block during composition.
+#
+# Default weights = Dataset297 (total, 3 mm). At a 128^3 input the 5 encoder stages land at
+# 128/64/32/16/8^3 with 32/64/128/256/320 ch; we concat stages {2,3,4} resampled to R=16
+# (stage 3 is the native 16^3 anchor, stage 2 a 2x avg-pool down, stage 4 a 2x trilinear up)
+# -> out_ch=704. The frozen conv re-applies its pretrain CTNormalization internally (invert
+# the loader z-score -> clip -> dataset mean/std), so features stay in-distribution.
+#
+# NOT spacing-aware (conv net, no RoPE): the physical cell scale is set purely by
+# data.crop_spacing_mm. The encoder was pretrained at 3 mm — crop_spacing_mm=3 keeps the conv
+# receptive fields in-distribution; other pitches (e.g. 2 mm for the 48/49 abdomen ceiling)
+# feed it structure at a different scale (an ablation knob, not a bug).
+arch:
+  encoder: nnunet_ts
+  encoder_frozen: true
+  nnunet_ts_weights: ${paths.totalseg_nnunet}/Dataset297_total_3mm/3d_fullres
+  nnunet_ts_stages: [2, 3, 4]   # multi-scale concat -> out_ch = 128+256+320 = 704
+  encoder_precision: bf16       # autocast dtype of the frozen encoder forward
+  enc_dims: [32, 32, 32, 32]    # ignored when encoder=nnunet_ts (schema parity)
+  resolution: 16                # token grid R; stage 3 is native 16^3 at a 128^3 input
+  img_embed_mlp: true           # MLP img_embed (Linear->GELU->Linear) over the 704-dim feats

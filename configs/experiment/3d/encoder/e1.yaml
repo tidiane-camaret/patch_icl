@@ -1,0 +1,20 @@
+# @package _global_
+# e1 — frozen CoLiPri (nnUNet Primus-M) image encoder, native-grid + spacing-aware.
+# Selected as a Hydra group: `encoder=e1`. Writes only the encoder-forward `arch.*`
+# keys; the transformer head + optim live in the `model` group (see model/m1.yaml).
+# Both merge into one `arch:` block during composition.
+#
+# native_grid: the ViT tokenizes at image_size/8 = 128/8 = 16^3, so `resolution` must
+# stay 16. spacing_aware scales the frozen ViT RoPE by physical voxel spacing (mm, not
+# tokens) — pair with a fixed/variable data.crop_spacing_mm.
+arch:
+  encoder: primus
+  encoder_frozen: true
+  primus_sidecar: ${paths.colipri}/primus_colipri.json
+  encoder_stage: 8              # early-exit: keep first 8/16 EVA blocks (~half the encoder FLOPs)
+  encoder_native_grid: true     # tokenize at image_size/8 (encoder FLOPs track data.image_size)
+  encoder_spacing_aware: true   # RoPE in mm (implies native_grid); pair with data.crop_spacing_mm
+  encoder_precision: bf16       # autocast dtype of the frozen encoder forward
+  enc_dims: [32, 32, 32, 32]    # ignored when encoder=primus (schema parity)
+  resolution: 16                # token grid R = image_size/8 under native_grid; must match
+  img_embed_mlp: true           # MLP img_embed (Linear->GELU->Linear); preserves primus 864-dim feats

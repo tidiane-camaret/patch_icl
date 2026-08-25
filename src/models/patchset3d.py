@@ -112,6 +112,8 @@ class PatchSet3D(nn.Module):
         encoder: str = "conv",
         encoder_frozen: bool = True,
         primus_sidecar: str = None,
+        nnunet_ts_weights: str = None,
+        nnunet_ts_stages=(2, 3, 4),
         img_embed_mlp: bool = False,
         encoder_stage: int = None,
         encoder_native_grid: bool = False,
@@ -170,10 +172,23 @@ class PatchSet3D(nn.Module):
             self.encoder = TapCTEncoder(resolution, image_size, frozen=encoder_frozen,
                                         device="cpu", encoder_stage=encoder_stage,
                                         precision=encoder_precision)
+        elif encoder == "nnunet_ts":
+            # Frozen TotalSegmentator nnU-Net PlainConvUNet encoder (default: Dataset297,
+            # total 3 mm). Multi-scale concat of nnunet_ts_stages resampled to R^3; input is
+            # 1-channel (image only), spacing arg ignored (conv net). nnunet_ts_weights points
+            # at the weights folder (plans.json + fold_0/checkpoint_final.pth).
+            from src.models.encoders.nnunet_ts import NnUNetTSEncoder   # lazy: avoids import cycle
+            if not nnunet_ts_weights:
+                raise ValueError("encoder='nnunet_ts' requires arch.nnunet_ts_weights")
+            self.encoder = NnUNetTSEncoder(nnunet_ts_weights, resolution,
+                                           stages=tuple(nnunet_ts_stages),
+                                           frozen=encoder_frozen, device="cpu",
+                                           precision=encoder_precision)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
-            raise ValueError(f"unknown arch.encoder {encoder!r} (conv | primus | tap_ct)")
+            raise ValueError(f"unknown arch.encoder {encoder!r} "
+                             f"(conv | primus | tap_ct | nnunet_ts)")
         # Encoder feature -> token width e. Default: a single Linear. When the encoder
         # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
         # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width

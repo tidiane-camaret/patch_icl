@@ -14,7 +14,8 @@ import torch
 
 from src.benchmark_models.base import InContextModel  # noqa: F401
 
-_ALL_MODELS = ["native_vit", "native_resenc", "medverse", "multilevel", "nninteractive"]
+_ALL_MODELS = ["native_vit", "native_resenc", "medverse", "multilevel", "nninteractive",
+               "totalsegmentator"]
 
 
 def load_model(
@@ -61,6 +62,13 @@ def load_model(
         if ckpt_path is None:
             raise ValueError("ckpt_path is required for nninteractive")
         return NNInteractiveAdapter(ckpt_path=ckpt_path, device=device, **kwargs)
+
+    if name == "totalsegmentator":
+        from src.benchmark_models.totalseg import TotalSegModel
+        wdir = kwargs.pop("weights_dir", None) or ckpt_path
+        if not wdir:
+            raise ValueError("totalsegmentator needs weights_dir (a .../<Dataset>/3d_fullres folder)")
+        return TotalSegModel(wdir, device=device, **kwargs)
 
     raise ValueError(
         f"Unknown model {name!r}. Choose from: {', '.join(_ALL_MODELS)}"

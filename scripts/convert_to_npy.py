@@ -88,6 +88,23 @@ def _iso_resize(vol: np.ndarray, target: tuple, order: int = 1, aa: bool = True,
     return out
 
 
+def _resample_to_spacing(vol: np.ndarray, native_sp, target_sp: float,
+                         order: int = 1, aa: bool = True) -> np.ndarray:
+    """Resample a volume from `native_sp` (per-axis mm) to isotropic `target_sp` mm.
+
+    Unlike `_iso_resize` (which fits the longest axis into a fixed cube, giving a per-subject
+    variable pitch), this yields an exact `target_sp`-mm grid at the volume's own extent —
+    what the v2 crop loader needs to skip the full-res read+resample. Gaussian AA before
+    downsampling (order>0) matches _iso_resize; nearest (order=0) for labels needs none."""
+    zoom = tuple(float(s) / target_sp for s in native_sp)
+    new_shape = tuple(max(1, round(n * z)) for n, z in zip(vol.shape, zoom))
+    if aa and order > 0:
+        sigma = [max(0.0, 0.5 * (n / m - 1)) for n, m in zip(vol.shape, new_shape)]
+        if any(s > 0.1 for s in sigma):
+            vol = ndi.gaussian_filter(vol, sigma=sigma)
+    return ndi.zoom(vol, tuple(m / n for m, n in zip(new_shape, vol.shape)), order=order)
+
+
 def _default_data_dir() -> str:
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(config_name="config")
@@ -162,6 +179,7 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
     size = task["size"]
     modality = task["modality"]
     store_raw = task["store_raw"]
+    target_sp = task.get("target_spacing")
     subj = subj_dir.name
 
     ct_out    = subj_dir / "ct.npy"
@@ -172,13 +190,18 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
     ct_sized    = subj_dir / f"ct_{size_str}.npy"  if size else None
     label_sized = subj_dir / f"label_{size_str}.npy" if size else None
 
+    # Pre-resampled image cache at `target_sp` mm (image only; the v2 loader keeps the
+    # occupancy mask on the full-res native label). Named to match TotalSegProvider.load.
+    ct_cache_out = subj_dir / f"ct_raw_{target_sp:g}mm.npy" if target_sp else None
+
     need_native = overwrite or not (ct_out.exists() and label_out.exists())
     need_raw    = store_raw and (overwrite or not ct_raw_out.exists())
     need_sized  = size is not None and (
         overwrite or not (ct_sized.exists() and label_sized.exists())
     )
+    need_cache  = ct_cache_out is not None and (overwrite or not ct_cache_out.exists())
 
-    if not need_native and not need_raw and not need_sized:
+    if not need_native and not need_raw and not need_sized and not need_cache:
         return subj, "skip", None, None, None
 
     try:
@@ -236,6 +259,32 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
             sp = tuple(native_spacing) if native_spacing else None
             np.save(ct_sized,    _iso_resize(vol,   size, order=1, aa=True,  spacing=sp).astype(np.float16))
             np.save(label_sized, _iso_resize(label, size, order=0, aa=False, spacing=sp))
+
+        if need_cache:
+            # Raw HU (native) + native spacing: reuse the in-memory read when the native/raw
+            # block ran, else load ct_raw.npy (raw int16 HU) and read spacing from the header.
+            raw_hu = raw if (need_native or need_raw) else None
+            if raw_hu is None:
+                if ct_raw_out.exists():
+                    raw_hu = np.load(ct_raw_out, mmap_mode="r").astype(np.float32)
+                else:
+                    img_fname = "mri.nii.gz" if modality == "mri" else "ct.nii.gz"
+                    ct_img = nib.as_closest_canonical(nib.load(str(subj_dir / img_fname)))
+                    raw_hu = ct_img.get_fdata(dtype=np.float32)
+                    native_spacing = [float(x) for x in nib.affines.voxel_sizes(ct_img.affine)[:3]]
+                    native_shape = list(raw_hu.shape)
+            if native_spacing is None:
+                img_fname = "mri.nii.gz" if modality == "mri" else "ct.nii.gz"
+                canonical = nib.as_closest_canonical(nib.load(str(subj_dir / img_fname)))
+                native_spacing = [float(x) for x in nib.affines.voxel_sizes(canonical.affine)[:3]]
+            if native_shape is None:
+                native_shape = list(raw_hu.shape)
+            img_rsp = _resample_to_spacing(np.asarray(raw_hu, dtype=np.float32),
+                                           native_spacing, float(target_sp), order=1, aa=True)
+            if modality == "mri":
+                np.save(ct_cache_out, img_rsp.astype(np.float16))
+            else:
+                np.save(ct_cache_out, np.clip(np.round(img_rsp), -32768, 32767).astype(np.int16))
 
     except Exception:
         return subj, traceback.format_exc(), None, None, None

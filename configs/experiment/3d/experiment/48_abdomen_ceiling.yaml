@@ -1,0 +1,62 @@
+# @package _global_
+# 48_abdomen_ceiling — achievable-Dice ceiling on 10 abdominal organs with a FROZEN
+# CoLiPri encoder, in-context dataloader v2, real cross-subject tasks only.
+#
+#   python experiments/3d/train.py experiment=48_abdomen_ceiling
+#
+# Self-contained via three modular groups (no dependency on other experiment yamls):
+#   dataset=d1  — abdomen TotalSeg, loader_v2, 2 mm crops
+#   model=m1    — PatchSet3D transformer head + Muon recipe
+#   encoder=e1  — frozen Primus/CoLiPri, native-grid, spacing-aware
+#
+# NOTE on "ceiling": v2 ignores self_context/synth/per_image, so this is a pure
+# cross-subject run. Augmentation is calibrated-minus-elastic-minus-affine-scale, but
+# task flips (p=0.5), affine rotation (+/-30 deg, p=0.2) and diffeomorphic deform
+# (p=0.2) STILL fire on GPU. For a stricter geometric ceiling also set
+# augmentations.task.{affine.p,deform.p,flip.p_d,flip.p_h,flip.p_w}=0.
+defaults:
+  - /encoder: e1
+  - override /dataset: d1
+  - override /model: m1
+  - override /augmentations: calibrated
+  - _self_
+
+# calibrated aug, trimmed: elastic off + affine scaling neutralized (applied on GPU,
+# since calibrated sets augmentations.gpu=true → v2 defers aug to the train loop).
+augmentations:
+  task:
+    affine:
+      p: 0.5
+      scale_min: 1
+      scale_max: 1
+    elastic:
+      p: 0
+    deform: 
+      p: 0
+  per_image:
+    affine:
+      p: 0
+    elastic:
+      p: 0
+    deform: 
+      p: 0
+      
+arch:
+  encoder_frozen: true
+
+eval:
+  crop_jitter: 0     # centered eval crops for a clean, reproducible ceiling
+                     # (the ad-hoc run left this null = T//4 jitter)
+
+train:
+  # schedule keys must be set here — train.yaml's _self_ shadows the model group for these
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  lawa_k: 0
+
+wandb:
+  name: 48_abdomen_ceiling

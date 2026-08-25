@@ -13,6 +13,13 @@ Best checkpoint (by mean val Dice) is saved so experiments/3d/eval.py can reload
     python experiments/3d/train.py                       # medverse on totalseg (default)
     python experiments/3d/train.py dataset=omnisynth3d   # train on omniSynth-3D
     python experiments/3d/train.py train.loss=bce_dice train.optimizer=adamw
+    python experiments/3d/train.py experiment=42_reg_to_all data.loader_v2=true  # v2 dataloader
+
+data.loader_v2=true routes BOTH the train and eval loaders (common.train_loader /
+common.make_eval_loader) through the v2 in-context dataloader (src/incontext_dataset_v2.py:
+generic InContextDataset engine over a TotalSegProvider, single raw_ct organ-crop path). v2
+implements the cross-subject real-task path only — the self_context/synth/multi-label/cascade
+probes are NOT supported (v2 design non-goals); those data.* keys are ignored under loader_v2.
 """
 
 import collections
@@ -253,6 +260,8 @@ def build_model(cfg: DictConfig):
             "encoder": a.get("encoder", "conv"),
             "encoder_frozen": a.get("encoder_frozen", True),
             "primus_sidecar": a.get("primus_sidecar", None),
+            "nnunet_ts_weights": a.get("nnunet_ts_weights", None),
+            "nnunet_ts_stages": a.get("nnunet_ts_stages", (2, 3, 4)),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
             "encoder_native_grid": a.get("encoder_native_grid", False),

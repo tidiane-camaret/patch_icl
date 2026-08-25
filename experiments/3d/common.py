@@ -284,7 +284,7 @@ def build_dataset(cfg, split: str):
         # per idx via eval_seed) — max_val_subjects overrides, default 100.
         length = (int(d.get("epoch_length", 10000)) if split == "train"
                   else int(d.get("max_val_subjects") or 100))
-        return SynthGmmMaisiDataset(
+        synth_ds = SynthGmmMaisiDataset(
             bank_dir=bank, image_size=tuple(d.image_size), context_size=d.context_size,
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
             crop_jitter=(cfg.get("eval", {}).get("crop_jitter", None) if split != "train"
@@ -301,12 +301,30 @@ def build_dataset(cfg, split: str):
             class_balanced=bool(d.get("class_balanced", True)),
             # to_container -> plain dict/list so CohortSampler's isinstance checks see native
             # types (a DictConfig/ListConfig randomness spec would slip past dict/list checks).
-            cohort=OmegaConf.to_container(d.get("cohort", {}), resolve=True),
+            # A config that doesn't define data.cohort yields a plain {} default (which
+            # to_container rejects), so only unwrap when it's actually an OmegaConf node.
+            cohort=(OmegaConf.to_container(d.cohort, resolve=True)
+                    if OmegaConf.is_config(d.get("cohort")) else dict(d.get("cohort") or {})),
             # gpu_realize: ship native crops + defer occupancy resample + paint to the GPU
             # train loop (src/gpu_synth_realize). TRAIN only — val is a real source via eval_cfg.
             gpu_realize=(split == "train" and bool(d.get("gpu_realize", False))),
             gpu_realize_max_native=int(d.get("gpu_realize_max_native", 256)),
             eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))))
+        if not d.get("loader_v2", False):
+            return synth_ds
+        # loader_v2: drive the same cohort dataset through the generic v2 engine via the
+        # cohort hook (src/providers/synth_gmm.py) — so synth shares the engine's task+
+        # intensity aug path with totalseg-v2. Aug is deferred to GPU (gpu=true) or skipped
+        # on eval (aug_cfg=None); gpu_realize items carry no image and stay aug-free here.
+        from src.incontext_dataset_v2 import InContextDataset
+        from src.providers.synth_gmm import SynthGmmProvider
+        is_train = split == "train"
+        return InContextDataset(
+            SynthGmmProvider(synth_ds), context_size=d.context_size,
+            aug_cfg=(cfg.augmentations if is_train else None),
+            defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))))
 
     d = cfg.data
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
@@ -447,6 +465,11 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
             num_workers=nw, collate_fn=incontext_collate_fn,
             pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
             prefetch_factor=2 if nw > 0 else None,
+            # forkserver: eval workers spawn from a clean server that never touched CUDA, so
+            # they don't inherit the parent's CUDA context (fork does -> the worker aborts in
+            # ExchangeDevice with "CUDA error: initialization error" at the first eval batch,
+            # since measure_flops/training already init CUDA in the parent). See docs/logs.md.
+            multiprocessing_context=("forkserver" if nw > 0 and DEVICE.type == "cuda" else None),
         )
         if spacing is not None:
             # totalseg_more_labels subclasses TotalSegInContextDataset, so it honours the
@@ -458,6 +481,38 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
             return DataLoader(ds, batch_sampler=batch_sampler, **common)
         return DataLoader(ds, batch_size=int(e.get("batch_size", 8)), shuffle=False, **common)
     _, root, is_mri = _source_root(cfg)
+    if d.get("loader_v2", False):
+        # v2 eval loader: deterministic cross-subject tasks over the raw_ct crop provider
+        # (src/incontext_dataset_v2.py). v2 does NOT implement the self_context/synth probes
+        # (v2 design non-goals), so any eval self_context settings are ignored here. Mirrors
+        # the v1 tail's (idx, spacing) constant-spacing handling below.
+        from src.incontext_dataset_v2 import InContextDataset
+        from src.providers.totalseg import TotalSegProvider
+        provider = TotalSegProvider(
+            root=root, classes=list(classes), image_size=tuple(d.image_size),
+            split=split, max_subjects=e.get("n_subjects", None),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=e.get("crop_jitter", None),
+            mask_downsample=d.get("mask_downsample", "occupancy"),
+            mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
+            modality=("mri" if is_mri else "ct"))
+        ds_v2 = InContextDataset(
+            provider, context_size=d.context_size, class_balanced=False,
+            aug_cfg=None, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            eval_seed=int(e.get("seed", 0)))
+        nw = int(e.get("workers", 4))
+        common = dict(num_workers=nw, collate_fn=incontext_collate_fn,
+                      pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
+                      prefetch_factor=2 if nw > 0 else None,
+                      # forkserver so eval workers don't inherit the parent CUDA context (fork
+                      # -> "CUDA error: initialization error" abort at first eval batch). See
+                      # the build_dataset branch above / docs/logs.md.
+                      multiprocessing_context=("forkserver" if nw > 0 and DEVICE.type == "cuda" else None))
+        if spacing is not None:
+            batch_sampler = SpacingBatchSampler(
+                SequentialSampler(ds_v2), int(e.get("batch_size", 8)), [spacing, spacing])
+            return DataLoader(ds_v2, batch_sampler=batch_sampler, **common)
+        return DataLoader(ds_v2, batch_size=int(e.get("batch_size", 8)), shuffle=False, **common)
     ds = TotalSegInContextDataset(
         root=root,
         classes=list(classes),
@@ -495,6 +550,9 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         pin_memory=DEVICE.type == "cuda",
         persistent_workers=nw > 0,
         prefetch_factor=2 if nw > 0 else None,
+        # forkserver so eval workers don't inherit the parent CUDA context (fork ->
+        # "CUDA error: initialization error" abort at first eval batch). See docs/logs.md.
+        multiprocessing_context=("forkserver" if nw > 0 and DEVICE.type == "cuda" else None),
     )
     if spacing is not None:
         # Constant-spacing pass: SpacingBatchSampler([s, s]) makes every batch that one

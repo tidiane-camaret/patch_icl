@@ -50,12 +50,37 @@ class InContextDataset(Dataset):
         self.defer_aug = bool(defer_aug)
         self.crop_spacing_mm = float(crop_spacing_mm)
         self.eval_seed = eval_seed
-        self.samples = [(s, c) for c in provider.classes
-                        for s in provider.subjects_for(c)]
-        self.active_classes = [c for c in provider.classes if provider.subjects_for(c)]
+        # Cohort providers (e.g. synth_gmm) sample a whole K+1 cohort + a shared appearance
+        # jointly, which the independent target+context load path below cannot express. They
+        # implement the optional `assemble_task` hook instead; the engine then owns only aug +
+        # the per-item RNG + (idx, spacing) unpacking. No per-subject samples in this mode.
+        self.cohort_mode = hasattr(provider, "assemble_task")
+        if self.cohort_mode:
+            self.samples, self.active_classes = [], []
+            self._length = int(provider.epoch_length)
+        else:
+            self.samples = [(s, c) for c in provider.classes
+                            for s in provider.subjects_for(c)]
+            self.active_classes = [c for c in provider.classes if provider.subjects_for(c)]
 
     def __len__(self):
-        return len(self.samples)
+        return self._length if self.cohort_mode else len(self.samples)
+
+    def _aug_active(self):
+        return (self.aug_cfg is not None and getattr(self.aug_cfg, "enabled", False)
+                and not self.defer_aug)
+
+    def _augment_stacks(self, image_t, label_t, ctx_in, ctx_out):
+        """Shared task (geometric) + per-volume intensity aug over target+contexts.
+
+        ctx_in (K,1,T,T,T), ctx_out (K,T,T,T). Returns the augmented
+        (image_t, label_t, ctx_in, ctx_out)."""
+        imgs = torch.cat([image_t.unsqueeze(0), ctx_in], dim=0)
+        msks = torch.cat([label_t.unsqueeze(0), ctx_out], dim=0)
+        imgs, msks = apply_task_aug(imgs, msks, self.aug_cfg.task)
+        for i in range(imgs.shape[0]):
+            imgs[i] = apply_intensity_aug(imgs[i], self.aug_cfg.intensity)
+        return imgs[0], msks[0], imgs[1:], msks[1:]
 
     def __getitem__(self, idx):
         crop_spacing = self.crop_spacing_mm
@@ -63,6 +88,16 @@ class InContextDataset(Dataset):
             idx, crop_spacing = int(idx[0]), float(idx[1])
         rng = (random.Random(hash((self.eval_seed, idx)))
                if self.eval_seed is not None else random)
+
+        if self.cohort_mode:
+            item = self.provider.assemble_task(rng, crop_spacing)
+            # gpu_realize items ship a native-crop payload (no "image") that is painted +
+            # augmented on-GPU downstream; only the CPU-paint item gets the engine's aug.
+            if "image" in item and self._aug_active():
+                (item["image"], item["label"],
+                 item["context_in"], item["context_out"]) = self._augment_stacks(
+                    item["image"], item["label"], item["context_in"], item["context_out"])
+            return item
 
         if self.class_balanced:
             cls = rng.choice(self.active_classes)
@@ -96,20 +131,16 @@ class InContextDataset(Dataset):
             context_out.append(context_out[i].clone())
             ctx_subjects.append(ctx_subjects[i])
 
-        if self.aug_cfg is not None and getattr(self.aug_cfg, "enabled", False) and not self.defer_aug:
-            imgs = torch.cat([image_t.unsqueeze(0), torch.stack(context_in)], dim=0)
-            msks = torch.cat([label_t.unsqueeze(0), torch.stack(context_out)], dim=0)
-            imgs, msks = apply_task_aug(imgs, msks, self.aug_cfg.task)
-            for i in range(imgs.shape[0]):
-                imgs[i] = apply_intensity_aug(imgs[i], self.aug_cfg.intensity)
-            image_t, label_t = imgs[0], msks[0]
-            context_in, context_out = list(imgs[1:]), list(msks[1:])
+        ctx_in, ctx_out = torch.stack(context_in), torch.stack(context_out)
+        if self._aug_active():
+            image_t, label_t, ctx_in, ctx_out = self._augment_stacks(
+                image_t, label_t, ctx_in, ctx_out)
 
         return {
             "image": image_t,
             "label": label_t,
-            "context_in": torch.stack(context_in),
-            "context_out": torch.stack(context_out),
+            "context_in": ctx_in,
+            "context_out": ctx_out,
             "subject": subj,
             "context_subjects": ctx_subjects,
             "label_name": cls,

@@ -1,0 +1,48 @@
+# @package _global_
+# m1 — PatchSet3D set-transformer head + optimizer recipe. Selected as a Hydra group:
+# `model=m1`. Encoder-forward keys are NOT here — pick a `encoder` group (e.g. encoder=e1)
+# to fill arch.encoder*. Both groups merge into one `arch:` block.
+model: patchset3d
+
+arch:
+  # --- transformer / head geometry ---
+  l: 4                          # transformer layers
+  e: 768                        # token width
+  h: 3072                       # MLP hidden
+  a: 12                         # attention heads
+  transformer_rope: true        # RoPE positions in the set-transformer
+  rope_theta: 100.0             # small-grid base frequency (<=32 tokens/axis)
+  feat_norm: self               # encoder-feature norm: each side by its own stats (query decoupled)
+  full_attn: true               # dense all-to-all attention (not register-routed)
+  register_routed: false        # thinking rows NOT the sole cross-image bus
+  register_flex: false          # dense bool-mask SDPA (avoids flex/ptxas cold-compile hang)
+  thinking_rows: 64             # learned register rows prepended to the set
+  query_self_attn: true         # target-token self-attention
+  context_id_embed: true
+  max_context: 16
+  residual_decay: 0.95
+  fourier_bands: 8
+  mask_patch_size: 8            # mask tokenization tile (8^3 occupancy per cell)
+  mask_patch_decode_size: 8     # decode tile: 16*8 = 128^3 prediction
+  token_mask_ratio_support: 0.25  # SimMIM support-token masking (train only)
+  token_mask_ratio_query: 0.50    # query-token masking (train only)
+  compile: true                 # torch.compile the transformer (encoder stays eager)
+
+train:
+  # --- optim recipe (model-intrinsic) ---
+  # NOTE: keys that train.yaml's own block defines (epochs, batch_size, eval_every,
+  # grad_clip, workers, seed) are applied by _self_ AFTER this group, so they must be
+  # set in the experiment layer, not here. Only keys train.yaml does NOT define survive.
+  optimizer: adamw              # only used when muon=false; muon path builds AdamW+Muon
+  muon: true                    # Muon on transformer 2D matrices + AdamW on the rest + LAWA
+  muon_lr_scale: 0.1            # Muon lr = muon_lr_scale * lr
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  lawa_k: 10                    # LAWA checkpoint-averaging buffer
+  lr: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 1
+  loss: bce_dice
+  dice_weight: 1.0
+  checkpoint: null              # null = fresh init | <path> = resume

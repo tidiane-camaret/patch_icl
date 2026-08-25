@@ -1,0 +1,21 @@
+# @package _global_
+# 50_abdomen_synth_nnunet_ts — the frozen-nnU-Net-encoder twin of 49_abdomen_synth_ceiling.
+# IDENTICAL recipe to 49 (GMM-synth MAISI train, real 10-organ abdomen val, calibrated aug,
+# 2 mm crops, 400 epochs, Muon head) — the ONLY change is the image encoder: swap the frozen
+# CoLiPri Primus (encoder=e1) for the frozen TotalSegmentator nnU-Net PlainConvUNet
+# (encoder=e2, Dataset297 total 3 mm, multi-scale stages {2,3,4} -> out_ch 704). Reads as
+# "does a supervised-CT-segmentation encoder beat the self-supervised CoLiPri encoder on the
+# same abdomen synth->real transfer?".
+#
+#   python experiments/3d/train.py experiment=50_abdomen_synth_nnunet_ts
+#
+# Caveat: the nnU-Net encoder is NOT spacing-aware and was pretrained at 3 mm; 49's 2 mm crops
+# (kept for ceiling comparability) feed it structure at 1.5x its train scale. Ablate with
+# data.crop_spacing_mm=3 (+ data.val.crop_spacing_mm=3) to match the pretrain pitch.
+defaults:
+  - 49_abdomen_synth_ceiling
+  - override /encoder: e2
+  - _self_
+
+wandb:
+  name: 50_abdomen_synth_nnunet_ts

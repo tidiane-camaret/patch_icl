@@ -39,6 +39,19 @@ def dice_binary(pred: torch.Tensor, target: torch.Tensor) -> float:
     return (2 * inter + 1) / (union + 1)
 
 
+def dice_batch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Batched smooth Dice on `pred.device`. pred, target: (B,D,H,W) binary -> (B,).
+
+    Same smooth formula as dice_binary ((2*inter+1)/(union+1)); inter/union are integer
+    voxel counts so the result is bit-identical to the per-sample CPU path once rounded.
+    """
+    p = (pred > 0).flatten(1).float()
+    g = (target > 0).flatten(1).float()
+    inter = (p * g).sum(1)
+    union = p.sum(1) + g.sum(1)
+    return (2 * inter + 1) / (union + 1)
+
+
 def soft_dice_binary(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> float:
     """Threshold-free Dice between a soft probability map and a binary target (any shape).
 
@@ -49,6 +62,71 @@ def soft_dice_binary(prob: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
     inter = (p * g).sum().item()
     den = p.sum().item() + g.sum().item()
     return (2 * inter + eps) / (den + eps)
+
+
+def _surface_voxels(x: torch.Tensor) -> torch.Tensor:
+    """Boundary of a binary volume: foreground voxels touching background (6-conn).
+
+    x: (B,1,D,H,W) float {0,1} -> same shape {0,1}. Erosion keeps a voxel only if it and its
+    6 face-neighbours are all foreground (out-of-bounds padded with 0, so border voxels erode);
+    x - erosion is the surface. 6-connectivity + zero border matches scipy's default
+    binary_erosion, i.e. MONAI's get_mask_edges — validated to give NSD identical to
+    monai.metrics.compute_surface_dice.
+    """
+    xp = F.pad(x, (1, 1, 1, 1, 1, 1), value=0.0)
+    ero = xp[..., 1:-1, 1:-1, 1:-1]
+    for sl in (
+        (..., slice(1, -1), slice(1, -1), slice(0, -2)),   # -x / +x
+        (..., slice(1, -1), slice(1, -1), slice(2, None)),
+        (..., slice(1, -1), slice(0, -2), slice(1, -1)),   # -y / +y
+        (..., slice(1, -1), slice(2, None), slice(1, -1)),
+        (..., slice(0, -2), slice(1, -1), slice(1, -1)),   # -z / +z
+        (..., slice(2, None), slice(1, -1), slice(1, -1)),
+    ):
+        ero = torch.minimum(ero, xp[sl])
+    return x - ero
+
+
+def _ball_kernel(tol_mm: float, spacing, device, dtype):
+    """Boolean ball of physical radius `tol_mm` on a grid with per-axis `spacing` (mm/vox).
+
+    Returns (kernel (1,1,kz,ky,kx), radii (rz,ry,rx)). A voxel offset is in the ball iff its
+    physical displacement is <= tol_mm, so convolving a surface with this kernel and testing
+    >0 answers "is any surface voxel within tol_mm?" — a thresholded distance transform
+    restricted to the ball neighbourhood (no full EDT needed for a fixed tolerance).
+    """
+    r = [max(1, int(tol_mm / float(s) + 0.999)) for s in spacing]
+    axes = [torch.arange(-ri, ri + 1, device=device, dtype=torch.float32) for ri in r]
+    zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
+    d2 = ((zz * float(spacing[0])) ** 2 + (yy * float(spacing[1])) ** 2
+          + (xx * float(spacing[2])) ** 2)
+    return (d2 <= tol_mm ** 2).to(dtype)[None, None], tuple(r)
+
+
+def nsd_batch(pred: torch.Tensor, target: torch.Tensor, spacing, tol_mm: float) -> torch.Tensor:
+    """Normalized Surface Dice at tolerance `tol_mm` (voxel-count / MONAI convention).
+
+    Fully batched on `pred.device`: extracts both surfaces (6-conn erosion), dilates each by a
+    physical ball of radius tol_mm (a small fixed conv, not a full distance transform), and
+    scores the fraction of each surface lying within tolerance of the other. Both surfaces
+    empty -> 1.0; exactly one empty -> 0.0 (falls out of the formula: an empty surface dilates
+    to nothing, so the non-empty side scores 0 while its own count fills the denominator).
+
+    This is the voxel-count NSD, validated bit-for-bit against monai.metrics.
+    compute_surface_dice (not the marching-cubes area-weighted DeepMind variant).
+    pred, target: (B,D,H,W) binary. spacing: (3,) mm/voxel. -> (B,) NSD in [0,1].
+    """
+    p = (pred > 0)[:, None].float()
+    g = (target > 0)[:, None].float()
+    sp, sg = _surface_voxels(p), _surface_voxels(g)
+    k, r = _ball_kernel(tol_mm, spacing, p.device, p.dtype)
+    dil = lambda s: (F.conv3d(s, k, padding=r) > 0).float()  # noqa: E731
+    gd, pd = dil(sg), dil(sp)
+    num = (sp * gd).flatten(1).sum(1) + (sg * pd).flatten(1).sum(1)
+    den = sp.flatten(1).sum(1) + sg.flatten(1).sum(1)
+    nsd = num / den.clamp_min(1e-8)
+    nsd[den == 0] = 1.0
+    return nsd
 
 
 def _best_slice(mask: np.ndarray) -> int:
@@ -201,7 +279,7 @@ def _sample_detail(meta: dict | None) -> str:
 # no coarse-grid / refine family like 2D's patchset_cnn). One row per eval case, carrying
 # the per-case Dice + GT/context occupancy stats + the source-adaptive `detail` string.
 _SAMPLE_TABLE_COLS = ["epoch", "class", "in_train", "subject", "ctx_cases", "self_ctx",
-                      "dice", "soft_dice", "loss", "time_ms", "tgt_size", "tgt_occ",
+                      "dice", "nsd", "soft_dice", "loss", "time_ms", "tgt_size", "tgt_occ",
                       "ctx_size", "ctx_occ", "spacing", "synth_size", "detail"]
 
 
@@ -224,6 +302,7 @@ def build_sample_table(cases: list[dict], epoch: int | None = None, train_classe
         in_train = c["class"] in train_set if train_set is not None else None
         table.add_data(ep, c["class"], in_train, c["subject"],
                        c.get("ctx_cases", ""), c.get("self_ctx", None), c["dice"],
+                       c.get("nsd", float("nan")),
                        c.get("soft_dice", float("nan")), c.get("loss", float("nan")),
                        c.get("time_ms", float("nan")),
                        c.get("tgt_size", float("nan")), c.get("tgt_occ", float("nan")),
@@ -372,6 +451,14 @@ def _summarize(cls: str, cases: list[dict]) -> dict:
         "std_dice":     round(std_dice, 4),
         "mean_time_ms": round(mean_ms, 1),
     }
+    # NSD is present only when an nsd_tolerance_mm was configured (eval.py benchmark path).
+    nsd_scores = [c["nsd"] for c in cases if "nsd" in c]
+    if nsd_scores:
+        m = sum(nsd_scores) / len(nsd_scores)
+        row["mean_nsd"] = round(m, 4)
+        row["std_nsd"] = round(
+            (sum((x - m) ** 2 for x in nsd_scores) / len(nsd_scores)) ** 0.5, 4
+        ) if len(nsd_scores) > 1 else 0.0
     # Soft-Dice / loss are only present when evaluate_classes gets a logits_fn/loss_fn
     # (train.py's val step); absent for the eval.py benchmark path.
     soft = [c["soft_dice"] for c in cases if "soft_dice" in c]
@@ -533,6 +620,11 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         split = split or cfg.eval.split
         loader = make_eval_loader(cfg, classes, split=split)
 
+    # NSD tolerance (mm). Read from the eval config; absent (e.g. train.py's val cfg has no
+    # nsd_tolerance_mm) -> NSD is skipped and cases carry Dice only. None disables it.
+    _ev = cfg.get("eval")
+    nsd_tol = _ev.get("nsd_tolerance_mm") if _ev is not None else None
+
     # Each case dict carries the columns for build_sample_table: class, subject, dice,
     # time_ms, detail (source-adaptive), + tgt_size/tgt_occ/ctx_size/ctx_occ occupancy stats.
     cases_by_class: dict[str, list[dict]] = defaultdict(list)
@@ -557,6 +649,10 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
         # in (PatchSet3D.spacing_aware) — medverse's predict/logits_fn take no spacing.
         sp_kw = ({"spacing": float(batch["spacing"][0, 0])}
                  if getattr(model, "spacing_aware", False) and "spacing" in batch else {})
+        # Context-free models (TotalSegmentator) can't infer the target class from context, so
+        # forward the per-sample class names when the model opts in (mirrors spacing_aware).
+        if getattr(model, "needs_label_names", False):
+            sp_kw["label_names"] = list(label_names)
         prob = None
         logits = None
         _sync()
@@ -593,6 +689,18 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
             sample_loss = ([float(loss_fn(logits[i:i + 1], tgt[i:i + 1]).item())
                             for i in range(logits.shape[0])] if loss_fn is not None else None)
 
+        # Overlap metrics computed batched on `pred.device`, OUTSIDE the t0 timing block above
+        # (so they never inflate the reported inference time). label moves to the GPU once and
+        # is shared by Dice + NSD. Spacing is fixed within a batch (crop path), so batch[0]
+        # represents all samples; fall back to an isotropic crop_spacing_mm if none is emitted.
+        label_dev = label.to(pred.device, non_blocking=True)
+        dice_vec = dice_batch(pred, label_dev).cpu()
+        nsd_vec = None
+        if nsd_tol is not None:
+            sp_vox = (batch["spacing"][0].tolist() if "spacing" in batch
+                      else [float(cfg.data.get("crop_spacing_mm", 1.5))] * 3)
+            nsd_vec = nsd_batch(pred, label_dev, sp_vox, float(nsd_tol)).cpu()
+
         pred, label = pred.cpu(), label.cpu()
         context_masks = context_masks.cpu()
 
@@ -607,7 +715,7 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                     ctx_img=context_imgs[i, 0].squeeze(0).cpu().numpy(),
                     ctx_gt=context_masks[i, 0].cpu().numpy(),
                     out_path=fig_dir / f"{cls}_{subj}.png",
-                    title=f"{cls}  {subj}  dice={dice_binary(pred[i], label[i]):.3f}",
+                    title=f"{cls}  {subj}  dice={float(dice_vec[i]):.3f}",
                 )
                 figs_saved.add(cls)
             cids = ctx_subjects[i] if ctx_subjects is not None else None
@@ -617,11 +725,13 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 # per-context case ids + self-context flag (all ctx == target case)
                 "ctx_cases": ";".join(map(str, cids)) if cids else "",
                 "self_ctx":  bool(cids and all(c == subjects[i] for c in cids)),
-                "dice":    round(dice_binary(pred[i], label[i]), 4),
+                "dice":    round(float(dice_vec[i]), 4),
                 "time_ms": round(per_sample_ms, 1),
                 "detail":  _sample_detail(metas[i] if metas is not None else None),
             }
             case.update(_occupancy_stats(label[i], context_masks[i]))
+            if nsd_vec is not None:
+                case["nsd"] = round(float(nsd_vec[i]), 4)
             # Per-sample effective spacing (mm/voxel) when the dataset reports it. Spacing is a
             # (3,) tensor; the crop path is isotropic and the spacing-aware model consumes the
             # first axis as its scalar, so log that same scalar. Absent for datasets that emit no

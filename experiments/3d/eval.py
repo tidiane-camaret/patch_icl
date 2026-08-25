@@ -167,6 +167,18 @@ def _build_model(cfg: DictConfig):
         model.eval()
         print(f"  Loaded PatchSet3D from {cfg.eval.checkpoint} (arch l={cfg.arch.l})")
         return model
+    if name == "totalsegmentator":
+        # Context-free nnU-Net TotalSegmentator organ reference (Route B). No checkpoint: the
+        # weights folder is eval.totalseg_weights, or the experiment's frozen-encoder weights
+        # (arch.nnunet_ts_weights, e.g. e2's Dataset291 organs) so `experiment=52 ...
+        # eval.model=totalsegmentator` reuses the already-staged model.
+        from src.benchmark_models.totalseg import TotalSegModel
+        wdir = cfg.eval.get("totalseg_weights") or cfg.get("arch", {}).get("nnunet_ts_weights")
+        if not wdir:
+            raise ValueError("eval.model=totalsegmentator needs eval.totalseg_weights "
+                             "(or an experiment providing arch.nnunet_ts_weights)")
+        print(f"  TotalSegmentator weights: {wdir}")
+        return TotalSegModel(wdir, device=DEVICE)
     return load_model(name, ckpt_path=cfg.eval.get("checkpoint"),
                       image_size=image_size, device=DEVICE)
 
@@ -246,6 +258,7 @@ def main(cfg: DictConfig) -> None:
                 "mask_downsample": cfg.data.get("mask_downsample"),
                 "mask_occupancy_thr": cfg.data.get("mask_occupancy_thr"),
                 "crop_spacing_mm": cfg.data.get("crop_spacing_mm"),
+                "nsd_tolerance_mm": cfg.eval.get("nsd_tolerance_mm"),
                 "spacing_sweep": spacing_sweep,
                 "spacing_locator": bool(cfg.eval.get("spacing_locator")),
                 "spacing_cascade": bool(cfg.eval.get("spacing_cascade")),
@@ -304,12 +317,15 @@ def main(cfg: DictConfig) -> None:
         row["gflops"] = round(gflops, 2)
         cont_str = (f"  cont={row['mean_containment']:.3f} (orc={row['mean_containment_oracle']:.3f})"
                     if "mean_containment" in row else "")
+        nsd_str = f"  nsd={row['mean_nsd']:.3f}" if "mean_nsd" in row else ""
         print(f"  {cls:<35s}{sp_str}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
-              f"  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}")
+              f"{nsd_str}  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}")
         if wb_on:
             # Only mean_dice per class; std_dice / mean_time_ms are inferable from the
             # per-sample `cases` table, so we don't duplicate them as scalar series.
             wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"]})
+            if "mean_nsd" in row:
+                wandb.log({f"class/{cls}/mean_nsd{sp_key}": row["mean_nsd"]})
             if "mean_containment" in row:
                 wandb.log({f"class/{cls}/containment{sp_key}": row["mean_containment"],
                            f"class/{cls}/containment_oracle{sp_key}": row["mean_containment_oracle"]})
@@ -321,11 +337,17 @@ def main(cfg: DictConfig) -> None:
     if valid:
         mean_dice = sum(r["mean_dice"] for r in valid) / len(valid)
         mean_ms   = sum(r["mean_time_ms"] for r in valid) / len(valid)
-        print(f"\n  Mean Dice: {mean_dice:.4f}  |  Mean time: {mean_ms:.1f} ms/sample  "
+        nsd_vals  = [r["mean_nsd"] for r in valid if "mean_nsd" in r]
+        mean_nsd  = sum(nsd_vals) / len(nsd_vals) if nsd_vals else None
+        nsd_line  = f"  |  Mean NSD: {mean_nsd:.4f}" if mean_nsd is not None else ""
+        print(f"\n  Mean Dice: {mean_dice:.4f}{nsd_line}  |  Mean time: {mean_ms:.1f} ms/sample  "
               f"|  GFLOPs: {gflops:.2f}")
         if wb_on:
-            wandb.log({"mean_dice": round(mean_dice, 4), "mean_time_ms": round(mean_ms, 1),
-                       "gflops": round(gflops, 2), "cases": case_table})
+            log = {"mean_dice": round(mean_dice, 4), "mean_time_ms": round(mean_ms, 1),
+                   "gflops": round(gflops, 2), "cases": case_table}
+            if mean_nsd is not None:
+                log["mean_nsd"] = round(mean_nsd, 4)
+            wandb.log(log)
         if sweep:
             # Aggregate curve: mean Dice over classes at each spacing (GT-centred passes).
             print("  spacing -> mean_dice:")
@@ -375,9 +397,11 @@ def main(cfg: DictConfig) -> None:
     sweep_col = ",spacing" if sweep else ""
     loc_col = ",locator_to,mean_containment,mean_containment_oracle,mean_loc_err_mm" if locator else ""
     casc_col = ",cascade_from,coarse_only_dice" if cascade else ""
-    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{sweep_col}{loc_col}{casc_col}"]
+    nsd_col = ",mean_nsd,std_nsd" if any("mean_nsd" in r for r in rows) else ""
+    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{nsd_col}{sweep_col}{loc_col}{casc_col}"]
     csv += [f"{model_name},{r['class']},{r['mean_dice']},{r['std_dice']},"
             f"{r.get('mean_time_ms','')},{r.get('gflops','')},{r['n_samples']}"
+            + (f",{r.get('mean_nsd','')},{r.get('std_nsd','')}" if nsd_col else "")
             + (f",{r.get('spacing','')}" if sweep else "")
             + (f",{r.get('locator_to','')},{r.get('mean_containment','')},"
                f"{r.get('mean_containment_oracle','')},{r.get('mean_loc_err_mm','')}" if locator else "")

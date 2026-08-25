@@ -18,6 +18,8 @@ Usage
   # Hydra overrides forwarded after the argparse flags:
   python experiments/3d/plot_dataset_items.py dataset=omnisynth3d synth3d.tiles_root=results/3d/omni_tiles
   python experiments/3d/plot_dataset_items.py cluster=meta           # totalseg on meta cluster
+  # --split val overlays the data.val cross-source block (common.eval_cfg): trains synth, plots real val
+  python experiments/3d/plot_dataset_items.py dataset=synth_gmm_v2 --split val
 """
 
 import argparse
@@ -40,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # for sibling `common`
 from torch.utils.data import RandomSampler
 
 from src.totalseg_dataloader_incontext import incontext_collate_fn
-from common import build_dataset, SpacingBatchSampler  # noqa: E402  experiments/3d/common.py
+from common import build_dataset, SpacingBatchSampler, eval_cfg  # noqa: E402  experiments/3d/common.py
 
 
 def _merge_batches(batches: list[dict]) -> dict:
@@ -138,6 +140,13 @@ def main():
     with initialize_config_dir(config_dir=str(ROOT / "configs" / "experiment" / "3d"),
                                version_base="1.3"):
         cfg = compose(config_name="train", overrides=hydra_overrides)
+
+    # Cross-source train/val: for a non-train split, overlay the optional `data.val` block
+    # (common.eval_cfg) so the figure shows the ACTUAL val source — e.g. a run that trains
+    # synth_gmm but validates totalseg plots the real totalseg items on --split val. No
+    # data.val block -> cfg unchanged (val == train source).
+    if args.split != "train":
+        cfg = eval_cfg(cfg)
 
     # This is a CPU visualization tool: it needs painted image/label items, not the native
     # crops the synth gpu_realize path ships (those are painted on GPU in the train loop). Force
@@ -289,9 +298,9 @@ def main():
                  f"{a.object_size_frac_max}  Δ={a.contrast_delta}{aug_tag}")
     else:
         aug_on    = args.split == "train" and cfg.augmentations.enabled
-        synth_on  = args.split == "train" and bool(cfg.data.synth_method)
-        aug_tag   = " + aug"                          if aug_on   else ""
-        synth_tag = f" + synth(p={cfg.data.p_synth})" if synth_on else ""
+        synth_on  = args.split == "train" and bool(cfg.data.get("synth_method"))  # v2 datasets omit this
+        aug_tag   = " + aug"                                  if aug_on   else ""
+        synth_tag = f" + synth(p={cfg.data.get('p_synth')})"  if synth_on else ""
         sp_tag    = (f" | spacing∈{list(train_spacing_range)}mm" if use_spacing
                      else f" | crop_spacing={cfg.data.get('crop_spacing_mm', 1.5)}mm"
                           if cfg.data.get("use_crop") else "")

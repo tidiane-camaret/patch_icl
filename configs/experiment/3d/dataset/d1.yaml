@@ -1,0 +1,27 @@
+# @package _global_
+# d1 — abdomen-organ TotalSegmentator, in-context dataloader v2 (raw_ct crop path).
+# Selected as a Hydra group: `dataset=d1`. Minimal on purpose: v2 (loader_v2=true)
+# implements ONLY the cross-subject real-task path, so the v1 probe keys
+# (self_context / synth_masks / p_synth / synth_method / num_labels_per_sample /
+# random_coloring / use_crop / raw_ct) are dead under v2 and intentionally omitted.
+# v2 always reads native ct_raw.npy + label.npy + spacings.json per subject.
+data:
+  source: totalseg
+  loader_v2: true               # route build_dataset + make_eval_loader through incontext_dataset_v2
+  image_size: [128, 128, 128]
+  context_size: 1               # K contexts per task
+  crop_spacing_mm: 2            # output pitch (FOV = 128*2 = 256 mm), resampled to 128^3 isotropic
+  train_spacing_range: null     # fixed 2 mm crops (no SpacingBatchSampler); eval always fixed
+  mask_downsample: occupancy    # area-pool + threshold (keeps thin masks under downsampling)
+  mask_occupancy_thr: 0.5       # foreground-fraction threshold
+  class_balanced: true          # sample class uniformly, then subject (train only)
+  max_ds_len_train: 1000        # samples per train epoch (loader cap)
+  max_train_subjects: null
+  max_val_subjects: null
+  # 10 abdominal organs
+  train_classes: [liver, spleen, pancreas, gallbladder, stomach, duodenum,
+                  kidney_right, kidney_left, adrenal_gland_right, adrenal_gland_left]
+  #     ["liver", "spleen", "pancreas", "gallbladder", "stomach", "duodenum",
+  #                "right kidney", "left kidney", adrenal_gland_right, adrenal_gland_left] 
+  val_classes:   [liver, spleen, pancreas, gallbladder, stomach, duodenum,
+                  kidney_right, kidney_left, adrenal_gland_right, adrenal_gland_left]

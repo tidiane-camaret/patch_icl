@@ -4,7 +4,7 @@
 # recipe. 128³ inputs only (Medverse runs level=1, no AR).
 model: medverse
 train:
-  batch_size: 4
+  batch_size: 8
   optimizer: adam               # adam | adamw
   lr: 3.0e-5
   weight_decay: 0.0
@@ -18,8 +18,7 @@ train:
   dice_weight: 1.0              # bce_dice only
   checkpoint: orig_weights      # weight source: orig_weights (released Medverse.ckpt) |
                                 # random (from scratch) | <path to our finetuned best.pt>
-data:
-  max_ds_len_train: 200         # fine-tune sample cap (overrides dataset/totalseg's 2000)
+
 
 # Training perf knobs (see experiments/3d/bench_arch.py). At B=4 both together beat the
 # eager baseline on time AND memory; applied after weight load in train.py.

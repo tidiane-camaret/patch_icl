@@ -9,6 +9,11 @@ defaults:
   - cluster: nfs
   - augmentations: multiverseg
   - dataset: totalseg
+  # `model` mirrors train.yaml so experiments that `override /model` (e.g. m1) compose under
+  # the eval root too (optional experiment: below). The composed model/arch is inert at eval:
+  # eval.model picks the model by name and the patchset3d path rebuilds cfg.arch from the
+  # checkpoint's stored arch, so this default only exists to satisfy the override.
+  - model: medverse
   - _self_
   - optional experiment:
 hydra:
@@ -47,9 +52,19 @@ eval:
   # the fine pred refitted into the coarse frame). Needs save_figures=true. See
   # experiments/3d/evaluate.py:save_cascade_figure.
   cascade_figures: false
+  # Normalized Surface Dice tolerance (mm). Each eval case also reports NSD@tol — the
+  # fraction of the GT/pred surfaces lying within `tol` mm of each other (voxel-count /
+  # MONAI convention, batched on-GPU; see evaluate.nsd_batch). Reported alongside Dice in
+  # the CSV/wandb (mean_nsd, class/<c>/mean_nsd). null disables NSD. Consider a per-organ
+  # tolerance later; 2 mm ≈ 1.3 vox at the 1.5 mm organ-encoder pitch.
+  nsd_tolerance_mm: 3.0
   save_figures: true
   max_figures: 200
   out_dir: ${paths.results}/3d_eval
+  # eval.model=totalsegmentator (context-free nnU-Net organ reference, Route B): folder with
+  # plans.json/dataset.json/fold_0 (a `.../<Dataset>/3d_fullres`). null -> fall back to the
+  # experiment's arch.nnunet_ts_weights (e.g. exp 52's staged Dataset291 organs).
+  totalseg_weights: null
   medverse_ckpt: null         # override Medverse.ckpt path; null = adapter default
   sw_roi_size: null           # sliding-window ROI; null = adapter default (128³)
   checkpoint: null            # trained best.pt (required for native_*/multilevel/nninteractive)

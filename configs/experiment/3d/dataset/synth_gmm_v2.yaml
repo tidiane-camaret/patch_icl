@@ -1,0 +1,51 @@
+# @package _global_
+# synth_gmm_v2 — cross-source in-context dataloader v2 dataset group:
+#   TRAIN on the GMM-synth MAISI mask-bank (cohort hook), VALIDATE on real TotalSeg.
+# The v2 twin of experiment 43: same train/val split, but routed through the generic
+# incontext_dataset_v2 engine (loader_v2=true) so both loaders share its aug + eval-seed
+# path. Select as a Hydra group and stack a v2 model/encoder on top, e.g.:
+#   python experiments/3d/train.py dataset=synth_gmm_v2 model=m1 encoder=e1
+#
+# How the cross-source split works (common.eval_cfg): the `data.val` block below overlays
+# data.* on the VAL path only, so train_loader() builds the synth source while
+# make_eval_loader() builds totalseg — no code change, both stay on loader_v2.
+paths:
+  gmm_bank: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gmm_bank
+data:
+  source: synth_gmm_maisi
+  loader_v2: true               # route train + val through incontext_dataset_v2
+  image_size: [128, 128, 128]
+  context_size: 1
+  train_classes: all            # every bank class with >= K+1 masks (MAISI ids/names or "all")
+  val_classes: all              # overridden per-source below (val uses TotalSeg names)
+  crop_spacing_mm: 1.5          # organ crop = image_size*this FOV, resampled to image_size^3
+  train_spacing_range: [1.0, 4.0]  # per-TRAIN-batch log-uniform spacing; eval fixed at crop_spacing_mm
+  mask_downsample: occupancy    # area-pool + thr (thin organs survive; matches totalseg training)
+  mask_occupancy_thr: 0.1
+  gpu_realize: true             # worker ships native crops; occupancy resample + GMM paint on GPU
+  gpu_realize_max_native: 256   #   (train loop, src/gpu_synth_realize). TRAIN-only — val is real.
+  class_balanced: true          # class-uniform target sampling (rare organs as often as common)
+  crop_jitter: null             # train crop-centre jitter (voxels); null -> image_size//4
+  epoch_length: 1000           # nominal TRAIN samples/epoch (generative)
+  max_val_subjects: 100         # cap val samples/epoch (deterministic per idx via eval.seed)
+  gmm:
+    var_max: 5.0
+    background_mode: zero
+  cohort:
+    w_span: 0
+    w_fov: 0
+    w_spacing: 0
+    w_by_class_size: 1
+    randomness: [0, 1]          # per-cohort tightness r ~ U[0,1] (continuous diversity spread)
+    min_masks_per_class: null
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+  # Eval-only source override (common.eval_cfg): validate on real TotalSeg for the honest OOD
+  # signal. Keys here overlay data.* on the val path only; image_size/context_size stay inherited
+  # (model input geometry must match). loader_v2 is inherited, so the val loader is v2 too.
+  val:
+    source: totalseg
+    val_classes: balanced       # resolve_classes -> the balanced TotalSeg eval class set
+    crop_spacing_mm: 1.5
+    mask_downsample: occupancy
+    mask_occupancy_thr: 0.1
