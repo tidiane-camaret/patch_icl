@@ -400,7 +400,11 @@ def build_dataset(cfg, split: str):
             # train loop (src/gpu_synth_realize). TRAIN only — val is a real source via eval_cfg.
             gpu_realize=(split == "train" and bool(d.get("gpu_realize", False))),
             gpu_realize_max_native=int(d.get("gpu_realize_max_native", 256)),
-            eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))))
+            eval_seed=(None if split == "train" else int(cfg.get("eval", {}).get("seed", 0))),
+            # paint_mask_aligned: when True, overwrites the paint map in mask=1 voxels with the
+            # target class, ensuring consistent intensity within the supervision mask. Eliminates
+            # boundary contamination from neighboring structures bleeding into the expanded mask.
+            paint_mask_aligned=bool(g.get("paint_mask_aligned", False)))
         if not d.get("loader_v2", False):
             return synth_ds
         # loader_v2: drive the same cohort dataset through the generic v2 engine via the

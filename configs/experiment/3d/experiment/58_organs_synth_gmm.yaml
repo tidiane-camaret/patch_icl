@@ -1,0 +1,42 @@
+# @package _global_
+# 58_organs_synth_gmm
+#
+#   python experiments/3d/train.py experiment=58_organs_synth_gmm
+#
+
+defaults:
+  - 57_organs_encoder_from_scratch
+  - _self_
+
+
+data:
+  source: synth_gmm_maisi
+  gpu_realize: true
+  gpu_realize_max_native: 512
+  epoch_length: 1000
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80 
+    background_mode: zero
+  cohort:
+    w_span: 0
+    w_fov: 0
+    w_spacing: 0
+    w_by_class_size: 1
+    randomness: 1          # per-cohort tightness r ~ U[0,1] (continuous diversity spread)
+    min_masks_per_class: null
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+  val: 
+    source: totalseg 
+
+augmentations:
+  intensity:
+    gaussian_noise:
+      p: 0.5
+    gaussian_blur:
+      p: 0.5
+
+
+wandb:
+  name: 58_organs_synth_gmm

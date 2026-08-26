@@ -33,7 +33,8 @@ class SynthGmmMaisiDataset(Dataset):
                  crop_spacing_mm=1.5, crop_jitter=None, classes=None, length=10000,
                  var_max=5.0, background_mode="zero", eval_seed=None, maxid=200,
                  cohort=None, mask_downsample="occupancy", mask_occupancy_thr=0.1,
-                 class_balanced=True, gpu_realize=False, gpu_realize_max_native=256):
+                 class_balanced=True, gpu_realize=False, gpu_realize_max_native=256,
+                 paint_mask_aligned=False):
         assert image_size[0] == image_size[1] == image_size[2], "cubic crops only"
         self.T = int(image_size[0])
         self.k = int(context_size)
@@ -61,6 +62,11 @@ class SynthGmmMaisiDataset(Dataset):
         # = uncapped. Only meaningful for the TRAIN split (val is a real source via eval_cfg).
         self.gpu_realize = bool(gpu_realize)
         self.gpu_realize_max_native = int(gpu_realize_max_native or 0)
+        # paint_mask_aligned: when True, overwrites the paint map in mask=1 voxels with the target
+        # class BEFORE painting, ensuring consistent intensity within the supervision mask. This
+        # eliminates artificial boundary variance from neighboring structures bleeding into the
+        # occupancy-expanded mask region. Default False for backward compat.
+        self.paint_mask_aligned = bool(paint_mask_aligned)
         # cohort-sampling knobs (distance weights + diversity) -> CohortSampler; empty = defaults.
         # class_balanced (uniform-over-classes vs mask-frequency prior) is a top-level knob
         # mirroring totalseg data.class_balanced, passed alongside the cohort dict.
@@ -74,10 +80,11 @@ class SynthGmmMaisiDataset(Dataset):
         _md = (self.mask_downsample
                + (f"(thr={self.mask_occupancy_thr})" if self.mask_downsample == "occupancy" else ""))
         _gr = (f"GPU(cap={self.gpu_realize_max_native or 'off'})" if self.gpu_realize else "CPU")
+        _pa = f" | paint_align={self.paint_mask_aligned}" if self.paint_mask_aligned else ""
         print(f"SynthGmmMaisiDataset: {len(self.cs.entries)} masks | "
               f"{len(self.cs.classes)} classes | K={self.k} | T={self.T} | "
               f"crop={self.crop_mm}mm | var_max={self.var_max} | mask={_md} | "
-              f"class_balanced={self.cs.class_balanced} | realize={_gr} | "
+              f"class_balanced={self.cs.class_balanced} | realize={_gr}{_pa} | "
               f"len={self.length}", flush=True)
 
     def __len__(self):
@@ -93,8 +100,12 @@ class SynthGmmMaisiDataset(Dataset):
           mask:      target-class BINARY under `mask_downsample`. "occupancy" area-pools the
                      target fraction and keeps voxels clearing mask_occupancy_thr, so a low thr
                      GROWS a small/thin target (matches totalseg resample_binary); "nearest"
-                     point-samples. Non-empty guard. Rim voxels (mask=1 but paint!=target) are
-                     realistic partial-volume hard cases — intentional, not a bug."""
+                     point-samples. Non-empty guard.
+
+        When `paint_mask_aligned=True`, the paint map is overwritten in mask=1 voxels with the
+        target class, ensuring consistent intensity within the supervision mask (no boundary
+        contamination from neighboring structures). When False (default), rim voxels where
+        mask=1 but paint!=target create partial-volume-like intensity variation."""
         size = tuple(int(s) for s in out_sizes)
         paint = F.interpolate(
             torch.from_numpy(np.ascontiguousarray(crop_lbl, np.float32))[None, None],
@@ -108,6 +119,10 @@ class SynthGmmMaisiDataset(Dataset):
             mask = mask.long()
         else:
             mask = (paint == target_cls).long()                   # nearest binary = paint==cls
+        # Align paint map with mask: where mask=1, force paint=target_cls. This eliminates
+        # the artificial variance from neighboring structures bleeding into the expanded mask.
+        if self.paint_mask_aligned:
+            paint = torch.where(mask.bool(), torch.tensor(target_cls, dtype=paint.dtype), paint)
         return paint, mask
 
     def _crop_paint_mask(self, e, cls, rng, crop_mm):
