@@ -15,6 +15,10 @@ The encoder was pretrained with nnU-Net `CTNormalization` (clip to [p0.5, p99.5]
 with the dataset foreground mean/std), NOT the loader's CT_MEAN/CT_STD. We invert the loader
 z-score back to HU, then re-apply CTNormalization from plans.json so the frozen conv sees
 in-distribution intensities.
+
+`random_init=True` keeps everything plans.json defines (architecture, CTNormalization,
+pretrain spacing) but skips the checkpoint and applies nnU-Net's own He init instead — the
+from-scratch control for "how much does supervised CT pretraining buy in-context?".
 """
 import json
 import os
@@ -93,8 +97,10 @@ def _build_plainconv_unet(cfg, num_classes):
 
 
 class NnUNetTSEncoder(nn.Module):
+    supports_fine = True          # exposes unpooled per-stage maps (see encode_with_fine)
+
     def __init__(self, weights_dir, resolution, stages=(2, 3, 4), frozen=True,
-                 device="cuda", cache_max=4096, precision="bf16"):
+                 device="cuda", cache_max=4096, precision="bf16", random_init=False):
         super().__init__()
         wd = resolve_ts_weights_dir(weights_dir)
         plans = json.load(open(wd / "plans.json"))
@@ -114,19 +120,58 @@ class NnUNetTSEncoder(nn.Module):
         self.train_spacing_mm = float(cfg["spacing"][0])  # isotropic pretrain pitch (297: 3 mm)
 
         net = _build_plainconv_unet(cfg, num_classes)
-        sd = torch.load(wd / "fold_0" / "checkpoint_final.pth",
-                        map_location="cpu", weights_only=False)["network_weights"]
-        missing, unexpected = net.load_state_dict(sd, strict=False)
-        enc_missing = [k for k in missing if k.startswith("encoder.")]
-        assert not enc_missing, f"encoder keys unfilled by checkpoint: {enc_missing[:4]}"
+        self.random_init = bool(random_init)
+        if self.random_init:
+            # From-scratch control: keep the ARCHITECTURE, the CTNormalization stats and the
+            # pretrain spacing that plans.json defines, and throw away only the trained weights
+            # (so a scratch run differs from the finetune run in exactly one thing).
+            #
+            # The explicit apply() is not optional. PlainConvUNet does NOT initialize in
+            # __init__ — nnU-Net does it in the trainer (get_network_from_plans ->
+            # network.apply(network.initialize) -> InitWeights_He(1e-2)). Just skipping the
+            # load would silently leave PyTorch's Conv3d default (kaiming_uniform, a=sqrt(5)),
+            # whose std is ~2.4x SMALLER than He. That matters here because every conv is
+            # followed by InstanceNorm3d(affine=True): conv weights are scale-invariant in the
+            # forward, so the init scale does not set the signal scale, it sets the EFFECTIVE
+            # step size (Adam moves ~lr per element, so the relative move is lr / weight-RMS).
+            # Measured on Dataset291, deepest tapped stage (s4, 320x320x3^3): torch-default RMS
+            # 0.0062, He 0.0152, converged pretrained 0.0070 — i.e. He starts ~2.2x above where
+            # nnU-Net's own training ends up, and moves ~2.4x more slowly per step than the
+            # default would. He is both the nnU-Net-faithful and the stabler choice.
+            net.apply(net.initialize)
+        else:
+            sd = torch.load(wd / "fold_0" / "checkpoint_final.pth",
+                            map_location="cpu", weights_only=False)["network_weights"]
+            missing, unexpected = net.load_state_dict(sd, strict=False)
+            enc_missing = [k for k in missing if k.startswith("encoder.")]
+            assert not enc_missing, f"encoder keys unfilled by checkpoint: {enc_missing[:4]}"
         self.encoder = net.encoder
         self.encoder.return_skips = True  # forward -> list of per-stage features
         n_ch = _stage_channels(cfg)
         self.out_ch = sum(n_ch[s] for s in self.stages)
+        self.stage_ch = n_ch
+        # Cumulative stride per stage (stage 0 is stride-1 in these plans) -> the divisor
+        # from input side to that stage's native side. Read from plans, not assumed.
+        self.stage_div, d = [], 1
+        for st in cfg["pool_op_kernel_sizes"]:
+            d *= int(st[0])
+            self.stage_div.append(d)
 
         if self.frozen:
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
+        else:
+            # Trainable encoder: nothing downstream ever reads a stage deeper than
+            # max(stages) — the forward still runs them, but their output is dropped, so
+            # their params only ever see an all-zero grad. (The fine_decode taps are always
+            # SHALLOWER than the coarse anchor: a deeper fine stage fails PatchSet3D's
+            # `fine_side % resolution` check at construction.) Freeze them so they stay out
+            # of the optimizer instead of collecting AdamW state and being weight-decayed for
+            # nothing, and so the trainable-param count train.py logs is honest. Dataset291:
+            # stage 5 = 5.5M of the encoder's 14.0M params.
+            for st in self.encoder.stages[max(self.stages) + 1:]:
+                for p in st.parameters():
+                    p.requires_grad_(False)
         self.encoder.to(device)
         self._cache = _EncodeCache(int(cache_max))
 
@@ -145,21 +190,46 @@ class NnUNetTSEncoder(nn.Module):
             return torch.autocast(device_type="cuda", enabled=False)
         return torch.autocast(device_type="cuda", dtype=dt, enabled=True)
 
-    def _encode_batch(self, x):
-        """(B,1,D,H,W) -> (B,out_ch,R,R,R): selected stages resampled to R^3 and concatenated."""
+    def _stage_feats(self, x):
+        """Frozen-safe encoder forward -> list of per-stage maps at native resolutions."""
         v = self._norm(x)
         with self._autocast_ctx():
             if self.frozen:
                 with torch.no_grad():
-                    feats = self.encoder(v)
-            else:
-                feats = self.encoder(v)
+                    return self.encoder(v)
+            return self.encoder(v)
+
+    def _encode_batch(self, x):
+        """(B,1,D,H,W) -> (B,out_ch,R,R,R): selected stages resampled to R^3 and concatenated."""
+        feats = self._stage_feats(x)
         picked = [_down_to(feats[s].float(), self.resolution) for s in self.stages]
         return torch.cat(picked, dim=1)
 
-    def forward(self, x, spacing=None):  # spacing accepted + ignored (conv net, no RoPE)
+    @property
+    def n_fine_stages(self) -> int:
+        return len(self.stage_ch)
+
+    def fine_stage_channels(self, stage: int) -> int:
+        return self.stage_ch[stage]
+
+    def fine_stage_size(self, in_size: int, stage: int) -> int:
+        return int(in_size) // self.stage_div[stage]
+
+    def _encode_fine_batch(self, x, fine_rows, fine_stage):
+        """One forward -> (coarse (B,out_ch,R,R,R), one fine map per stage in `fine_stage`)."""
+        feats = self._stage_feats(x)
+        coarse = torch.cat([_down_to(feats[s].float(), self.resolution) for s in self.stages], dim=1)
+        return coarse, tuple(feats[st].index_select(0, fine_rows.to(feats[st].device))
+                             for st in fine_stage)
+
+    def forward(self, x, spacing=None, fine_rows=None, fine_stage=None):
+        # spacing accepted + ignored (conv net, no RoPE)
         dev = next(self.encoder.parameters()).device
         x = x.to(dev)
+        if fine_rows is not None:
+            # Not cacheable: the encode cache stores only the coarse R^3 map, and a fine map
+            # is far too large to keep — so a fine-decode run re-encodes each eval crop.
+            return self._encode_fine_batch(x, fine_rows, fine_stage)
         if not (self.frozen and not self.training):
             return self._encode_batch(x)
         return _cached_encode(self._encode_batch, x,

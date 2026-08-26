@@ -169,7 +169,9 @@ class PatchSet3DEncoderAdapter(EncoderAdapter):
     def transformer_query(self, image, context_in, context_out, spacing=None):
         """Post-transformer query rep (B,N,e) via a decoder-input hook (res=R only)."""
         captured = {}
-        h = self.model.decoder.register_forward_pre_hook(
+        # fine_decode builds no .decoder — filter_head is then the first module to see q.
+        head = getattr(self.model, "decoder", None) or self.model.filter_head
+        h = head.register_forward_pre_hook(
             lambda mod, args: captured.setdefault("q", args[0]))
         try:
             self.model(image, context_in=context_in, context_out=context_out,

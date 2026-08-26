@@ -7,7 +7,9 @@ content-based in-context matching over that set. Position is a Fourier feature o
 (i,j,k) cell, not a tensor axis, so the transformer core is reused verbatim.
 
 Single level only: prediction at the token grid R (mask_patch_decode_size=1) or tiled
-to (R·d)³ (d>1). Refine / sim_prior / Muon-LAWA are intentionally omitted
+to (R·d)³ (d>1). arch.fine_decode swaps the constant-tile head for a per-token dynamic
+filter read against the query's own unpooled encoder stage (sub-patch detail; conv
+encoders only). Refine / sim_prior / Muon-LAWA are intentionally omitted
 (see docs/superpowers/specs/2026-07-22-patchset3d-design.md).
 """
 
@@ -58,10 +60,13 @@ class ConvEncoder3D(nn.Module):
     (B,in_ch,D,H,W) -> (B, sum(dims), R,R,R). Depth = len(dims)-1 stride-2 stages after a
     full-res stem; every scale is resampled to R³ (adaptive_avg_pool3d down, trilinear up)
     and concatenated on channels."""
+    supports_fine = True          # exposes unpooled per-stage maps (see encode_with_fine)
+
     def __init__(self, in_ch: int, dims: tuple[int, ...], resolution: int, groups: int = 8):
         super().__init__()
         assert len(dims) >= 1, "dims needs at least a stem width"
         self.resolution = resolution
+        self.dims = tuple(dims)
         n_down = len(dims) - 1
 
         def cbr(ci, co, stride):
@@ -81,11 +86,37 @@ class ConvEncoder3D(nn.Module):
     def _resample(self, f: torch.Tensor, R: int) -> torch.Tensor:
         return _down_to(f, R)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _stage_feats(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Per-stage maps at their native resolutions: [stem@D, stage1@D/2, ...]."""
         feats = [self.stem(x)]
         for stage in self.stages:
             feats.append(stage(feats[-1]))
-        return torch.cat([self._resample(f, self.resolution) for f in feats], dim=1)
+        return feats
+
+    @property
+    def n_fine_stages(self) -> int:
+        return len(self.dims)
+
+    def fine_stage_channels(self, stage: int) -> int:
+        return self.dims[stage]
+
+    def fine_stage_size(self, in_size: int, stage: int) -> int:
+        """Spatial side of `stage`'s native map: stride-1 stem, then one stride-2 per stage."""
+        return int(in_size) // (2 ** int(stage))
+
+    def forward(self, x: torch.Tensor, fine_rows=None, fine_stage=None):
+        """(B,in,D,H,W) -> (B,out_ch,R,R,R), or (coarse, fine) when fine_rows is given.
+
+        `fine_rows` selects which volumes keep an unpooled map and `fine_stage` is a
+        sequence of stage indices (one map returned per stage); the rest are freed with the
+        stage list, so only the requested rows cost memory beyond the peak this forward
+        already reaches."""
+        feats = self._stage_feats(x)
+        coarse = torch.cat([self._resample(f, self.resolution) for f in feats], dim=1)
+        if fine_rows is None:
+            return coarse
+        return coarse, tuple(feats[st].index_select(0, fine_rows.to(feats[st].device))
+                             for st in fine_stage)
 
 
 class PatchSet3D(nn.Module):
@@ -114,6 +145,7 @@ class PatchSet3D(nn.Module):
         primus_sidecar: str = None,
         nnunet_ts_weights: str = None,
         nnunet_ts_stages=(2, 3, 4),
+        nnunet_ts_random_init: bool = False,
         img_embed_mlp: bool = False,
         encoder_stage: int = None,
         encoder_native_grid: bool = False,
@@ -124,6 +156,9 @@ class PatchSet3D(nn.Module):
         feat_norm: str = "context",
         token_mask_ratio_support: float = 0.0,
         token_mask_ratio_query: float = 0.0,
+        fine_decode: bool = False,
+        fine_stage: int = 1,
+        fine_proj_dim: int = 64,
     ):
         super().__init__()
         self.resolution = resolution
@@ -176,14 +211,17 @@ class PatchSet3D(nn.Module):
             # Frozen TotalSegmentator nnU-Net PlainConvUNet encoder (default: Dataset297,
             # total 3 mm). Multi-scale concat of nnunet_ts_stages resampled to R^3; input is
             # 1-channel (image only), spacing arg ignored (conv net). nnunet_ts_weights points
-            # at the weights folder (plans.json + fold_0/checkpoint_final.pth).
+            # at the weights folder (plans.json + fold_0/checkpoint_final.pth) and is required
+            # even when nnunet_ts_random_init=True — plans.json defines the architecture and the
+            # CTNormalization stats; only the trained weights are dropped (He init instead).
             from src.models.encoders.nnunet_ts import NnUNetTSEncoder   # lazy: avoids import cycle
             if not nnunet_ts_weights:
                 raise ValueError("encoder='nnunet_ts' requires arch.nnunet_ts_weights")
             self.encoder = NnUNetTSEncoder(nnunet_ts_weights, resolution,
                                            stages=tuple(nnunet_ts_stages),
                                            frozen=encoder_frozen, device="cpu",
-                                           precision=encoder_precision)
+                                           precision=encoder_precision,
+                                           random_init=nnunet_ts_random_init)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
@@ -230,8 +268,55 @@ class PatchSet3D(nn.Module):
             nn.init.normal_(self.qry_id, std=0.1)
         self.thinking = ThinkingRows(thinking_rows, e)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
-        self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(),
-                                     nn.Linear(h, self.mask_patch_decode_size ** 3))
+        # Decode head. Default: a per-token MLP emitting d^3 CONSTANTS per cell, so a cell's
+        # e-vector is the only evidence for its 8^3 voxels and no boundary can be placed
+        # inside a cell. fine_decode instead has each token emit a dynamic FILTER, dotted
+        # against the query volume's own unpooled encoder features inside that cell, plus a
+        # linear tile term (keeping the head a superset of a coarse tile decode when the fine
+        # features are weak). Conv encoders only — a ViT has no finer stage to tap.
+        self.fine_decode = bool(fine_decode)
+        # int or list: [0, 1] projects both stages and sums them at the finer grid.
+        self.fine_stage = tuple(int(st) for st in (
+            [fine_stage] if isinstance(fine_stage, int) else list(fine_stage)))
+        self.fine_m = None
+        if not self.fine_decode:
+            self.decoder = nn.Sequential(nn.Linear(e, h), nn.GELU(),
+                                         nn.Linear(h, self.mask_patch_decode_size ** 3))
+        else:
+            if not getattr(self.encoder, "supports_fine", False):
+                raise ValueError(
+                    f"arch.fine_decode needs an encoder exposing unpooled stages; "
+                    f"arch.encoder={encoder!r} has none (use conv | nnunet_ts)")
+            for st in self.fine_stage:
+                if not 0 <= st < self.encoder.n_fine_stages:
+                    raise ValueError(f"arch.fine_stage {st} out of range "
+                                     f"[0, {self.encoder.n_fine_stages})")
+            if not image_size:
+                raise ValueError("arch.fine_decode needs arch.image_size (from data.image_size)")
+            sides = [self.encoder.fine_stage_size(int(image_size[0]), st)
+                     for st in self.fine_stage]
+            fine_side = max(sides)                        # readout runs at the FINEST stage
+            if fine_side % resolution:
+                raise ValueError(f"fine stage side {fine_side} is not divisible by "
+                                 f"resolution {resolution}")
+            self.fine_m = fine_side // resolution         # fine voxels per cell axis
+            chans = [self.encoder.fine_stage_channels(st) for st in self.fine_stage]
+            # One 1x1x1 projection per stage, each applied at that stage's NATIVE resolution;
+            # the projected maps are upsampled to the finest side and summed. Trilinear
+            # upsampling is per-channel and a 1x1x1 conv is per-voxel, so they commute:
+            # this is exactly Conv1x1(concat[f0, up(f1)]) without ever materializing the
+            # concatenated map at full resolution.
+            self.fine_proj = nn.ModuleList([nn.Conv3d(c, fine_proj_dim, 1) for c in chans])
+            self.filter_head = nn.Linear(e, fine_proj_dim)
+            self.tile_head = nn.Linear(e, self.fine_m ** 3)
+            # The readout is linear in the fine features (1x1x1 conv then a channel
+            # contraction), so the token-generated filter lives in the row space of the
+            # projection: its rank is capped at min(fine_proj_dim, sum(C_f)). Anything above
+            # that is dead width.
+            if fine_proj_dim > sum(chans):
+                print(f"[PatchSet3D] arch.fine_proj_dim={fine_proj_dim} exceeds total fine "
+                      f"channels {sum(chans)} (stages {self.fine_stage}); the filter rank is "
+                      f"capped at {sum(chans)} — the extra width is unused.")
         # (i,j,k) lattice, row-major over R³ (cell index n = i*R² + j*R + k)
         r = resolution
         ii = torch.arange(r).repeat_interleave(r * r)
@@ -281,10 +366,13 @@ class PatchSet3D(nn.Module):
             msk = msk + pos
         return torch.stack([img, msk], dim=2)               # (B,M,2,e)
 
-    def _tile_logits(self, out):
-        """(B,N,d³) -> (B,1,Rd,Rd,Rd), inverse of _mask_tiles_3d (d=1 -> one logit per cell)."""
+    def _tile_logits(self, out, d=None):
+        """(B,N,d³) -> (B,1,Rd,Rd,Rd), inverse of _mask_tiles_3d (d=1 -> one logit per cell).
+
+        d defaults to mask_patch_decode_size; the fine decoder passes its own tile size."""
         B = out.shape[0]
-        r, d = self.resolution, self.mask_patch_decode_size
+        r = self.resolution
+        d = self.mask_patch_decode_size if d is None else int(d)
         if d == 1:
             return out.reshape(B, 1, r, r, r)
         return (out.reshape(B, r, r, r, d, d, d)
@@ -384,26 +472,75 @@ class PatchSet3D(nn.Module):
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
                              rope=rope, block_mask=block_mask)
         q = x[:, sep_t:, 0, :]                               # (B,Q,e) query img-col
-        logit = self._tile_logits(self.decoder(q))          # (B,1,Rd,Rd,Rd)
-        return logit, mask_support, mask_query
+        return q, mask_support, mask_query
+
+    def _decode(self, q, fine=None):
+        """Query tokens (B,N,e) -> logits (B,1,G,G,G), G = resolution*mask_patch_decode_size.
+
+        fine_decode path: z-score + 1x1x1-project each requested unpooled stage at its own
+        resolution, sum them at the finest grid, regroup into per-cell blocks, and score each
+        fine voxel with its own cell's token-generated filter; the tile term adds the
+        token-only constant the default head would emit."""
+        if not self.fine_decode:
+            return self._tile_logits(self.decoder(q))
+        B, N = q.shape[0], q.shape[1]
+        R, m = self.resolution, self.fine_m
+        side = R * m
+        p = None
+        for conv, f in zip(self.fine_proj, fine):
+            f = f.float()
+            mu = f.mean(dim=(2, 3, 4), keepdim=True)
+            sig = f.std(dim=(2, 3, 4), keepdim=True) + 1e-8
+            pi = conv(self._zscore(f, mu, sig))               # (B,Cp,S_i,S_i,S_i)
+            if pi.shape[-1] != side:                          # lift coarser stages to the
+                pi = F.interpolate(pi, size=(side, side, side),   # finest stage's grid
+                                   mode="trilinear", align_corners=False)
+            p = pi if p is None else p + pi                   # (B,Cp,S,S,S)
+        cp = p.shape[1]
+        # Regroup to cells with the SAME permutation as _mask_tiles_3d, so cell order matches
+        # ijk_base (n = i*R² + j*R + k) and _tile_logits is its exact inverse. Left as a view —
+        # einsum consumes it without materializing a contiguous copy.
+        cells = (p.reshape(B, cp, R, m, R, m, R, m)
+                  .permute(0, 2, 4, 6, 1, 3, 5, 7))           # (B,R,R,R,Cp,m,m,m)
+        w = self.filter_head(q).reshape(B, R, R, R, cp)
+        out = torch.einsum("bijkc,bijkcxyz->bijkxyz", w, cells).reshape(B, N, m ** 3)
+        logit = self._tile_logits(out + self.tile_head(q), d=m)    # (B,1,S,S,S)
+        g = self.grid_size
+        if logit.shape[-1] != g:
+            logit = F.interpolate(logit, size=(g, g, g), mode="trilinear", align_corners=False)
+        return logit
 
     def forward(self, image, context_in, context_out, mode="train", spacing=None):
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
         T = imgs.shape[1]
-        feat_map = self._encode(imgs.reshape(B * T, 1, D, H, W), spacing)  # (B*T,Cf,R,R,R)
+        x = imgs.reshape(B * T, 1, D, H, W)
+        fine = None
+        if self.fine_decode:
+            # The query volume is the last of T, so its flat rows are b*T + K; only those
+            # keep an unpooled map (one encoder pass, the rest freed with the stage list).
+            rows = torch.arange(B, device=x.device) * T + K
+            feat_map, fine = self._encode(x, spacing, fine_rows=rows)
+        else:
+            feat_map = self._encode(x, spacing)                        # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        logit, mask_support, mask_query = self._attn(
+        q, mask_support, mask_query = self._attn(
             sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing)
+        logit = self._decode(q, fine)
         return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query}
 
-    def _encode(self, x, spacing):
+    def _encode(self, x, spacing, fine_rows=None):
         """Dispatch to the encoder, passing per-batch `spacing` only when it accepts it
-        (PrimusEncoder in spacing-aware mode); the conv encoder takes only the image."""
-        if self.spacing_aware:
-            return self.encoder(x, spacing=spacing)
-        return self.encoder(x)
+        (PrimusEncoder in spacing-aware mode); the conv encoder takes only the image.
+
+        Always goes through Module.__call__ so forward hooks fire (train.py's
+        profile_timing records encode GPU time there). Returns (coarse, fine) when
+        fine_rows is given, else the coarse grid alone."""
+        kw = {"spacing": spacing} if self.spacing_aware else {}
+        if fine_rows is not None:
+            kw.update(fine_rows=fine_rows, fine_stage=self.fine_stage)
+        return self.encoder(x, **kw)
 
     def _native_logit(self, image, context_in, context_out, spacing=None):
         dev = next(self.parameters()).device

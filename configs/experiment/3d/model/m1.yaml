@@ -26,7 +26,27 @@ arch:
   mask_patch_decode_size: 8     # decode tile: 16*8 = 128^3 prediction
   token_mask_ratio_support: 0.25  # SimMIM support-token masking (train only)
   token_mask_ratio_query: 0.50    # query-token masking (train only)
-  compile: true                 # torch.compile the transformer (encoder stays eager)
+  # --- sub-patch decode (conv encoders only; see src/models/patchset3d.py::_decode) ---
+  # false = per-token MLP emitting mask_patch_decode_size^3 constants per cell (no sub-patch
+  # detail). true = each token emits a filter read against the query's own unpooled encoder
+  # stage, so boundaries can be placed INSIDE a cell. Errors at construction on ViT encoders.
+  fine_decode: false
+  # Encoder stage(s) tapped (0 = full res, 1 = half, ...). An int taps one stage; a list
+  # e.g. [0, 1] projects each at its native resolution and sums them at the finest grid
+  # (== concat-then-project, since 1x1x1 conv and trilinear upsampling commute).
+  fine_stage: 1
+  # Width the fine maps are projected to = the token-generated filter's length. The readout
+  # is LINEAR in the fine features, so filter rank is capped at min(fine_proj_dim, sum C_f);
+  # above that the extra width is dead. C_f per stage on Dataset291: 32 / 64 / 128 / 256 ...
+  fine_proj_dim: 64
+  compile: true                 # torch.compile the transformer + Muon Newton-Schulz
+  # Extra compile targets (both need compile: true). Measured on exp52 + fine_decode, RTX PRO
+  # 6000: encoder+decoder together = -6% step time / -1.0 GiB peak at B=8 K=1 fine_stage=1,
+  # and -18% at B=4 K=3 fine_stage=[0,1] (encoder fwd -28%, decode fwd -80%). Compiled output
+  # is not bit-exact vs eager (bf16 conv reassociation, ~0.7% mean logit drift) — keep a
+  # setting fixed for the whole run rather than flipping it on a resume.
+  compile_encoder: true         # image encoder stack (nnunet_ts/conv; ViT encoders always on)
+  compile_decoder: true         # decode head (_decode: tile MLP or the fine_decode readout)
 
 train:
   # --- optim recipe (model-intrinsic) ---
@@ -40,6 +60,19 @@ train:
   muon_wd: 0.1
   lawa_k: 10                    # LAWA checkpoint-averaging buffer
   lr: 1.0e-4
+  # Learning rate of a TRAINABLE image encoder (arch.encoder_frozen=false), as a fraction of
+  # lr; 1.0 = one param group, i.e. the encoder learns at the head's rate. A pretrained
+  # encoder needs a much smaller step than the randomly-initialized head (see exp53).
+  encoder_lr_scale: 1.0
+  # Zero weight decay on ndim<=1 params (InstanceNorm/LayerNorm gains, conv/linear biases).
+  # Decaying a norm gain is not regularization — the conv after it is scale-invariant in the
+  # forward, so shrinking ||W|| raises the EFFECTIVE step size instead of shrinking the signal.
+  # false = one decayed group (reproduces exp43-53); turn on when the encoder trains.
+  no_decay_norm_bias: false
+  # Put Muon under the same warmup+cosine as AdamW (scaled to its own muon_lr_scale base).
+  # false = Muon runs at a constant lr with no warmup and no anneal (exp48-53). Turn on when
+  # the encoder is unfrozen — the head's inputs are then non-stationary for thousands of steps.
+  muon_scheduled: false
   weight_decay: 0.01
   scheduler: cosine
   warmup_epochs: 1
