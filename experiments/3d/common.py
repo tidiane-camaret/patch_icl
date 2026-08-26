@@ -28,6 +28,61 @@ from src.synth_gen_maisi_dataset import SynthGenMaisiDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def _resolve_maisi_classes(spec) -> list[str] | None:
+    """Resolve a MAISI class spec to a list of class names.
+
+    Args:
+        spec: None, "all", a single class name string, a list of names/ids,
+              or a TotalSeg-style spec list with tokens like "ts_organs" and
+              "-class" removals (e.g., [ts_organs, -kidney_cyst_left]).
+
+    Returns:
+        None (all classes) or a list of class names. Spec tokens are expanded
+        via resolve_classes(), then each name is normalized to canonical form.
+        Both MAISI names ("left kidney") and TotalSeg names ("kidney_left")
+        are accepted.
+    """
+    if spec is None or (isinstance(spec, str) and spec.lower() == "all"):
+        return None
+
+    from data.class_registry import normalize_lenient, to_maisi_idx
+
+    # Check if spec contains TotalSeg-style tokens that need expansion
+    # (ts_organs, benchmark, -removals, etc.)
+    needs_expansion = False
+    if isinstance(spec, str):
+        # Single string that's not "all" — could be a class name or a token
+        if spec in ("benchmark", "balanced", "not_benchmark", "not_balanced") or spec.startswith("ts_"):
+            needs_expansion = True
+    elif hasattr(spec, '__iter__'):
+        # List — check for tokens or removals
+        for item in spec:
+            s = str(item)
+            if s.startswith("-") or s.startswith("ts_") or s in (
+                "benchmark", "balanced", "not_benchmark", "not_balanced", "all"
+            ):
+                needs_expansion = True
+                break
+
+    if needs_expansion:
+        # Expand via TotalSeg's resolve_classes, then filter to classes with MAISI mapping
+        expanded = resolve_classes(spec)
+        # Filter to only classes that exist in MAISI vocabulary
+        result = []
+        for name in expanded:
+            canon = normalize_lenient(name)
+            if to_maisi_idx(canon) is not None:
+                result.append(canon)
+        return result if result else None
+
+    if isinstance(spec, str):
+        # Single class name — normalize via registry
+        return [normalize_lenient(spec)]
+
+    # Plain list of names/ids — normalize each
+    return [normalize_lenient(c) if isinstance(c, str) else c for c in spec]
+
 # data.source values served by TotalSegInContextDataset (differ only in root + classes).
 _TOTALSEG_SOURCES = {"totalseg", "totalsegmri", "chemotox"}
 
@@ -288,9 +343,9 @@ def build_dataset(cfg, split: str):
         if root is None:
             raise ValueError("cfg.paths.synth_gen_maisi is not set "
                              "(needed for data.source=synth_gen_maisi)")
-        # classes: explicit MAISI-name list from config; "all"/None -> every MAISI class
+        # classes: explicit MAISI-name list, single name, or "all"/None for all
         spec = d.get("train_classes") if split == "train" else d.get("val_classes")
-        classes = None if (spec is None or isinstance(spec, str)) else list(spec)
+        classes = _resolve_maisi_classes(spec)
         return SynthGenMaisiDataset(
             root=root, classes=classes, image_size=tuple(d.image_size),
             split=split, context_size=d.context_size,
@@ -314,7 +369,7 @@ def build_dataset(cfg, split: str):
         if bank is None:
             raise ValueError("cfg.paths.gmm_bank is not set (needed for data.source=synth_gmm_maisi)")
         spec = d.get("train_classes") if split == "train" else d.get("val_classes")
-        classes = None if (spec is None or isinstance(spec, str)) else list(spec)
+        classes = _resolve_maisi_classes(spec)
         g = cfg.data.get("gmm", {})
         # train iterates epoch_length generative samples; val is capped small (deterministic
         # per idx via eval_seed) — max_val_subjects overrides, default 100.

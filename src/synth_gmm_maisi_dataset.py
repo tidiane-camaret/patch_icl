@@ -221,17 +221,23 @@ class SynthGmmMaisiDataset(Dataset):
 
 
 def _name_to_id(name):
-    from data.maisi_classes import MAISI_CLASS_TO_IDX
+    """Convert a class name (any format) to MAISI index.
+
+    Accepts both MAISI names ('left kidney') and TotalSeg names ('kidney_left')
+    via the unified class registry.
+    """
+    from data.class_registry import to_maisi_idx, normalize_lenient
+    # Try the class registry first (handles both vocabularies)
     try:
-        return MAISI_CLASS_TO_IDX[name]
+        canon = normalize_lenient(name)
+        maisi_idx = to_maisi_idx(canon)
+        if maisi_idx is not None:
+            return maisi_idx
     except KeyError:
-        # Common trap: TotalSeg underscore names (e.g. 'kidney_right') reach the MAISI
-        # synth bank, whose vocabulary uses spaces ('right kidney'). Fail with the likely
-        # fix instead of a bare KeyError. See docs on cross-source class vocabularies.
-        alt = name.replace("_", " ")
-        hint = (f" — did you mean {alt!r}? (MAISI uses space-separated names; "
-                f"'{name}' looks like a TotalSeg class)"
-                if alt in MAISI_CLASS_TO_IDX else
-                f" (valid MAISI names use spaces, e.g. 'right kidney'; "
-                f"pass MAISI ids/names or 'all')")
-        raise KeyError(f"{name!r} is not a MAISI class{hint}") from None
+        pass
+    # Fallback to direct MAISI lookup for any edge cases
+    from data.maisi_classes import MAISI_CLASS_TO_IDX
+    if name in MAISI_CLASS_TO_IDX:
+        return MAISI_CLASS_TO_IDX[name]
+    raise KeyError(f"{name!r} is not a known MAISI class. Use MAISI names "
+                   f"('left kidney'), TotalSeg names ('kidney_left'), or MAISI ids.")

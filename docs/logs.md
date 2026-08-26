@@ -1,5 +1,31 @@
 # Change log
 
+## 2026-08-26 — Unified class registry (MAISI ↔ TotalSeg vocabulary)
+
+Added `data/class_registry.py` — single source of truth for class names across
+MAISI and TotalSegmentator vocabularies with bidirectional lookup and automatic
+normalization.
+
+**FIX**: `synth_gmm_maisi` and `synth_gen_maisi` now respect single-class
+`train_classes`/`val_classes` specs. Previously `train_classes=heart` was
+treated as a special string (like "all") and ignored; now it correctly filters
+to just that class. Added `_resolve_maisi_classes()` helper in `common.py` and
+updated `_name_to_id()` in `synth_gmm_maisi_dataset.py` to use the class registry.
+
+- **Canonical format**: TotalSeg underscore style (e.g., `kidney_left`, `rib_left_6`)
+- **`normalize(name)`**: Convert any format to canonical
+  - TotalSeg passthrough: `"kidney_left"` → `"kidney_left"`
+  - MAISI L/R flip: `"left kidney"` → `"kidney_left"`
+  - MAISI rib format: `"left rib 6"` → `"rib_left_6"`
+  - Synonym: `"bladder"` → `"urinary_bladder"`
+- **Index lookups**: `to_maisi_idx()`, `to_totalseg_idx()`, `from_maisi_idx()`, `from_totalseg_idx()`
+- **Cross-vocab conversion**: `maisi_to_totalseg_idx()`, `totalseg_to_maisi_idx()`
+- **ClassDef dataclass**: Stores canonical name, MAISI name, both indices, category
+
+Registry stats: 130 total classes (125 with MAISI idx, 122 with TotalSeg idx).
+All 125 MAISI and 117 TotalSeg classes verified against original vocabularies.
+Tests: `tests/test_class_registry.py` (15 tests).
+
 ## 2026-08-20 — In-context dataloader v2
 
 Added `src/incontext_dataset_v2.py` (`InContextDataset` engine + `LoadRequest`/

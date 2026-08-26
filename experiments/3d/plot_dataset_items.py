@@ -146,12 +146,19 @@ def main():
     # synth_gmm but validates totalseg plots the real totalseg items on --split val. No
     # data.val block -> cfg unchanged (val == train source).
     if args.split != "train":
+        has_val_block = cfg.data.get("val") is not None
         cfg = eval_cfg(cfg)
+        if not has_val_block:
+            print(f"WARNING: --split {args.split} but no data.val block in config; "
+                  f"using train source '{cfg.data.source}'. "
+                  f"Use '++data.val.source=<source>' to override.")
 
     # This is a CPU visualization tool: it needs painted image/label items, not the native
     # crops the synth gpu_realize path ships (those are painted on GPU in the train loop). Force
     # gpu_realize off so `experiment=43_synth_gmm` plots without a manual data.gpu_realize=false.
     if cfg.data.get("gpu_realize", False):
+        print("WARNING: gpu_realize=true ignored (plot_dataset_items is a CPU tool; "
+              "GMM paint runs on CPU here, not GPU)")
         OmegaConf.set_struct(cfg, False)
         cfg.data.gpu_realize = False
         OmegaConf.set_struct(cfg, True)
