@@ -25,20 +25,22 @@ from src.totalseg_dataset import _ALL_CLASSES_IDX, normalize_ct, normalize_mri
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
                    crop_spacing_mm, native_spacing, jitter, rng,
-                   mask_downsample, occ_thr, normalize_fn=None):
+                   mask_downsample, occ_thr, normalize_fn=None, antialias=False):
     """Organ-centred crop of physical extent T*crop_spacing_mm around `center`,
     resampled to T^3 and centre-padded. Returns (image (1,T,T,T) f32, label
     (T,T,T) i64 binary for class_idx, crop_geom (4,3) i64).
 
     `normalize_fn`, when given, maps the cropped raw image slice to model input
-    space BEFORE placement (so the air-pad value matches the normalized min)."""
+    space BEFORE placement (so the air-pad value matches the normalized min).
+    `antialias` area-prefilters downsampled image axes (see place_image) — needed
+    when the native grid is finer than the crop pitch, e.g. anisotropic sources."""
     crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
         image_np, label_np, center, list(native_spacing),
         image_size=(T, T, T), crop_mm=crop_spacing_mm, jitter=jitter, rng=rng)
     crop_ct = np.ascontiguousarray(crop_ct)
     if normalize_fn is not None:
         crop_ct = normalize_fn(crop_ct)
-    image_t = place_image(crop_ct, out_sizes, pad_lo, T)
+    image_t = place_image(crop_ct, out_sizes, pad_lo, T, antialias=antialias)
     lbl_small = resample_binary(crop_lbl == class_idx, tuple(out_sizes),
                                 mode=mask_downsample, occ_thr=occ_thr)
     label_t = place_label(lbl_small, out_sizes, pad_lo, T).long()

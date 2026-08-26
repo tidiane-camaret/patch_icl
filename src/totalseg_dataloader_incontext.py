@@ -236,12 +236,23 @@ def organ_crop_arrays(ct_mm, label_mm, center, sp, *, image_size, crop_mm, jitte
     return crop_ct, crop_lbl, out_sizes, pad_lo, crop_geom
 
 
-def place_image(crop_ct, out_sizes, pad_lo, T):
+def place_image(crop_ct, out_sizes, pad_lo, T, *, antialias=False):
     """Resample the native CT slice to out_sizes (trilinear) and centre it in an
-    air-filled T³ tensor. Returns (1, T, T, T)."""
-    img_small = F.interpolate(
-        torch.from_numpy(crop_ct.astype(np.float32))[None, None],
-        size=tuple(out_sizes), mode="trilinear", align_corners=False)[0]
+    air-filled T³ tensor. Returns (1, T, T, T).
+
+    `antialias=True` area-prefilters the axes that are being DOWNsampled before the
+    trilinear resample. Plain trilinear point-samples (F.interpolate has no 3D
+    `antialias` option), so a decimated crop aliases; on FLARE22's anisotropic native
+    grid that is ~10 HU mean error and 8% of voxels off by >25 HU. No-op when no axis
+    is downsampled — which is why the totalseg 1.5mm-native path never needed it."""
+    src = torch.from_numpy(crop_ct.astype(np.float32))[None, None]
+    if antialias:
+        pre = [min(o, s) for o, s in zip(out_sizes, crop_ct.shape)]
+        if tuple(pre) != tuple(crop_ct.shape):
+            src = F.interpolate(src, size=tuple(pre), mode="area")
+    img_small = (src[0] if tuple(src.shape[2:]) == tuple(out_sizes) else
+                 F.interpolate(src, size=tuple(out_sizes),
+                               mode="trilinear", align_corners=False)[0])
     if all(o == T for o in out_sizes):
         return img_small
     image_t = torch.full((1, T, T, T), float(crop_ct.min()), dtype=torch.float32)
