@@ -4743,3 +4743,457 @@ forward + predict shapes correct, encoder no-grad while img_embed trains; eval c
 - Root cause: no `set_start_method` in train.py -> Linux default = FORK. `measure_flops` (and training) initialize CUDA in the parent BEFORE loaders run, so eval workers are forked from a CUDA-initialized parent and inherit its CUDA context; the first CUDA touch in the worker aborts (contexts can't cross fork). Confirmed: `eval.workers=0` (no forked workers) -> run completes, val_dice=0.0341.
 - Fix: `experiments/3d/common.py` make_eval_loader — all 3 eval DataLoader `common` dicts now pass `multiprocessing_context=("forkserver" if nw>0 and DEVICE.type=="cuda" else None)`. forkserver workers spawn from a clean server that never touched CUDA -> no inherited context. Keeps eval parallel (no per-run flag). Train loader left as fork (works; forked earlier under lighter CUDA state). CPU / workers=0 paths unchanged (None = default).
 - Verified: default eval.workers (parallel) run completes, eval 31/31, val_dice=0.0341 (identical to workers=0), Done. forkserver adds a one-time ~30s worker-spin-up on the first eval (module re-import), then 2.5 it/s. Applies to eval.py too (same helper).
+
+### PatchSet3D sub-patch decode: per-token dynamic filter over unpooled encoder features — 2026-08-25
+- Problem: the decode head was `Linear(e,h)->GELU->Linear(h,d³)`, i.e. one 768-d query token expanded to `mask_patch_decode_size³ = 512` CONSTANTS per 8³ cell (12 mm at 1.5 mm pitch). No sub-patch evidence reaches the output at all, and there is no spatial mixing across cell borders — boundaries cannot be placed inside a cell. Meanwhile the image token grid is the only stream still at 16³ (mask I/O is already full 128³, cf. the 2026-08-11 self-context entry).
+- Key enabling fact: the fine features are **free in compute and in peak memory**. `NnUNetTSEncoder` runs the conv with `return_skips=True`, so every stage is already materialized before `picked = [...]` selects {2,3,4}; stages 0/1 (128³×32, 64³×64 for Dataset291) were computed and dropped. Taking a slice of them adds no forward pass and no new transient peak — only the retained rows cost.
+- **`arch.fine_decode`** (default false = byte-identical to before). When on, the head becomes, per query token: a dynamic FILTER `Linear(e, C_p)` dotted against the query volume's own unpooled stage map inside that token's cell, plus a linear tile term `Linear(e, m³)`. The tile term is deliberate insurance — a pure dot product is NOT a superset of the old head (w→0 collapses a cell to one constant, strictly coarser than an 8³ tile), so keeping it means the head can only match or beat the baseline, and zeroing the fine term is the exact ablation.
+- Encoder contract: new optional `supports_fine` / `n_fine_stages` / `fine_stage_channels(s)` / `fine_stage_size(in,s)` on `ConvEncoder3D` + `NnUNetTSEncoder`, plus `fine_rows` / `fine_stage` kwargs on their `forward`. ONE forward returns `(coarse, fine[rows])`; `rows = arange(B)*T + K` selects only the query volume (the query is the last of T), so context fine maps are freed with the stage list. nnU-Net derives `stage_div` from `plans["pool_op_kernel_sizes"]` rather than assuming stride-2 everywhere. ViT encoders (primus/tap_ct) define none of this and raise a `ValueError` at construction — deliberately loud, not a silent fallback.
+- **The fine request goes through `forward` kwargs, NOT a separate method** — first cut used `encode_with_fine(x, rows, stage)` and the exp52 smoke crashed in `train_epoch` with `ValueError: Both events must be recorded before calculating elapsed time`. Cause: exp52 inherits `train.profile_timing=true` from 48, whose CUDA-event hooks are `net.encoder.register_forward_pre_hook`; a plain method call bypasses `Module.__call__` so the hooks never fired (and `measure_flops` likewise lost the encoder — the header printed no `encoder=` term). Invariant to preserve: **the encoder is reached once per forward via `__call__`**. `PatchSet3D._encode(x, spacing, fine_rows=None)` is now the single dispatch point.
+- Alignment is the one silent-catastrophic risk: the cell regroup uses the SAME permutation as `_mask_tiles_3d` (`(B,C,R,m,R,m,R,m).permute(0,2,4,6,1,3,5,7)`), so cell order matches `ijk_base` (n = i·R²+j·R+k) and `_tile_logits` (now taking an explicit `d`) is its exact inverse. Verified: regroup→fold round-trips bit-exact, and cell n=27 maps to spatial block (1,2,3). einsum runs on the permuted **view** — no contiguous copy.
+- `_attn` now returns query tokens `q`; decode moved to `_decode(q, fine)`. Geometry unchanged: `grid_size = R·mask_patch_decode_size = 128`, so `target_like`/loss/eval are untouched; the fine tile size is `m = S/R` (fine_stage), trilinear-resampled to the output grid when `S != 128`. At `fine_stage=0`, `m == mask_patch_decode_size` and there is no resample.
+- Verified on the real Dataset291 1.5 mm encoder, 128³, R=16, B=1: stage 0 → C_f=32/S=128/m=8, stage 1 → 64/64/4, stage 2 → 128/32/2; all produce `(B,1,128,128,128)`. Peak VRAM stage 1 5.06 GiB vs baseline 4.98 (+0.08); stage 0 6.42 (+1.44). Head params SHRINK 3.94M → 103K (stage 1). Grads flow to all three new modules. 32/32 existing 3d tests pass; Hydra composes and overrides.
+- Also: `feature_sim/adapters.py::transformer_query` hooked `model.decoder`, which fine_decode does not build — now falls back to `filter_head`.
+- KNOWN TRADE: `encode_with_fine` bypasses the frozen-encoder eval cache (`_cached_encode` stores only the coarse R³ map; a 64³×64ch fine map is ~67 MB, uncacheable at any useful entry count), so eval re-encodes each crop. Training is unaffected — that cache is already inactive in train mode.
+- exp52 smoke (1 epoch, 8 items, B=2, `wandb.project=null`) runs clean both ways. fine vs baseline: params 34.7M/48.7M vs 38.5M/52.5M (head shrinks), GFLOPs 3347.9 vs 3377.2, per-step encode 142 vs 143 ms (fine map really is free in the encoder forward), attn 2667 vs 2775 ms. EVAL is the cost: 21 s vs 11 s on this tiny eval, the encode-cache bypass showing up — and the gap widens over epochs, since only the baseline's cache warms. `val_dice=nan` appears in BOTH runs at `eval.n_subjects=2` ("no context candidates" → self-context fallback, 2 subjects over 22 classes); it is the smoke config, not the fine path.
+- NOT DONE (deferred by request): the `fine_stage` bench sweep (step time / peak VRAM via `bench_train_step.py`), the seam diagnostic that would decide whether a token-conditioned conv decoder is warranted, and any training run. Forward timings above are single un-warmed calls and are NOT benchmark numbers.
+
+### fine_decode: multi-stage fine features (arch.fine_stage as a list) — 2026-08-25
+- `arch.fine_stage` now takes an int (unchanged) OR a list, e.g. `[0, 1]`. Each listed stage gets its own `Conv3d(C_f_s, fine_proj_dim, 1)` applied at that stage's NATIVE resolution; the projected maps are trilinear-upsampled to the finest listed stage's grid and SUMMED. `self.fine_proj` is now an `nn.ModuleList`.
+- **Why the sum form, not a literal concat**: trilinear upsampling is a per-channel convex combination and a 1x1x1 conv is a per-voxel channel map, so they COMMUTE — `Conv1x1(concat[f0, up(f1)])` and `Conv1x1_0(f0) + up(Conv1x1_1(f1))` compute the identical function. The factored form never materializes the concatenated map at full resolution. Verified numerically: max abs diff 9.5e-7 between the two forms.
+- **Rank fact that sets `fine_proj_dim`**: the readout is LINEAR in the fine features (1x1x1 conv, then a contraction over channels against the token-generated filter `w`), so the effective per-voxel filter is `u = W^T w`, which lives in the row space of `W` — rank capped at `min(fine_proj_dim, sum(C_f))`. `fine_proj_dim` above that total is dead width; a construction-time print now says so. Corollary: the earlier single-stage `fine_stage=0` runs at `fine_proj_dim=64` were capped at C_f=32, i.e. half the width was unused. For `[0,1]` on Dataset291, `sum(C_f) = 32+64 = 96` → `fine_proj_dim=96` saturates exactly.
+- Readout resolution = the FINEST listed stage (`max` of the per-stage sides), so `[0,1]` decodes at 128³ with `m=8` and no output resample; coarser stages are lifted to it.
+- Verified: int form back-compatible (`fine_stage=1` → `(1,)`, one conv); `[0,1]` builds 2 convs with in_ch `[32,64]` on the real encoder, grads flow to both; out-of-range stage inside a list raises; warning fires above `sum(C_f)` and is quiet at exactly it. exp52 smoke with `arch.fine_stage=[0,1] arch.fine_proj_dim=96` runs clean end-to-end (35.0M trainable vs 34.7M for stage 0 alone, 38.5M baseline). 32/32 3d tests pass.
+- **CHECKPOINT BREAK**: `fine_proj` moved from a bare `Conv3d` to a `ModuleList`, so state-dict keys changed `fine_proj.weight` → `fine_proj.0.weight`. Any in-flight `fine_decode` checkpoint cannot be resumed without a key remap.
+- Recipe: `python experiments/3d/train.py experiment=52_organs_real_nnunet_ts arch.fine_decode=true 'arch.fine_stage=[0,1]' arch.fine_proj_dim=96` (quote the list for the shell).
+
+### torch.compile the image encoder + decode head (`arch.compile_encoder` / `arch.compile_decoder`) — 2026-08-25
+- Audit of what exp52 actually compiled: `arch.compile=true` (model/m1.yaml) only ever compiled `net.transformer` + Muon's `_newtonschulz5_batched`. The encoder branch in `train.py` fired for `primus`/`tap_ct` only, so the **frozen nnU-Net conv ran eager**, as did everything outside `TransformerEncoderStack` — `img_embed`/`mask_embed`, `_feat_norm`, `_occupancy`, RoPE build, `ThinkingRows`, and the whole `_decode` (incl. the fine_decode readout).
+- Benchmarked (`scratchpad/bench_compile_parts.py`: real `build_model`, random inputs at the exp52 shapes, full fwd+bwd+clip+AdamW+Muon step, 4 warmup + 12 timed; RTX PRO 6000 Blackwell **shared with a live run**, but per-step spread <1%). exp52 `fine_decode=true`, B=4 K=1 ms/step: all-eager 261.3 → transformer-only (old default) 202.2 → +encoder 190.7 → +decoder 200.2 → **both 188.6 (−6.7%, peak 12.41→11.91 GiB)**. Forward split enc/attn/dec: 35.5/46.8/2.9 → 23.9/46.8/0.9 ms. At the config's B=8: 389.5 → 366.1 ms (−6.0%), peak 24.53 → 23.53 GiB.
+- The win scales with K and with decode grid: the exp54-style config (B=4, K=3, `fine_stage=[0,1]`, e=384/h=1536/a=6/l=3) goes **290.2 → 239.1 ms (−17.6%)**, encoder fwd 67.5→48.9 (−28%), decode fwd 33.3→6.8 (−80%) — the fine readout's z-score + 1×1×1 proj + per-cell einsum is memory-bound elementwise work inductor fuses. `dynamic=True` measured identical to `dynamic=False` (239.6 vs 239.1), so use dynamic for eval-shape robustness.
+- Implementation: `train.py::_compile_encoder(net, cfg)` is now the single encoder-compile dispatch. `arch.compile_encoder`: `null` = legacy (ViT encoders compiled, conv encoders eager), `true` = compile whichever encoder is configured (`nnunet_ts` → the inner `PlainConvUNet` `enc.encoder`; `conv` → `ConvEncoder3D._stage_feats`), `false` = every encoder eager. `arch.compile_decoder=true` shadows `net._decode` with a compiled callable (a method, so **no state_dict keys change**) and covers both the tile MLP and the fine_decode head. Only the pure conv/attention stack is compiled, never the encoder wrapper — the CT renorm / `_down_to` / encode cache would graph-break, and `profile_timing`'s hooks stay on the eager `net.encoder`.
+- Both default **true** in `model/m1.yaml` (so 48/52/54 pick them up); everything else keeps the old behaviour via the code-side defaults. `eval.py` never compiled patchset3d, and rebuilds `cfg.arch` from the checkpoint — the extra keys are inert there.
+- Verified: no graph breaks / recompiles under `TORCH_LOGS=graph_breaks,recompiles`; exp52 smoke (1 epoch, B=2, 8 items) runs clean and prints `Compiled net.transformer + Newton–Schulz (dynamic=True) + frozen nnU-Net encoder stack + decode head`; state_dict round-trip holds (140/156 keys carry `_orig_mod.`, the save-path strip loads strict into a fresh uncompiled model); `compile_encoder=false` / unset reproduce the legacy messages. `val_dice=nan` in the smoke is the known 2-subject/22-class self-context artifact, not the compile path.
+- CAVEAT: compiled output is **not bit-exact** vs eager — max|Δ| 1.7e-1, mean|Δ| 1.1e-2 on logits of mean magnitude 1.69 (~0.7%), from bf16 conv reassociation. Keep the setting fixed for a whole run rather than flipping it on a resume.
+
+### FLARE22 explored as an eval dataset (docs only) — 2026-08-25
+- New `docs/datasets/flare22.md`: composition, labels, image characteristics, metrics, and an
+  overlap analysis against our training pool. No code changes; dataset not downloaded.
+- Key facts: 50 labelled train (Zenodo, CC-BY-4.0, images+pancreas GT from MSD Task07, other organs
+  from AbdomenCT-1K) + 2000 unlabelled + 50 validation (GT released post-challenge) + 200 hidden test.
+  13 dense abdominal organs, portal-venous CT, 512² in-plane, ~2.5 mm slice, abdomen-only FOV.
+- Overlap check (`data/totalseg_classes.py`): 11/13 organs are in our held-out `BENCHMARK_CLASSES`,
+  but **adrenal_gland_right and duodenum are trained on** — report separately or drop. All 13 are
+  inside TotalSegmentator's label set, so FLARE22 is an **unseen-centre / acquisition-shift**
+  benchmark, not an unseen-class one.
+- Main reason to include it: Medverse uses 50 FLARE22 cases as its "unseen centre" held-out split
+  (k=4, ×8 samplings, Dice) → direct head-to-head with our closest 3D-ICL baseline.
+- Integration sketch (unbuilt) follows the `totalseg_more_labels` eval-only pattern: converter →
+  native `ct.npy`/`label.npy`/`spacings.json` + centroids, `src/flare22_dataset.py` subclassing
+  `TotalSegInContextDataset`, dispatch in `experiments/3d/common.py` + `eval.py`, and
+  `configs/experiment/3d/dataset/flare22.yaml`.
+
+### FLARE22 downloaded + explored (50 labelled cases on NFS) — 2026-08-25
+- `paths.flare22` added to `configs/cluster/nfs.yaml`; data at `.../data/flare22/FLARE22Train/{images,labels}`
+  (nnU-Net layout, `FLARE22_Tr_%04d[_0000].nii.gz`, 50+50 files, 1.4 GB). Exploration scripts kept in
+  `experiments/flare22/` (`explore_flare22.py`, `lat.py`, `fl_border.py`, `ts_vols.py`).
+- **Label order verified**, not assumed: 1 liver, 2 kidney_right, 3 spleen, 4 pancreas, 5 aorta, 6 IVC,
+  7 adrenal_R, 8 adrenal_L, 9 gallbladder, 10 esophagus, 11 stomach, 12 duodenum, 13 kidney_left.
+  Laterality confirmed on the RAS x-axis 50/50 for both kidney and adrenal pairs. All 13 organs present
+  in all 50 cases (dense) → 650 (subject, class) eval tasks. Labels uint16, RAS, geometry == image.
+- **Acquisition shift is anisotropy.** FLARE22 native 0.80×0.80×2.5 mm (47/50 at 2.5, one 4.0, two 5.0),
+  512²×71–113, anisotropy 3.14×, abdomen-only 243 mm z FOV. Our totalseg copy is **1.5 mm isotropic for
+  all 1228 subjects** — the model has seen zero anisotropy variance. `use_crop` will downsample in-plane
+  and interpolate z ×1.67 at `crop_spacing_mm=1.5`; **sweep [1.5, 2.5, 4.0]**, 2.5 being the only value
+  that leaves z untouched.
+- **Label-convention drift measured** (TS volumes restricted to subjects where the mask does NOT touch
+  the volume border, so FOV truncation is excluded): liver 1.03 and spleen 0.96 agree, but pancreas 1.30,
+  kidney_L 1.31, kidney_R 1.34, gallbladder 1.32, adrenal_L 1.31, duodenum 1.43 are systematically ~30%
+  LARGER in FLARE22. Not a global scale artefact. Implies a **Dice ceiling of 2/(1+r) ≈ 0.87** for a
+  TotalSegmentator-convention model on those organs regardless of quality — absolute FLARE22 Dice must be
+  read against it.
+- aorta (50/50) and esophagus (50/50) masks touch the FOV border in every case, IVC in 27/50 → those are
+  *segments*, volume-incomparable across datasets; their 0.39/0.46 ratios are FOV, not convention.
+- Proposed experiment the drift enables: FLARE22 contexts vs TotalSeg contexts vs `eval.model=totalsegmentator`
+  (context-free) on FLARE22 targets — a direct test of whether in-context reads the annotation convention
+  off the context mask.
+
+### FLARE22 wired as an eval source (native-grid extraction + load-time resample) — 2026-08-25
+
+Converted + wired end-to-end. `scripts/convert_flare22.py` → `src/providers/flare22.py`
+(`Flare22Provider`, v2 `VolumeProvider`) → `configs/experiment/3d/dataset/flare22.yaml`,
+dispatched in `experiments/3d/common.py` (`_source_root`, `build_dataset`, eval loader) and
+`experiments/3d/eval.py`. `python experiments/3d/eval.py dataset=flare22 eval.model=...`;
+650 (subject, class) tasks, verified end-to-end through Hydra composition.
+
+- **Extraction is native + lossless.** `ct_raw.npy` int16, `label.npy` uint8, root
+  `spacings.json` with spacing/shape/**full 4×4 affine**. 50/50 cases pass the converter's
+  per-case integrality + range check (global HU exactly [-1024, 3071]), so int16 is bit-exact;
+  float16 would not be (no odd integers > 2048). 2.0 GB total → the OS page cache holds the whole
+  dataset, so no per-pitch image cache is needed (unlike totalseg's `ct_raw_{pitch}mm.npy`).
+  Storing the affine (not just spacing) is what allows writing predictions back into the source frame.
+- **All resampling deferred to the dataloader** → `crop_spacing_mm` is a config knob, not a
+  re-conversion. `Flare22Provider` reuses `crop_and_place`, so crop geometry stays in one place.
+- **`place_image` gained `antialias=`** (default False, so nothing existing changes). `F.interpolate`
+  has no 3D `antialias`; plain trilinear point-samples and aliases under the 2–4× in-plane decimation
+  FLARE22's native grid requires. The new path area-prefilters *only* the downsampled axes, leaving
+  the z upsample at 1.5 mm alone. Measured 4–12% of voxels changed on real crops. The 1.5mm-isotropic
+  totalseg path never hit this because there the resample was an identity — which is why the bug
+  survived until the first anisotropic source.
+- **Defaults: `crop_spacing_mm=2.5`, `mask_occupancy_thr=0.5`.** 2.5 makes the z resample an *exact
+  identity* (crop pitch == native z spacing; confirmed in `crop_geom`, crop_sizes[2]==out_sizes[2]==110)
+  and 320 mm FOV truncates nothing, so it beats 1.5 on GT fidelity for every organ despite being 3.9×
+  coarser in-plane — z is the coarse axis, so z boundary error dominates. thr 0.1 (the v2 totalseg
+  default) dilates: adrenal GT volume ~1.7× vs ~1.08× at 0.5.
+- **Open: metrics are still computed in crop space.** `evaluate.py` Dices against the *resampled*
+  label, inflating Dice by 2–21 points vs native FLARE22 voxel space (perfect-predictor ceiling:
+  liver 0.984, aorta 0.941, adrenal_R 0.832 at 2.5mm) and reordering organs. `crop_geom` already
+  inverts the crop exactly and `Flare22Provider.native_meta()` supplies native shape/spacing/affine,
+  so this is an `evaluate.py` change only. `nsd_batch` takes per-axis spacing but is fed the crop's
+  isotropic pitch. See docs/datasets/flare22.md §7.
+
+**Follow-up (same day):** eval pitch set back to **1.5 mm isotropic** in
+`configs/experiment/3d/dataset/flare22.yaml` (harness-consistent for now; the 2.5 mm
+fidelity argument is kept in the config comment as an override). Items plotted with
+`experiments/3d/plot_dataset_items.py dataset=flare22 --split val --separate_overlay`
+→ `results/3d/flare22_items.png`. Verified while plotting: **array axis order matches
+totalseg** — axis 0 is L–R in both (kidney_left − kidney_right centroid delta is
+axis-0 dominant with the same sign: totalseg s0001 −83.3, flare22 −219/−222), so
+`as_closest_canonical` with no transpose is consistent across the two converters and the
+model sees the same anatomical axis ordering it trained on. Note `plot_dataset_items.py`
+calls axis-0 slices "axial" in its docstring; they are sagittal — pre-existing, affects
+every 3D source equally, cosmetic only.
+
+### NasalSeg inspected (docs only) — 2026-08-25
+
+Head/sinus CT, NRRD (needs `pynrrd`, in `.venv_blackwell`), 5 air-filled cavity classes.
+Full characterisation in `docs/datasets/nasalseg.md`. Not wired in. Three findings that
+change how it must be used:
+
+- **130 files, 107 unique cases.** 19 groups of byte-identical duplicates (image AND label,
+  SHA-1 over raw arrays; P076–P079 is a 4-way copy). For in-context eval this is silent
+  leakage: a twin drawn as its duplicate's context is an exact clone of the target, inflating
+  Dice toward the trivial-matching ceiling, and the case ids differ so the `SELF` flag in
+  `plot_dataset_items.py`/eval never fires. De-dup to 107 → 535 (subject, class) tasks.
+- **12 `_seg.nrrd` headers are junk** (9 with a negative z-direction + non-overlapping origin,
+  3 with z-spacing 1.0 vs the image's 1.5) while the arrays are index-aligned. Verified via
+  contrast polarity rather than assumed: labels mark air, and as-is the mask covers 93–99% of
+  voxels < −300 HU (mean −760…−930), while z-flipping drops that to 45–74%. A converter must
+  take geometry from the IMAGE header and assert only shape equality.
+- **Frame is LPS, not RAS** in all 130 — the mirror of what `as_closest_canonical` gives in
+  `convert_to_npy.py` / `convert_flare22.py`. Needs an axis 0/1 flip or the model sees
+  mirrored heads.
+
+Label order verified geometrically (no metadata in the files): 1/2 = maxillary_sinus R/L
+(12–15 mm off the mid-sagittal plane), 3/4 = nasal_cavity R/L (touch the midline, 0.1–0.4 mm),
+5 = nasopharynx (midline, posterior +54.9, inferior). Geometry otherwise clean: 0.586 mm
+in-plane in all 130, z 1.5, exactly diagonal directions, int16 with global HU [−1024, 3071]
+(so int16 is bit-exact). Volumes are small — median 152×187×51 = 1.4M voxels, FOV 89×110×76 mm,
+217 MB total; that FOV is SMALLER than one 128³ crop at 1.5 mm, so an organ-crop path air-pads
+heavily and wants ~0.6–0.8 mm crop pitch.
+
+Why it is worth wiring: zero class overlap with TotalSegmentator (all 5 strictly zero-shot),
+and the targets are AIR cavities (≈ −840 HU) bounded by bone — inverted contrast polarity vs
+every soft-tissue organ we evaluate on. Sharper OOD probe than FLARE22 (acquisition +
+convention drift only); tests whether in-context reads appearance off the context mask.
+
+### NasalSeg wired as an eval source (de-duped, LPS→RAS) — 2026-08-25
+
+`scripts/convert_nasalseg.py` → `src/providers/nasalseg.py` → `configs/experiment/3d/dataset/nasalseg.yaml`,
+dispatched in `experiments/3d/common.py` + `eval.py`. 107 cases × 5 classes = **535 tasks**,
+verified end-to-end through Hydra composition and plotted
+(`results/3d/nasalseg_items.png`). Full detail in `docs/datasets/nasalseg.md`.
+
+- **De-dup is part of conversion**, re-derived by hashing the raw arrays rather than from a
+  hardcoded list: 130 files → 107 unique (19 groups, 23 dropped), mapping written to
+  `duplicates.json`. Keeping them would be silent in-context leakage — a twin drawn as its
+  duplicate's context is an exact clone of the target and the `SELF` check misses it because
+  the case ids differ.
+- **LPS→RAS flip verified, not assumed**: after conversion `maxillary_sinus_left − right` on
+  axis 0 is −78…−89 voxels, same sign as flare22's `kidney_left − kidney_right` (−219).
+  Per-case alignment re-checked at convert time via contrast polarity (`frac_air_under_label`
+  min 83.5%, med 95.9%). Geometry taken from the IMAGE header only — 12 seg headers are junk.
+- **Refactor**: `src/providers/native_grid.py` (`NativeGridProvider`) now holds the shared
+  native-grid crop/resample/centroid-cache body; `Flare22Provider` and `NasalSegProvider` are
+  ~15-line subclasses (class list + index map). No behaviour change — flare22 rebuilt
+  identically (650 tasks, out_sizes 128³ at 1.5 mm) and test_crop_helpers passes.
+- **Settings differ from flare22 for measured reasons.** `crop_spacing_mm: 0.8`: the head FOV
+  (89×110×76 mm) is smaller than a 128³ crop at 1.5 mm, which would leave ~4/5 of the grid as
+  air pad (out_sizes [59,73,49] vs [111,128,93] at 0.8). Unlike flare22 the round-trip ceiling
+  is ~flat across pitches — the binding constraint is structure complexity, not the resample —
+  so grid utilisation decides. `mask_downsample: occupancy` is mandatory, not a preference:
+  `nearest` collapses the thin convoluted nasal cavities (ceiling 0.670 vs 0.859).
+- **Read Dice against a ~0.86 ceiling for the nasal cavities** (0.94–0.95 for the sinuses).
+
+**Bug found + fixed while wiring**: the earlier 2.5→1.5 edit to `flare22.yaml` had deleted the
+`crop_spacing_mm` key outright. Eval and plots still ran at 1.5 mm only because `build_dataset`
+falls back to that default — silently correct, but the config no longer said so. Key restored.
+
+### exp53: unfreezing the nnU-Net image encoder (`arch.encoder_frozen=false`) — 2026-08-25
+
+exp52's frozen TotalSegmentator encoder can now be **finetuned**. Three pieces:
+
+- **`train.encoder_lr_scale`** (`experiments/3d/train.py::encoder_groups`, default `1.0`): puts
+  every `encoder.*` param in its own AdamW group at `encoder_lr_scale * train.lr`. Unfreezing at
+  the head's lr is the failure mode this exists for — the head is randomly initialized, so its
+  first epochs push noise into the only weights that carry transferable signal. Default 1.0 =
+  one group, i.e. byte-identical to the previous behaviour (exp43's unfrozen Primus reproduces).
+  Muon is untouched; the group split happens on the AdamW side only, and both schedulers
+  (cosine LambdaLR, plateau) already scale per-group.
+- **Untapped stages stay frozen** (`src/models/encoders/nnunet_ts.py`): nothing downstream reads
+  a stage deeper than `max(nnunet_ts_stages)`, so those params only ever see an all-zero grad —
+  previously they would have collected AdamW state and been weight-decayed for nothing, and
+  inflated the trainable-param count. Dataset291: stage 5 = 5.5M of the encoder's 14.0M.
+  Trainable total 38.5M (frozen) → 47.0M (unfrozen), not 52.5M.
+- **`configs/experiment/3d/experiment/53_organs_real_nnunet_ts_unfrozen.yaml`**: exp52 +
+  `encoder_frozen=false` + `encoder_lr_scale=0.1` (encoder lr 1e-5). exp52 is left as the
+  frozen baseline.
+
+**Nothing else had to change** — the encoder was already written to train (`_stage_feats` only
+wraps `no_grad` when `frozen`, and `forward` bypasses the encode cache unless
+`frozen and not training`). Verified twice: on CPU, 40/48 encoder tensors get a nonzero grad at
+`frozen=False` (the 8 zero ones = stage 5, now frozen) and 0/48 at `frozen=True`; and
+end-to-end, diffing a 2-step exp53 checkpoint against the pretrained TotalSegmentator weights
+gives `max|Δ| = 1.5e-5` on stages 0-4 (= the AdamW steps at lr 1e-5) and exactly `0` on stage 5,
+while the same run under exp52 is `0` everywhere.
+
+**`encoder_drift/*` (new metric)** — `experiments/3d/train.py::EncoderDrift` logs
+`||W - W0|| / ||W0||` per encoder stage (`s0..s4`) plus a `total`, every epoch, W0 = the
+weights this run started from. It makes "is the finetune eating the pretrained features?"
+readable directly instead of inferred from the val curve. Trainable tensors only (so it is a
+no-op, and prints nothing, on a frozen run), params captured by reference so `torch.compile`'s
+key renaming is irrelevant, reference weights on CPU (56 MB for the nnU-Net encoder), one D2H
+copy per epoch. `enc_drift=` is also appended to the console eval line. Calibrated: injecting
++1% on stage 3 reads exactly `s3=0.0100` with every other stage at 0; a real 8-step run at
+`encoder_lr_scale=0.1` read 0.0013 → 0.0021, matching `steps × lr / weight-RMS`.
+
+**How to read it / what lr to use.** With Adam the per-element step is ~lr, so what matters is
+lr against the pretrained weight scale. Conv-weight RMS by stage on Dataset291: s0 0.032,
+s2 0.016, s3 0.011, **s4 0.0069** (the deepest tapped stage is the most fragile). At 125
+steps/epoch, steps to move s4 by 1× its own RMS: **69 (0.55 epoch) at scale 1.0**, 690 (5.5
+epochs) at 0.1, 6900 (55 epochs) at 0.01. Hence 0.1 as exp53's default — scale 1.0 can rewrite
+the encoder before the head has stopped emitting noise. Diagnostic: if `val/dice` sits under
+exp52's frozen curve at epochs 10-20 while `encoder_drift/total` climbs, that is damage, not
+slow learning — drop to 0.01. `train.warmup_epochs=5` (from 1) is cheap insurance either way,
+since the warmup applies to both param groups.
+
+**Measured cost** (RTX PRO 6000, B=8 K=1 128³, one train step, m1's compile settings, dummy
+data — `frozen → unfrozen`): peak **22.8 → 35.6 GiB**, **364 → 531 ms/step** (+46%). Eager:
+22.8 → 34.2 GiB, 501 → 653 ms. So it fits on a 96 GB card at exp52's batch size with room to
+spare; the encoder activations scale with `B·(K+1)`, so K=3 (T=4 volumes vs 2) costs ~2× the
++12.8 GiB delta.
+`torch.compile` (transformer + encoder + decode) works unchanged with grads through the encoder.
+Two second-order effects: the frozen-encoder LRU cache is inert once the weights move (val pays
+a full encode per crop), and LAWA — if `lawa_k>0`, which exp48/52 do not use — now averages the
+encoder too.
+
+### exp57 groundwork: from-scratch nnU-Net encoder + no-decay groups + scheduled Muon — 2026-08-26
+
+Follow-up to exp53 (unfrozen pretrained encoder). Three changes so the same architecture can be
+trained **from scratch** as the "how much does supervised CT pretraining actually buy in-context?"
+control, plus the two optimizer fixes that from-scratch training exposes.
+
+**1. `arch.nnunet_ts_random_init` (`src/models/encoders/nnunet_ts.py`).** Keeps everything
+`plans.json` defines — architecture, CTNormalization stats, pretrain spacing — and skips only
+`fold_0/checkpoint_final.pth` (and the `enc_missing` assert), so a scratch run differs from exp53
+in exactly one thing. `nnunet_ts_weights` is still required (plans.json is the arch source).
+Threaded through `PatchSet3D.__init__` and `build_model`; `eval.py` gets it for free via the
+checkpoint's stored `arch`.
+
+**The explicit He init is the load-bearing part.** `PlainConvUNet` does NOT initialize in
+`__init__` — nnU-Net does it in the trainer (`get_network_from_plans` →
+`network.apply(network.initialize)` → `InitWeights_He(1e-2)`). Simply skipping the load would
+silently leave PyTorch's `Conv3d` default (`kaiming_uniform_, a=√5`), whose std is **~2.4× smaller**
+than He. That is not cosmetic here: every conv is followed by `InstanceNorm3d(affine=True)`, so
+conv weights are scale-invariant in the forward — the init scale does not set the signal scale, it
+sets the **effective step size** (Adam moves ~`lr` per element, so the relative move is
+`lr / weight-RMS`). Measured conv-weight RMS on Dataset291:
+
+| stage.conv | shape | pretrained | torch default | He(1e-2) |
+|---|---|---|---|---|
+| s0.conv0 | (32,1,3³) | 0.164 | 0.111 | 0.272 |
+| s2.conv1 | (128,128,3³) | 0.0159 | 0.0098 | 0.0241 |
+| s3.conv1 | (256,256,3³) | 0.0107 | 0.0069 | 0.0170 |
+| s4.conv1 | (320,320,3³) | 0.0070 | 0.0062 | 0.0152 |
+
+nnU-Net's own SGD+wd training ends up *below* its He starting scale, close to the torch default.
+He therefore starts ~2.2× above the converged scale and moves ~2.4× more slowly per step than the
+default would — both nnU-Net-faithful and the stabler choice. Verified: every conv lands within
+±15% of its He std, biases zero, 40/40 trainable tensors get nonzero grad, weights ≠ checkpoint.
+
+**2. `train.no_decay_norm_bias` (`encoder_groups`).** Every `ndim <= 1` param (InstanceNorm/
+LayerNorm gains, conv/linear biases) goes into a `weight_decay=0` group. Decaying a norm gain is
+not regularization — by the same scale-invariance, shrinking `‖W‖` *raises* the effective step
+size rather than shrinking the signal, the classic late-run instability. `encoder_groups` now
+buckets on (is-encoder, is-no-decay) → up to 4 groups; both splits default OFF, and with both off
+it returns one group with the params in the original order, so exp43–53 reproduce byte-for-byte.
+
+**3. `train.muon_scheduled` (`build_scheduler` + new `MultiScheduler`).** Muon was never on the
+scheduler — `build_scheduler` only ever saw `optimizers[0]` (AdamW), so the transformer's 2D
+matrices ran at a **constant** `muon_lr_scale·lr` with no warmup and no anneal for the whole run.
+Fine with a frozen encoder (stationary features from step 0); bad with a moving one, and worst from
+scratch: the head's input distribution is non-stationary for thousands of steps, so an unwarmed,
+never-annealed Muon is the piece most likely to lock in early garbage and then fail to fine-converge.
+`build_scheduler` now takes a list of optimizers and gives each its own scheduler of the same shape,
+wrapped in `MultiScheduler` (Muon is a plain `torch.optim.Optimizer`, so LambdaLR/plateau drive it
+unchanged; each sub-scheduler multiplies its *own* `initial_lr`, so Muon keeps its
+`muon_lr_scale`-relative base and only inherits the warmup/cosine shape). Default false = exp48–53
+behaviour. Plateau's floor also became per-group (`group lr × lr_min_factor`) instead of one global
+`train.lr × lr_min_factor` — identical for single-group optimizers, and no existing config combines
+plateau with `encoder_lr_scale` (m1 is cosine). New wandb curves: `train/lr_encoder`, `train/lr_muon`.
+
+Verified on the composed `experiment=57_organs_encoder_from_scratch`: 4 param groups
+(10@1e-4/wd .01, 36@1e-4/wd 0, 10@1e-5/wd .01, 30@1e-5/wd 0), encoder 8.5M at 1e-5,
+`MultiScheduler` with 2 sub-schedulers, and after the 5-epoch warmup adam/enc/muon sit at exactly
+1e-4 / 1e-5 / 1e-5 with an identical multiplier on every group at every step.
+
+**Open call — `train.encoder_lr_scale` in exp57 is still 0.1** (inherited from exp53). That value
+exists to *protect* pretrained features from the random head's early noise gradients. From scratch
+there is nothing to protect and the random encoder is the slowest-learning part of the model, so
+**1.0 is the right setting**; 0.1 risks making the scratch arm a strawman. Flagged in the config,
+not changed. Related: 50k steps (400 ep × 125) vs nnU-Net's 250k is the other confound — keep 400
+for the matched-compute comparison against exp52/53, then run one 800–1000 epoch scratch arm before
+concluding anything about pretraining's value.
+
+### exp57 class subset + seen/unseen val split — 2026-08-26
+
+**Train set cut from 22 organs to 8**, chosen off the exp55 epoch-10 per-sample table
+(`wandb/run-20260825_212633-mtxknh2q`, 248 rows, 22 classes × ~11 subjects, 1.5 mm, val macro
+0.7812): `liver, spleen, kidney_left, stomach, urinary_bladder, colon, esophagus, pancreas`.
+
+**What that table says.** Dice is dominated by how much of the organ is in the crop —
+Spearman(dice, tgt_size) = **0.711**. Targets under 500 voxels (16 rows) average **0.134** with
+81% below 0.3; targets over 200k average 0.934. 22 of 248 rows have a target *or* context under
+10% of that class's typical size and average **0.303**; excluding them moves the macro
+**0.7812 → 0.8245**. So ~0.04 of the reported number is a labelling/FOV artifact, not model
+quality. Worst case `lung_upper_lobe_right`: 5 of 14 rows have targets of 13/64/114/249/283
+voxels against a 117k median, dragging its mean to 0.615 when the 9 real rows give
+**0.951 ± 0.023** — the best class in the set. Not crop misses: s0045 has 236k voxels of
+`lung_lower_lobe_right` in the same scan, so the right-upper-lobe label itself is a sliver.
+Separately `pancreas/s0458` scores exactly 0.0 with a normal 21k-voxel target but contexts
+averaging 873 voxels — the empty-prompt mode from the `more_labels` post-mortem.
+Selection therefore favoured classes with zero sub-500-voxel rows, ≥571 subjects, and a spread
+from ceiling (spleen 0.942, liver 0.930) through the working range (0.81–0.92) to the
+discriminative hard ones (esophagus 0.719, pancreas 0.597). Excluded: `kidney_cyst_*` (30/25
+subjects, pathology), `lung_upper_lobe_right` (above), `duodenum` (sd 0.272 at n=10),
+adrenal/thyroid (≤ one 24 mm mask cell at `crop_spacing_mm=3` → guaranteed floor).
+
+**Val = those 8 + 8 held-out**, as a generalization control. Every held-out class sits inside the
+trained size range (8k–392k voxels), because novel-class failure tracks object size (ρ +0.52) and
+empty prompts rather than localization — an unseen class that is also small just re-measures the
+small-object floor. Four tiers: `kidney_right` (mirror of a trained class, 35.7k vs 35.4k);
+`small_bowel`, `duodenum` (unseen abdominal organ, same category); `lung_lower_lobe_left`, `heart`
+(unseen organ system); `aorta`, `autochthon_left`, `sacrum` (unseen **tissue type** — vessel /
+muscle / bone, size-matched to bladder / stomach / bladder respectively). Bone probe is `sacrum`
+(618 subjects, 48k vox), not `vertebrae_L3`: vertebrae carry the same instance-ambiguity problem
+the feature-sim study found on ribs, so a low score there would conflate novel tissue with
+"can't tell L3 from L2".
+
+**`val/dice_seen` / `val/dice_unseen`** (`experiments/3d/train.py`, val block): macro over the val
+classes that are / are not in the train-class set, plus a `seen=… unseen=…` suffix on the console
+eval line when both exist. Reporting only — **`val/dice` is still the plain mean over every val
+class and best-checkpoint selection is unchanged** (deliberate: the user asked for the split as a
+diagnostic, not as the selection criterion). No-ops to a single `dice_seen` key on an all-seen
+config, so exp48–56 log one extra key and nothing else changes. `in_train` in the `val/samples`
+table already separated the two per-row; this just makes the split a curve.
+
+### `eval.tasks_per_class`: decouple eval cost from the eval subject pool — 2026-08-26
+
+**The problem.** `eval.n_subjects` is a POOL cap, not a task cap. In the v2 eval path
+(`common.make_eval_loader`) it becomes `TotalSegProvider(max_subjects=N)` → `_subjects()` returns
+`alls[:N]`, and that one truncated list feeds *both* sides of every task:
+`_label_to_subjects` → `InContextDataset.samples` (the targets) **and** `subjects_for(cls)` inside
+`__getitem__` (the context candidates). So bounding eval time also starved the retrieval pool —
+at `n_subjects=20` each exp57 task drew its contexts from only ~9–17 candidates.
+
+Exact numbers, exp57's 16 val classes against a **57-subject** val split (not hundreds):
+196 tasks / 9–17 context candidates at `n_subjects=20`, vs **628 tasks / 23–51 candidates** at the
+full pool (3.2× the eval cost). Widening the pool is otherwise free: `_load_or_build_scan` /
+`_load_or_build_bbox` are keyed on `_key()` = a hash of EVERY subject dir and are built over all of
+them, so `max_subjects` only filters an in-memory list — no cache rebuild.
+
+**The fix.** `InContextDataset(max_tasks_per_class=N)` caps how many TARGETS each class
+contributes when `self.samples` is built, and touches nothing else — contexts keep drawing from the
+whole `subjects_for(cls)`. Wired as `eval.tasks_per_class` in `make_eval_loader`'s v2 branch
+(v1 / build_dataset branches unchanged; default None = every (subject, class) pair, so exp48–56
+reproduce). Subsampling is `random.Random(f"{eval_seed}:{cls}").sample(...)` then re-sorted, so the
+task list is identical across models, runs, workers and DataLoader order (cf. the eval-repro fix
+above) and stays class-contiguous for the `shuffle=False` pass.
+
+exp57 now sets `eval.n_subjects: null` + `eval.tasks_per_class: 10`. Verified against the real val
+split without touching the model: **160 tasks** (10 per class, exactly), 48 distinct target
+subjects of 57, context candidates unchanged at 23–51 per class, identical across rebuilds and
+different under a changed `eval.seed`.
+
+Also noted while merging the config: `eval.split` is read by `experiments/3d/eval.py` only —
+`train.py` passes `split="val"` explicitly to both `make_eval_loader` and `evaluate_classes`, so
+setting `eval.split: test` does NOT redirect validation during training.
+
+### exp57 at batch_size 4 — 2026-08-26
+
+`train.batch_size: 8 -> 4`, `train.lr: 1.0e-4 -> 7.0e-5`. Nothing else needed.
+
+`data.max_ds_len_train` is a SAMPLE cap (`train_loader` builds
+`RandomSampler(num_samples=min(1000, len(ds)))`), not a batch cap, so halving the batch does not
+halve the data per epoch — it doubles the optimizer steps over the same 1000 tasks:
+**125 -> 250 steps/epoch, 50k -> 100k updates** across the 400 epochs. Everything schedule-shaped
+self-corrects: `warmup_epochs` is expressed in epochs (`build_scheduler` does
+`warmup_epochs * steps_per_epoch` -> 625 -> 1250 steps), cosine `total_steps = epochs *
+len(loader)`, and Muon's lr is derived from `train.lr` (and now scheduled). The encoder's
+`InstanceNorm3d` is per-sample, so unlike BatchNorm the normalization statistics are untouched by
+B — the main reason small batches are safe in this architecture.
+
+lr uses sqrt scaling (1e-4/sqrt(2)): Adam-family updates are normalized by gradient RMS, so the
+linear rule over-corrects. Net effect is ~1.4x more movement per epoch than B=8, which is welcome
+given 50k steps was already thin for a from-scratch conv encoder (nnU-Net trains these ~250k).
+`5.0e-5` is the alternative if B=4 should REPRODUCE the B=8 trajectory — steps exactly double, so
+the linear rule holds `lr * steps` (and hence per-epoch movement and total AdamW decay) invariant.
+
+Two second-order effects left alone: AdamW's decoupled decay is per-step, so at 250 steps x 7e-5
+the per-epoch decay is ~1.4x the B=8 value (`weight_decay: 0.007` would match it exactly); and
+`grad_clip: 1.0` fires more often on the noisier B=4 gradients. `eval.batch_size` is a separate
+knob, still 8.
+
+### exp57 classes: train = ts_organs(-cysts), val = organs + cardiac + muscles — 2026-08-26
+
+Re-cut off run `tvewat4y` (`56_3mm_balanced_trainable_enc`: exp52 base, K=3, **3 mm**, total_3mm
+weights, `train_classes=balanced` = 61 classes, `val_classes=all` = 115 present, unfrozen encoder
+at 0.1x, epoch 140/400, val/dice 0.5986, still climbing). 1173 val rows.
+
+**Left/right mirrors transfer for free.** 18 pairs had exactly one side in the train set; the mean
+delta on the untrained side is **-0.003** (kidney_left 0.845 -> kidney_right 0.843; autochthon
+0.812 -> 0.822; femur 0.923 -> 0.917). So a mirrored twin is NOT a generalization probe —
+`kidney_right`, which the previous cut used as the "mirror tier", measures nothing and was dropped.
+The two big outliers (lung_upper_lobe_right -0.23, adrenal_gland_right -0.17) are size/degenerate
+-label artifacts, not lateral failures.
+
+**3 mm shrinks everything ~8x** (liver 427k -> 56k voxels, esophagus 5198 -> 671, adrenal ~1000 ->
+125). 351 of 1173 rows now have targets under 500 voxels; Spearman(dice, log size) = **0.690**.
+Per part set (classes / #>=2k vox / #<500 vox / macro / macro on the >=2k subset):
+
+| set | cls | >=2k | <500 | macro | macro(>=2k) |
+|---|---|---|---|---|---|
+| ts_organs | 22 | 13 | 2 | 0.642 | 0.728 |
+| ts_cardiac | 18 | **2** | **9** | 0.487 | 0.753 |
+| ts_muscles | 23 | **18** | **0** | **0.795** | 0.798 |
+| ts_vertebrae | 26 | 6 | 4 | 0.531 | 0.708 |
+| ts_ribs | 26 | 1 | 14 | 0.532 | 0.630 |
+
+`ts_cardiac` is only 2-of-18 measurable at 3 mm (only heart 16.9k and aorta 4.2k clear 2000
+voxels), so ~0.27 of its 0.487 is the size floor rather than generalization — keep it as the hard
+tissue-type probe (train has no vessels, no mirror twins), but do not read it as a clean signal.
+`ts_muscles` is the well-conditioned instrument: zero sub-500 classes, 18 of 23 over 2k, and
+**seen 0.795 vs unseen 0.795** — exact parity, size-matched to the trained organs, so a drop there
+under a from-scratch encoder is unambiguous.
+
+Config: `train_classes: [ts_organs, -kidney_cyst_left, -kidney_cyst_right]` (22),
+`val_classes: [ts_organs, ts_cardiac, ts_muscles, -cysts]` (63 = 22 seen + 41 unseen).
+Adrenals stay in train for coverage but are floor-bound at 3 mm (median 125 voxels, 11/11 val rows
+under 500) — drop them or go to 2 mm if that 2/22 sampler share proves wasted.
+
+**`resolve_classes` now expands part-set/spec tokens INSIDE a list and applies `-name` removals**
+(`data/totalseg_classes.py`). Previously `[ts_organs, ts_cardiac]` was read as two literal class
+names: the provider found no subjects for either, `active_classes` dropped them, and the split
+evaluated on **nothing** — an empty val set with no error. Bare lists of ordinary names (omnisynth
+alphabets, chemotox BC_NAMES, explicit class lists) contain no tokens and no `-` prefix, so they
+pass through untouched. Split names ("train"/"val") deliberately do not expand inside a list.

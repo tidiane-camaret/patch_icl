@@ -51,3 +51,5 @@ results/3d/*.csv
 
 # SDD scratch workspace
 .superpowers/
+
+**/.ipynb_checkpoints/
