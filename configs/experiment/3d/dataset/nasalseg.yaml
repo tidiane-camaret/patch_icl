@@ -1,0 +1,40 @@
+# @package _global_
+# NasalSeg — head/sinus CT, 5 air-filled cavity classes, all present in all cases.
+# Eval-only: no synth, no aug.
+#
+#   python scripts/convert_nasalseg.py --workers 16       # once, .nrrd -> native RAS .npy
+#   python experiments/3d/eval.py dataset=nasalseg eval.model=patchset3d
+#
+# The converter DE-DUPLICATES 130 files -> 107 unique cases (19 groups of byte-identical
+# image+label). Keeping them would be silent in-context leakage: a twin drawn as its
+# duplicate's context is an exact clone of the target and the `SELF` check misses it,
+# because the case ids differ. 107 x 5 = 535 (subject, class) tasks.
+#
+# Strictly zero-shot for any TotalSegmentator-trained checkpoint (no nasal cavity /
+# maxillary sinus / nasopharynx class exists there), and the targets are AIR (~ -840 HU)
+# bounded by bone — inverted contrast polarity vs every soft-tissue organ we evaluate on.
+paths:
+  nasalseg: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/nasalseg/npy
+data:
+  source: nasalseg
+  loader_v2: true               # nasalseg is v2-only (NasalSegProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 0.8 mm, NOT the 1.5 mm used elsewhere: the head FOV is only ~89x110x76 mm, so a 128^3
+  # crop at 1.5 mm (192 mm) is larger than the volume and 4/5 of the grid would be air pad
+  # (out_sizes ~[59,73,49]). At 0.8 the grid is well filled (~[111,128,93]) with 100% of GT
+  # inside the crop. Round-trip Dice of a PERFECT predictor is ~flat across pitches here
+  # (unlike FLARE22, where matching native z dominated) — the binding constraint is
+  # structure complexity, not the resample, so grid utilisation decides:
+  #   pitch  0.6 -> out[128,128,124]  0.8 -> [111,128,93]  1.0 -> [89,110,74]  1.5 -> [59,73,49]
+  crop_spacing_mm: 0.8
+  val_classes: all              # all 5, or an explicit subset
+  max_val_subjects: null
+  # occupancy@0.5 is not optional here — the nasal cavities are thin and convoluted
+  # (turbinates), and `nearest` loses them: round-trip ceiling 0.859 vs 0.670. thr 0.1
+  # dilates badly (GT volume x1.5). Measured, see docs/datasets/nasalseg.md.
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false
