@@ -1,0 +1,104 @@
+# @package _global_
+# 57_organs_encoder_from_scratch
+#
+#   python experiments/3d/train.py experiment=57_organs_encoder_from_scratch
+#
+
+defaults:
+  - 48_abdomen_ceiling
+  - override /encoder: e2
+  - _self_
+
+arch:
+  compile_encoder: true
+  compile_decoder: true
+  nnunet_ts_weights: total_3mm
+  encoder_frozen: false
+  nnunet_ts_random_init: true
+  nnunet_ts_stages: [3, 4]
+  e: 512
+  h: 2048
+  a: 8
+  thinking_rows: 8
+  token_mask_ratio_query: 0.10
+  token_mask_ratio_support: 0.10
+  fine_decode: true
+  fine_stage: [0,1]
+  fine_proj_dim: 96
+
+data:
+  context_size: 3
+  crop_spacing_mm: 3
+  train_spacing_range: null
+  # --- TRAIN: the full organ part-set, minus the two pathology classes --------------------
+  # ts_organs is 24; kidney_cyst_left/right occur in only 30/25 subjects (vs 571-1033 for the
+  # rest) and are ~absent from standard label.npy, so class-balanced sampling would spend 8% of
+  # every epoch cycling 55 subjects of pathology. -name removes them (resolve_classes expands
+  # part-set tokens and applies `-` removals inside a list).
+  # NB at crop_spacing_mm=3 the adrenal glands are median ~125 voxels (run tvewat4y e140: 11 of
+  # 11 val rows under 500) — smaller than one 24 mm mask cell, so they are floor-bound here.
+  # Kept for coverage; drop them from TRAIN, or go to 2 mm, if that 2/22 share of the sampler
+  # turns out to be wasted.
+  train_classes: [ts_organs, -kidney_cyst_left, -kidney_cyst_right]
+  # --- VAL: organs (seen) + cardiac + muscles (both fully held out) ------------------------
+  # With train = organs, neither held-out set has a trained mirror twin, which matters: over the
+  # 18 left/right pairs in run tvewat4y where exactly one side was trained, the mean unseen-side
+  # delta is -0.003 (kidney_left 0.845 -> kidney_right 0.843). A mirrored twin is free, so it is
+  # not a generalization probe at all.
+  #   ts_cardiac  = the hard tissue-type probe (vessels; train has none), but only 2 of 18
+  #                 classes clear 2000 voxels at 3 mm and 9 sit under 500 — macro 0.487 overall
+  #                 vs 0.753 on the >=2k subset, so most of that number is the size floor.
+  #   ts_muscles  = the well-conditioned one: 18 of 23 classes >=2k voxels, ZERO under 500, and
+  #                 seen 0.795 vs unseen 0.795 (exact parity). Size-matched to the trained
+  #                 organs, so a drop here is generalization failure, not a size artifact.
+  # 63 classes x eval.tasks_per_class -> 630 tasks at 10, 1260 at 20 (~52 ms/task measured on
+  # run tvewat4y: data 6 + encode 14 + attn 32 ms/item), i.e. 33-66 s per eval at eval_every=10.
+  # Delete the ts_muscles token for organs+cardiac only.
+  val_classes:   [ts_organs, ts_cardiac, ts_muscles,
+                  -kidney_cyst_left, -kidney_cyst_right]
+augmentations:
+  per_image:
+    affine: 
+      p: 0.2
+train:
+  # B=8 -> 4. NB max_ds_len_train is a SAMPLE cap (RandomSampler num_samples=1000), not a batch
+  # cap, so halving the batch does NOT halve the data per epoch — it DOUBLES the optimizer steps
+  # over the same 1000 tasks: 125 -> 250 steps/epoch, 50k -> 100k updates over 400 epochs.
+  # Everything schedule-shaped self-corrects (warmup_epochs is in epochs; cosine total_steps =
+  # epochs * len(loader); Muon's lr is derived from train.lr), and the encoder's InstanceNorm3d
+  # is per-sample, so unlike BatchNorm nothing about the normalization statistics changes.
+  batch_size: 4
+  # 1e-4 / sqrt(2). Adam-family updates are normalized by gradient RMS, so the linear scaling
+  # rule over-corrects; sqrt(B) is the usual compromise. With 2x the steps this travels ~1.4x
+  # further per epoch than B=8 — welcome here, since 50k steps was already thin for a
+  # from-scratch conv encoder (nnU-Net trains these for ~250k). Use 5.0e-5 instead if you want
+  # B=4 to REPRODUCE the B=8 trajectory: steps exactly double, so the linear rule holds
+  # lr * steps — and therefore per-epoch movement and total AdamW decay — invariant.
+  lr: 7.0e-5
+  # 1.0 (not exp53's 0.1): that value exists to PROTECT pretrained features from the random
+  # head's early noise gradients. From scratch there is nothing to protect and the random
+  # encoder is the slowest-learning part of the model, so it learns at the head's rate.
+  # NB scale=1.0 means ONE param group -> `encoder_drift/*` still logs, but W0 is now the
+  # random init, so rising drift is progress, not damage (see docs/logs.md 2026-08-26).
+  encoder_lr_scale: 1
+  warmup_epochs: 5
+  no_decay_norm_bias: true   # no wd on InstanceNorm gains / biases (weight norms still moving)
+  muon_scheduled: true       # Muon gets the warmup+cosine too (non-stationary head inputs)
+  lawa_k: 10
+
+eval:
+  # split is read by experiments/3d/eval.py only — train.py's val loop always passes
+  # split="val" explicitly, so this does NOT redirect validation during training.
+  split: val
+  # Decouple eval COST from eval POOL. eval.n_subjects caps the provider's subject list, which
+  # serves BOTH the targets and the context candidates — at 20 it left each task retrieving from
+  # only ~9-17 candidates. null = the full 57-subject val split (22-51 candidates per class), and
+  # it costs nothing extra to build: the scan/bbox caches are keyed on every subject dir already.
+  # tasks_per_class then bounds the work: N targets per class, contexts still drawn from the
+  # whole pool. At 63 val classes that is 1260 tasks (~66 s), vs 3900+ uncapped. Seeded per
+  # class from eval.seed, so the task list is identical across models and runs.
+  n_subjects: null
+  tasks_per_class: 20
+
+wandb:
+  name: 57_organs_encoder_from_scratch

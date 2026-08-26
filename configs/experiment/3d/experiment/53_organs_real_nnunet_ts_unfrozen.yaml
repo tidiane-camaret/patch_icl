@@ -1,0 +1,39 @@
+# @package _global_
+# 53_organs_real_nnunet_ts_unfrozen — exp52 with the nnU-Net image encoder FINETUNED instead
+# of frozen. Same data, same head, same 1.5 mm crops; the only change is that the encoder's
+# weights now move, at a fraction of the head's learning rate.
+#
+#   python experiments/3d/train.py experiment=53_organs_real_nnunet_ts_unfrozen
+#
+# Why a separate lr (train.encoder_lr_scale=0.1 -> 1e-5): the head is randomly initialized, so
+# its first epochs push noise gradients into the encoder — unfrozen at the head's 1e-4 the
+# pretrained TotalSegmentator features are wiped before the head can use them, which is exactly
+# the signal exp48-52 are measuring. 0.1x + the m1 cosine warmup keeps them.
+#
+# Measured cost vs the frozen exp52 (RTX PRO 6000, B=8 K=1 128^3, m1 compile settings, one
+# train step): peak 22.8 -> 35.6 GiB, 364 -> 531 ms/step (+46%). Fits on a 96 GB card as-is;
+# at larger K (T = K+1 volumes are encoded per task) the encoder activations scale linearly,
+# so K=3 needs ~26 GiB more than K=1 — drop train.batch_size if it does not fit.
+# Note the frozen encode cache is inert here (a moving encoder cannot be cached), so val is
+# also a full encoder pass per crop.
+#
+# Trainable params: 38.5M (head) -> 47.0M. Encoder stage 5 stays frozen — nothing reads a
+# stage deeper than the tapped {2,3,4} (see src/models/encoders/nnunet_ts.py).
+defaults:
+  - 52_organs_real_nnunet_ts
+  - _self_
+
+arch:
+  encoder_frozen: false
+
+train:
+  # encoder lr = 0.1 * train.lr (1e-4) = 1e-5. Sized against the pretrained weight scale: with
+  # Adam the per-element step is ~lr, and the deepest tapped stage's conv weights have RMS
+  # 0.0069, so at the head's 1e-4 the encoder can be rewritten in ~0.55 epoch (125 steps/epoch)
+  # — at 1e-5 that is 5.5 epochs. Watch `encoder_drift/*` (||W-W0||/||W0|| per stage, logged
+  # every epoch): drift climbing while val/dice sits under exp52's frozen curve = damage, drop
+  # to 0.01.
+  encoder_lr_scale: 0.1
+
+wandb:
+  name: 53_organs_real_nnunet_ts_unfrozen

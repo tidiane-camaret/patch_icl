@@ -27,6 +27,7 @@ import datetime
 import math
 import os
 import random
+import re
 import socket
 import sys
 import tempfile
@@ -59,7 +60,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -189,6 +190,50 @@ def _hard_dice(logits, target, is_prob: bool = False):
 # Optimizer / scheduler (config-driven)
 # ---------------------------------------------------------------------------
 
+def encoder_groups(cfg, named):
+    """Split `named` [(name, param), ...] into AdamW param groups. Two orthogonal splits, each
+    OFF by default so every earlier run (e.g. exp43's unfrozen Primus) reproduces exactly.
+
+    train.encoder_lr_scale != 1.0 gives a TRAINABLE image encoder (arch.encoder_frozen=false)
+    its own lr = encoder_lr_scale * train.lr. A PRETRAINED encoder unfrozen at the head's lr is
+    destroyed in the first epochs: the head is randomly initialized, so its early gradient is
+    noise, and the encoder is what carries all the transferable signal (the premise of exp
+    48-53). The standard fix is a discriminative lr — head at train.lr, encoder at a fraction.
+    NB this inverts for a FROM-SCRATCH encoder (arch.nnunet_ts_random_init): there is nothing
+    to protect and the random encoder is the slowest-learning part of the model, so it wants
+    scale ~1.0; anything much below that makes the scratch arm a strawman.
+
+    train.no_decay_norm_bias=true puts every param with ndim <= 1 (InstanceNorm/LayerNorm affine
+    gains, conv and linear biases) in a weight_decay=0 group. Decaying a norm gain is not
+    regularization: the conv that follows it is scale-invariant in the forward, so shrinking
+    ||W|| does not shrink the signal, it RAISES the effective step size (with Adam the relative
+    move per step is lr / weight-RMS) — the usual source of late-run instability. Matters most
+    while a from-scratch encoder's weight norms are still moving.
+
+    Returns (groups, info) where info is (n_params, lr) for the encoder, or None when the
+    encoder is not split out. Group 0 is a non-encoder decayed group, so callers reading
+    param_groups[0]['lr'] still see train.lr."""
+    scale = float(cfg.train.get("encoder_lr_scale", 1.0))
+    nodecay = bool(cfg.train.get("no_decay_norm_bias", False))
+    split_enc = scale != 1.0 and any(n.startswith("encoder.") for n, _ in named)
+    enc_lr = float(cfg.train.lr) * scale
+    buckets = {k: [] for k in ((False, False), (False, True), (True, False), (True, True))}
+    for n, p in named:
+        buckets[(split_enc and n.startswith("encoder."), nodecay and p.ndim <= 1)].append(p)
+    groups = []
+    for (is_enc, nd), ps in buckets.items():
+        if not ps:
+            continue
+        g = {"params": ps}
+        if is_enc:
+            g["lr"] = enc_lr
+        if nd:
+            g["weight_decay"] = 0.0
+        groups.append(g)
+    n_enc = sum(p.numel() for k in ((True, False), (True, True)) for p in buckets[k])
+    return groups, ((n_enc, enc_lr) if split_enc else None)
+
+
 def build_optimizer(cfg, params):
     name = cfg.train.get("optimizer", "adam")
     lr, wd = float(cfg.train.lr), float(cfg.train.get("weight_decay", 0.0))
@@ -199,28 +244,58 @@ def build_optimizer(cfg, params):
     raise ValueError(f"unknown train.optimizer {name!r} (adam | adamw)")
 
 
-def build_scheduler(cfg, optimizer, total_steps, steps_per_epoch):
-    """Return (scheduler, step_per_batch). Plateau steps on val Dice in main()."""
-    name = cfg.train.get("scheduler", "plateau")
-    lr = float(cfg.train.lr)
-    if name == "plateau":
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=float(cfg.train.get("lr_factor", 0.5)),
-            patience=int(cfg.train.get("lr_patience", 5)),
-            min_lr=lr * float(cfg.train.get("lr_min_factor", 0.01)))
-        return sch, False
-    if name == "cosine":
-        warmup = int(cfg.train.get("warmup_epochs", 1) * steps_per_epoch)
+class MultiScheduler:
+    """One scheduler per optimizer, stepped together — used to drive Muon alongside AdamW.
 
-        def lr_lambda(step):
-            if step < warmup:
-                return (step + 1) / max(1, warmup)
-            prog = (step - warmup) / max(1, total_steps - warmup)
-            return 0.5 * (1.0 + math.cos(math.pi * prog))
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda), True
-    if name == "constant":
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0), True
-    raise ValueError(f"unknown train.scheduler {name!r} (plateau | cosine | constant)")
+    Muon is a plain torch.optim.Optimizer, so LambdaLR / ReduceLROnPlateau handle it exactly
+    like AdamW. Each sub-scheduler multiplies its OWN optimizer's initial_lr, so Muon keeps its
+    muon_lr_scale-relative base and only picks up the same warmup/cosine shape."""
+
+    def __init__(self, scheds):
+        self.scheds = list(scheds)
+
+    def step(self, *args):
+        for s in self.scheds:
+            s.step(*args)
+
+
+def build_scheduler(cfg, optimizers, total_steps, steps_per_epoch):
+    """Return (scheduler, step_per_batch). Plateau steps on val Dice in main().
+
+    `optimizers` may be one optimizer or a list; with a list every optimizer gets its own
+    scheduler of the same shape, wrapped in MultiScheduler. main() only passes Muon in when
+    train.muon_scheduled=true (default false = Muon stays at a constant lr, as in exp48-53).
+
+    Plateau's floor is per param group (group lr * lr_min_factor) rather than one global
+    train.lr * lr_min_factor, so a discriminative-lr group gets a floor relative to its own
+    base. Identical to the old behaviour for a single-group optimizer; no existing config
+    combines plateau with encoder_lr_scale (m1 is cosine)."""
+    if isinstance(optimizers, torch.optim.Optimizer):
+        optimizers = [optimizers]
+    name = cfg.train.get("scheduler", "plateau")
+
+    def _one(opt):
+        if name == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="max", factor=float(cfg.train.get("lr_factor", 0.5)),
+                patience=int(cfg.train.get("lr_patience", 5)),
+                min_lr=[g["lr"] * float(cfg.train.get("lr_min_factor", 0.01))
+                        for g in opt.param_groups])
+        if name == "cosine":
+            warmup = int(cfg.train.get("warmup_epochs", 1) * steps_per_epoch)
+
+            def lr_lambda(step):
+                if step < warmup:
+                    return (step + 1) / max(1, warmup)
+                prog = (step - warmup) / max(1, total_steps - warmup)
+                return 0.5 * (1.0 + math.cos(math.pi * prog))
+            return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        if name == "constant":
+            return torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+        raise ValueError(f"unknown train.scheduler {name!r} (plateau | cosine | constant)")
+
+    scheds = [_one(o) for o in optimizers]
+    return (scheds[0] if len(scheds) == 1 else MultiScheduler(scheds)), name != "plateau"
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +337,7 @@ def build_model(cfg: DictConfig):
             "primus_sidecar": a.get("primus_sidecar", None),
             "nnunet_ts_weights": a.get("nnunet_ts_weights", None),
             "nnunet_ts_stages": a.get("nnunet_ts_stages", (2, 3, 4)),
+            "nnunet_ts_random_init": a.get("nnunet_ts_random_init", False),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
             "encoder_native_grid": a.get("encoder_native_grid", False),
@@ -272,9 +348,60 @@ def build_model(cfg: DictConfig):
             "feat_norm": a.get("feat_norm", "context"),
             "token_mask_ratio_support": a.get("token_mask_ratio_support", 0.0),
             "token_mask_ratio_query": a.get("token_mask_ratio_query", 0.0),
+            "fine_decode": a.get("fine_decode", False),
+            "fine_stage": (list(a.fine_stage) if isinstance(a.get("fine_stage", 1), ListConfig)
+                           else a.get("fine_stage", 1)),
+            "fine_proj_dim": a.get("fine_proj_dim", 64),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
+
+
+class EncoderDrift:
+    """Per-stage relative weight drift of a TRAINABLE image encoder: ||W - W0|| / ||W0||.
+
+    W0 = the encoder's weights at the START of this run — the pretrained TotalSegmentator /
+    CoLiPri weights on a fresh run, the resumed weights on a resume — so the metric always
+    reads "how far has THIS run moved the encoder".
+
+    Makes "is finetuning damaging the pretrained features?" directly visible instead of
+    inferred from the val curve. With Adam the per-step move is ~lr per element regardless of
+    gradient scale, so at train.lr=1e-4 the deepest tapped nnU-Net stage (conv weight RMS
+    0.0069) can be rewritten inside one epoch; train.encoder_lr_scale is what buys that back
+    (docs/logs.md 2026-08-25). A drift that climbs past ~1 while val/dice sits under the frozen
+    baseline is the encoder being destroyed, not the head learning slowly.
+
+    Reference weights are held on CPU (nnU-Net encoder: 14M trainable params = 56 MB); each
+    read is one D2H copy of the same, a few ms against a ~60 s epoch.
+    """
+
+    def __init__(self, net):
+        # Frozen tensors cannot drift, so only the trainable ones are tracked. Params are
+        # captured by REFERENCE, so this is insensitive to torch.compile's `_orig_mod.` key
+        # renaming (compile wraps the module, it does not rebuild the parameters).
+        self.refs = []
+        for n, p in net.named_parameters():
+            if not (p.requires_grad and n.startswith("encoder.")):
+                continue
+            m = re.search(r"(?:stages|blocks|layers)\.(\d+)\.", n)   # conv stage / ViT block
+            bucket = f"s{int(m.group(1))}" if m else "other"
+            self.refs.append((bucket, p, p.detach().to("cpu", torch.float32, copy=True)))
+
+    def __bool__(self):
+        return bool(self.refs)
+
+    @torch.no_grad()
+    def read(self) -> dict:
+        """{'encoder_drift/<bucket>': rel_drift, ..., 'encoder_drift/total': rel_drift}."""
+        num, den = collections.defaultdict(float), collections.defaultdict(float)
+        for bucket, p, ref in self.refs:
+            w = p.detach().to("cpu", torch.float32)
+            num[bucket] += (w - ref).pow(2).sum().item()
+            den[bucket] += ref.pow(2).sum().item()
+        out = {f"encoder_drift/{b}": math.sqrt(num[b] / max(den[b], 1e-12)) for b in num}
+        out["encoder_drift/total"] = math.sqrt(
+            sum(num.values()) / max(sum(den.values()), 1e-12))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +640,52 @@ def _resolve_classes_for(cfg, classes_key):
     return resolve_classes(cfg.data.get(classes_key), root, is_mri=is_mri)
 
 
+def _compile_encoder(net, cfg) -> str:
+    """torch.compile the image encoder in place; returns a fragment for the compile log line.
+
+    arch.compile_encoder: null (default) = legacy behaviour — the frozen ViT encoders
+    (primus / tap_ct) get compiled, the conv encoders stay eager; true = compile whichever
+    encoder is configured; false = leave every encoder eager.
+
+    Only the pure conv/attention stack is compiled, never the NnUNetTSEncoder/PrimusEncoder
+    wrapper around it: the CT renormalization, the _down_to resamples and the encode cache have
+    data-dependent shapes/branches that would graph-break, and train_epoch's profile_timing
+    hooks are registered on net.encoder itself (a compiled wrapper still fires them, but the
+    eager wrapper keeps the timing comparable across runs). dynamic=True so train/eval batch
+    -size differences don't retrigger compilation.
+    """
+    want = cfg.arch.get("compile_encoder", None)
+    if want is False:
+        return "; encoder runs eager (arch.compile_encoder=false)"
+    enc = getattr(net, "encoder", None)
+    which = cfg.arch.get("encoder", "conv")
+    if enc is None:
+        return ""
+    if which == "primus" and hasattr(enc, "primus"):
+        # Frozen Primus ViT: the dominant per-step cost, a pure attention/MLP stack. The
+        # interpolate/_down_to that would graph-break live OUTSIDE it (_preprocess/_encode_batch).
+        enc.primus.eva = torch.compile(enc.primus.eva, dynamic=True)
+        return " + frozen Primus eva stack"
+    if which == "tap_ct" and hasattr(enc, "model"):
+        # Frozen TAP ViT: encodes one volume at a time at a fixed T, so shapes are static ->
+        # dynamic=False. The SDPA-patched attention compiles cleanly (mirrors feature-sim).
+        enc.model = torch.compile(enc.model, dynamic=False)
+        return " + frozen tap-ct ViT"
+    if not want:                      # conv encoders: opt-in only (arch.compile_encoder=true)
+        return "; conv encoder runs eager"
+    if which == "nnunet_ts" and hasattr(enc, "encoder"):
+        # Inner PlainConvUNet encoder stack (conv / InstanceNorm / LeakyReLU): inductor fuses
+        # the norm+activation tails around cuDNN's convs.
+        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        return " + frozen nnU-Net encoder stack"
+    if which == "conv" and hasattr(enc, "_stage_feats"):
+        # ConvEncoder3D: compile the stem+stages only — forward's _resample/concat to R^3 stays
+        # eager (data-dependent avg_pool3d window).
+        enc._stage_feats = torch.compile(enc._stage_feats, dynamic=True)
+        return " + conv encoder stages"
+    return "; encoder runs eager (no compile target)"
+
+
 @hydra.main(config_path="../../configs/experiment/3d", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     random.seed(cfg.train.seed)
@@ -570,35 +743,28 @@ def main(cfg: DictConfig) -> None:
             model.load_finetuned(sd)
         print(f"Resumed weights from {checkpoint}")
 
-    # Compile only the transformer submodule (like experiments/2d/train.py): it is pure
-    # tensor ops so it graph-compiles cleanly, whereas the conv encoder's adaptive_avg_pool3d
-    # / trilinear resamples with data-dependent windows would graph-break. Encoder stays eager.
+    # Compile (patchset3d, arch.compile). The transformer is pure tensor ops so it graph
+    # -compiles cleanly; Muon's Newton–Schulz likewise (cf. experiments/2d/train.py).
+    # arch.compile_encoder / arch.compile_decoder extend it to the image encoder and the
+    # decode head — both measured wins on the frozen-nnU-Net recipe (docs/logs.md 2026-08-25):
+    # exp52 B=8 K=1 389 -> 366 ms/step (-6%, -1.0 GiB peak); the K=3 fine_stage=[0,1] variant
+    # 290 -> 239 ms/step (-18%, encoder fwd -28%, decode fwd -80%). NOT bit-exact vs eager
+    # (bf16 conv reassociation, ~0.7% mean logit drift), so set them per-run, not mid-run.
     # Compiled AFTER the checkpoint load so warm-starting a raw state_dict isn't blocked by the
     # `_orig_mod.` prefix; the prefix is stripped again when this run saves (see below).
-    # Muon's Newton–Schulz orthogonalization is pure tensor ops → compile it too (cf. 2D).
     if is_patchset and cfg.arch.get("compile", False) and hasattr(net, "transformer"):
         net.transformer = torch.compile(net.transformer, dynamic=True)
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
         msg = "Compiled net.transformer + Newton–Schulz (dynamic=True)"
-        # The frozen Primus ViT is the dominant per-step cost yet runs eager by default. It is a
-        # pure attention/MLP stack (compiles cleanly, unlike the conv encoder), so compile the eva
-        # block stack — the interpolate/_down_to that would graph-break live OUTSIDE it (in
-        # _preprocess/_encode_batch). dynamic=True so target/context batch-size differences don't
-        # retrigger compilation. No-op for encoder=conv.
-        enc = getattr(net, "encoder", None)
-        which_enc = cfg.arch.get("encoder", "conv")
-        if which_enc == "primus" and enc is not None and hasattr(enc, "primus"):
-            enc.primus.eva = torch.compile(enc.primus.eva, dynamic=True)
-            msg += " + frozen Primus eva stack"
-        elif which_enc == "tap_ct" and enc is not None and hasattr(enc, "model"):
-            # Frozen TAP ViT: the dominant per-step cost. It encodes one volume at a time at a
-            # fixed T, so shapes are static -> dynamic=False. The SDPA-patched attention
-            # (F.scaled_dot_product_attention) compiles cleanly. Mirrors the feature-sim path.
-            enc.model = torch.compile(enc.model, dynamic=False)
-            msg += " + frozen tap-ct ViT"
-        else:
-            msg += "; conv encoder runs eager"
+        msg += _compile_encoder(net, cfg)
+        if cfg.arch.get("compile_decoder", False):
+            # _decode is a method, so this shadows it with a compiled callable on the instance —
+            # no state_dict keys change. Covers both heads: the plain per-token tile MLP and the
+            # fine_decode path, whose z-score / 1x1x1 projection / per-cell einsum are
+            # memory-bound elementwise work that inductor fuses.
+            net._decode = torch.compile(net._decode, dynamic=True)
+            msg += " + decode head"
         print(msg)
 
     # Medverse perf knobs (medverse.grad_checkpoint / .compile — see model/medverse.yaml,
@@ -624,9 +790,10 @@ def main(cfg: DictConfig) -> None:
     if use_muon:
         muon_params = [p for n, p in net.named_parameters()
                        if p.requires_grad and p.ndim == 2 and "transformer" in n]
-        adam_params = [p for n, p in net.named_parameters()
-                       if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
-        optimizer = torch.optim.AdamW(adam_params, lr=float(cfg.train.lr),
+        adam_named = [(n, p) for n, p in net.named_parameters()
+                      if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
+        adam_groups, enc_info = encoder_groups(cfg, adam_named)
+        optimizer = torch.optim.AdamW(adam_groups, lr=float(cfg.train.lr),
                                       weight_decay=float(cfg.train.get("weight_decay", 0.01)))
         optimizers = [optimizer]
         if muon_params:
@@ -635,13 +802,42 @@ def main(cfg: DictConfig) -> None:
                 lr=cfg.train.get("muon_lr_scale", 0.1) * float(cfg.train.lr),
                 momentum=cfg.train.get("muon_momentum", 0.96),
                 weight_decay=cfg.train.get("muon_wd", 0.1)))
-        print(f"Muon on {len(muon_params)} transformer matrices + AdamW on {len(adam_params)} "
+        print(f"Muon on {len(muon_params)} transformer matrices + AdamW on {len(adam_named)} "
               f"other tensors, LAWA k={cfg.train.get('lawa_k', 10)}")
     else:
-        optimizer = build_optimizer(cfg, (p for p in net.parameters() if p.requires_grad))
+        groups, enc_info = encoder_groups(
+            cfg, [(n, p) for n, p in net.named_parameters() if p.requires_grad])
+        optimizer = build_optimizer(cfg, groups)
         optimizers = [optimizer]
+    # Trainable image encoder (arch.encoder_frozen=false): say so, and at which lr — the
+    # frozen-vs-finetuned distinction is the whole point of these runs and is otherwise only
+    # visible in the trainable-param count.
+    n_enc = sum(p.numel() for n, p in net.named_parameters()
+                if p.requires_grad and n.startswith("encoder.")) if is_patchset else 0
+    if n_enc:
+        print(f"Image encoder TRAINABLE: {n_enc/1e6:.1f}M params at lr="
+              f"{float(cfg.train.lr) * float(cfg.train.get('encoder_lr_scale', 1.0)):.2e} "
+              f"(train.encoder_lr_scale={cfg.train.get('encoder_lr_scale', 1.0)})"
+              + ("" if enc_info else "  [same group as the head]"))
+    # Per-stage encoder weight drift, logged every epoch (no-op when the encoder is frozen).
+    # Built here so W0 is this run's starting point: after the checkpoint load and after
+    # compile, both of which are done above.
+    drift = EncoderDrift(net) if is_patchset else None
+    if drift:
+        print(f"Tracking encoder drift ||W-W0||/||W0|| on {len(drift.refs)} tensors "
+              f"-> encoder_drift/*")
     steps = max(1, len(loader))
-    scheduler, step_per_batch = build_scheduler(cfg, optimizer, cfg.train.epochs * steps, steps)
+    # train.muon_scheduled=true puts Muon under the SAME warmup+cosine as AdamW (scaled to its
+    # own muon_lr_scale base). Default false = Muon runs at a constant lr with no warmup and no
+    # anneal, reproducing exp48-53. Turn it on whenever the encoder is not frozen — and above
+    # all when it trains from scratch: the head's input distribution is then non-stationary for
+    # thousands of steps, and an unwarmed, never-annealed Muon is the piece most likely to lock
+    # in early garbage and then fail to fine-converge at the end of the run.
+    sched_opts = optimizers if cfg.train.get("muon_scheduled", False) else [optimizer]
+    scheduler, step_per_batch = build_scheduler(cfg, sched_opts, cfg.train.epochs * steps, steps)
+    if len(sched_opts) > 1:
+        print(f"Scheduler ({cfg.train.get('scheduler', 'plateau')}) drives AdamW + Muon "
+              f"(train.muon_scheduled=true)")
 
     # LAWA checkpoint-averaging buffer (patchset3d + Muon only): a CPU state_dict is pushed
     # each epoch; at eval the queue is averaged into the model, evaluated + saved, then the raw
@@ -709,7 +905,13 @@ def main(cfg: DictConfig) -> None:
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}
+        if enc_info:                      # discriminative-lr encoder group (constant unless scheduled)
+            log["train/lr_encoder"] = optimizer.param_groups[-1]["lr"]
+        if len(optimizers) > 1:           # Muon: flat unless train.muon_scheduled
+            log["train/lr_muon"] = optimizers[1].param_groups[0]["lr"]
         log.update({f"train/{k}": v for k, v in tr_grid.items()})
+        if drift:
+            log.update(drift.read())
 
         if lawa_queue is not None:   # push this epoch's raw TRAINABLE weights to the LAWA buffer
             lawa_queue.append({k: v.cpu().clone()
@@ -725,6 +927,17 @@ def main(cfg: DictConfig) -> None:
             log["val/dice_soft"] = val_soft
             log["val/loss"] = val_loss
             log.update({f"val/dice/{r['class']}": r["mean_dice"] for r in rows if "mean_dice" in r})
+            # Seen/unseen macro split. data.val_classes may deliberately hold classes the model
+            # never trained on, as a generalization control (exp57: 8 trained + 8 held-out, each
+            # size-matched to a trained class). REPORTING ONLY — val/dice above stays the plain
+            # mean over every val class, so best-checkpoint selection is unchanged.
+            seen_unseen = {}
+            for tag, want in (("seen", True), ("unseen", False)):
+                v = [r["mean_dice"] for r in rows
+                     if "mean_dice" in r and (r["class"] in train_classes) == want]
+                if v:
+                    seen_unseen[tag] = sum(v) / len(v)
+                    log[f"val/dice_{tag}"] = seen_unseen[tag]
             if is_patchset:
                 rd = net.grid_size
                 for mkey, label in (("mean_dice_ds", "dice_ds"),
@@ -760,7 +973,10 @@ def main(cfg: DictConfig) -> None:
                 scheduler.step(val_dice)
             tqdm.write(f"  [e{epoch}] loss={loss:.4f} train_dice={tr_dice:.4f} "
                        f"val_dice={val_dice:.4f} val_soft={val_soft:.4f} val_loss={val_loss:.4f} "
-                       f"(best {max(best, val_dice):.4f})")
+                       f"(best {max(best, val_dice):.4f})"
+                       + ("".join(f" {k}={v:.4f}" for k, v in seen_unseen.items())
+                          if len(seen_unseen) == 2 else "")
+                       + (f" enc_drift={log['encoder_drift/total']:.4f}" if drift else ""))
             if val_dice > best:
                 best = val_dice
                 # Strip the `_orig_mod.` prefix torch.compile leaves on transformer keys so the
