@@ -243,6 +243,13 @@ def balanced_ood_tiers() -> dict[str, list[str]]:
     return {"near": near, "level": level, "far": far}
 
 
+# Spec strings that also expand when they appear as an ELEMENT of a list (see resolve_classes).
+# Split names ("train"/"val", read from label_stats.csv) are deliberately excluded — they are
+# only meaningful as the whole value.
+_LIST_EXPANDABLE = frozenset(
+    {"all", "benchmark", "not_benchmark", "balanced", "not_balanced"})
+
+
 def resolve_classes(
     value: Union[str, list],
     totalseg_root: Union[str, Path, None] = None,
@@ -250,7 +257,10 @@ def resolve_classes(
 ) -> list[str]:
     """Resolve a class list from a Hydra config value.
 
-    If *value* is already a list (or OmegaConf ListConfig), return it as a plain list.
+    A list (or OmegaConf ListConfig) may mix literal class names with any of the spec tokens
+    below and ``-name`` removals, e.g. ``[ts_organs, ts_cardiac, -kidney_cyst_left]``; tokens are
+    expanded in order, removals applied last, duplicates dropped. A bare list of names is
+    returned unchanged.
     Special string values (CT by default; pass ``is_mri=True`` for MRI variants):
       ``"benchmark"``     → BENCHMARK_CLASSES / MRI_BENCHMARK_CLASSES
       ``"not_benchmark"`` → ALL_CLASSES[:117] / MRI_ALL_CLASSES minus the benchmark set
@@ -271,7 +281,22 @@ def resolve_classes(
         is_mri:         Set True when cfg.data.dataset == "totalsegmri".
     """
     if not isinstance(value, str):
-        return list(value)
+        # Expand spec tokens INSIDE a list. Without this, `[ts_organs, ts_cardiac]` was taken as
+        # two literal class names: the provider found no subjects for either, active_classes
+        # silently dropped them, and the split evaluated on nothing — an empty val set with no
+        # error. Lists of ordinary names (omnisynth alphabets, chemotox BC_NAMES, explicit
+        # class lists) contain no tokens and no `-` prefix, so they pass through untouched.
+        out, drop = [], set()
+        for item in value:
+            name = str(item)
+            if name.startswith("-"):
+                drop.add(name[1:])
+            elif name in TS_PART_SETS or name in _LIST_EXPANDABLE:
+                out.extend(resolve_classes(name, totalseg_root, is_mri))
+            else:
+                out.append(name)
+        seen = set()
+        return [c for c in out if c not in drop and not (c in seen or seen.add(c))]
 
     if value == "all":
         # Every anatomical class (CT: the 117 label.npy classes; the 4 trailing

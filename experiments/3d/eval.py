@@ -207,6 +207,14 @@ def main(cfg: DictConfig) -> None:
             cfg.eval.split, tuple(resolve_classes(s3.get("classes") or (),
                                                   totalseg_root=cfg.paths.get("totalseg"))))
         classes = [bank.alphabet(c) for c in bank.task_ids()]
+    elif source == "flare22":
+        from src.providers.flare22 import resolve_flare22_classes
+        root = cfg.paths.get("flare22")
+        classes = resolve_flare22_classes(cfg.data.val_classes)
+    elif source == "nasalseg":
+        from src.providers.nasalseg import resolve_nasalseg_classes
+        root = cfg.paths.get("nasalseg")
+        classes = resolve_nasalseg_classes(cfg.data.val_classes)
     elif source == "totalseg_more_labels":
         from data.totalseg_classes import resolve_more_labels_classes
         root = cfg.paths.get("totalseg_more_labels")

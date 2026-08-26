@@ -41,6 +41,12 @@ def _source_root(cfg) -> tuple[str, str, bool]:
             raise ValueError("cfg.paths.totalseg_more_labels is not set "
                              "(needed for data.source=totalseg_more_labels)")
         return source, root, False
+    if source in ("flare22", "nasalseg"):
+        root = cfg.paths.get(source)
+        if root is None:
+            raise ValueError(f"cfg.paths.{source} is not set "
+                             f"(needed for data.source={source})")
+        return source, root, False
     if source == "chemotox_bc":
         root = cfg.paths.get("chemotox")
         if root is None:
@@ -136,6 +142,36 @@ def build_dataset(cfg, split: str):
     n_synth_merge_*) is forwarded, so the dataset is identical to training.
     """
     d = cfg.data
+    if d.get("source") in ("flare22", "nasalseg"):
+        # Sources stored on their native anisotropic grid; the provider crops + resamples
+        # to the isotropic model grid per item (src/providers/native_grid.py). v2 only.
+        from src.incontext_dataset_v2 import InContextDataset
+        _, root, _ = _source_root(cfg)
+        if d.get("source") == "flare22":
+            from src.providers.flare22 import Flare22Provider as _Provider
+        else:
+            from src.providers.nasalseg import NasalSegProvider as _Provider
+        is_train = split == "train"
+        provider = _Provider(
+            root=root,
+            classes=(d.get("train_classes", "all") if is_train else d.get("val_classes", "all")),
+            image_size=tuple(d.image_size),
+            max_subjects=(d.get("max_train_subjects") if is_train
+                          else d.get("max_val_subjects")),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            crop_jitter=(d.get("crop_jitter", 0) if is_train
+                         else cfg.get("eval", {}).get("crop_jitter", 0)),
+            mask_downsample=d.get("mask_downsample", "occupancy"),
+            mask_occupancy_thr=d.get("mask_occupancy_thr", 0.5),
+            image_antialias=d.get("image_antialias", True))
+        return InContextDataset(
+            provider, context_size=d.context_size,
+            class_balanced=(is_train and d.get("class_balanced", False)),
+            aug_cfg=(cfg.augmentations if is_train else None),
+            defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))))
+
     if d.get("loader_v2", False) and d.get("source", "totalseg") in _TOTALSEG_SOURCES:
         from src.incontext_dataset_v2 import InContextDataset
         from src.providers.totalseg import TotalSegProvider
@@ -452,7 +488,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     d, e = cfg.data, cfg.eval
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
-                            "chemotox_bc", "synth_gmm_maisi"):
+                            "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool
@@ -499,7 +535,12 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         ds_v2 = InContextDataset(
             provider, context_size=d.context_size, class_balanced=False,
             aug_cfg=None, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
-            eval_seed=int(e.get("seed", 0)))
+            eval_seed=int(e.get("seed", 0)),
+            # eval.tasks_per_class caps the TARGETS per class; eval.n_subjects caps the
+            # provider POOL (targets AND context candidates). Use tasks_per_class to bound
+            # eval time while leaving n_subjects=null, so every task still retrieves its
+            # contexts from the whole split.
+            max_tasks_per_class=e.get("tasks_per_class", None))
         nw = int(e.get("workers", 4))
         common = dict(num_workers=nw, collate_fn=incontext_collate_fn,
                       pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,

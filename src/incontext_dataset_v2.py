@@ -42,7 +42,8 @@ class InContextDataset(Dataset):
     """Generic in-context task assembler over a VolumeProvider."""
 
     def __init__(self, provider, context_size=3, class_balanced=False,
-                 aug_cfg=None, defer_aug=False, crop_spacing_mm=1.5, eval_seed=None):
+                 aug_cfg=None, defer_aug=False, crop_spacing_mm=1.5, eval_seed=None,
+                 max_tasks_per_class=None):
         self.provider = provider
         self.context_size = int(context_size)
         self.class_balanced = bool(class_balanced)
@@ -59,8 +60,22 @@ class InContextDataset(Dataset):
             self.samples, self.active_classes = [], []
             self._length = int(provider.epoch_length)
         else:
-            self.samples = [(s, c) for c in provider.classes
-                            for s in provider.subjects_for(c)]
+            # max_tasks_per_class caps how many TARGETS each class contributes, without
+            # touching the provider's subject pool — so contexts keep drawing from every
+            # candidate in `subjects_for(cls)`. This is what decouples eval COST from eval
+            # POOL: the alternative knob, eval.n_subjects, shrinks the provider itself and
+            # therefore starves the context sampler too (see common.make_eval_loader).
+            # Subsampling is seeded per class from eval_seed, so the task list is identical
+            # across models, runs, workers and DataLoader order (cf. the eval-reproducibility
+            # fix in docs/logs.md) — and stays sorted, keeping samples grouped by class for
+            # the shuffle=False eval pass.
+            cap = None if max_tasks_per_class is None else int(max_tasks_per_class)
+            self.samples = []
+            for c in provider.classes:
+                subs = provider.subjects_for(c)
+                if cap is not None and len(subs) > cap:
+                    subs = sorted(random.Random(f"{eval_seed}:{c}").sample(list(subs), cap))
+                self.samples += [(s, c) for s in subs]
             self.active_classes = [c for c in provider.classes if provider.subjects_for(c)]
 
     def __len__(self):
