@@ -39,6 +39,15 @@ arch:
   # is LINEAR in the fine features, so filter rank is capped at min(fine_proj_dim, sum C_f);
   # above that the extra width is dead. C_f per stage on Dataset291: 32 / 64 / 128 / 256 ...
   fine_proj_dim: 64
+  # Which fine_decode head (fine_decode=true only):
+  #   fine_filter — per-cell token-generated filter dotted against the query's unpooled
+  #                 features + linear tile term (default; cheap, cells don't interact).
+  #   conv        — progressive coarse->fine conv decoder: project tokens to decoder_dim,
+  #                 upsample the R^3 field, fuse each fine_stage (concat at coarse levels,
+  #                 per-voxel FiLM at the finest), 3x3x3 conv per level, 1x1x1 head + a
+  #                 token-only residual. Spatially coupled; ~6x the decode FLOPs.
+  decoder: fine_filter
+  decoder_dim: 64               # base width of the conv decoder (halves per level, >=8)
   compile: true                 # torch.compile the transformer + Muon Newton-Schulz
   # Extra compile targets (both need compile: true). Measured on exp52 + fine_decode, RTX PRO
   # 6000: encoder+decoder together = -6% step time / -1.0 GiB peak at B=8 K=1 fine_stage=1,

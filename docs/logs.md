@@ -1,6 +1,117 @@
 # Change log
 
-## 2026-08-27 — CT normalization unified into one frame (CtNormSpec)
+## 2026-08-27 — PatchSet3D `arch.decoder=conv`: progressive coarse→fine conv decode head
+
+New alternative to the `fine_decode` per-cell filter head (`fine_filter`), gated by
+`arch.decoder: fine_filter | conv` (default `fine_filter` — exp48–57 byte-identical). `conv`
+builds a **progressive coarse→fine conv decoder** (`PatchSet3D._build_conv_decoder` /
+`_decode_conv`, `src/models/patchset3d.py`):
+
+- `token_proj` Linear(e → `arch.decoder_dim`, default 64) → `(B, C_d, R, R, R)` token field.
+- One level per `arch.fine_stage`, ordered coarse→fine by native side. Each level: trilinear
+  upsample the running tensor to the stage side, `InstanceNorm3d(affine=False)` the raw skip
+  (= the `fine_filter` z-score, guards the from-scratch encoder's activation scale), then
+  **concat + 3×3×3 conv** at the coarse levels and **per-voxel FiLM + 3×3×3 conv** at the
+  finest (`(1+γ)·skip + β`, γ/β = 1×1×1 conv of the upsampled field). `_ConvNormAct` =
+  conv→InstanceNorm3d(affine)→LeakyReLU. `decoder_dim` halves per level (≥8).
+- `dec_head` 1×1×1 → 1 logit/voxel, **plus a token-only residual** (`dec_token_residual`:
+  upsampled token field → 1×1×1) so the head can predict from tokens alone while the encoder's
+  fine features are still noise — the analogue of `fine_filter`'s `tile_head` term.
+- Unlike `fine_filter`, cells interact (conv receptive field) — the bet is boundary Dice on
+  well-matched objects and thin/connected structures (vessels, ribs).
+
+**Measured (exp57 recipe, `encoder=e3_resenc resenc_n_stages=4 nnunet_ts_stages=[2,3]`,
+`decoder_dim=64`, `fine_stage=[0,1,2]` = skips at 32³/64³/128³, B=4, K=3, compiled,
+`bench_resenc_step.py`):**
+
+| head | step ms | decode fwd | bwd | peak GB |
+|---|---|---|---|---|
+| `fine_filter` (`fine_stage=[0,1]`) | 826 | 10.5 | 583 | 45.75 |
+| **`conv` P2-FiLM** (`fine_stage=[0,1,2]`) | **887 (+7.4 %)** | 19.9 | 634 | **45.40** |
+
++61 ms/step, **memory-neutral** (inductor manages the conv activations better than
+`fine_filter`'s fp32 `p`; eager peak was 49.5 GB, compile recovers it). Decode-head params
+0.36 M (vs 0.32 M). Matches the design estimate (docs "P2-FiLM ≈ +3–7 %").
+
+**Profiler — the +61 ms is NOT the conv FLOPs.** `convolution_backward` only grew +11 ms/step.
+The cost is: the **64³→128³ trilinear upsample backward fused with the FiLM elementwise**
+(`triton_poi_fused__..._unsafe_index_put_add_mul`, **~48 ms/step** — trilinear-interp backward
+is a scatter-add, run at 128³ over ~32 channels), plus InstanceNorm3d + LeakyReLU traffic at
+64³/128³ (~20 ms/step). So the cheap fix if this head proves worth training: **do the FiLM at
+64³ and only upsample the 1-channel logit to 128³** (scatter-add on 1 ch ≈ 32× cheaper —
+≈ the P3 variant, boundary sharpness ≈ `fine_stage=[1]`), and/or `mode="nearest"` for the
+token-field upsample (backward is a gather, no scatter-add).
+
+exp57 is unchanged (still `fine_filter`); `conv` is opt-in until a real training run shows a
+boundary-Dice gain — the decoder is not the size-stall bottleneck
+(`project_colipri_selfctx_ceiling`), so this is a boundary-quality bet, not a headline-metric
+one.
+
+## 2026-08-27 — exp57 ResEnc train-step profiling: where the ~825 ms goes, and what doesn't help
+
+Profiled the exp57 from-scratch-ResEnc recipe end to end on nora-odin (RTX PRO 6000 Blackwell,
+97 GB, torch 2.12+cu130) to find training-throughput wins. New tools:
+`experiments/3d/bench_resenc_step.py` (compute-only microbench: CUDA-event fwd/bwd split +
+per-module fwd hooks + `--torch-profile` + `--channels-last` / `--batch` / `--no-compile`
+flags), and a v2-config fix to `bench_train_step.py` (`cfg.data.use_crop` → `.get(...)`, v2
+datasets have no such key).
+
+**Config benchmarked** (the intended command `arch.resenc_n_stages=4 arch.nnunet_ts_stages=[3,4]`
+**crashes** — `ResEncTSEncoder` asserts `stage < n_stages`, and stage 4 with n_stages=4 is out of
+range; used `nnunet_ts_stages=[2,3]`, the valid deep-tap for a 4-stage net at R=16). B=4, K=3,
+128³, bce_dice, fine_decode `fine_stage=[0,1]`.
+
+**End-to-end split (`bench_train_step.py`): 964 ms/step eager, DATA-wait 15 ms (12 workers) —
+98 % compute-bound.** The loader is a non-issue; every lever is on the GPU step.
+
+| variant | ms/step | vs compiled | peak GB | verdict |
+|---|---|---|---|---|
+| eager (no `torch.compile` at all) | 964 | +17 % | 55 | — |
+| **compile transformer + decode** (repo default) | **825** | — | 46 | ✓ keep |
+| + compile the ResEnc encoder stack | 825 | 0 % | 47 | neutral (fwd −30 ms / bwd +30 ms) |
+| `channels_last_3d` on encoder (compiled) | 926 | +12 % | 47 | ✗ **hurts** |
+| `channels_last_3d` on encoder (eager) | 892 | +8 % | 46 | ✗ **hurts** |
+| `batch_size=8` | 3039 (380/sample) | +84 %/sample | 91 | ✗ **memory cliff** |
+| `fine_stage=[1]` (drop the 128³ tap) | 784 | −5 % | 41 | modeling change; −5 GB |
+
+**`_compile_encoder` (train.py) silently skipped `encoder=resenc_ts`** — it handled
+`nnunet_ts` / `conv` / ViT only, so `arch.compile_encoder=true` (which exp57 sets) fell through
+to "no compile target" and the dominant module ran eager. Added a `resenc_ts` branch
+(`torch.compile(enc.encoder, dynamic=True)`). Measured net-neutral on wall time (compiled conv
+backward is ~30 ms slower than cuDNN's, cancelling the ~30 ms forward gain) and +1.5 GB peak, so
+the branch is kept only to make the flag honest — **exp57 is marginally better with
+`arch.compile_encoder=false`** (leaner peak, no bf16-conv reassociation drift, faster startup).
+
+**`torch.profiler` op breakdown of the 825 ms step:**
+- ResEnc encoder conv fwd+bwd + layout kernels ≈ **445 ms (54 %)**, of which ~88 ms is pure
+  `nchwToNhwcKernel` / `nhwcToNchwKernel` (cuDNN transposing NCDHW↔NDHWC around every 3D conv).
+  Forcing `channels_last_3d` to pre-empt that still lost overall — cuDNN's internal path +
+  InstanceNorm3d in channels-last is slower than the transpose it avoids on this cu13 stack.
+- Transformer sample-axis FlashAttention over **16 392 tokens** (8 think + 3·4096 support +
+  4096 query), fwd+bwd ≈ **172 ms (21 %)** — `flash_attention_backward` alone is 127 ms.
+- `fine_decode` (`fine_proj` 1×1×1 conv backward @128³ + trilinear-interp backward + the fp32
+  `.float()` z-score) ≈ **150 ms (18 %)**.
+- "Command Buffer Full" shows large CPU-side (launch-stall) — mild launch-bound signal; CUDA
+  graphs (`mode="reduce-overhead"`) untried, out of window.
+
+**Batch size can't grow.** B=8 peaks at 91 GB and backward blows up 4.1× (611→2522 ms) — the
+allocator/cuDNN-workspace thrash past ~85 GB. The fp32 `fine_decode` activations at 128³ are the
+memory hog; B=4 leaves room for ~B=5–6 at most. "Batch image encoding over tgt+ctx" is **already
+done** — `PatchSet3D.forward` reshapes `[ctx, tgt]` to `(B·(K+1), 1, D,H,W)` for one encoder call.
+
+**Float precision is already tuned — nothing left there.** The step runs a bf16 autocast over
+the whole forward (encoder, transformer, FlashAttention); fp32 is kept only where it must be
+(`LowerPrecisionRMSNorm` internals, the loss with autocast disabled, TF32 for stray fp32
+matmuls). The one *apparently* fp32 spot — `_decode`'s `f = f.float()` before the fine readout —
+is a red herring: under the bf16 autocast `nn.Conv3d` / `torch.einsum` are autocast ops and run
+in bf16 regardless, so `.float()` only makes the z-score mean/std reduction fp32, and
+`compile_decoder=true` already fuses that. Measured A/B (same seed → same init, `bench_resenc_step.py`
+logit-stats): bf16 readout vs fp32 readout = **826→824 ms, 45.75→45.75 GB, logit |mean| 1.78899→
+1.78937 (0.02% drift)** — i.e. no difference. A prototyped `arch.fine_decode_fp32` flag was
+reverted as measured-dead. fp8 (Blackwell tensor cores, transformer linears) is the only precision
+lever left but needs a scaling recipe and is fragile for a from-scratch run — not worth it while
+the transformer is 21% of the step. The real remaining wins are structural (attention token count,
+CUDA graphs), not numeric.
 
 The CT intensity path had 3 places, 2 disagreeing constant sets: the loader z-scored with
 the 1228-subject fingerprint (`-167.3 / 505.8`, clip `[-1007, 1573]`); the GPU augmentor

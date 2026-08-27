@@ -354,6 +354,8 @@ def build_model(cfg: DictConfig):
             "fine_stage": (list(a.fine_stage) if isinstance(a.get("fine_stage", 1), ListConfig)
                            else a.get("fine_stage", 1)),
             "fine_proj_dim": a.get("fine_proj_dim", 64),
+            "decoder": a.get("decoder", "fine_filter"),
+            "decoder_dim": a.get("decoder_dim", 64),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
@@ -680,6 +682,14 @@ def _compile_encoder(net, cfg) -> str:
         # the norm+activation tails around cuDNN's convs.
         enc.encoder = torch.compile(enc.encoder, dynamic=True)
         return " + frozen nnU-Net encoder stack"
+    if which == "resenc_ts" and hasattr(enc, "encoder"):
+        # From-scratch ResidualEncoderUNet.encoder (conv / InstanceNorm / LeakyReLU residual
+        # blocks): the dominant per-step cost here, and it is a TRAINABLE stack, so compile
+        # covers fwd+bwd. Only the raw residual stack is compiled — the passthrough _norm and
+        # the _down_to/cat to R^3 stay eager (data-dependent trilinear window), mirroring the
+        # nnunet_ts branch. dynamic=True so train/eval batch-size differences don't recompile.
+        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        return " + from-scratch ResEnc encoder stack"
     if which == "conv" and hasattr(enc, "_stage_feats"):
         # ConvEncoder3D: compile the stem+stages only — forward's _resample/concat to R^3 stays
         # eager (data-dependent avg_pool3d window).

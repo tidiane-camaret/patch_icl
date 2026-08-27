@@ -119,6 +119,19 @@ class ConvEncoder3D(nn.Module):
                              for st in fine_stage)
 
 
+class _ConvNormAct(nn.Module):
+    """3x3x3 conv -> InstanceNorm3d(affine) -> LeakyReLU, the nnU-Net decoder block style
+    (matches the ResEnc encoder's norm/nonlin so the from-scratch stats stay consistent)."""
+    def __init__(self, cin: int, cout: int):
+        super().__init__()
+        self.conv = nn.Conv3d(cin, cout, 3, padding=1, bias=True)
+        self.norm = nn.InstanceNorm3d(cout, eps=1e-5, affine=True)
+        self.act = nn.LeakyReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
 class PatchSet3D(nn.Module):
     def __init__(
         self,
@@ -161,6 +174,8 @@ class PatchSet3D(nn.Module):
         fine_decode: bool = False,
         fine_stage: int = 1,
         fine_proj_dim: int = 64,
+        decoder: str = "fine_filter",
+        decoder_dim: int = 64,
     ):
         super().__init__()
         self.resolution = resolution
@@ -286,14 +301,21 @@ class PatchSet3D(nn.Module):
             nn.init.normal_(self.qry_id, std=0.1)
         self.thinking = ThinkingRows(thinking_rows, e)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
-        # Decode head. Default: a per-token MLP emitting d^3 CONSTANTS per cell, so a cell's
-        # e-vector is the only evidence for its 8^3 voxels and no boundary can be placed
-        # inside a cell. fine_decode instead has each token emit a dynamic FILTER, dotted
-        # against the query volume's own unpooled encoder features inside that cell, plus a
-        # linear tile term (keeping the head a superset of a coarse tile decode when the fine
-        # features are weak). Conv encoders only — a ViT has no finer stage to tap.
+        # Decode head. Default (fine_decode=False): a per-token MLP emitting d^3 CONSTANTS per
+        # cell. fine_decode=True picks between two heads via `decoder`:
+        #   "fine_filter" — each token emits a dynamic FILTER dotted against the query volume's
+        #                   own unpooled encoder features inside its cell, + a linear tile term.
+        #                   Cheap, but cells never interact (per-cell-independent readout).
+        #   "conv"        — a progressive coarse->fine conv decoder: project tokens to
+        #                   decoder_dim, upsample the R^3 field, fuse each requested unpooled
+        #                   stage (concat at coarse levels, per-voxel FiLM at the finest), a
+        #                   3x3x3 conv per level, then a 1x1x1 head + a token-only residual.
+        #                   Spatially coupled (conv receptive field); ~6x the FLOPs.
+        # Both need an encoder exposing unpooled stages (conv | nnunet_ts | resenc_ts).
         self.fine_decode = bool(fine_decode)
-        # int or list: [0, 1] projects both stages and sums them at the finer grid.
+        self.decoder_kind = str(decoder)
+        # int or list: fine_filter sums the projected stages at the finest grid; conv uses
+        # them as the skip pyramid (coarse->fine order is derived, any order accepted here).
         self.fine_stage = tuple(int(st) for st in (
             [fine_stage] if isinstance(fine_stage, int) else list(fine_stage)))
         self.fine_m = None
@@ -304,7 +326,7 @@ class PatchSet3D(nn.Module):
             if not getattr(self.encoder, "supports_fine", False):
                 raise ValueError(
                     f"arch.fine_decode needs an encoder exposing unpooled stages; "
-                    f"arch.encoder={encoder!r} has none (use conv | nnunet_ts)")
+                    f"arch.encoder={encoder!r} has none (use conv | nnunet_ts | resenc_ts)")
             for st in self.fine_stage:
                 if not 0 <= st < self.encoder.n_fine_stages:
                     raise ValueError(f"arch.fine_stage {st} out of range "
@@ -319,28 +341,67 @@ class PatchSet3D(nn.Module):
                                  f"resolution {resolution}")
             self.fine_m = fine_side // resolution         # fine voxels per cell axis
             chans = [self.encoder.fine_stage_channels(st) for st in self.fine_stage]
-            # One 1x1x1 projection per stage, each applied at that stage's NATIVE resolution;
-            # the projected maps are upsampled to the finest side and summed. Trilinear
-            # upsampling is per-channel and a 1x1x1 conv is per-voxel, so they commute:
-            # this is exactly Conv1x1(concat[f0, up(f1)]) without ever materializing the
-            # concatenated map at full resolution.
-            self.fine_proj = nn.ModuleList([nn.Conv3d(c, fine_proj_dim, 1) for c in chans])
-            self.filter_head = nn.Linear(e, fine_proj_dim)
-            self.tile_head = nn.Linear(e, self.fine_m ** 3)
-            # The readout is linear in the fine features (1x1x1 conv then a channel
-            # contraction), so the token-generated filter lives in the row space of the
-            # projection: its rank is capped at min(fine_proj_dim, sum(C_f)). Anything above
-            # that is dead width.
-            if fine_proj_dim > sum(chans):
-                print(f"[PatchSet3D] arch.fine_proj_dim={fine_proj_dim} exceeds total fine "
-                      f"channels {sum(chans)} (stages {self.fine_stage}); the filter rank is "
-                      f"capped at {sum(chans)} — the extra width is unused.")
+            if self.decoder_kind == "fine_filter":
+                # One 1x1x1 projection per stage, each applied at that stage's NATIVE
+                # resolution; the projected maps are upsampled to the finest side and summed.
+                # Trilinear upsampling is per-channel and a 1x1x1 conv is per-voxel, so they
+                # commute: this is exactly Conv1x1(concat[f0, up(f1)]) without ever
+                # materializing the concatenated map at full resolution.
+                self.fine_proj = nn.ModuleList([nn.Conv3d(c, fine_proj_dim, 1) for c in chans])
+                self.filter_head = nn.Linear(e, fine_proj_dim)
+                self.tile_head = nn.Linear(e, self.fine_m ** 3)
+                # The readout is linear in the fine features (1x1x1 conv then a channel
+                # contraction), so the token-generated filter lives in the row space of the
+                # projection: its rank is capped at min(fine_proj_dim, sum(C_f)). Anything
+                # above that is dead width.
+                if fine_proj_dim > sum(chans):
+                    print(f"[PatchSet3D] arch.fine_proj_dim={fine_proj_dim} exceeds total fine "
+                          f"channels {sum(chans)} (stages {self.fine_stage}); the filter rank is "
+                          f"capped at {sum(chans)} — the extra width is unused.")
+            elif self.decoder_kind == "conv":
+                self._build_conv_decoder(e, int(image_size[0]), resolution, int(decoder_dim))
+            else:
+                raise ValueError(f"arch.decoder {self.decoder_kind!r} (fine_filter | conv)")
         # (i,j,k) lattice, row-major over R³ (cell index n = i*R² + j*R + k)
         r = resolution
         ii = torch.arange(r).repeat_interleave(r * r)
         jj = torch.arange(r).repeat_interleave(r).repeat(r)
         kk = torch.arange(r).repeat(r * r)
         self.register_buffer("ijk_base", torch.stack([ii, jj, kk], dim=-1), persistent=False)  # (N,3)
+
+    def _build_conv_decoder(self, e: int, in_size: int, resolution: int, c_d: int):
+        """Progressive coarse->fine conv decoder (arch.decoder=conv). Levels are the requested
+        unpooled stages ordered by resolution (coarsest first); the token field is upsampled to
+        each and fused — concat + 3x3x3 conv at the coarse levels, per-voxel FiLM + 3x3x3 conv
+        at the finest. decoder_dim halves per level (>=8). A 1x1x1 head plus a token-only
+        residual (upsampled token field -> 1x1x1) gives the head a token-only fallback while
+        the from-scratch encoder's fine features are still noise (cf. fine_filter's tile term)."""
+        stages = sorted(self.fine_stage,
+                        key=lambda st: self.encoder.fine_stage_size(in_size, st))  # coarse->fine
+        self._dec_stage_order = [self.fine_stage.index(st) for st in stages]        # into `fine`
+        self._dec_sides = [self.encoder.fine_stage_size(in_size, st) for st in stages]
+        chans = [self.encoder.fine_stage_channels(st) for st in stages]
+        n = len(stages)
+        dims = [max(c_d // (2 ** i), 8) for i in range(n)]                          # taper
+        self.token_proj = nn.Linear(e, c_d)
+        # per-skip instance norm (affine off) = the fine_filter path's per-(sample,channel)
+        # z-score, so the raw from-scratch encoder activation scale can't blow up the fuse.
+        self.dec_skip_norm = nn.ModuleList([nn.InstanceNorm3d(c, affine=False) for c in chans])
+        self.dec_skip_proj = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        self.dec_film = None
+        prev = c_d
+        for i in range(n):
+            if i < n - 1:                                   # concat fuse
+                self.dec_skip_proj.append(nn.Conv3d(chans[i], dims[i], 1))
+                self.dec_blocks.append(_ConvNormAct(prev + dims[i], dims[i]))
+            else:                                           # finest: per-voxel FiLM fuse
+                self.dec_film = nn.Conv3d(prev, 2 * chans[i], 1)   # gamma, beta over the skip
+                self.dec_skip_proj.append(None)
+                self.dec_blocks.append(_ConvNormAct(chans[i], dims[i]))
+            prev = dims[i]
+        self.dec_head = nn.Conv3d(prev, 1, 1)
+        self.dec_token_residual = nn.Conv3d(c_d, 1, 1)
 
     @property
     def grid_size(self) -> int:
@@ -501,6 +562,8 @@ class PatchSet3D(nn.Module):
         token-only constant the default head would emit."""
         if not self.fine_decode:
             return self._tile_logits(self.decoder(q))
+        if self.decoder_kind == "conv":
+            return self._decode_conv(q, fine)
         B, N = q.shape[0], q.shape[1]
         R, m = self.resolution, self.fine_m
         side = R * m
@@ -526,6 +589,32 @@ class PatchSet3D(nn.Module):
         g = self.grid_size
         if logit.shape[-1] != g:
             logit = F.interpolate(logit, size=(g, g, g), mode="trilinear", align_corners=False)
+        return logit
+
+    def _decode_conv(self, q, fine):
+        """arch.decoder=conv: progressive coarse->fine conv decoder over the query's unpooled
+        stages. `fine` is in self.fine_stage order; self._dec_stage_order reindexes to
+        coarse->fine. Returns (B,1,G,G,G)."""
+        B, N = q.shape[0], q.shape[1]
+        R = self.resolution
+        t = self.token_proj(q).transpose(1, 2).reshape(B, -1, R, R, R)   # (B,C_d,R,R,R)
+        x = t
+        n = len(self.dec_blocks)
+        for i in range(n):
+            s = self._dec_sides[i]
+            x = F.interpolate(x, size=(s, s, s), mode="trilinear", align_corners=False)
+            skip = self.dec_skip_norm[i](fine[self._dec_stage_order[i]].to(x.dtype))
+            if i < n - 1:                                   # concat fuse
+                x = self.dec_blocks[i](torch.cat([x, self.dec_skip_proj[i](skip)], dim=1))
+            else:                                          # finest: per-voxel FiLM fuse
+                g, b = self.dec_film(x).chunk(2, dim=1)
+                x = self.dec_blocks[i]((1.0 + g) * skip + b)
+        logit = self.dec_head(x)
+        tr = F.interpolate(t, size=x.shape[-3:], mode="trilinear", align_corners=False)
+        logit = logit + self.dec_token_residual(tr)         # token-only fallback path
+        gs = self.grid_size
+        if logit.shape[-1] != gs:
+            logit = F.interpolate(logit, size=(gs, gs, gs), mode="trilinear", align_corners=False)
         return logit
 
     def forward(self, image, context_in, context_out, mode="train", spacing=None):

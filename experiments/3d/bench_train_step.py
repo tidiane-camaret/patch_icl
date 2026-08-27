@@ -72,7 +72,7 @@ def main():
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
     B = int(cfg.train.batch_size)
     print(f"model={name} enc={cfg.arch.get('encoder','conv') if 'arch' in cfg else '-'} "
-          f"size={list(cfg.data.image_size)} use_crop={cfg.data.use_crop} K={cfg.data.context_size} "
+          f"size={list(cfg.data.image_size)} use_crop={cfg.data.get('use_crop', 'v2')} K={cfg.data.context_size} "
           f"B={B} workers={args.workers} | trainable={n_params:.1f}M")
 
     def step(dev_batch):
