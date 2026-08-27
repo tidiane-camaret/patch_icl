@@ -1,0 +1,39 @@
+# @package _global_
+# e3_resenc — from-scratch nnU-Net ResidualEncoderUNet image encoder. The ResEnc twin of
+# e2 (frozen PlainConvUNet). Selected as a Hydra group: `encoder=e3_resenc`. Writes only
+# the encoder-forward `arch.*` keys; the transformer head + optim live in the `model`
+# group (model/m1.yaml). Both merge into one `arch:` block during composition.
+#
+# No plans.json / checkpoint: the architecture is fully specified here. Width follows the
+# nnU-Net ResEnc-M/L/XL recipe (base 32, x2 per stage, capped at 320) with the residual
+# block schedule (1, 3, 4, 6, 6, 6, ...). nnU-Net's M/L/XL presets have IDENTICAL width and
+# block schedule — they differ only in the planned patch size, which sets how many
+# downsampling stages the net gets — so `resenc_n_stages` IS that knob. n_stages=5
+# reproduces e2's PlainConvUNet stage geometry (sides /1 /2 /4 /8 /16 -> 128/64/32/16/8 at
+# a 128^3 input; channels 32/64/128/256/320) with residual blocks -> ~10x the params
+# (~55M encoder). Bump to 6 for an extra 320-ch stage (needs data.image_size>=256, or a
+# shallower tap, to keep an R=16 grid sane).
+#
+# From scratch, so pair with encoder_frozen=false and the from-scratch training recipe
+# (see 57_organs_encoder_from_scratch: encoder_lr_scale=1, warmup, LaWA).
+#
+# NOT spacing-aware (conv net, no RoPE): the physical cell scale is set purely by
+# data.crop_spacing_mm. The ResEnc recipe is a 3 mm net (Dataset297 pitch) — keep
+# crop_spacing_mm=3 unless deliberately ablating scale.
+#
+# Normalization: the provider already delivers the image in the pipeline CT frame
+# (data.ct_norm, default `fingerprint_1228`) and the GPU augmentor operates in it — so the
+# encoder does NOTHING to intensities (encoder_input_norm=passthrough). One frame, no
+# round trip. Contrast e2, where a frozen encoder pretrained in a different frame must
+# `reframe`. See src/totalseg_dataset.CtNormSpec.
+arch:
+  encoder: resenc_ts
+  encoder_frozen: false
+  resenc_n_stages: 5             # M/L/XL knob (fixed width). 5 -> feats [32,64,128,256,320],
+                                #   blocks [1,3,4,6,6]. 6 adds a 320-ch stage.
+  nnunet_ts_stages: [2, 3, 4]   # multi-scale concat -> out_ch = 128+256+320 = 704
+  encoder_input_norm: passthrough  # passthrough | reframe | zscore (see header)
+  encoder_precision: bf16       # autocast dtype of the encoder forward
+  enc_dims: [32, 32, 32, 32]   # ignored when encoder=resenc_ts (schema parity)
+  resolution: 16               # token grid R; stage 3 is native 16^3 at a 128^3 input
+  img_embed_mlp: true          # MLP img_embed (Linear->GELU->Linear) over the 704-dim feats

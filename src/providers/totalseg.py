@@ -20,7 +20,8 @@ from src.totalseg_dataloader_incontext import (
     organ_crop_arrays, place_image, place_label, resample_binary,
     _bbox_for_subject, _IDX_TO_CLASS,
 )
-from src.totalseg_dataset import _ALL_CLASSES_IDX, normalize_ct, normalize_mri
+from src.totalseg_dataset import (_ALL_CLASSES_IDX, normalize_ct, normalize_mri,
+                                  resolve_ct_norm)
 
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
@@ -95,8 +96,11 @@ class TotalSegProvider:
 
     def __init__(self, root, classes, image_size, split=None, meta_csv=None,
                  max_subjects=None, crop_spacing_mm=1.5, crop_jitter=None,
-                 mask_downsample="occupancy", mask_occupancy_thr=0.1, modality="ct"):
+                 mask_downsample="occupancy", mask_occupancy_thr=0.1, modality="ct",
+                 ct_norm=None):
         assert modality in ("ct", "mri"), modality
+        # The one CT frame the whole pipeline runs in (see src/totalseg_dataset.CtNormSpec).
+        self.ct_spec = resolve_ct_norm(ct_norm)
         self.root = Path(root)
         self.classes = list(classes)
         self.image_size = tuple(image_size)
@@ -131,7 +135,7 @@ class TotalSegProvider:
             D, H, W = label_np.shape
             center = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
-        norm = (normalize_ct if self.modality == "ct"
+        norm = ((lambda a: normalize_ct(a, self.ct_spec)) if self.modality == "ct"
                 else (lambda a: normalize_mri(a, self._ct_stats[subject])))
         # Fast path: a pre-resampled `ct_raw_{crop_spacing:g}mm.npy` image cache (whole-body
         # native CT downsampled to the crop pitch once, offline). Used only when its pitch

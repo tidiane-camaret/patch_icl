@@ -146,6 +146,8 @@ class PatchSet3D(nn.Module):
         nnunet_ts_weights: str = None,
         nnunet_ts_stages=(2, 3, 4),
         nnunet_ts_random_init: bool = False,
+        resenc_n_stages: int = 5,
+        encoder_input_norm: str = None,
         img_embed_mlp: bool = False,
         encoder_stage: int = None,
         encoder_native_grid: bool = False,
@@ -217,16 +219,32 @@ class PatchSet3D(nn.Module):
             from src.models.encoders.nnunet_ts import NnUNetTSEncoder   # lazy: avoids import cycle
             if not nnunet_ts_weights:
                 raise ValueError("encoder='nnunet_ts' requires arch.nnunet_ts_weights")
+            # encoder_input_norm: None keeps each encoder's own default (nnunet_ts=reframe,
+            # so a frozen pretrained encoder still converts loader-frame -> its plans frame).
+            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
             self.encoder = NnUNetTSEncoder(nnunet_ts_weights, resolution,
                                            stages=tuple(nnunet_ts_stages),
                                            frozen=encoder_frozen, device="cpu",
                                            precision=encoder_precision,
-                                           random_init=nnunet_ts_random_init)
+                                           random_init=nnunet_ts_random_init, **_in_norm)
+        elif encoder == "resenc_ts":
+            # From-scratch nnU-Net ResidualEncoderUNet (the ResEnc twin of nnunet_ts). No
+            # plans.json / checkpoint: the architecture is the ResEnc M/L/XL recipe with
+            # resenc_n_stages stages (base 32, x2, cap 320; blocks 1/3/4/6/6/...), He init.
+            # Multi-scale concat of nnunet_ts_stages resampled to R^3; 1-channel image input,
+            # spacing arg ignored. encoder_input_norm defaults to passthrough (the image is
+            # already in the pipeline CT frame — see src/totalseg_dataset.CtNormSpec).
+            from src.models.encoders.resenc_ts import ResEncTSEncoder   # lazy: avoids import cycle
+            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
+            self.encoder = ResEncTSEncoder(resolution, n_stages=resenc_n_stages,
+                                           stages=tuple(nnunet_ts_stages),
+                                           frozen=encoder_frozen, device="cpu",
+                                           precision=encoder_precision, **_in_norm)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
             raise ValueError(f"unknown arch.encoder {encoder!r} "
-                             f"(conv | primus | tap_ct | nnunet_ts)")
+                             f"(conv | primus | tap_ct | nnunet_ts | resenc_ts)")
         # Encoder feature -> token width e. Default: a single Linear. When the encoder
         # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
         # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width

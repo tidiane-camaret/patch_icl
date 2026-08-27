@@ -242,7 +242,8 @@ def build_dataset(cfg, split: str):
             crop_jitter=(d.get("crop_jitter") if is_train else cfg.get("eval", {}).get("crop_jitter", 0)),
             mask_downsample=d.get("mask_downsample", "occupancy"),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
-            modality=("mri" if is_mri else "ct"))
+            modality=("mri" if is_mri else "ct"),
+            ct_norm=d.get("ct_norm"))
         return InContextDataset(
             provider, context_size=d.context_size,
             class_balanced=(is_train and d.get("class_balanced", False)),
@@ -590,7 +591,8 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
             crop_jitter=e.get("crop_jitter", None),
             mask_downsample=d.get("mask_downsample", "occupancy"),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
-            modality=("mri" if is_mri else "ct"))
+            modality=("mri" if is_mri else "ct"),
+            ct_norm=d.get("ct_norm"))
         ds_v2 = InContextDataset(
             provider, context_size=d.context_size, class_balanced=False,
             aug_cfg=None, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),

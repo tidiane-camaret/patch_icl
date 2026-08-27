@@ -12,6 +12,7 @@ pre-convert to .npy (uncompressed) for near-instant random access.
 
 import csv
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,32 +24,85 @@ from torch.utils.data import Dataset
 
 from data.totalseg_classes import ALL_CLASSES  # noqa: F401  (re-exported for back-compat)
 
-# CT normalisation constants matching nnUNet CTNormalization on this dataset.
-# Derived from the 1228-subject fingerprint in nnUNet_preprocessed/dataset_fingerprint.json.
-#   Clip:   p0.5 / p99.5 of foreground HU across all subjects.
-#   Z-score: global mean / std of foreground HU (after clipping).
-# Stored .npy files contain float16 z-score values; the runtime range is [-1.66, +3.44].
-CT_CLIP_MIN: float = -1007.0
-CT_CLIP_MAX: float =  1573.0
-CT_MEAN:     float =  -167.3
-CT_STD:      float =   505.8
-# Pre-computed z-score bounds (used by augmentations for clamping).
-CT_NORM_MIN: float = (CT_CLIP_MIN - CT_MEAN) / CT_STD   # ≈ -1.661
-CT_NORM_MAX: float = (CT_CLIP_MAX - CT_MEAN) / CT_STD   # ≈ +3.441
+# ---------------------------------------------------------------------------
+# CT intensity normalization — ONE source of truth for the whole pipeline.
+#
+# A CtNormSpec is (clip window in HU, then z-score by mean/std). The provider applies
+# exactly one spec at crop time (the "training frame"); the GPU augmentor clamps to that
+# frame's [norm_min, norm_max]; a frozen pretrained encoder that was trained in a DIFFERENT
+# frame declares `input_norm=reframe` and converts. Nothing re-normalizes silently.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CtNormSpec:
+    """clip(HU, [clip_lo, clip_hi]) then (HU - mean) / std."""
+    clip_lo: float
+    clip_hi: float
+    mean: float
+    std: float
+
+    @property
+    def norm_min(self) -> float:
+        return (self.clip_lo - self.mean) / self.std
+
+    @property
+    def norm_max(self) -> float:
+        return (self.clip_hi - self.mean) / self.std
+
+
+# Named frames. `fingerprint_1228` = the 1228-subject TotalSegmentator fingerprint
+# (nnUNet_preprocessed/dataset_fingerprint.json: p0.5/p99.5 foreground HU + post-clip
+# foreground mean/std) — the pipeline default. `d297` = Dataset297_total_3mm's plans.json
+# foreground_intensity_properties (what the nnunet_ts frozen encoder was pretrained in).
+CT_NORM_PRESETS: dict[str, CtNormSpec] = {
+    "fingerprint_1228": CtNormSpec(clip_lo=-1007.0, clip_hi=1573.0, mean=-167.3, std=505.8),
+    "d297":             CtNormSpec(clip_lo=-1004.0, clip_hi=1588.0,
+                                   mean=-50.38697721419439, std=503.39235619144),
+}
+DEFAULT_CT_NORM: CtNormSpec = CT_NORM_PRESETS["fingerprint_1228"]
+
+
+def resolve_ct_norm(spec) -> CtNormSpec:
+    """None -> DEFAULT_CT_NORM; str -> preset lookup; CtNormSpec -> as-is;
+    mapping (dict / OmegaConf) -> CtNormSpec(clip_lo, clip_hi, mean, std)."""
+    if spec is None:
+        return DEFAULT_CT_NORM
+    if isinstance(spec, CtNormSpec):
+        return spec
+    if isinstance(spec, str):
+        try:
+            return CT_NORM_PRESETS[spec]
+        except KeyError:
+            raise KeyError(f"unknown ct_norm preset {spec!r} ({'|'.join(CT_NORM_PRESETS)})")
+    return CtNormSpec(clip_lo=float(spec["clip_lo"]), clip_hi=float(spec["clip_hi"]),
+                      mean=float(spec["mean"]), std=float(spec["std"]))
+
+
+# Back-compat module constants — DERIVED from the default frame so there is one literal
+# set. Existing importers (gpu_augment, augmentations, convert_to_npy, encoders) are
+# unchanged; they all track DEFAULT_CT_NORM.
+CT_CLIP_MIN: float = DEFAULT_CT_NORM.clip_lo
+CT_CLIP_MAX: float = DEFAULT_CT_NORM.clip_hi
+CT_MEAN:     float = DEFAULT_CT_NORM.mean
+CT_STD:      float = DEFAULT_CT_NORM.std
+CT_NORM_MIN: float = DEFAULT_CT_NORM.norm_min   # ≈ -1.661
+CT_NORM_MAX: float = DEFAULT_CT_NORM.norm_max   # ≈ +3.441
 
 
 # -------------------------------------------------------------------------
 # Volume helpers
 # -------------------------------------------------------------------------
 
-def normalize_ct(vol: np.ndarray) -> np.ndarray:
-    """Global CT normalization: clip to the HU window, then dataset z-score.
+def normalize_ct(vol: np.ndarray, spec=None) -> np.ndarray:
+    """Global CT normalization: clip to the HU window, then z-score (a CtNormSpec).
 
-    Pointwise with fixed dataset-fingerprint constants — so normalizing a crop is identical
-    to normalizing the whole volume (no need to load the full volume for stats). This is the
-    shared helper used by convert_to_npy (writing ct.npy) and the raw-CT loader path."""
-    vol = np.clip(vol.astype(np.float32), CT_CLIP_MIN, CT_CLIP_MAX)
-    return (vol - CT_MEAN) / CT_STD
+    Pointwise with fixed constants — so normalizing a crop is identical to normalizing the
+    whole volume (no full-volume stats needed). `spec` is None (DEFAULT_CT_NORM), a preset
+    name, a CtNormSpec, or a {clip_lo,clip_hi,mean,std} mapping. This is the single shared
+    helper used by convert_to_npy (writing ct.npy) and the raw-CT loader path."""
+    s = resolve_ct_norm(spec)
+    vol = np.clip(vol.astype(np.float32), s.clip_lo, s.clip_hi)
+    return (vol - s.mean) / s.std
 
 
 def mri_stats(vol: np.ndarray) -> dict:

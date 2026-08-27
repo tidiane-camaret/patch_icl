@@ -338,6 +338,8 @@ def build_model(cfg: DictConfig):
             "nnunet_ts_weights": a.get("nnunet_ts_weights", None),
             "nnunet_ts_stages": a.get("nnunet_ts_stages", (2, 3, 4)),
             "nnunet_ts_random_init": a.get("nnunet_ts_random_init", False),
+            "resenc_n_stages": a.get("resenc_n_stages", 5),
+            "encoder_input_norm": a.get("encoder_input_norm", None),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
             "encoder_native_grid": a.get("encoder_native_grid", False),
@@ -880,7 +882,8 @@ def main(cfg: DictConfig) -> None:
         gpu_aug = GpuAugmentor(cfg.augmentations,
                                self_context_per_image=bool(_sc_pi),
                                self_context_intensity=bool(_sc_int),
-                               seed=int(cfg.get("seed", 0)))
+                               seed=int(cfg.get("seed", 0)),
+                               ct_norm=cfg.data.get("ct_norm"))
     else:
         gpu_aug = None
 

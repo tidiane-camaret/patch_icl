@@ -31,11 +31,13 @@ from dynamic_network_architectures.architectures.unet import PlainConvUNet
 
 from src.models.patchset3d import _down_to
 from src.models.primus_encoder import _EncodeCache, _cached_encode
-from src.totalseg_dataset import CT_MEAN, CT_STD
+from src.totalseg_dataset import resolve_ct_norm
 
 _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
            "fp16": torch.float16, "float16": torch.float16,
            "fp32": None, "float32": None}
+
+_INPUT_NORMS = ("passthrough", "reframe", "zscore")
 
 
 def resolve_ts_weights_dir(spec) -> Path:
@@ -100,8 +102,13 @@ class NnUNetTSEncoder(nn.Module):
     supports_fine = True          # exposes unpooled per-stage maps (see encode_with_fine)
 
     def __init__(self, weights_dir, resolution, stages=(2, 3, 4), frozen=True,
-                 device="cuda", cache_max=4096, precision="bf16", random_init=False):
+                 device="cuda", cache_max=4096, precision="bf16", random_init=False,
+                 input_norm="reframe", loader_ct_norm=None):
         super().__init__()
+        self.input_norm = str(input_norm)
+        if self.input_norm not in _INPUT_NORMS:
+            raise ValueError(f"unknown input_norm {input_norm!r} ({'|'.join(_INPUT_NORMS)})")
+        self._loader_spec = resolve_ct_norm(loader_ct_norm)
         wd = resolve_ts_weights_dir(weights_dir)
         plans = json.load(open(wd / "plans.json"))
         cfg = plans["configurations"]["3d_fullres"]
@@ -176,10 +183,18 @@ class NnUNetTSEncoder(nn.Module):
         self._cache = _EncodeCache(int(cache_max))
 
     def _norm(self, x):
-        """Loader z-scored HU -> nnU-Net CTNormalization (invert loader norm, re-normalize)."""
-        hu = x.float() * CT_STD + CT_MEAN
-        hu = hu.clamp(*self.ct_clip)
-        return (hu - self.ct_mean) / self.ct_std
+        """passthrough: identity. reframe (default): invert the loader frame to HU, then
+        apply this checkpoint's plans CTNormalization. zscore: invert, then per-volume."""
+        x = x.float()
+        if self.input_norm == "passthrough":
+            return x
+        hu = x * self._loader_spec.std + self._loader_spec.mean
+        if self.input_norm == "reframe":
+            return (hu.clamp(*self.ct_clip) - self.ct_mean) / self.ct_std
+        flat = hu.reshape(hu.shape[0], -1)                       # zscore
+        mu = flat.mean(dim=1).reshape(-1, 1, 1, 1, 1)
+        sig = flat.std(dim=1).reshape(-1, 1, 1, 1, 1)
+        return (hu - mu) / (sig + 1e-8)
 
     def _autocast_ctx(self):
         dev = next(self.encoder.parameters()).device

@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from src.augmentations import _make_affine_theta, _svf_displacement
-from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX
+from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX, DEFAULT_CT_NORM, resolve_ct_norm
 
 REAL, SYNTH, SELF_CONTEXT = 0, 1, 2
 
@@ -302,7 +302,14 @@ def _geometric(vols, masks, group_size, cfg, gen):
 
 class GpuAugmentor:
     def __init__(self, aug_cfg, self_context_per_image: bool = False,
-                 self_context_intensity: bool = False, seed: int = 0):
+                 self_context_intensity: bool = False, seed: int = 0, ct_norm=None):
+        # Intensity ops clamp to the module-level CT_NORM_MIN/MAX, which track the default
+        # CT frame. A non-default data.ct_norm would silently mis-clip, so stop loudly until
+        # the ops are parametrized (they read module globals across ~10 free functions).
+        if resolve_ct_norm(ct_norm) != DEFAULT_CT_NORM:
+            raise NotImplementedError(
+                "GpuAugmentor is pinned to the default CT frame (fingerprint_1228); "
+                f"data.ct_norm={ct_norm!r} not yet supported by the GPU intensity ops.")
         self.cfg = aug_cfg
         self.self_context_per_image = bool(self_context_per_image)
         self.self_context_intensity = bool(self_context_intensity)

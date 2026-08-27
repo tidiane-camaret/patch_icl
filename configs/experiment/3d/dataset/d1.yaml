@@ -14,6 +14,12 @@ data:
   train_spacing_range: null     # fixed 2 mm crops (no SpacingBatchSampler); eval always fixed
   mask_downsample: occupancy    # area-pool + threshold (keeps thin masks under downsampling)
   mask_occupancy_thr: 0.5       # foreground-fraction threshold
+  # The ONE CT normalization frame for the whole pipeline (provider applies it at crop time;
+  # GPU augmentor clamps to it; a passthrough encoder trusts it). A preset name
+  # (fingerprint_1228 | d297) or an inline {clip_lo,clip_hi,mean,std}. null = fingerprint_1228
+  # (the 1228-subject TotalSegmentator fingerprint). See src/totalseg_dataset.CtNormSpec.
+  # NB the GPU augmentor only supports the default frame today (src/gpu_augment.py guard).
+  ct_norm: null
   class_balanced: true          # sample class uniformly, then subject (train only)
   max_ds_len_train: 1000        # samples per train epoch (loader cap)
   max_train_subjects: null

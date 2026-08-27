@@ -1,5 +1,55 @@
 # Change log
 
+## 2026-08-27 — CT normalization unified into one frame (CtNormSpec)
+
+The CT intensity path had 3 places, 2 disagreeing constant sets: the loader z-scored with
+the 1228-subject fingerprint (`-167.3 / 505.8`, clip `[-1007, 1573]`); the GPU augmentor
+clamped to that frame's `CT_NORM_MIN/MAX`; the `nnunet_ts` encoder `_norm` then INVERTED the
+loader z-score and re-normalized to Dataset297's plans stats (`-50.4 / 503.4`, clip
+`[-1004, 1588]`). For a frozen pretrained encoder the round trip is necessary; for a
+from-scratch one it's waste on a meaningless target.
+
+- **`src/totalseg_dataset.py`**: `CtNormSpec(clip_lo, clip_hi, mean, std)` + `CT_NORM_PRESETS`
+  (`fingerprint_1228`, `d297`) + `resolve_ct_norm(None|str|spec|mapping)`. The old module
+  constants (`CT_MEAN/CT_STD/CT_CLIP_*/CT_NORM_*`) are now DERIVED from `DEFAULT_CT_NORM` —
+  one literal set, every existing importer unchanged. `normalize_ct(vol, spec=None)`.
+- **Provider is the one application point**: `TotalSegProvider(ct_norm=...)` -> `self.ct_spec`;
+  `common.build_dataset` / eval loader forward `data.ct_norm`. `d1.yaml` documents it
+  (`ct_norm: null` = `fingerprint_1228`).
+- **Encoders** (`resenc_ts`, `nnunet_ts`): `input_norm` replaces the buried inversion —
+  `passthrough` (identity; **new default for `resenc_ts` / e3**), `reframe` (invert loader
+  frame -> apply target frame; **default for `nnunet_ts`**, so e2 / exp48-56 are byte-identical),
+  `zscore` (invert -> per-volume). Both frames are `CtNormSpec`, not hardcoded literals.
+- **GPU augmentor**: intensity ops still read the module `CT_NORM_MIN/MAX` (default frame);
+  `GpuAugmentor(ct_norm=...)` raises `NotImplementedError` if a non-default frame is set,
+  rather than silently mis-clipping (~10 free functions read the globals — deferred).
+- Tests: `tests/test_ct_norm.py`, updated `tests/test_resenc_ts_encoder.py`.
+
+## 2026-08-27 — e3_resenc: from-scratch ResidualEncoderUNet image encoder
+
+New `encoder=e3_resenc` Hydra group + `ResEncTSEncoder` (`src/models/encoders/resenc_ts.py`) —
+the ResEnc twin of `e2`'s frozen PlainConvUNet, for training a larger conv encoder from scratch.
+
+- **No plans.json / checkpoint.** Architecture is specified inline as the nnU-Net ResEnc-M/L/XL
+  recipe: base 32, x2 per stage capped at 320, residual block schedule `(1,3,4,6,6,6,...)`,
+  stage-0 stride-1 then stride-2, He init (`net.apply(net.initialize)`). The M/L/XL presets have
+  identical width and block schedule — they differ only in planned patch size, which sets stage
+  count — so `arch.resenc_n_stages` (default 5) IS that knob. 5 stages = e2's PlainConv geometry
+  (feats `[32,64,128,256,320]`) with residual blocks -> ~10x the params (~55M encoder).
+- Same public contract as `NnUNetTSEncoder` (`out_ch`, `resolution`, `train_spacing_mm`,
+  `supports_fine` per-stage taps) so PatchSet3D / fine_decode / encode-cache are unchanged.
+  Taps `arch.nnunet_ts_stages` (reused; default `[2,3,4]` -> out_ch 704), concat at R^3.
+- `arch.encoder_input_norm` (default `passthrough`, see the normalization-unification entry
+  below): the from-scratch encoder does NOTHING to intensities — the image already arrives in
+  the pipeline CT frame. `reframe` / `zscore` available for pretrained weights. Not
+  spacing-aware (conv net) — physical scale set by `data.crop_spacing_mm`; the recipe is a
+  3 mm net, keep `crop_spacing_mm=3` unless ablating.
+- Wiring: `PatchSet3D` gains `encoder="resenc_ts"` branch + `resenc_n_stages` /
+  `encoder_input_norm` kwargs; `experiments/3d/train.py::build_model` forwards them; `eval.py`
+  rebuilds from the ckpt-stored arch dict (no change). Test: `tests/test_resenc_ts_encoder.py`
+  (shape / fine geometry / norm paths). exp57 unchanged — switch it later with
+  `override /encoder: e3_resenc` minus the `nnunet_ts_*` lines.
+
 ## 2026-08-26 — Unified class registry (MAISI ↔ TotalSeg vocabulary)
 
 Added `data/class_registry.py` — single source of truth for class names across
