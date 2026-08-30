@@ -10,8 +10,11 @@
 # coarse->fine, each overwriting the previous). See
 # docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
 #
-# PRE-REQ: a per-spacing image cache `ct_raw_1.5mm.npy` (and `ct_raw_3mm.npy`) must exist
-# per subject dir, else the provider falls back to full-res ct_raw.npy per re-crop load.
+# IMAGE CACHES (measured): without per-spacing `ct_raw_{s:g}mm.npy` caches (ct_raw_3mm.npy,
+# ct_raw_1.5mm.npy) the provider falls back to the full-res ct_raw.npy on every re-crop load.
+# On this cluster only ct_raw_6mm.npy exists, so each step does ~B*(K+1) synchronous full-res
+# loads (~195 ms at 3 mm, ~18-26 ms at 1.5 mm) ≈ +0.3 s/step and ~100 s per val pass. Build
+# the caches (scripts/ downsample) to remove it — training is correct without them, just slow.
 
 defaults:
   - 57_organs_encoder_from_scratch

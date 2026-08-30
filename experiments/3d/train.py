@@ -510,16 +510,27 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
             t_rc = time.perf_counter()
+            # Only hand the augmentor to the cascade when aug is actually enabled — else the
+            # dataset already applied CPU aug and the cascade would re-apply GPU aug (double
+            # aug). _assert_cascade_supported forbids enabled+non-gpu, so gpu_aug here is the
+            # GPU path; None keeps the cascade aug-free.
+            _aug = gpu_aug if (cfg.get("augmentations", {}) or {}).get("enabled", False) else None
             with _autocast():
                 res = run_cascade(
-                    model, loader.dataset.provider, batch, gpu_aug, spacings,
+                    model, loader.dataset.provider, batch, _aug, spacings,
                     device=DEVICE, training=True, step=gstep, seed=int(cfg.train.seed),
                     jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob)
+                # Fail fast on a non-finite forward at ANY level, BEFORE the loss: a NaN
+                # reaching F.binary_cross_entropy trips an async device assert with a useless
+                # later stack (cf. the non-cascade guard).
+                for _li, _lg in enumerate(res.logits):
+                    if not torch.isfinite(_lg).all():
+                        raise RuntimeError(
+                            f"non-finite cascade forward @ epoch {epoch} step {n} level {_li} "
+                            f"(spacing {spacings[_li]:g})")
                 loss, per_level = _cascade_loss(
                     res, loss_fn, cfg.train.get("cascade_loss_weights"))
             fine = res.logits[-1].float()
-            if not torch.isfinite(fine).all():
-                raise RuntimeError(f"non-finite cascade forward @ epoch {epoch} step {n}")
             loss.backward()
             if cfg.train.get("grad_clip"):
                 torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.train.grad_clip)
@@ -546,6 +557,7 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                     res.logits[si].float(), res.targets[si], is_prob)
             _c_empty_acc[0] += res.empty_frac
             if prof:
+                prof_items += batch["image"].shape[0]     # per-item = per-step ÷ batch size
                 tsum.setdefault("recrop", 0.0)
                 tsum["recrop"] += (time.perf_counter() - t_rc) * 1000
             pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
@@ -647,16 +659,17 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     if prof and n:
         pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
         bs = prof_items / n                            # avg batch size
-        for k in ("data", "encode", "attn"):
-            grid[f"time/{k}_ms"] = tsum[k] / n         # per-step (per-batch) wall time
-            grid[f"time/{k}_ms_item"] = tsum[k] / pi   # per-item (÷ batch size): B-comparable
+        if tsum["encode"] > 0:                         # a non-cascade (single-forward) epoch ran
+            for k in ("data", "encode", "attn"):
+                grid[f"time/{k}_ms"] = tsum[k] / n     # per-step (per-batch) wall time
+                grid[f"time/{k}_ms_item"] = tsum[k] / pi  # per-item (÷ batch size): B-comparable
+            tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
+                       f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
+                       f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
+                       f"encode {tsum['encode']/pi:4.0f}ms | attn {tsum['attn']/pi:4.0f}ms")
         if "recrop" in tsum:                           # cascade re-crop I/O (cascade branch only)
             grid["time/recrop_ms"] = tsum["recrop"] / n
             grid["time/recrop_ms_item"] = tsum["recrop"] / pi
-        tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
-                   f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
-                   f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
-                   f"encode {tsum['encode']/pi:4.0f}ms | attn {tsum['attn']/pi:4.0f}ms")
     return total / max(n, 1), dice_sum / max(n, 1), soft_run / max(n, 1), grid
 
 
@@ -867,6 +880,15 @@ def main(cfg: DictConfig) -> None:
           f"| sched={cfg.train.get('scheduler','plateau')} | val classes={len(val_classes)}")
 
     loader = train_loader(cfg)
+    if cfg.data.get("cascade_spacings"):
+        import warnings
+        _sd = next(iter(sorted(Path(cfg.paths.totalseg).glob("s*"))), None)
+        for _s in cfg.data.cascade_spacings:
+            if _sd is not None and not (_sd / f"ct_raw_{float(_s):g}mm.npy").exists():
+                warnings.warn(
+                    f"cascade: no ct_raw_{float(_s):g}mm.npy image cache — provider falls back "
+                    f"to full-res ct_raw.npy per re-crop load (slow: ~+0.3 s/step, ~100 s/val). "
+                    f"Build the per-spacing caches to remove it.")
     val_loader = make_eval_loader(vcfg, val_classes, split="val")  # built once, reused every eval
     model, model_name = build_model(cfg)
     is_patchset = model_name == "patchset3d"

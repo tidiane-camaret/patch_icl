@@ -203,6 +203,16 @@ def _assert_cascade_supported(cfg) -> None:
                          f"v2 TotalSeg source ({sorted(_TOTALSEG_SOURCES)}).")
     if len(spacings) < 2:
         raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
+    _sp_f = [float(s) for s in spacings]
+    if not all(a > b for a, b in zip(_sp_f, _sp_f[1:])):
+        raise ValueError(f"data.cascade_spacings must be strictly coarse->fine (descending); "
+                         f"got {list(spacings)}")
+    aug = cfg.get("augmentations", {}) or {}
+    if aug.get("enabled", False) and not aug.get("gpu", False):
+        raise ValueError(
+            "data.cascade_spacings with augmentations.enabled requires augmentations.gpu=true "
+            "(else the dataset applies CPU aug and the cascade re-applies GPU aug -> double "
+            "augmentation).")
     if float(spacings[0]) != float(d.get("crop_spacing_mm")):
         raise ValueError(f"data.cascade_spacings[0]={spacings[0]} must equal "
                          f"data.crop_spacing_mm={d.get('crop_spacing_mm')} (level-0 geometry).")

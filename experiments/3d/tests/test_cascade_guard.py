@@ -60,3 +60,22 @@ def test_rejects_short_list():
 def test_rejects_weight_length_mismatch():
     with pytest.raises(ValueError, match="cascade_loss_weights"):
         _assert_cascade_supported(_cfg(train={"cascade_loss_weights": [1.0]}))
+
+
+def test_rejects_enabled_cpu_aug():
+    with pytest.raises(ValueError, match="augmentations.gpu"):
+        _assert_cascade_supported(_cfg(augmentations={"enabled": True, "gpu": False}))
+
+
+def test_allows_enabled_gpu_aug():
+    _assert_cascade_supported(_cfg(augmentations={"enabled": True, "gpu": True}))
+
+
+def test_rejects_non_descending_spacings():
+    with pytest.raises(ValueError, match="descending"):
+        _assert_cascade_supported(_cfg(data={"cascade_spacings": [1.5, 3], "crop_spacing_mm": 1.5}))
+
+
+def test_rejects_equal_adjacent_spacings():
+    with pytest.raises(ValueError, match="descending"):
+        _assert_cascade_supported(_cfg(data={"cascade_spacings": [3, 3], "crop_spacing_mm": 3}))
