@@ -44,7 +44,8 @@ def crop_and_place(image_np, label_np, class_idx, center, T, *,
     image_t = place_image(crop_ct, out_sizes, pad_lo, T, antialias=antialias)
     lbl_small = resample_binary(crop_lbl == class_idx, tuple(out_sizes),
                                 mode=mask_downsample, occ_thr=occ_thr)
-    label_t = place_label(lbl_small, out_sizes, pad_lo, T).long()
+    # dtype preserved: long for occupancy/nearest, float32 (partial-volume fraction) for "soft"
+    label_t = place_label(lbl_small, out_sizes, pad_lo, T)
     return image_t, label_t, geom
 
 
@@ -86,7 +87,8 @@ def crop_and_place_cached(img_cache_np, label_np, class_idx, center, T, *,
     image_t = place_image(img_crop, out_sizes, pad_lo, T)  # cache->out ~identity when pitches match
     lbl_small = resample_binary(crop_lbl == class_idx, tuple(out_sizes),
                                 mode=mask_downsample, occ_thr=occ_thr)
-    label_t = place_label(lbl_small, out_sizes, pad_lo, T).long()
+    # dtype preserved: long for occupancy/nearest, float32 (partial-volume fraction) for "soft"
+    label_t = place_label(lbl_small, out_sizes, pad_lo, T)
     return image_t, label_t, geom
 
 

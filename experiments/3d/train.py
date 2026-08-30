@@ -181,8 +181,9 @@ def build_loss(cfg):
 @torch.no_grad()
 def _hard_dice(logits, target, is_prob: bool = False):
     pred = (_to_prob(logits, is_prob) >= 0.5).float()
-    inter = (pred * target).sum().item()
-    den = pred.sum().item() + target.sum().item()
+    gt = (target >= 0.5).float()   # >=0.5 so a soft partial-volume target thresholds cleanly
+    inter = (pred * gt).sum().item()
+    den = pred.sum().item() + gt.sum().item()
     return (2 * inter + 1) / (den + 1)
 
 
@@ -258,6 +259,13 @@ class MultiScheduler:
         for s in self.scheds:
             s.step(*args)
 
+    def state_dict(self):
+        return {"scheds": [s.state_dict() for s in self.scheds]}
+
+    def load_state_dict(self, state):
+        for s, st in zip(self.scheds, state["scheds"]):
+            s.load_state_dict(st)
+
 
 def build_scheduler(cfg, optimizers, total_steps, steps_per_epoch):
     """Return (scheduler, step_per_batch). Plateau steps on val Dice in main().
@@ -296,6 +304,49 @@ def build_scheduler(cfg, optimizers, total_steps, steps_per_epoch):
 
     scheds = [_one(o) for o in optimizers]
     return (scheds[0] if len(scheds) == 1 else MultiScheduler(scheds)), name != "plateau"
+
+
+def restore_training_state(ckpt, optimizers, scheduler):
+    """Roll a full-resume checkpoint's training state into the freshly-built optimizers and
+    scheduler, IN PLACE (counterpart to the state saved in main()). Restores per-optimizer
+    moment buffers, the LR-scheduler step count (so cosine/plateau CONTINUE instead of
+    replaying warmup from the peak onto already-converged weights — the post-resume plateau,
+    docs/logs.md 2026-08-29) and Python/torch/CUDA RNG. The caller rolls the epoch counter
+    and `best` forward.
+
+    The optimizer param-group layout must match the resumed run's config (same optimizer,
+    same encoder_lr_scale / no_decay_norm_bias / Muon on-off). Changing the recipe -> resume
+    with train.resume_weights_only=true, which skips this."""
+    opt_states = ckpt.get("optimizers", [])
+    if len(opt_states) != len(optimizers):
+        raise RuntimeError(
+            f"resume: checkpoint carries {len(opt_states)} optimizer state(s), this run built "
+            f"{len(optimizers)} (Muon toggled? optimizer changed?). "
+            f"Use train.resume_weights_only=true.")
+    for opt, st in zip(optimizers, opt_states):
+        opt.load_state_dict(st)
+    if ckpt.get("scheduler") is not None:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    # A scheduler only pushes its LR onto the optimizer on its next .step(); re-apply the
+    # restored _last_lr now so the very first post-resume step already runs at the annealed LR.
+    groups = [g for opt in optimizers for g in opt.param_groups]
+    last_lr = getattr(scheduler, "_last_lr", None)
+    if last_lr is None and hasattr(scheduler, "scheds"):     # MultiScheduler (Muon scheduled)
+        last_lr = [lr for s in scheduler.scheds for lr in getattr(s, "_last_lr", [])]
+    for g, lr in zip(groups, last_lr or []):
+        g["lr"] = lr
+    # RNG restore is best-effort: dataloader-worker streams are seeded independently and
+    # dominate the stochasticity, so a size/version mismatch here is a warning, not a failure.
+    rng = ckpt.get("rng", {})
+    try:
+        if rng.get("python") is not None:
+            random.setstate(rng["python"])
+        if rng.get("torch") is not None:
+            torch.set_rng_state(rng["torch"].cpu())
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+    except Exception as e:
+        print(f"resume: RNG restore skipped ({type(e).__name__}: {e})")
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +390,10 @@ def build_model(cfg: DictConfig):
             "nnunet_ts_stages": a.get("nnunet_ts_stages", (2, 3, 4)),
             "nnunet_ts_random_init": a.get("nnunet_ts_random_init", False),
             "resenc_n_stages": a.get("resenc_n_stages", 5),
+            "plainconv_ts_n_stages": a.get("plainconv_ts_n_stages", 5),
+            "plainconv_ts_features_per_stage": (
+                list(a.plainconv_ts_features_per_stage)
+                if a.get("plainconv_ts_features_per_stage") is not None else None),
             "encoder_input_norm": a.get("encoder_input_norm", None),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "encoder_stage": a.get("encoder_stage", None),
@@ -690,6 +745,11 @@ def _compile_encoder(net, cfg) -> str:
         # nnunet_ts branch. dynamic=True so train/eval batch-size differences don't recompile.
         enc.encoder = torch.compile(enc.encoder, dynamic=True)
         return " + from-scratch ResEnc encoder stack"
+    if which == "plainconv_ts" and hasattr(enc, "encoder"):
+        # From-scratch PlainConvUNet.encoder (conv / InstanceNorm / LeakyReLU, no residual
+        # blocks): the plainconv_ts twin of the resenc_ts branch above.
+        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        return " + from-scratch PlainConv encoder stack"
     if which == "conv" and hasattr(enc, "_stage_feats"):
         # ConvEncoder3D: compile the stem+stages only — forward's _resample/concat to R^3 stays
         # eager (data-dependent avg_pool3d window).
@@ -745,6 +805,7 @@ def main(cfg: DictConfig) -> None:
     # "random") are handled at model construction (build_model); only an actual path
     # loads weights here — our finetuned best.pt for medverse, a raw resume for patchset3d.
     checkpoint = cfg.train.get("checkpoint")
+    resume_ckpt = None   # set below to the loaded dict for a FULL resume (optimizer+sched+epoch)
     if checkpoint and checkpoint not in ("orig_weights", "random"):
         ckpt = torch.load(checkpoint, map_location=DEVICE, weights_only=False)
         sd = ckpt["model"] if "model" in ckpt else ckpt
@@ -753,7 +814,24 @@ def main(cfg: DictConfig) -> None:
             net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in sd.items()})
         else:
             model.load_finetuned(sd)
-        print(f"Resumed weights from {checkpoint}")
+        # Weights are loaded here (before compile) so the `_orig_mod.` prefix can't block the
+        # load. Optimizer / scheduler / epoch / best are restored LATER (once both optimizer and
+        # scheduler exist) from resume_ckpt, so a resumed run CONTINUES its LR schedule instead
+        # of replaying warmup+cosine from the peak (docs/logs.md 2026-08-29). A legacy checkpoint
+        # with no optimizer state, or train.resume_weights_only=true, keeps the weights-only
+        # behaviour (fresh schedule from epoch 0) — use the flag when changing recipe/arch.
+        if bool(cfg.train.get("resume_weights_only", False)):
+            print(f"Resumed WEIGHTS ONLY from {checkpoint} (train.resume_weights_only=true): "
+                  f"fresh optimizer/scheduler, epoch 0, best reset.")
+        elif "optimizers" not in ckpt:
+            print(f"Resumed weights from {checkpoint} (legacy checkpoint, no optimizer state -> "
+                  f"fresh schedule from epoch 0, best reset). Re-save with this build, or set "
+                  f"train.resume_weights_only=true, to silence this note.")
+        else:
+            resume_ckpt = ckpt
+            print(f"Resuming from {checkpoint}: weights loaded; optimizer/scheduler/epoch/best "
+                  f"restore pending (saved epoch {ckpt.get('epoch')}, "
+                  f"best {ckpt.get('best_val_dice', float('nan')):.4f}).")
 
     # Compile (patchset3d, arch.compile). The transformer is pure tensor ops so it graph
     # -compiles cleanly; Muon's Newton–Schulz likewise (cf. experiments/2d/train.py).
@@ -851,6 +929,20 @@ def main(cfg: DictConfig) -> None:
         print(f"Scheduler ({cfg.train.get('scheduler', 'plateau')}) drives AdamW + Muon "
               f"(train.muon_scheduled=true)")
 
+    # Full resume: now that optimizers + scheduler exist, roll the training state forward so
+    # the schedule CONTINUES. Without this the cosine replays its warmup and anneals from the
+    # peak lr onto already-converged weights -> the post-resume plateau (docs/logs.md 2026-08-29).
+    resume_epoch, resume_best = 0, -1.0
+    if resume_ckpt is not None:
+        restore_training_state(resume_ckpt, optimizers, scheduler)
+        resume_epoch = int(resume_ckpt["epoch"]) + 1
+        resume_best = float(resume_ckpt.get("best_val_dice", -1.0))
+        _warn = ("" if resume_epoch < cfg.train.epochs else
+                 "  [WARNING: saved epoch >= train.epochs — bump train.epochs to train further]")
+        print(f"Full resume: optimizer/scheduler/RNG restored -> continue at epoch "
+              f"{resume_epoch}/{cfg.train.epochs}, best={resume_best:.4f}, "
+              f"lr={optimizer.param_groups[0]['lr']:.2e}{_warn}")
+
     # LAWA checkpoint-averaging buffer (patchset3d + Muon only): a CPU state_dict is pushed
     # each epoch; at eval the queue is averaged into the model, evaluated + saved, then the raw
     # training weights are restored so optimization continues from them (cf. 2D trainer).
@@ -902,15 +994,23 @@ def main(cfg: DictConfig) -> None:
     # loader ships painted volumes and never hits the realizer.
     if cfg.data.get("source") == "synth_gmm_maisi" and cfg.data.get("gpu_realize", False):
         from src.gpu_synth_realize import SynthRealizer
+        from src.gpu_gmm_intensity import resolve_between_ratio
+        _g = cfg.data.get("gmm", {})
         synth_realizer = SynthRealizer(T=int(cfg.data.image_size[0]),
                                        occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
                                        mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
-                                       seed=int(cfg.get("seed", 0)))
+                                       seed=int(cfg.get("seed", 0)),
+                                       paint_mask_aligned=bool(_g.get("paint_mask_aligned", False)),
+                                       # 200 = SynthGmmMaisiDataset's default maxid (not
+                                       # currently config-exposed); must match the dataset's
+                                       # gmm_mu/gmm_sd length shipped in the batch.
+                                       between_ratio=resolve_between_ratio(
+                                           _g.get("sd_between_ratio"), maxid=200))
     else:
         synth_realizer = None
 
-    best = -1.0
-    for epoch in range(cfg.train.epochs):
+    best = resume_best
+    for epoch in range(resume_epoch, cfg.train.epochs):
         t0 = time.perf_counter()
         loss, tr_dice, tr_soft, tr_grid = train_epoch(
             model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
@@ -999,6 +1099,17 @@ def main(cfg: DictConfig) -> None:
                     "model": sd, "model_name": model_name,
                     "image_size": list(image_size), "context_size": cfg.data.context_size,
                     "best_val_dice": best, "epoch": epoch,
+                    # Training state for a full resume (train.checkpoint=<path>): optimizer
+                    # moments, the LR-scheduler step count and RNG, so a resumed run CONTINUES
+                    # its schedule instead of replaying warmup from the peak (docs/logs.md
+                    # 2026-08-29). With LAWA on, "model" holds the AVERAGED weights while these
+                    # moments track the raw weights — a perturbation of the same order as LAWA.
+                    "optimizers": [o.state_dict() for o in optimizers],
+                    "scheduler": scheduler.state_dict(),
+                    "rng": {"python": random.getstate(),
+                            "torch": torch.get_rng_state(),
+                            "cuda": (torch.cuda.get_rng_state_all()
+                                     if DEVICE.type == "cuda" else None)},
                     "data": OmegaConf.to_container(cfg.data, resolve=True),
                     # arch (patchset3d only): lets eval.py rebuild the exact architecture
                     # from the checkpoint instead of re-supplying arch.* overrides.

@@ -1,5 +1,111 @@
 # Change log
 
+## 2026-08-30 — Soft (partial-volume) mask downsampling: `mask_downsample=soft` + `task.mask_interp=bilinear`
+
+**Motivation:** the GT mask is downsampled from the native `label.npy` to the crop/token grid
+by `resample_binary` (`occupancy` = area-pool + threshold at `mask_occupancy_thr`). Thresholding
+staircases the boundary and coin-flips sub-cell organs (adrenals ~125 vox at 3 mm). The
+PatchSet3D loss target (`grid_metrics.target_like` = `adaptive_avg_pool3d`) and `bce_dice` /
+`smooth_l1` already accept a soft target in `[0,1]` — only the upstream binarization was in the way.
+
+**What changed (all opt-in; every non-soft run is byte-identical):**
+- `src/totalseg_dataloader_incontext.py`
+  - `resample_binary`: new `mode="soft"` — returns the area-pool FRACTION as float32 `[0,1]`,
+    no threshold. Non-empty guard mirrors `occupancy`: if the input is non-empty but no cell
+    reaches `occ_thr`, the peak cell(s) are floored to `occ_thr` so a sub-cell structure never
+    vanishes. `__init__` assert accepts `"soft"`.
+  - `place_label`: background tensor now takes `label_small.dtype` (was hard-coded `torch.long`)
+    so the float fraction survives centre-padding. Backward-compatible for the integer modes.
+- `src/providers/totalseg.py`: dropped the redundant trailing `.long()` on `place_label(...)`
+  in `crop_and_place` / `crop_and_place_cached` (no-op for integer modes; it floored the soft
+  fraction). Label still comes from full-res native `label.npy` in both branches.
+- `src/gpu_augment.py`: mask tensors flow as float32 when `batch["label"]` is float (hard masks
+  stay `long`). `_geometric` warps a soft mask with `grid_sample(mode="bilinear")` when
+  `cfg.<task|synth|per_image>.mask_interp == "bilinear"` (else nearest), clamps to `[0,1]`;
+  hard masks unchanged (nearest + long).
+- `src/augmentations.py` (CPU parity): `_apply_grid` gains `mask_mode`; `apply_task_aug`,
+  `apply_per_image_aug` and `apply_synth_aug` each read `mask_interp` from their own sub-block
+  (`task` / `per_image` / `synth`; default `"nearest"`) and thread it through every
+  affine/elastic/deform warp. Same float-preserving / clamp logic. GPU `_geometric` already
+  reads `mask_interp` off whichever sub-cfg it is handed, so `per_image` / `synth` only needed
+  the config key there.
+- `experiments/3d/common.py` `make_eval_loader` (v2): `soft` → `occupancy` for the eval
+  provider so Dice / NSD (which treat any `>0` voxel as foreground) stay hard. Training loader
+  keeps `soft`.
+- `experiments/3d/grid_metrics.py` `hard_sum` and `experiments/3d/train.py` `_hard_dice`:
+  GT side `(gt > 0)` → `(gt >= 0.5)` so a soft target thresholds cleanly for the monitor
+  metrics. `soft_sum` / `cos_sum` / `_soft_dice` unchanged (threshold-free, want the fraction).
+- `configs/experiment/3d/experiment/57_organs_encoder_from_scratch.yaml`: `data.mask_downsample:
+  soft`, `augmentations.{task,per_image}.mask_interp: bilinear`.
+
+**Caveat — per_image aug is inert on exp57's path.** v2 (`InContextDataset`) only runs
+`apply_task_aug` + intensity; the GPU `_geometric(cfg.per_image, …)` fires only for the
+`SELF_CONTEXT` aug-mode, which v2 never emits (all tasks are `REAL`). So
+`augmentations.per_image.*` on a v2 experiment — including exp57's `affine.p: 0.2` and the new
+`mask_interp` — currently changes nothing at runtime; the plumbing is in place for when
+per-image jitter is actually enabled (v1, or a future v2 self-context path).
+
+**Notes:** BCE now has a non-zero entropy floor at the optimum (`p = t`); absolute `train/loss`
+and `dice_ds@R` shift — don't compare across the change. `target_like` and the support-mask
+`_occupancy` path were already avg-pool (soft-safe), so the support/target sides stay consistent.
+Tests: `experiments/3d/tests/test_crop_helpers.py` (soft fraction, partial cell, non-empty
+guard, float `place_label`).
+
+**Follow-up — `resample_binary` identity/integer fast path (dataloading perf).** Profiling
+the v2 soft load at `crop_spacing_mm=1.5` (native 1.5 mm → `out_sizes == crop_sizes` for
+80/80 items) showed `F.interpolate(mode="area")` costing a flat ~17 ms/item for a **no-op
+resize** — it allocates + copies a full 128³ pass even at identity size, and this hit BOTH
+`occupancy` and `soft`. New `_area_pool_3d`: return the input unchanged at identity size,
+strided `avg_pool3d` for an exact integer downsample (~25 % faster than adaptive, matches
+`_down_to`), `F.interpolate` otherwise; bit-identical to the old path (verified). `nearest`
+mode gets the same identity guard. Per-item `provider.load` mean at 1.5 mm: occupancy
+42→28 ms, soft 36→20 ms. The residual ~2–100 ms spread is NFS I/O on the `ct_raw.npy` crop
+read (bimodal ~6 ms warm / ~450 ms cold in `normalize_ct`'s first touch), independent of
+`mask_downsample` — mitigate with `train.workers` / `prefetch_factor`, not code.
+
+**Follow-up — `plot_dataset_items.py` "holes" in soft masks (rendering-only bug).** A soft
+mask through the GPU bilinear warp (`task.mask_interp=bilinear` + affine rotation) has interior
+voxels at `0.99999994` (float32 bilinear of four `1.0` corners), not exactly `1.0`. `_overlay`
+tested foreground with an exact `mask_slice == lid`, so ~25% of a lung's interior voxels were
+dropped from the colour overlay → scattered "holes" (reported: s0299 `lung_middle_lobe_right`
+at 1.5 mm — where `resample_binary(soft)` is itself bit-identical to `occupancy`, so the data
+is fine). Fix: `_fg_mask(mask, lid)` — exact `== lid` for integer masks, `round(mask) == lid`
+for float; used by `_overlay` and `_best_slice`. Not a data/training bug (`_soft_dice`/BCE
+consume the raw fraction). Test: `experiments/3d/tests/test_plot_dataset_items.py`.
+
+## 2026-08-29 — 3D trainer: `train.checkpoint=<path>` now does a FULL resume (was weights-only)
+
+**Symptom:** continuing a run with `train.checkpoint=<path>` plateaued vs. an uninterrupted
+run. **Cause:** `experiments/3d/train.py` loaded only `ckpt["model"]`. The optimizer moments,
+the LR-scheduler step count, the epoch counter and `best` were all reinitialised — and the
+checkpoint never stored them in the first place. So the cosine schedule (`build_scheduler`,
+`scheduler: cosine` via `model=m1`) restarted from step 0: a fresh `warmup_epochs`-long warmup
+then a full-length anneal from the `lr` peak, applied to already-converged weights. Resuming a
+run whose LR had annealed to ~0 slammed it back to `7e-5` (exp57), kicking the model out of its
+minimum and re-annealing over a horizon a short continuation never finishes. `best = -1.0` also
+meant the first post-resume eval always overwrote `best.pt`.
+
+**Fix:**
+- Checkpoint save (`main()`) now also stores `optimizers` (`[o.state_dict() …]`), `scheduler`
+  (`scheduler.state_dict()`), and `rng` (python / torch / CUDA). `epoch` + `best_val_dice` were
+  already saved.
+- New `restore_training_state(ckpt, optimizers, scheduler)`: loads the optimizer moments and
+  the scheduler step count in place, re-applies the restored `_last_lr` to the live param
+  groups (schedulers only push LR on their next `.step()`), and restores RNG (best-effort —
+  worker streams dominate). `main()` then rolls `resume_epoch = ckpt["epoch"] + 1` and
+  `best = ckpt["best_val_dice"]`; the epoch loop starts at `resume_epoch`.
+- `MultiScheduler` (the `muon_scheduled=true` wrapper) gained `state_dict` / `load_state_dict`.
+- New knob `train.resume_weights_only` (default `false`, in `model/m1.yaml` + `model/medverse.yaml`):
+  `true` keeps the old weights-only behaviour — use it when deliberately changing recipe/arch,
+  or an LR sweep, where a fresh schedule is wanted. A legacy checkpoint with no `optimizers`
+  key also falls back to weights-only, with a printed note.
+
+Round-trip verified for cosine / plateau / constant (± `muon_scheduled`): restored LR matches
+the pre-save LR exactly and the LR trajectory continues bit-identically. With LAWA on, saved
+`"model"` is the averaged weights while the saved moments track the raw weights — a
+perturbation of the same order as LAWA itself; the LAWA queue is not persisted (too large) so
+it re-warms over `lawa_k` epochs after a resume.
+
 ## 2026-08-27 — PatchSet3D `arch.decoder=conv`: progressive coarse→fine conv decode head
 
 New alternative to the `fine_decode` per-cell filter head (`fine_filter`), gated by
@@ -5384,3 +5490,651 @@ names: the provider found no subjects for either, `active_classes` dropped them,
 evaluated on **nothing** — an empty val set with no error. Bare lists of ordinary names (omnisynth
 alphabets, chemotox BC_NAMES, explicit class lists) contain no tokens and no `-` prefix, so they
 pass through untouched. Split names ("train"/"val") deliberately do not expand inside a list.
+
+### exp57 encoder body: ResEnc vs PlainConv train-step compute — 2026-08-28
+
+Apples-to-apples compute comparison of the two `encoder=` options for
+`experiment=57_organs_encoder_from_scratch` — same recipe (`encoder_frozen=false`,
+`nnunet_ts_stages=[3,4]`, B=4 K=3 128³, transformer+decode compiled), only the encoder body
+differs: `e3_resenc` (`ResidualEncoderUNet.encoder`, residual blocks) vs the experiment's own
+default `e2` (`PlainConvUNet.encoder`, plain conv). `bench_resenc_step.py` (compute-only
+microbench, random on-device inputs), nora-odin (Blackwell), `.venv_blackwell`, 30 timed steps.
+
+| | PlainConv (e2) | ResEnc (e3_resenc) | ratio |
+|---|---|---|---|
+| step (wall) | 505.5 ms | 868.9 ms | **1.72x** |
+| enc_fwd | 55.0 ms | 155.7 ms | **2.83x** |
+| attn_fwd | 79.2 ms | 79.3 ms | 1.00x (same transformer/token count) |
+| bwd (lumped) | 359.0 ms | 618.9 ms | 1.72x |
+| trainable params | 24.4 M | 73.0 M | 3.0x |
+| peak mem | 35.04 GB | 47.77 GB | 1.36x |
+| throughput | 1.98 it/s | 1.15 it/s | 0.58x |
+
+Confirms the residual encoder body (nnU-Net ResEnc-M block schedule `[1,3,4,6,6]`) is
+substantially more compute-intensive than the plain-conv body at matched stage/channel geometry
+— attention cost is identical (same token count/architecture downstream), so the entire step
+delta is the encoder: forward is ~2.8x slower and backward scales with it (residual blocks =
+~3x the conv work + skip-add traffic per stage). Confirms the qualitative read from
+`project_exp57_resenc_trainstep_profile` (ResEnc encoder ≈54% of its own step) by isolating it
+against the PlainConv twin at 1.72x wall-clock, not just a fraction-of-step estimate.
+
+`bench_resenc_step.py`'s summary print crashed on non-ResEnc configs (`cfg.arch.resenc_n_stages`
+missing from `e2.yaml`'s struct) — fixed to `cfg.arch.get('resenc_n_stages', 'n/a')`, and added
+`frozen=` to the same line so the printed config makes `encoder_frozen` state explicit instead of
+implicit in the (static, compile-branch-name) log line.
+
+### plainconv_ts: general (plans-free) from-scratch PlainConvUNet encoder — 2026-08-28
+
+Added `arch.encoder=plainconv_ts` (`src/models/encoders/plainconv_ts.py`, config
+`configs/experiment/3d/encoder/e4_plainconv_ts.yaml`) — the PlainConv twin of `resenc_ts`:
+no plans.json, no checkpoint, no dependency on a particular TotalSegmentator dataset's plan.
+Mirrors `resenc_ts.py`'s structure exactly (same `passthrough|reframe|zscore` `input_norm`
+enum, same cache/fine-stage-tap plumbing) with two differences: `n_conv_per_stage=2`
+throughout (nnU-Net's standard plain-conv schedule, vs. ResEnc's `(1,3,4,6,6,...)` residual
+-block counts), and `input_norm` defaults to **zscore** (per-volume HU) rather than
+`resenc_ts`'s `passthrough` — this encoder carries no plans-file CTNormalization stats to
+reframe into, so a real per-volume normalization is the sane default instead.
+
+Width: `arch.plainconv_ts_features_per_stage` (explicit list, one entry per stage, e.g.
+`[16,32,64,128,160]`) overrides the depth+width directly (its length sets `n_stages`); left
+`null`, falls back to the same base=32/×2/cap=320 formula `resenc_ts` uses via
+`arch.plainconv_ts_n_stages` (default 5 → `[32,64,128,256,320]`, i.e. e2's current geometry).
+Wired through `experiments/3d/train.py`'s `build_model` and `_compile_encoder` (new
+`plainconv_ts` compile branch, parallel to the `resenc_ts` one) and `PatchSet3D.__init__`.
+
+`nnunet_ts.py`/`e2.yaml` (plans-tied, for loading an actual pretrained TotalSegmentator
+checkpoint) are unchanged — `plainconv_ts` is an addition, not a replacement.
+
+**Verified compute parity + the width lever**, `bench_resenc_step.py`, same exp57 recipe
+(B=4 K=3 128³, `nnunet_ts_stages=[3,4]`):
+
+| widths | step | enc_fwd | trainable | peak mem |
+|---|---|---|---|---|
+| default `[32,64,128,256,320]` (= e2 geometry) | 505.2 ms | 55.2 ms | 24.4 M | 35.04 GB |
+| e2 (plans-tied, for reference) | 505.5 ms | 55.0 ms | 24.4 M | 35.04 GB |
+| narrow `[16,32,64,128,160]` | 477.8 ms | 33.5 ms | 17.7 M | 27.45 GB |
+
+Default widths reproduce e2's compute profile almost exactly (only the normalization
+differs, which is compute-negligible) — confirms the plans-free rebuild is a faithful
+architectural twin of e2, not just similarly-shaped. Halving each stage's width (narrow row)
+saves ~5% step time (encoder fwd alone −39%) and ~22% peak memory at this stage count; the
+step-time saving is muted because attention (79ms, unaffected by encoder width) and the
+lumped backward still dominate — see `project_exp57_resenc_trainstep_profile` for the
+op-level breakdown this scales from.
+
+Tests: `tests/test_plainconv_ts_encoder.py` (mirrors `test_resenc_ts_encoder.py`: out_ch/
+forward shape, `features_per_stage` override, fine-stage geometry/taps, all three norm
+paths) — 11/11 passing alongside the existing resenc_ts suite.
+
+## 2026-08-29 — Real-data intensity correlation analysis (GMM synth realism, step 1)
+
+`src/gpu_gmm_intensity.py`/`SynthGmmMaisiDataset` draw each label slot's `mu ~ U(0,255)` /
+`var ~ U(0,var_max)` INDEPENDENTLY per cohort — no cross-class correlation, unlike real CT
+where e.g. IV-contrast phase brightens several parenchymal organs together. New
+`experiments/3d/synth_task_generation/analyze_totalseg_intensity.py` measures this on the
+real 1228-subject TotalSegmentator set: one `np.bincount` pass per subject over `ct_raw.npy`
+(raw HU) under `label.npy` gives a (subject × class) mean-HU matrix (cached,
+`results/synth_task_gen/totalseg_intensity_stats.npz`), then PCA/correlation + a k-factor
+Gaussian fit (`mu_c = mean_c + std_c·(loadings[:,c]·z + resid_std_c·ε_c)`) over a chosen
+class subset.
+
+Two findings:
+- **Coverage is FOV-driven, not annotation-driven** (echoes `project_cohort_distance_structure`):
+  TotalSegmentator scan protocols vary hugely (chest-only, abdomen-only, angio, …), so only
+  12/122 classes clear 75% subject presence unconditionally. Restricting to the actual
+  `ts_organs` class set (minus `kidney_cyst_*`/`prostate`, too rare) and requiring all 21
+  present narrows to 229/1228 subjects — thin, but clean.
+- **On that 21-organ set, PC1 explains 31% of the between-subject cross-class HU spread and
+  loads with the SAME sign on every solid parenchymal organ AND the lungs/trachea/small_bowel**
+  (kidneys, spleen, adrenals, pancreas, liver, thyroid, gallbladder — corr up to r=0.95 for
+  kidney_left/right) — reads as a global whole-scan brightness/window shift. **PC2 (19%) then
+  splits lungs from solid organs** (lungs strongly negative, solid organs mildly positive) — a
+  separate respiration/inflation axis, uncorrelated with organ perfusion. GI lumen classes
+  (colon/stomach/duodenum/esophagus/urinary_bladder) load near zero on both — content-dependent
+  (air/fluid/food/oral contrast), not tissue-dependent, close to uncorrelated noise. A 3-factor
+  fit recovers R²=0.57 of the 21-class spread (per-class R² 0.02–0.85, best on kidney/spleen/
+  liver/pancreas/adrenal). Full-coverage (12-class) set: PC1 mixed-sign, R²=0.55 — the
+  FOV-driven subject pool dilutes the signal until restricted to organs that co-occur.
+
+Fitted `mean_c, std_c, loadings[k,c], resid_std_c` saved to
+`totalseg_intensity_factors{,_ts_organs}.npz`; plots `totalseg_intensity_{corr,scree,
+loadings}{,_ts_organs}.png`. **Open design tension, not yet resolved**: `gpu_gmm_intensity.py`
+currently decorrelates same-class slots ON PURPOSE ("intended domain randomization" — intensity
+should carry no anatomical identity signal); a class-indexed loading vector as fit here would
+reintroduce that signal if wired in naively. Next step (not yet implemented) is deciding how a
+shared-but-anonymous cohort factor (e.g. randomly-signed/permuted loadings per cohort) can keep
+the "correlated shading, no identity leakage" property.
+
+**Follow-up, same day — ran over all 122 classes.** Requiring one subject to have every class
+present (the ts_organs approach) doesn't scale past ~20 classes — TotalSegmentator subjects are
+disjoint scan-protocol subsets (chest-only/abdomen-only/angio/...), so intersecting on 116
+classes leaves ~0 subjects. Switched correlation to pairwise-complete (`pandas.DataFrame.corr`,
+each class PAIR uses whichever subjects have both, `min_pair_n=15`) and PCA to `eigh` on that
+correlation matrix (no dense data matrix exists once classes span disjoint subject pools;
+`trace(corr) = n_core` regardless, so `eigval/n_core` is still a valid explained-variance-ratio;
+small negative eigenvalues from non-PSD pairwise estimation are clipped to 0). Corr heatmap
+plot now hierarchically-clustering-ordered (cosmetic only) so blocks are visible instead of
+alphabetical.
+
+Over 116 classes (6 dropped for <30 subjects: `hip_implant`, `intervertebral_discs`,
+`kidney_cyst_right`, `lung_left/right` [dup of the per-lobe labels], `vertebrae` [legacy dup]),
+5 factors reach cumulative R²=0.65 and are each independently interpretable — mean|r|=0.31,
+max r=0.98:
+- **PC1 (38%)**: global bone density. Every individual vertebra + rib loads 0.85–0.94, all one
+  sign — the single largest source of between-subject HU variation in the whole vocabulary.
+- **PC2 (11%)**: vascular/arterial contrast-bolus phase — aorta, iliac/carotid/subclavian
+  arteries, brachiocephalic trunk, pulmonary vein (the mechanistically "contrast phase" signal
+  from the ts_organs run, but now correctly separated from bone instead of absorbed into PC1).
+- **PC3 (8%)**: muscle/soft-tissue density — iliopsoas, gluteus, autochthon, + liver.
+- **PC4 (4%)**: lung/airway inflation state (independent of the above three).
+- **PC5 (4%)**: smaller adrenal-vs-gluteus/lung mixed axis — variance is flattening out here,
+  diminishing returns past k=5.
+
+**Important artifact, not yet corrected**: PCA over raw (unweighted) classes lets a block's
+PC-share scale with how many labels TotalSegmentator happens to give it — bone gets ~50/116
+classes (every vertebra and rib separately) vs. ~10 for abdominal organs, so PC1 "winning" at
+38% partly reflects vote-counting, not biological dominance. The mechanistically distinct
+signals (contrast phase, body composition, respiration) are real but sit at PC2–4, diluted by
+the bone block being counted once per vertebra/rib instead of once. A block-aware fit (one
+node per anatomical group, or bone deduplicated before PCA) would separate "how important" from
+"how many labels this body part has" — not yet done.
+
+Outputs (same dir, `_all` tag): `totalseg_intensity_factors_all.npz`,
+`totalseg_intensity_{corr,scree,loadings}_all.png`. `analyze_totalseg_intensity.py` CLI:
+`--classes` now optional (default = all classes with `--min_n` subjects, was `ts_organs`-only),
+new `--min_n` (drop sparse classes) and `--min_pair_n` (zero out sparse correlation pairs).
+
+**Follow-up 2, same day — fixed the vote-counting artifact via intensity-only clustering (no
+class names).** Anatomy-name-based dedup (manually listing "these are the bone classes") would
+tie the fix to this one label vocabulary; instead classes are grouped by **avg-linkage
+hierarchical clustering on 1-corr distance** (`--cluster_dist`, default 0.4) using ONLY the
+already-computed pairwise correlation matrix -- no class name or anatomy lookup, so it
+generalizes to any label set (MAISI ids included). Chose hierarchical-with-a-distance-cutoff
+over k-means specifically because it doesn't need a preset k -- the number of true redundancy
+groups is unknown and shouldn't be a hyperparameter tied to how many labels a given vocabulary
+happens to have.
+
+Each cluster is collapsed to one representative per-subject signal (nanmean of its
+standardized members present in that subject), PCA is refit on THAT (`_fit_pca`, `_pairwise_corr`
+refactored out of `analyze()` so both passes share code), and the resulting count-unbiased
+loadings are broadcast back so every real class still gets a row (`totalseg_intensity_factors
+{tag}_debiased.npz` -- this is the file to actually use, not the raw one).
+
+Result on the 116-class run: 29 intensity-clusters (avg-linkage, dist<=0.4) -- one cluster of
+**54** (nearly every vertebra + rib + clavicle + hip + sacrum + scapula, i.e. "bone" recovered
+purely from correlation, never told it was bone), one of 12 (aorta/heart/great arteries --
+the vascular block), one of 11 (adrenals/kidneys/IVC/iliac veins -- abdominal
+organ/venous block), one of 10 (autochthon/gluteus -- muscle), plus small lung/vein pairs and
+singletons for everything with a genuinely independent profile (GI lumen classes, most
+individual organs). PCA on the 29 cluster signals: PC1 **37.7% -> 15.4%**, cumulative-by-PC5
+**65% -> 44%** -- confirms bone's raw PC1 share was ~2.4x inflated by its label count, not by
+being 2.4x more biologically dominant. Per-class R² after broadcasting the debiased loadings
+back: 0.618 (vs 0.651 raw) -- barely moved, because redundant members stay highly self-similar
+to their own cluster mean regardless of which factor absorbs it.
+
+**Important nuance, not a "bone doesn't matter" result**: the bone supercluster still has the
+top-magnitude loading on debiased PC1 (~0.75) -- after collapsing its ~50 votes to 1, it is
+STILL among the largest real correlated groups, just not artificially ~2.4x oversized. Dedup
+corrects the WEIGHT, not the conclusion that skeletal density is a genuine, large,
+cross-vertebra/rib shared axis (plausible driver: age/osteoporosis or scanner
+calibration -- not investigated further here).
+
+New in `analyze_totalseg_intensity.py`: `_pairwise_corr`, `_fit_pca`, `_cluster_classes`,
+`_dedup_signal` helpers; CLI `--cluster_dist` (avg-linkage cutoff) and `--no_dedupe` (raw-only,
+skip the debias pass). Outputs: `totalseg_intensity_factors{tag}_debiased.npz`,
+`totalseg_intensity_{corr,scree,loadings}{tag}_dedup.png` (plotted on the 29 cluster signals,
+not projected back to 116 classes -- that IS the point, the whole heatmap is now legible at
+one row per genuinely distinct signal instead of one per label).
+
+**Follow-up 3, same day — ran the identical pipeline on TotalSegmentator MRI.** Motivation:
+check whether the CT correlation structure is a CT-specific artifact (absolute HU calibration)
+or a general property of real anatomy that should also inform the MRI generator. `ct_raw.npy`
+on MRI has NO absolute unit (arbitrary per-scan gain/sequence), unlike CT's physically-fixed
+HU, so pooling it across subjects needs a per-subject frame first -- `analyze_totalseg_intensity
+.py` now takes `--dataset {totalseg,totalsegmri}`; the MRI branch clip+zscores each subject via
+its own `ct_stats.json` entry (the SAME transform `normalize_mri()` applies at train time)
+before the bincount pass, so "mean_z" columns are comparable across MRI subjects the way
+"mean_HU" is comparable across CT subjects. label.npy uses the shared CT `ALL_CLASSES`
+encoding on both (confirmed by `totalseg_mri.yaml`), so the rest of the pipeline (pairwise
+corr, eigh-PCA, intensity-only clustering) is unchanged code.
+
+MRI has a much smaller usable vocabulary (no per-rib/per-vertebra classes, no cardiac
+part-set): 616 subjects, only 50/122 classes clear `--min_n 30` (vs 116/122 for CT) --
+per-level vertebrae/ribs exist in the shared label encoding but are essentially unpopulated
+for MRI subjects (correctly dropped, not a bug). Same qualitative shape as CT, confirming the
+user's expectation that within-subject anatomical redundancy correlation is a general
+phenomenon, not a CT-HU artifact -- but the STRUCTURE differs in a physiologically sensible way:
+- Raw PC1 explains even MORE (43% vs CT's 38%) and is 84% one-sign across nearly every organ,
+  vessel, muscle AND bone class at once -- MRI's much weaker cross-scanner/sequence
+  standardization (vs CT's physically fixed HU) shows up as a stronger, less tissue-specific
+  global gain nuisance factor.
+- Intensity-only clustering (same `--cluster_dist 0.4`) finds 9 clusters from 50 classes:
+  two ~16-member blocks (abdominal organs+great vessels; trunk muscle+colon) instead of CT's
+  one bone-dominated giant cluster, PLUS **bone splits into two separate clusters** -- upper
+  limb (clavicle/humerus/scapula, 6) and lower limb/pelvis (femur/hip/sacrum, 5) -- rather than
+  one unified skeleton block. Physiologically sensible: CT bone correlates via mineral density
+  (one mechanism, uniform across the skeleton); MRI bone signal is mostly marrow (fat/water
+  content), which genuinely differs by region (red vs yellow marrow, proximal vs distal) --
+  so "bone of the same case is closer" (the user's hypothesis) HOLDS, but the redundancy
+  grouping itself is anatomically finer-grained than in CT, not identical across modalities.
+- Debiased PCA on the 9 clusters is much more concentrated than CT's 29-cluster case: R²=0.90
+  by k=5 (vs CT's 0.44) -- consistent with MRI intensity being governed by fewer, more
+  powerful global nuisance axes (sequence/gain) rather than many independent tissue-specific
+  ones. Debiased per-class R² actually IMPROVES over raw here (0.884 vs 0.793 raw) -- opposite
+  of CT's slight drop -- because MRI's bone-vote inflation was much milder to begin with, so
+  the 50->9 reduction mainly recovers dimensions PCA was wasting on redundant votes rather than
+  losing real signal.
+
+Takeaway for the generator design (still not implemented): the "redundancy group size /
+tightness" SHAPE is real and worth injecting for both modalities, but is not universal across
+them (CT: one dominant skeleton-wide group; MRI: bone splits by region, and the dominant axis
+is more global/scanner-like) -- a single hardcoded group-size recipe should not be assumed to
+transfer between the CT and MRI generators without checking each modality's own dedup output.
+
+Outputs (`--dataset totalsegmri`): `totalsegmri_intensity_{stats,factors_all,
+factors_all_debiased}.npz`, `totalsegmri_intensity_class_table_all.csv`,
+`totalsegmri_intensity_{corr,scree,loadings}_all{,_dedup}.png`.
+
+**Follow-up 4, same day — wired a CT-calibrated version into the actual GMM-synth generator.**
+Deliberately NOT "inject the real per-class means" (that would leak real HU values AND fix a
+persistent per-class identity, both defeating `gpu_gmm_intensity.py`'s domain-randomization
+design). Also deliberately NOT plain independent-per-slot sampling either: fully independent
+mu (today's default) lets a model tell any two slots apart by shade alone within a single
+cohort (e.g. two ribs painted at unrelated brightness), which real CT never allows (same-tissue
+structures share a HU band) -- so independent sampling makes localization artificially easy
+relative to real difficulty, which is the opposite failure mode from leaking identity.
+
+New `sample_grouped_uniform(n, lo, hi, group_frac, group_rho, rng)` in `src/gpu_gmm_intensity.py`:
+a Gaussian-copula construction (`combined_i = sqrt(rho)*z_group + sqrt(1-rho)*z_i`, then
+`u_i = Phi(combined_i)`) that keeps EVERY slot's marginal EXACTLY Uniform(lo,hi) (byte-for-byte
+the same statistics as full independence -- no real value ever enters) while giving a random
+subset of slots the target Pearson correlation with each other. `group_rho` is specified as
+the intended REALIZED correlation, not the latent copula parameter -- inverted internally via
+`_gaussian_copula_latent_rho` (`rho_latent = 2*sin(target*pi/6)`, the Gaussian-copula
+uniform-margin relation). Group MEMBERSHIP is a fresh `rng.permutation` every call (no
+persistent slot->group map across cohorts) -- only a group-size/tightness SHAPE is reused, so
+no real class identity is ever tied to a group.
+
+`CT_GROUP_FRAC=(0.466,0.103,0.095,0.086)` / `CT_GROUP_RHO=(0.70,0.86,0.73,0.70)` are that shape
+for CT, read directly off `analyze_totalseg_intensity.py`'s intensity-only clustering (the four
+groups >=10 members from the 116-class debiased fit, `cluster_dist=0.4`) -- their MEASURED
+mean within-cluster correlation, not guessed. (MRI needs its own calibration -- explicitly
+deferred, see follow-up 3's takeaway: MRI's redundancy shape is NOT the same as CT's.)
+
+Verified `sample_grouped_uniform` in isolation (`tests/test_gmm_intensity.py`, 3 new tests):
+pooled marginal is exactly Uniform(0,1) (flat deciles, mean/std match to 3 decimals) regardless
+of grouping; fixing one group assignment and redrawing 3000x, achieved within-group Pearson r
+matches the target to within ~0.03 for all four CT groups, cross-group ~0; group membership
+differs across repeated calls (not a fixed identity map). All 14 tests in the file pass.
+
+Wired into `SynthGmmMaisiDataset` (new `mu_group_frac`/`mu_group_rho` ctor args, default
+`()` = unchanged fully-independent behavior) and `experiments/3d/common.py`'s synth_gmm_maisi
+branch (`data.gmm.mu_group_frac: ct` expands to the CT preset; or pass explicit
+`mu_group_frac`/`mu_group_rho` lists). NOT enabled in `58_organs_synth_gmm.yaml` -- opt-in only
+(`mu_group_frac: null` placeholder added to its `data.gmm:` block so the override is legal
+under Hydra struct mode; that experiment sets `data.source` directly rather than composing
+`dataset=synth_gmm_maisi.yaml`, which got the same placeholder for the OTHER invocation path,
+`train.py dataset=synth_gmm_maisi`), pending a decision on whether/how to turn it on for
+training. Verified end-to-end via `experiment=58_organs_synth_gmm data.gmm.mu_group_frac=ct`
+through the real Hydra compose -> `common.build_dataset` -> `SynthGmmMaisiDataset` ->
+`InContextDataset` chain against the real gmm_bank (gpu_realize=true path): config resolves,
+`mu_groups=(0.466, 0.103, 0.095, 0.086)@rho(0.7, 0.86, 0.73, 0.7)` logged, `gmm_mu` draws land
+in [0,255] as before -- only reachable difference is the joint structure.
+
+**Follow-up 5, same day — checked whether the injected correlation actually reproduces the
+real structure. It does NOT; found a real design flaw.** New
+`experiments/3d/synth_task_generation/analyze_synth_gmm_intensity.py` draws thousands of
+cohort-shared `mu` vectors the exact way `SynthGmmMaisiDataset.assemble()` does (fresh rng
+per draw), indexed by real MAISI id, and measures the ACHIEVED cross-id Pearson correlation
+across draws -- the same "many samples -> corr matrix" measurement `analyze_totalseg_
+intensity.py` used on real subjects, with "cohort draw" standing in for "subject".
+
+Result: with `mu_group_frac=ct`, EVERY pair of MAISI ids shows the same ~+0.17 correlation --
+real bone-id pairs (target 0.70), real bone-vs-organ pairs (real CT: ~0, different tissue),
+and ids that aren't in any real cluster at all all land at +0.17-0.173 alike. Root cause,
+predicted analytically then confirmed empirically: `sample_grouped_uniform`'s group
+MEMBERSHIP reshuffles via a fresh `rng.permutation` every draw with zero anatomical
+awareness, so for ANY fixed pair of real ids the aggregate correlation across many cohorts is
+just `rho * P(both land in the same random group this draw)`, and that co-occurrence
+probability is the SAME for every pair regardless of real anatomy (`sum_g (m_g/n)*
+((m_g-1)/(n-1))*rho_g` -- 0.171 for the CT preset's group sizes, matching the measured 0.170-
+0.173 across every test almost exactly). Baseline (no grouping) correctly shows ~0 everywhere,
+confirming the measurement itself is sound -- the flaw is specific to the reshuffle design.
+
+**Diagnosis**: the design over-corrected on "no identity leakage." The user's actual concern
+was never leaking a real ABSOLUTE VALUE or a fixed brightness-to-organ mapping ("kidneys are
+always dark") -- reshuffling membership every cohort was my own extra precaution, and it
+destroys the one thing being injected: real anatomy's block structure (bone correlates with
+bone, not with organs) collapses into a flat, anatomy-blind bump applied to every pair alike,
+which does not "fit" the real correlation matrix at all (confirmed by the CROSS bone-vs-organ
+number landing at the same +0.17 that real CT measures as ~0).
+
+**Fix direction (not yet implemented, pending user decision)**: keep group MEMBERSHIP fixed
+by real MAISI id (matching the true redundancy structure, e.g. the same ~54 skeletal ids
+every cohort) while the shared VALUE each group takes is still redrawn fresh per cohort (as
+today) -- this reproduces the real block-diagonal structure faithfully and still never
+leaks an absolute HU value or a persistent brightness-to-organ mapping (the color is still
+random every cohort); it only encodes "these specific slots are the same tissue type," which
+is true, real, non-value-bearing anatomical structure, not identity leakage in the sense the
+original concern was about.
+
+**Follow-up 6, same day — implemented the fix: FIXED group membership by real MAISI id.**
+`sample_grouped_uniform`'s signature changed from `group_frac` (fractions + an internal fresh
+`rng.permutation` every call) to `group_indices` (explicit, FIXED index arrays passed in --
+no permutation, no reshuffle). `CT_GROUP_FRAC` replaced by `CT_GROUP_MAISI_IDS` (the 4 real
+clusters' actual MAISI ids, 87 total, translated once via `data.class_registry.to_maisi_idx`
+from the debiased fit's TotalSeg names -- frozen as a literal tuple, no runtime name lookup)
++ `CT_GROUP_INDICES` (0-based, `maisi_ids_to_indices` helper). `CT_GROUP_RHO` unchanged (it
+was already the measured target correlation, independent of the membership mechanism).
+
+Renamed end to end for clarity now that "frac" no longer describes the parameter:
+`SynthGmmMaisiDataset(mu_group_frac=...)` -> `mu_group_ids=...` (takes 1-based MAISI ids,
+converted to 0-based once in `__init__` via `maisi_ids_to_indices`, not per-`assemble()`
+call); `experiments/3d/common.py`'s `data.gmm.mu_group_ids: ct` expands to
+`CT_GROUP_MAISI_IDS`; `configs/experiment/3d/{dataset/synth_gmm_maisi,experiment/
+58_organs_synth_gmm}.yaml`'s placeholder keys renamed to match.
+
+Re-ran `analyze_synth_gmm_intensity.py` (also updated to the new API) after the fix -- it now
+passes the check that failed before: within-group achieved r matches target almost exactly
+(bone 0.706 vs target 0.70, vessels 0.862 vs 0.86, organs 0.729 vs 0.73, muscle 0.694 vs 0.70),
+CROSS bone-vs-organs correlation is +0.014 (real CT: ~0 -- matches), and the never-grouped
+control ids show exactly 0. This is the real block-diagonal structure, not the flat 0.17 bump
+follow-up 5 found. `tests/test_gmm_intensity.py` updated to match (fixed-membership
+correlation-target test, a "membership doesn't reshuffle" regression test comparing against
+the old ~0.17 dilution value, `maisi_ids_to_indices` unit test) -- 15/15 passing. Verified
+end-to-end again via `experiment=58_organs_synth_gmm data.gmm.mu_group_ids=ct` through real
+Hydra compose -> `SynthGmmMaisiDataset`: `mu_groups=[54, 12, 11, 10]@rho(0.7, 0.86, 0.73, 0.7)`
+logged, `gmm_mu` still lands in [0,255]. Still opt-in only, not enabled by default in
+`58_organs_synth_gmm.yaml`.
+
+Open question, deferred per user: whether "intra-cohort correlation" (something measured
+from a single cohort's voxels/K+1 members, as opposed to the between-draws population
+statistic this and follow-up 5 both measured) is a separate property worth checking too --
+the K+1 members of one cohort already share `mu` exactly by construction, so the interesting
+question there would be about voxel-level structure within one painted volume, not yet
+investigated.
+
+**Follow-up 7, same day — expanded from 4 coarse groups to 18 finer ones.** The first
+`CT_GROUP_MAISI_IDS` used `analyze_totalseg_intensity.py --cluster_dist 0.4`, which merges
+nearly the whole skeleton into one 54-id "bone" blob and mixes arterial+venous vasculature
+into one "vessels" group -- coarse but not very informative about STRUCTURE. Re-ran the same
+dedup clustering at `--cluster_dist 0.25` (tighter cutoff -> finer, more clusters: swept 0.2-
+0.6, chose 0.25 as the resolution where structure is richest without fragmenting into mostly
+singletons -- 18 multi-member clusters vs 43 total). Result is far more physiologically
+legible: bone splits into ribs (22) + 3 separate vertebral column segments (cervical/upper-
+thoracic 10, mid-thoracic 6, lower 8) instead of one blob; vasculature splits into ARTERIAL
+(11, rho=0.90: aorta/carotids/subclavian/iliac arteries/heart) and VENOUS (3, rho=0.88: iliac
+veins+IVC, plus a separate brachiocephalic-vein+SVC pair at rho=0.76) instead of one mixed
+"vessels" group; most of the rest are bilateral left/right pairs of the SAME structure
+(autochthon 0.97, hip 0.94, clavicula 0.92, scapula/gluteus_minimus 0.85, iliopsoas 0.86,
+sacrum+vertebrae_S1 0.82) plus separate left-lung/right-lung pairs (0.80/0.82) and a
+gluteus_maximus+medius foursome (0.83). 91/116 core classes covered (up from 87), rho per
+group is still the MEASURED mean within-cluster correlation at that resolution, not guessed.
+
+`CT_GROUP_MAISI_IDS`/`CT_GROUP_RHO` replaced in `src/gpu_gmm_intensity.py` (18 groups, no
+overlap -- asserted). `sample_grouped_uniform`, `SynthGmmMaisiDataset`, `common.py`'s
+`mu_group_ids: ct` wiring, and the existing tests (written generically against
+`CT_GROUP_INDICES`/`CT_GROUP_RHO`, no hardcoded group count) all needed zero code changes --
+only the constant grew. Re-verified via `analyze_synth_gmm_intensity.py`: achieved correlation
+matches target for all 18 groups (e.g. autochthon 0.972 vs 0.97, ribs 0.829 vs 0.83), a
+ribs-vs-abdominal-organs cross-check is +0.007 (~0, as in real CT), leftover control ids are
+exactly 0. `tests/test_gmm_intensity.py` (15/15) and the real Hydra compose ->
+`SynthGmmMaisiDataset` end-to-end check both re-verified against the new preset unchanged.
+
+## 2026-08-29 (cont.) — Does a shared clustering explain intensity variance across MERGED CT+MRI?
+
+New `analyze_merged()` in `analyze_totalseg_intensity.py` (`--dataset merged`). CT's raw HU
+and MRI's per-subject z-score are each already comparable WITHIN their own modality, but not
+ACROSS modalities (CT bone ~200 HU means nothing next to MRI bone's z-score) -- so each
+dataset's per-class column is standardized to ITS OWN between-subject mean/std first
+(`class_mean_matrix` extracted as a shared helper from `analyze()`), THEN the two subject
+pools (1228 CT + 616 MRI = 1844 rows) are stacked on their common classes. This measures "do
+these tissue types co-vary the same WAY in a typical CT subject as in a typical MRI subject",
+not "do they have the same absolute intensity".
+
+Only 46/122 classes are covered (n>=30) in BOTH datasets -- MRI's coarser granularity (no
+per-rib/per-vertebra/per-lung-lobe splits) is the bottleneck, so CT's finest structure (the
+18-group CT-only preset) can't participate here; this pooled analysis is necessarily coarser.
+
+**Result: yes, a shared clustering exists, and it's the SAME structure found separately in
+each modality** -- not an artifact of one dataset dominating the pool. Pooled clustering
+(dist<=0.25) recovers: abdominal-organ+venous block (7: adrenals/kidneys/pancreas/portal
+vein/spleen -- IVC/iliac veins merge in at this resolution, unlike the CT-only run), arterial
+(4: aorta/heart/iliac arteries), gluteal muscle (4), plus bilateral pairs (autochthon,
+clavicula, gluteus_minimus, hip, iliopsoas, scapula). Verified this is real shared structure,
+not pooling artifact, by checking each pooled cluster's mean correlation WITHIN CT alone vs
+WITHIN MRI alone on the same members -- near-identical in every case: abdominal-organ block
+CT=0.819/MRI=0.795, arterial CT=0.857/MRI=0.811, gluteal CT=0.827/MRI=0.893, venous
+CT=0.880/MRI=0.874. Pooled PC1 (32%) loads on exactly the abdominal-organ+vascular block
+again, echoing both single-modality results.
+
+**One clean negative finding, also informative**: femur_left/right and humerus_left/right do
+NOT reach the clustering threshold in the pooled analysis (near-zero correlation with
+everything, visible as pale rows/columns in the corr heatmap) even though the OTHER
+bilateral bone pairs (hip, clavicula, scapula) cluster tightly -- i.e. long-bone SHAFTS behave
+differently from flat/girdle bones across both modalities, a distinction the earlier CT-only
+18-group analysis couldn't see (long-bone-shaft classes weren't examined against non-bone
+classes in isolation there). Plausible mechanism: shaft cortical bone (little marrow, mostly
+mineral in CT / mostly signal-void in MRI) vs. flat-bone marrow content -- not investigated
+further.
+
+Outputs: `totalseg_mri_merged_intensity_factors_merged.npz` (corr_pooled/corr_ct/corr_mri
+saved together for exactly this within-modality-agreement check), `totalseg_mri_merged_
+intensity_{corr,scree,loadings}_merged.png`.
+
+## 2026-08-29 (cont.) — a single ~20-cluster fit for both CT and MRI, wired as a 2nd preset
+
+Swept `--cluster_dist` (0.15-0.5) on the pooled 46-shared-class correlation matrix from the
+merged analysis above, looking for the resolution matching CT_GROUP_MAISI_IDS's target
+granularity (~20 total clusters incl. singletons). `dist=0.35` lands exactly there: 20 total
+clusters, 6 multi-member (32 classes) + 14 singletons. Unlike the earlier "4 big clusters"
+merged pass, this is fine enough to be informative rather than just directional.
+
+The 6 groups, each checked for CT-alone vs MRI-alone agreement (not just the pooled value):
+
+| group | n | pooled r | CT r | MRI r |
+|---|---|---|---|---|
+| muscle (autochthon+gluteus x3+iliopsoas) | 10 | 0.72 | 0.70 | 0.81 |
+| abdominal organs (adrenals/kidneys/liver/pancreas/portal vein/spleen) | 8 | 0.78 | 0.79 | 0.77 |
+| arterial (aorta/heart/iliac artery) | 4 | 0.85 | 0.86 | 0.81 |
+| shoulder girdle (clavicula/scapula) | 4 | 0.76 | 0.76 | 0.79 |
+| pelvis (hip/sacrum) | 3 | 0.81 | 0.80 | 0.87 |
+| venous (iliac vena/IVC) | 3 | 0.88 | 0.88 | 0.87 |
+
+CT and MRI agree within ~0.05-0.1 on every group -- confirms this is a real, modality-robust
+anatomical redundancy structure, not a pooling artifact. **One structural difference from
+CT_GROUP_MAISI_IDS worth noting**: femur/humerus (long-bone shafts) don't cluster with
+anything here, in EITHER modality -- only flat/girdle bone (clavicula/scapula/hip/sacrum)
+shows the redundancy at this resolution. The CT-only 18-group preset never tested long-bone-
+shaft classes against non-bone classes in isolation (they were folded into other groups by
+proximity in ALL_CLASSES ordering, not really -- they just weren't part of the CT-only
+analysis's core-class list in a way that separated them this cleanly); this cross-modality
+check surfaces it because MRI's coarser vocabulary forces exactly that comparison.
+
+Added as a SECOND preset (not a replacement) in `src/gpu_gmm_intensity.py`:
+`MERGED_GROUP_MAISI_IDS`/`MERGED_GROUP_RHO` (+ `MERGED_GROUP_INDICES`), rho = the pooled
+measured correlation. `experiments/3d/common.py`'s `mu_group_ids` resolution generalized to a
+`_MU_GROUP_PRESETS` dict (`'ct'` -> 18-group CT-only, `'merged'` -> 6-group cross-modality);
+YAML comments updated in both `dataset/synth_gmm_maisi.yaml` and `experiment/
+58_organs_synth_gmm.yaml`. `tests/test_gmm_intensity.py`: the achieves-target-correlation
+test now runs parametrized over BOTH presets, plus a new no-overlap/maps-cleanly test for the
+merged one -- 17/17 passing. Verified end-to-end via real Hydra compose with
+`data.gmm.mu_group_ids={ct,merged,null}` all three producing correct `SynthGmmMaisiDataset`
+behavior (`mu_groups=[...]` logged for ct/merged, absent -- unchanged default -- for null).
+
+## 2026-08-29 (cont.) — synth_gmm paint now trilinear-resampled like a real image, not nearest-then-colored
+
+User noticed the target mask sometimes looked smaller than the visibly-painted organ when
+plotting `synth_gmm` items. Root cause was NOT just mask/paint decoupling: the paint map was
+resampled with `nearest` on the DISCRETE label id (winner-take-all point sample), then colored
+AFTER resampling -- so boundary voxels were a hard cliff (100% one tissue's exact color or
+100% a neighbor's, zero blending). The mask, by contrast, is an `occupancy` area-pool +
+threshold of the native binary target -- a fundamentally different (physically-weighted)
+aggregation. A single native point sample can land on the target class in a window whose
+occupancy fraction is below `mask_occupancy_thr`, painting a voxel target-colored with no
+mask coverage there.
+
+Real images (`src/providers/totalseg.place_image`) never do this: the CONTINUOUS raw CT is
+resampled directly with trilinear (+ area anti-alias prefilter when downsampling), giving
+genuine partial-volume-blended boundary values. Fixed synth_gmm to match: paint the GMM
+Gaussian at NATIVE resolution first (continuous field, exactly like a real CT), THEN run it
+through `place_image`'s trilinear+antialias resample -- instead of resampling the label and
+coloring after. The mask stays an unchanged separate occupancy resample of the native binary
+target.
+
+Changed `src/synth_gmm_maisi_dataset.py` (`_resample_paint_mask`/`_crop_paint_mask`, CPU path)
+and `src/gpu_synth_realize.py` (`_resample_member`, GPU `gpu_realize=True` path) in lockstep --
+both now: `noise = randn(native_shape); paint_native = mu[native]+sd[native]*noise;
+normalize; place_image(paint_native, ..., antialias=True)`. `_paint()` (old post-resample
+colorer) removed, now dead code. `paint_mask_aligned` (force mask=1 voxels to a fresh
+target-class draw) reimplemented at the new post-resample stage on the continuous image
+instead of pre-resample on the label -- same intent (clean interior, no boundary blend inside
+the supervised region), same call site.
+
+Side finding while touching this: `paint_mask_aligned` was **never wired into the GPU
+`gpu_realize` path** before this fix -- `SynthRealizer`/`experiments/3d/train.py` never passed
+it through, so `58_organs_synth_gmm.yaml`'s `gmm.paint_mask_aligned: true` was silently a
+no-op under its own `gpu_realize: true` default. Fixed as part of this change: added
+`paint_mask_aligned` to `SynthRealizer.__init__`/`_resample_member`, wired from
+`cfg.data.gmm.paint_mask_aligned` in `experiments/3d/train.py`.
+
+Verified: CPU and GPU paths run end-to-end on the real gmm_bank + a real GPU; painted images
+went from a small discrete near-delta value set per id to a fully continuous field (>99% of
+sampled voxels unique, vs. tight per-id clusters before) confirming real blending now occurs.
+Re-verified the full `58_organs_synth_gmm` config via real Hydra compose +
+`common.build_dataset` + `SynthRealizer` exactly as `train.py` wires them -- produces a valid
+batch (image/label/context_in/context_out) with `paint_mask_aligned=True` honored on GPU.
+`tests/test_gmm_intensity.py` (unaffected surface, `sample_grouped_uniform` only): 17/17 still
+passing.
+
+## 2026-08-29 (cont.) — real intra-cohort (between-member) variance analysis
+
+Confirmed the generator's current behavior: `mu[c]`/`sd[c]` are both drawn ONCE per cohort
+(`SynthGmmMaisiDataset.assemble()`) and shared verbatim by every member -- the only per-member
+randomness is per-voxel noise using that one shared `sd[c]`. Since `sd[c]` is a per-VOXEL
+scale, not a per-member mean shift, any organ with more than a few hundred voxels sees its
+per-member mean converge to `mu[c]` (noise averages out, ~`sd[c]^2/n_voxels`) -- so today
+there is close to ZERO actual member-to-member ("this cohort's second kidney is a bit
+brighter") variability; `sd[c]` only models within-scan voxel texture, and does so with one
+GLOBAL `var_max` range for all 117 classes.
+
+New script `experiments/3d/synth_task_generation/analyze_intracohort_variance.py` re-derives
+the real ratio `between_subj_std_hu / within_subj_voxel_std_hu` per class from the columns
+already sitting in `totalseg_intensity_class_table.csv` (between_subj_std_hu = real subject-
+to-subject spread of a class's mean HU -- the true intra-cohort quantity currently unmodeled;
+within_subj_voxel_std_hu = real within-one-scan voxel texture -- what `sd[c]` actually models
+today) -- ratio is unit-free so it survives synth intensities living on an arbitrary 0-255
+scale rather than real HU. 115/122 classes have >=100 subjects present.
+
+**Finding: the ratio is NOT constant across classes -- it spans nearly an order of magnitude
+(0.18 to 1.57, median 0.48) and is driven by clean physiology, not sampling noise**
+(corr(n_present, ratio) = 0.03):
+
+| family (name-pattern) | n classes | ratio mean +/- std |
+|---|---|---|
+| vascular/cardiac (aorta, great vessels, atrial appendage) | 18 | **1.11 +/- 0.27** |
+| organ (kidney/liver/spleen/pancreas/bladder/...) | 16 | 0.62 +/- 0.21 |
+| lung | 5 | 0.61 +/- 0.11 |
+| bone (ribs/vertebrae/pelvis/scapula/clavicula) | 63 | 0.43 +/- 0.09 |
+| muscle (autochthon/iliopsoas) | 10 | 0.39 +/- 0.10 |
+| other (trachea, spinal_cord, ...) | 3 | 0.30 +/- 0.12 |
+
+Vascular/cardiac is the standout: ratio > 1 means real between-subject variability actually
+EXCEEDS within-scan texture -- physiologically obvious in hindsight (IV-contrast bolus timing
+varies hugely scan-to-scan: arterial/venous/non-contrast phase shifts a vessel's characteristic
+HU far more than the lumen's own internal texture, which is fairly homogeneous blood pool).
+Bone/muscle sit at the other end (~0.4): trabecular/fiber texture WITHIN one scan dominates,
+real bone density is comparatively consistent patient-to-patient at this resolution -- so the
+current all-texture-no-between-member approximation is much less wrong for these than for
+vessels.
+
+**The intensity-only clusters already built for the mu-correlation preset (docs/logs.md,
+CT_GROUP_MAISI_IDS) substantially explain this ratio too**, without having been calibrated
+for it at all: pooled within-cluster ratio std = 0.131 vs. 0.290 overall. The "11 arterial"
+correlation cluster (rho=0.90 in CT_GROUP_MAISI_IDS) has ratio 1.17; the 54-class bone
+supercluster has ratio 0.42+/-0.09. Suggests the SAME coarse groups (or the family-level split
+above) can likely carry a per-group between/within ratio, rather than needing 115 individual
+numbers or a whole new clustering pass.
+
+Outputs: `results/synth_task_gen/intracohort_variance_ratio.csv` (full per-class table) +
+`intracohort_variance_{hist,by_family,by_cluster,vs_n}.png`. No generator changes yet --
+analysis only, parameterization (per-family vs. per-CT_GROUP vs. per-class; how to fold the
+ratio into `var_max`/`sd[c]`) still open.
+
+## 2026-08-29 (cont.) — real intra-cohort variance wired into the generator (sd_between_ratio)
+
+Implemented the two-level Gaussian hierarchy proposed for the "real intra-cohort variance"
+finding above. `mu[c]`/`sd[c]` stay exactly as before (cohort-shared); added ONE extra term
+applied per MEMBER (not per voxel): `mu_e = mu + ratio[c]*sd[c]*eps_e`, `eps_e ~ N(0,1)` fresh
+per member, drawn just before that member is painted. `sd[c]` keeps its existing meaning
+(within-scan voxel texture, untouched) -- `ratio[c]*sd[c]` becomes the new member-to-member
+spread. `ratio=0` (or `sd_between_ratio=None`, the default) exactly recovers today's behavior
+and consumes zero extra randomness (no behavior change unless opted in).
+
+`ratio[c]` is a FIXED per-class lookup table (`src/gpu_gmm_intensity.py`:
+`CT_BETWEEN_WITHIN_GROUPS` + `CT_BETWEEN_WITHIN_DEFAULT=0.48`, `build_between_ratio_table`,
+`resolve_between_ratio`) built from the 6-family split found in
+`analyze_intracohort_variance.py` (vascular/cardiac 1.11, organ 0.62, lung 0.61, bone 0.43,
+muscle 0.39, trachea/spinal_cord/other 0.30; all 115 measured TotalSeg classes translated to
+MAISI ids via the class registry, no overlaps, no per-class tuning). `resolve_between_ratio`
+accepts `None` (disabled) | `'ct'` (the preset) | an explicit `(maxid+1,)` array, mirroring the
+`mu_group_ids` preset-resolution pattern exactly.
+
+Wired in lockstep on both paths:
+- CPU (`SynthGmmMaisiDataset`): new `sd_between_ratio` ctor arg -> `self.between_ratio`
+  (resolved once at construction); `assemble()`'s per-member loop computes `mu_e` right before
+  `_crop_paint_mask` (which now takes `mu_e` instead of the shared `mu`).
+- GPU (`gpu_synth_realize.SynthRealizer`): new `between_ratio` ctor arg (the table itself, not
+  a preset name -- it's a fixed calibration constant, not cohort-random, so it's passed once at
+  construction rather than shipped per-item like `gmm_mu`/`gmm_sd`); `__call__`'s per-member
+  loop draws `eps` via the same `torch.Generator` used for voxel noise and computes `mu_e`
+  before calling `_resample_member`.
+- `experiments/3d/common.py` passes `data.gmm.sd_between_ratio` straight through (resolved
+  inside the dataset ctor); `experiments/3d/train.py` resolves it separately (via
+  `resolve_between_ratio`) for `SynthRealizer`, same duplication pattern already used for
+  `paint_mask_aligned`. YAML placeholders (`sd_between_ratio: null`) added to both
+  `dataset/synth_gmm_maisi.yaml` and `experiment/58_organs_synth_gmm.yaml` (Hydra struct mode,
+  same precedent as `mu_group_ids`) -- still opt-in, default unchanged.
+
+Tests (`tests/test_gmm_intensity.py`, now 20/20): no-overlap + default-fill check on the
+built table, `resolve_between_ratio` preset/explicit/shape-assert coverage, and a direct
+Monte Carlo check that `mu + ratio*sd*eps` realizes `std(mu_e) ~= ratio*sd` as intended.
+Verified end-to-end on the real gmm_bank + a real GPU: CPU dataset and `SynthRealizer` both
+run cleanly with `sd_between_ratio='ct'` and with `None` (unchanged); re-verified through the
+real `58_organs_synth_gmm` Hydra config + `common.build_dataset` + `SynthRealizer` exactly as
+`train.py` wires them (`between_ratio=ct` override composes and logs
+`between_ratio[0.00,1.11]`).
+
+## 2026-08-29 (cont.) — effect of sd_between_ratio on generated intensity distributions
+
+New script `experiments/3d/synth_task_generation/analyze_between_ratio_effect.py` measures
+what `sd_between_ratio='ct'` actually does to the generator's output, simulating the exact
+formula (`mu[c]`, `sd[c]` per cohort; `mu_e = mu + ratio*sd*eps_e` per member) with realistic
+finite-voxel averaging (N_VOX=2000/member) for one representative class per family, K+1=4
+members/cohort (matches `58_organs_synth_gmm`'s `context_size=3`), 3000 cohort draws.
+
+**Caught and fixed a measurement bug before trusting any number**: a first pass measured
+achieved ratio ~20% BELOW target for every class (0.80x, suspiciously uniform). Traced to
+`numpy .std(axis=1, ddof=0)` on only 4 samples/cohort being a biased estimator (confirmed
+against the closed-form correction `c4(4)*sqrt(3/4)=0.80` -- exact match) -- NOT a generator
+flaw. Fixed by estimating the between-member component against the TRUE per-cohort mu (known
+in simulation, pooled over all 3000x4=12000 residuals) instead of a per-cohort 4-sample
+group-std. After the fix, achieved ratio matches target closely for all 5 families (e.g.
+vascular target 1.11 -> achieved 1.18; bone target 0.43 -> achieved 0.46) -- confirms the
+formula is wired correctly end-to-end.
+
+**Effect on the actual distribution**:
+- Across-cohort `mu` marginal (what currently provides domain randomization) is untouched:
+  mean=127.7 std=73.5 vs. the exact U(0,255) target (127.5, 73.6) -- the feature only changes
+  INTRA-cohort structure, not the across-cohort appearance-range the model already sees.
+- A single painted voxel's TOTAL intensity variance for a class increases by
+  `sqrt(1+ratio^2)` -- `mu_e`'s extra term ADDS a variance component on top of `sd`, it
+  doesn't redistribute a fixed budget. Vascular/cardiac voxels get ~1.5x wider overall once
+  enabled; bone/muscle only ~1.07-1.09x (matches the calibration philosophy: minimal
+  disturbance where real data says texture already dominates).
+- The practically visible effect, what a plotted training cohort actually shows: naive
+  std across the K+1=4 members present in ONE cohort goes from ~0.11 (today, members visually
+  indistinguishable -- explains why plots showed flat per-member shade) to 1.9-5.3 (~20x for
+  vascular, ~18x for bone/muscle) once enabled -- members are now visibly separated in shade,
+  by an amount that itself carries the real per-family calibration (vascular separates most,
+  bone/muscle least), matching the physiological finding this feature was built to encode.

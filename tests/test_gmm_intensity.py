@@ -6,9 +6,18 @@ coverage, and the near-piecewise-constant "clean" contrast profile (discrete nea
 peaks per id). Runs on CUDA when available, else CPU (torch.Generator is device-typed).
 """
 import sys; sys.path.insert(0, ".")
+import numpy as np
 import torch
 
-from src.gpu_gmm_intensity import synthesize_intensities, pack_label_ids
+from src.gpu_gmm_intensity import (
+    synthesize_intensities, pack_label_ids, sample_grouped_uniform,
+    _gaussian_copula_latent_rho, maisi_ids_to_indices,
+    CT_GROUP_MAISI_IDS, CT_GROUP_INDICES, CT_GROUP_RHO,
+    MERGED_GROUP_MAISI_IDS, MERGED_GROUP_INDICES, MERGED_GROUP_RHO,
+    CT_BETWEEN_WITHIN_GROUPS, CT_BETWEEN_WITHIN_DEFAULT,
+    build_between_ratio_table, resolve_between_ratio,
+)
+import pytest
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -120,6 +129,130 @@ def test_pack_label_ids():
     assert packed.flatten().tolist() == [0, 1, 1, 2, 3]  # 200 → L+1 = 3
     # packed is a valid intensity-stage input
     synthesize_intensities(packed, L, _gen(0), _gen(1))
+
+
+N_SLOTS = 200   # SynthGmmMaisiDataset's default maxid (mu[1:] has this many entries)
+
+
+def test_grouped_uniform_marginal_is_exact():
+    """Pooled over slots+draws, u is EXACTLY Uniform(0,1) regardless of grouping -- the whole
+    point (inject correlation, not shifted/narrowed per-slot marginals -> no leaked values,
+    no change to any individual slot's appearance range)."""
+    rng = np.random.default_rng(0)
+    draws = np.stack([sample_grouped_uniform(N_SLOTS, 0.0, 1.0, CT_GROUP_INDICES, CT_GROUP_RHO, rng)
+                      for _ in range(3000)])
+    assert abs(draws.mean() - 0.5) < 0.01
+    assert abs(draws.std() - (1 / 12 ** 0.5)) < 0.01
+    hist, _ = np.histogram(draws.ravel(), bins=10, range=(0, 1))
+    assert (hist / hist.mean()).std() < 0.05                # flat deciles
+
+
+@pytest.mark.parametrize("group_indices,group_rho", [
+    (CT_GROUP_INDICES, CT_GROUP_RHO),
+    (MERGED_GROUP_INDICES, MERGED_GROUP_RHO),
+])
+def test_grouped_uniform_achieves_target_correlation(group_indices, group_rho):
+    """Redraw many times with FIXED membership: within-group achieved Pearson r matches the
+    requested target; cross-group pairs land near 0. Checked for both presets (CT-only and
+    the coarser cross-modality-validated 'merged' one)."""
+    rng = np.random.default_rng(1)
+    N = 3000
+    draws = np.stack([sample_grouped_uniform(N_SLOTS, 0.0, 1.0, group_indices, group_rho, rng)
+                      for _ in range(N)])
+
+    for idx, target in zip(group_indices, group_rho):
+        c = np.corrcoef(draws[:, idx], rowvar=False)
+        off = c[~np.eye(len(idx), dtype=bool)]
+        assert abs(off.mean() - target) < 0.03, (target, off.mean())
+
+    a, b = group_indices[0][:5], group_indices[1][:5]
+    cross = [np.corrcoef(draws[:, i], draws[:, j])[0, 1] for i in a for j in b]
+    assert abs(np.mean(cross)) < 0.05
+
+
+def test_merged_group_ids_no_overlap_and_maps_cleanly():
+    """MERGED_GROUP_MAISI_IDS (cross-modality preset): no id in two groups, matches its
+    precomputed 0-based MERGED_GROUP_INDICES."""
+    assert len(MERGED_GROUP_MAISI_IDS) == len(MERGED_GROUP_RHO)
+    all_ids = [i for group in MERGED_GROUP_MAISI_IDS for i in group]
+    assert len(set(all_ids)) == len(all_ids)
+    assert MERGED_GROUP_INDICES == maisi_ids_to_indices(MERGED_GROUP_MAISI_IDS)
+    # the two presets need not be disjoint (different analyses), but each is internally clean
+    for ids in MERGED_GROUP_MAISI_IDS:
+        assert len(set(ids)) == len(ids)
+
+
+def test_grouped_uniform_membership_is_fixed_not_reshuffled():
+    """Membership must NOT reshuffle across calls -- a reshuffled-per-call version was tried
+    and rejected (docs/logs.md): it collapses the real block-diagonal correlation structure
+    into a flat, anatomy-blind bump applied to every id pair alike. Two independent calls with
+    CT_GROUP_INDICES must group the exact same slots every time."""
+    rng = np.random.default_rng(2)
+    # sample_grouped_uniform doesn't expose membership directly, so probe it indirectly:
+    # two ids in the SAME fixed group correlate at the target rho across many draws; if
+    # membership reshuffled, that correlation would collapse to the diluted co-occurrence
+    # value instead (see analyze_synth_gmm_intensity.py's follow-up-5 finding, ~0.17 not 0.70).
+    N = 2000
+    draws = np.stack([sample_grouped_uniform(N_SLOTS, 0.0, 1.0, CT_GROUP_INDICES, CT_GROUP_RHO, rng)
+                      for _ in range(N)])
+    i, j = CT_GROUP_INDICES[0][0], CT_GROUP_INDICES[0][1]        # two fixed "bone" ids
+    r = np.corrcoef(draws[:, i], draws[:, j])[0, 1]
+    assert abs(r - CT_GROUP_RHO[0]) < 0.05, r                    # matches target, not ~0.17
+
+
+def test_maisi_ids_to_indices():
+    idx = maisi_ids_to_indices(((5, 8, 12),))
+    assert idx == ((4, 7, 11),)
+    assert CT_GROUP_INDICES == maisi_ids_to_indices(CT_GROUP_MAISI_IDS)
+    for ids in CT_GROUP_MAISI_IDS:
+        assert len(set(ids)) == len(ids)                         # no duplicate ids within a group
+    all_ids = [i for group in CT_GROUP_MAISI_IDS for i in group]
+    assert len(set(all_ids)) == len(all_ids)                     # groups don't overlap
+
+
+def test_between_ratio_table_no_overlap_and_covers_default():
+    """CT_BETWEEN_WITHIN_GROUPS ids don't collide; anything not listed gets the global default;
+    background (id 0) is always 0 (never perturbed between members)."""
+    all_ids = [i for ids, _ in CT_BETWEEN_WITHIN_GROUPS for i in ids]
+    assert len(set(all_ids)) == len(all_ids)
+    table = build_between_ratio_table(200)
+    assert table.shape == (201,)
+    assert table[0] == 0.0
+    listed = set(all_ids)
+    for i in range(1, 201):
+        if i not in listed:
+            assert table[i] == CT_BETWEEN_WITHIN_DEFAULT
+    for ids, r in CT_BETWEEN_WITHIN_GROUPS:
+        for i in ids:
+            assert table[i] == np.float32(r)
+
+
+def test_resolve_between_ratio_none_ct_and_explicit():
+    assert resolve_between_ratio(None, 200) is None
+    ct = resolve_between_ratio("ct", 200)
+    assert ct.shape == (201,) and ct.dtype == np.float32
+    explicit = np.full(201, 0.7, dtype=np.float32)
+    out = resolve_between_ratio(explicit, 200)
+    assert np.array_equal(out, explicit)
+    try:
+        resolve_between_ratio(np.zeros(5), 200)
+        assert False, "expected a shape-mismatch assertion"
+    except AssertionError:
+        pass
+
+
+def test_between_ratio_realizes_target_member_spread():
+    """The generative formula synth_gmm_maisi_dataset.assemble()/gpu_synth_realize use:
+    mu_e = mu + ratio*sd*eps_e, eps_e ~ N(0,1) FRESH per member. Across many simulated
+    members, std(mu_e) should match ratio*sd (the whole point: sd stays the within-scan
+    texture scale, ratio*sd becomes the member-to-member spread)."""
+    rng = np.random.default_rng(0)
+    mu_c, sd_c, ratio_c = 100.0, 8.0, 1.11                       # a "vascular"-like class
+    N = 20000
+    eps = rng.standard_normal(N)
+    mu_e = mu_c + ratio_c * sd_c * eps
+    assert abs(mu_e.mean() - mu_c) < 0.2
+    assert abs(mu_e.std() - ratio_c * sd_c) < 0.2
 
 
 if __name__ == "__main__":

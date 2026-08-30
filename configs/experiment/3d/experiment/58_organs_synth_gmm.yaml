@@ -16,8 +16,22 @@ data:
   epoch_length: 1000
   gmm:
     paint_mask_aligned: true
-    var_max: 80 
+    var_max: 80
     background_mode: zero
+    # Cross-slot intensity correlation injection (src/gpu_gmm_intensity.sample_grouped_uniform;
+    # docs/logs.md 2026-08-29). FIXED real-MAISI-id group membership, per-cohort-random shared
+    # value. null = unchanged fully-independent draw. Declared here (not just in dataset/
+    # synth_gmm_maisi.yaml, which this experiment does NOT compose -- data.source is set
+    # directly above) so `data.gmm.mu_group_ids=ct` overrides don't need `+` (Hydra struct
+    # mode). 'ct' = CT-only-calibrated preset (18 groups); 'merged' = coarser but cross-
+    # modality-validated with real TotalSegmentator-MRI (6 groups); still opt-in, not default.
+    mu_group_ids: null
+    mu_group_rho: null
+    # Real intra-cohort (member-to-member) variance -- src/gpu_gmm_intensity.py
+    # CT_BETWEEN_WITHIN_GROUPS, docs/logs.md "real intra-cohort variance analysis". Declared
+    # here (see mu_group_ids comment above for why) so `data.gmm.sd_between_ratio=ct`
+    # overrides don't need `+`. null = unchanged (opt-in, not default).
+    sd_between_ratio: null
   cohort:
     w_span: 0
     w_fov: 0

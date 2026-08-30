@@ -27,6 +27,37 @@ data:
   gmm:
     var_max: 5.0                # sigma^2 ~ U(0,var_max); tiny by design (texture = downstream aug)
     background_mode: zero       # zero (hard air) | component (dark air component)
+    # Inject REALISTIC cross-slot intensity CORRELATION (not values): a FIXED subset of real
+    # MAISI ids share a latent factor every cohort (src.gpu_gmm_intensity.
+    # sample_grouped_uniform), so same-tissue structures land in the same shade band the way
+    # real CT does, instead of every slot being independently colorable (which lets a model
+    # localize by shade alone -- artificially easier than the real task). Every slot's
+    # marginal stays EXACTLY Uniform(0,255) either way, and the shared VALUE each group takes
+    # is still a fresh random draw every cohort -- no real HU value or persistent
+    # brightness-to-identity mapping is ever injected, only "these ids are the same tissue
+    # type" (membership is fixed by design -- a reshuffled-per-cohort version was tried and
+    # rejected, see docs/logs.md, it collapses the real correlation structure into a flat
+    # anatomy-blind bump). null (default) = unchanged fully-independent draw. 'ct' = the
+    # CT-only-calibrated preset (CT_GROUP_MAISI_IDS/CT_GROUP_RHO, 18 groups, docs/logs.md
+    # 2026-08-29). 'merged' = coarser (6 groups) but validated to hold in BOTH CT and real
+    # TotalSegmentator-MRI (MERGED_GROUP_MAISI_IDS/MERGED_GROUP_RHO, same date "single
+    # ~20-cluster fit for both" follow-up) -- prefer this if the calibration needs to be
+    # modality-robust. Or pass explicit mu_group_ids/mu_group_rho lists (must be equal length).
+    mu_group_ids: null
+    mu_group_rho: null
+    # Inject REAL INTRA-COHORT (member-to-member) intensity variance -- today mu[c] is shared
+    # verbatim by every member (see mu_group_ids above), and sd[c] (the per-voxel noise scale
+    # above) is a WITHIN-scan texture term only, so any organ with more than a few hundred
+    # voxels sees near-zero actual member-to-member variability. Real CT splits a class's
+    # total spread into between-subject (patient-to-patient, e.g. IV-contrast timing shifts a
+    # vessel's whole HU) and within-scan voxel texture; their RATIO is NOT constant across
+    # classes (docs/logs.md "real intra-cohort variance analysis": vascular ~1.1, organ/lung
+    # ~0.6, bone/muscle ~0.4). Modeled as a 2nd Gaussian level: each MEMBER (not just each
+    # voxel) gets its own mu_e = mu + ratio*sd*eps_e, eps_e ~ N(0,1) fresh per member; sd
+    # itself is untouched. null (default) = ratio=0 everywhere = unchanged. 'ct' =
+    # CT_BETWEEN_WITHIN_GROUPS preset (6-family lookup, src/gpu_gmm_intensity.py). Or pass an
+    # explicit (maxid+1,)-length list.
+    sd_between_ratio: null
   # Cohort sampling (K+1 similar masks) — CohortSampler. Distance = weighted L1 over 4 axes;
   # NB raw scales differ hugely so weights are NOT the real influence: measured contribution
   # (full bank) is fov 60% / by_class_size 19% / span 17% / spacing 4% (analyze_cohort_distance.py).

@@ -87,4 +87,8 @@ train:
   warmup_epochs: 1
   loss: bce_dice
   dice_weight: 1.0
-  checkpoint: null              # null = fresh init | <path> = resume
+  checkpoint: null              # null = fresh init | <path> = FULL resume (weights + optimizer
+                                # moments + LR-schedule step count + epoch + best, so cosine
+                                # CONTINUES rather than replaying warmup; docs/logs.md 2026-08-29)
+  resume_weights_only: false    # true = warm-start WEIGHTS ONLY from train.checkpoint (fresh
+                                # optimizer/schedule/epoch) — use when changing recipe or arch

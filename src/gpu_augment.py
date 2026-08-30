@@ -24,7 +24,10 @@ def _stack_task(batch: dict) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     T = K + 1
     D, H, W = img.shape[-3:]
     vols = torch.cat([img.unsqueeze(1), ctx], dim=1).reshape(B * T, 1, D, H, W)
-    masks = torch.cat([lbl.unsqueeze(1), cout], dim=1).reshape(B * T, D, H, W).long()
+    masks = torch.cat([lbl.unsqueeze(1), cout], dim=1).reshape(B * T, D, H, W)
+    # Preserve a soft (partial-volume fraction) target through aug; hard masks stay long
+    # so non-soft runs are byte-identical.
+    masks = masks.float() if masks.is_floating_point() else masks.long()
     return vols, masks, B, T
 
 
@@ -295,9 +298,16 @@ def _geometric(vols, masks, group_size, cfg, gen):
     grid = grid.to(vols.dtype)
     vols = F.grid_sample(vols, grid, mode="bilinear", padding_mode="border",
                          align_corners=False)
-    m = F.grid_sample(masks.unsqueeze(1).float(), grid, mode="nearest",
+    # Soft (float) masks: bilinear warp (anti-aliased boundary) when cfg.mask_interp asks
+    # for it, else nearest keeps the fractions but blocky. Hard (long) masks: nearest+long
+    # exactly as before.
+    mask_soft = masks.is_floating_point()
+    mask_mode = ("bilinear" if mask_soft and getattr(cfg, "mask_interp", "nearest") == "bilinear"
+                 else "nearest")
+    m = F.grid_sample(masks.unsqueeze(1).float(), grid, mode=mask_mode,
                       padding_mode="zeros", align_corners=False)
-    return vols, m.squeeze(1).long()
+    m = m.squeeze(1)
+    return vols, (m.clamp(0.0, 1.0) if mask_soft else m.long())
 
 
 class GpuAugmentor:

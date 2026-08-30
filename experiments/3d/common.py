@@ -365,6 +365,10 @@ def build_dataset(cfg, split: str):
     if cfg.data.get("source") == "synth_gmm_maisi":
         from omegaconf import OmegaConf
         from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
+        from src.gpu_gmm_intensity import (CT_GROUP_MAISI_IDS, CT_GROUP_RHO,
+                                          MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)
+        _MU_GROUP_PRESETS = {"ct": (CT_GROUP_MAISI_IDS, CT_GROUP_RHO),
+                            "merged": (MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)}
         d = cfg.data
         bank = cfg.paths.get("gmm_bank")
         if bank is None:
@@ -372,6 +376,8 @@ def build_dataset(cfg, split: str):
         spec = d.get("train_classes") if split == "train" else d.get("val_classes")
         classes = _resolve_maisi_classes(spec)
         g = cfg.data.get("gmm", {})
+        _mu_group_ids_cfg = g.get("mu_group_ids")
+        _mu_preset_ids, _mu_preset_rho = _MU_GROUP_PRESETS.get(_mu_group_ids_cfg, (None, None))
         # train iterates epoch_length generative samples; val is capped small (deterministic
         # per idx via eval_seed) — max_val_subjects overrides, default 100.
         length = (int(d.get("epoch_length", 10000)) if split == "train"
@@ -405,7 +411,22 @@ def build_dataset(cfg, split: str):
             # paint_mask_aligned: when True, overwrites the paint map in mask=1 voxels with the
             # target class, ensuring consistent intensity within the supervision mask. Eliminates
             # boundary contamination from neighboring structures bleeding into the expanded mask.
-            paint_mask_aligned=bool(g.get("paint_mask_aligned", False)))
+            paint_mask_aligned=bool(g.get("paint_mask_aligned", False)),
+            # inject realistic cross-slot intensity CORRELATION (not values) -- see
+            # src.gpu_gmm_intensity.sample_grouped_uniform. Empty (default) = unchanged
+            # fully-independent-per-slot behavior. 'ct' = the CT-only-calibrated FIXED preset
+            # (18 groups, docs/logs.md 2026-08-29); 'merged' = the coarser but cross-modality-
+            # validated preset (6 groups, CT+MRI agree closely on each -- same date, "single
+            # ~20-cluster fit for both" follow-up); otherwise pass explicit lists via
+            # data.gmm.mu_group_ids / data.gmm.mu_group_rho.
+            mu_group_ids=(_mu_preset_ids if _mu_preset_ids is not None else _mu_group_ids_cfg),
+            mu_group_rho=(_mu_preset_rho if _mu_preset_rho is not None else g.get("mu_group_rho")),
+            # inject REAL INTRA-COHORT (member-to-member) variance -- see
+            # src.gpu_gmm_intensity.resolve_between_ratio / SynthGmmMaisiDataset.between_ratio.
+            # None (default) = unchanged (mu is member-invariant, today's behavior). 'ct' =
+            # CT_BETWEEN_WITHIN_GROUPS preset (6-family lookup, docs/logs.md "real intra-cohort
+            # variance analysis"). Or pass an explicit (maxid+1,)-length list.
+            sd_between_ratio=g.get("sd_between_ratio"))
         if not d.get("loader_v2", False):
             return synth_ds
         # loader_v2: drive the same cohort dataset through the generic v2 engine via the
@@ -584,12 +605,15 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         # the v1 tail's (idx, spacing) constant-spacing handling below.
         from src.incontext_dataset_v2 import InContextDataset
         from src.providers.totalseg import TotalSegProvider
+        # Eval GT stays HARD: "soft" (a smooth training target) maps back to "occupancy"
+        # so the Dice / NSD metrics (which treat any >0 voxel as foreground) are unchanged.
+        _eval_md = d.get("mask_downsample", "occupancy")
         provider = TotalSegProvider(
             root=root, classes=list(classes), image_size=tuple(d.image_size),
             split=split, max_subjects=e.get("n_subjects", None),
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
             crop_jitter=e.get("crop_jitter", None),
-            mask_downsample=d.get("mask_downsample", "occupancy"),
+            mask_downsample=("occupancy" if _eval_md == "soft" else _eval_md),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"),
             ct_norm=d.get("ct_norm"))

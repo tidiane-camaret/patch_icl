@@ -71,13 +71,19 @@ def _make_affine_theta(
 
 
 def _apply_grid(images: torch.Tensor, masks: torch.Tensor,
-                grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """grid: (N, D, H, W, 3) in normalised coords [-1, 1]."""
+                grid: torch.Tensor, mask_mode: str = "nearest") -> Tuple[torch.Tensor, torch.Tensor]:
+    """grid: (N, D, H, W, 3) in normalised coords [-1, 1].
+
+    A float `masks` (soft partial-volume target) is warped with `mask_mode` (bilinear
+    anti-aliases the boundary) and kept float in [0, 1]; an integer mask uses nearest +
+    long exactly as before regardless of `mask_mode`."""
     images = F.grid_sample(images, grid, mode="bilinear",
                            padding_mode="border", align_corners=False)
-    masks_f = F.grid_sample(masks.unsqueeze(1).float(), grid, mode="nearest",
-                             padding_mode="zeros", align_corners=False)
-    return images, masks_f.squeeze(1).long()
+    mask_soft = masks.is_floating_point()
+    mode = "bilinear" if (mask_soft and mask_mode == "bilinear") else "nearest"
+    masks_f = F.grid_sample(masks.unsqueeze(1).float(), grid, mode=mode,
+                             padding_mode="zeros", align_corners=False).squeeze(1)
+    return images, (masks_f.clamp(0.0, 1.0) if mask_soft else masks_f.long())
 
 
 def _svf_displacement(shape, control_points, max_disp, num_steps,
@@ -126,6 +132,7 @@ def apply_task_aug(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply geometric augmentations with one shared set of random params."""
     N = images.shape[0]
+    mask_mode = getattr(cfg, "mask_interp", "nearest")   # "bilinear" -> soft-mask warp
 
     # --- Flips -----------------------------------------------------------
     fcfg = cfg.flip
@@ -153,7 +160,7 @@ def apply_task_aug(
         theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)
         theta = theta.expand(N, -1, -1)                     # (N, 3, 4)
         grid  = F.affine_grid(theta, images.shape, align_corners=False)
-        images, masks = _apply_grid(images, masks, grid)
+        images, masks = _apply_grid(images, masks, grid, mask_mode)
 
     # --- Elastic ---------------------------------------------------------
     ecfg = cfg.elastic
@@ -171,7 +178,7 @@ def apply_task_aug(
         theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
         base_grid = F.affine_grid(theta_id, images.shape, align_corners=False)
         grid = (base_grid + disp).clamp(-1.0, 1.0)
-        images, masks = _apply_grid(images, masks, grid)
+        images, masks = _apply_grid(images, masks, grid, mask_mode)
 
     # --- Diffeomorphic deform (SVF, shared field, no folding) ------------
     dcfg = getattr(cfg, "deform", None)
@@ -180,7 +187,7 @@ def apply_task_aug(
         phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
         theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
         base_grid = F.affine_grid(theta_id, images.shape, align_corners=False)
-        images, masks = _apply_grid(images, masks, (base_grid + phi).clamp(-1.0, 1.0))
+        images, masks = _apply_grid(images, masks, (base_grid + phi).clamp(-1.0, 1.0), mask_mode)
 
     # Independent per-volume geometry (flip/affine/elastic) is applied by the
     # caller via apply_per_image_aug using cfg.per_image — see the real-context
@@ -200,6 +207,7 @@ def apply_per_image_aug(image, mask, cfg):
     image (1, D, H, W), mask (D, H, W)."""
     img = image.unsqueeze(0)        # (1, 1, D, H, W)
     msk = mask.unsqueeze(0)         # (1, D, H, W)
+    mask_mode = getattr(cfg, "mask_interp", "nearest")   # "bilinear" -> soft-mask warp
 
     fcfg = cfg.flip
     for vol_dim, mask_dim, p in [(2, 1, fcfg.p_d), (3, 2, fcfg.p_h), (4, 3, fcfg.p_w)]:
@@ -214,7 +222,7 @@ def apply_per_image_aug(image, mask, cfg):
         tx, ty, tz = (random.uniform(-acfg.max_translate, acfg.max_translate) for _ in range(3))
         theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)
         grid = F.affine_grid(theta, img.shape, align_corners=False)
-        img, msk = _apply_grid(img, msk, grid)
+        img, msk = _apply_grid(img, msk, grid, mask_mode)
 
     ecfg = cfg.elastic
     if random.random() < ecfg.p:
@@ -224,14 +232,14 @@ def apply_per_image_aug(image, mask, cfg):
         disp = F.interpolate(torch.randn(1, 3, sd, sh, sw) * ecfg.alpha, size=(D, H, W),
                              mode="trilinear", align_corners=False).permute(0, 2, 3, 4, 1)
         base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), img.shape, align_corners=False)
-        img, msk = _apply_grid(img, msk, (base + disp).clamp(-1.0, 1.0))
+        img, msk = _apply_grid(img, msk, (base + disp).clamp(-1.0, 1.0), mask_mode)
 
     dcfg = getattr(cfg, "deform", None)
     if dcfg is not None and random.random() < dcfg.p:
         _, _, D, H, W = img.shape
         phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
         base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), img.shape, align_corners=False)
-        img, msk = _apply_grid(img, msk, (base + phi).clamp(-1.0, 1.0))
+        img, msk = _apply_grid(img, msk, (base + phi).clamp(-1.0, 1.0), mask_mode)
 
     return img.squeeze(0), msk.squeeze(0)   # (1, D, H, W), (D, H, W)
 
@@ -482,6 +490,7 @@ def apply_synth_aug(
     Call once per copy so K+1 views of the same supervoxel diverge.
     """
     _, D, H, W = image.shape
+    mask_mode = getattr(cfg, "mask_interp", "nearest")   # "bilinear" -> soft-mask warp
 
     # --- Flips (all 3 axes) ----------------------------------------------
     for img_dim, msk_dim, p in [
@@ -506,7 +515,7 @@ def apply_synth_aug(
         tz = random.uniform(-acfg.max_translate, acfg.max_translate)
         theta = _make_affine_theta(rx, ry, rz, scale, tx, ty, tz)
         grid  = F.affine_grid(theta, (1, 1, D, H, W), align_corners=False)
-        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid, mask_mode)
         image = image.squeeze(0)   # (1, D, H, W)
         mask  = mask.squeeze(0)    # (D, H, W)
 
@@ -532,7 +541,7 @@ def apply_synth_aug(
         theta_id = torch.eye(3, 4).unsqueeze(0)
         base  = F.affine_grid(theta_id, (1, 1, D, H, W), align_corners=False)
         grid  = (base + disp_n).clamp(-1.0, 1.0)
-        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid)
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), grid, mask_mode)
         image = image.squeeze(0)
         mask  = mask.squeeze(0)
 
@@ -541,7 +550,8 @@ def apply_synth_aug(
     if dcfg is not None and random.random() < dcfg.p:
         phi = _svf_displacement((D, H, W), dcfg.control_points, dcfg.max_disp, dcfg.num_steps)
         base = F.affine_grid(torch.eye(3, 4).unsqueeze(0), (1, 1, D, H, W), align_corners=False)
-        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0), (base + phi).clamp(-1.0, 1.0))
+        image, mask = _apply_grid(image.unsqueeze(0), mask.unsqueeze(0),
+                                  (base + phi).clamp(-1.0, 1.0), mask_mode)
         image = image.squeeze(0)
         mask  = mask.squeeze(0)
 

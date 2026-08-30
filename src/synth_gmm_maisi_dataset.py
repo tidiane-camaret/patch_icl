@@ -20,7 +20,9 @@ from torch.utils.data import Dataset
 
 from data.maisi_classes import MAISI_IDX_TO_CLASS
 from src.gmm_cohort_sampler import CohortSampler
-from src.totalseg_dataloader_incontext import organ_crop_arrays, place_label
+from src.gpu_gmm_intensity import maisi_ids_to_indices, resolve_between_ratio, sample_grouped_uniform
+from src.totalseg_dataloader_incontext import (organ_crop_arrays, place_image, place_label,
+                                                resample_binary)
 
 BODY_ID = 200
 # fixed 0-255 -> ~zero-mean/unit-std bridge (uniform-ish over 0..255: mean 128, std ~74).
@@ -34,7 +36,8 @@ class SynthGmmMaisiDataset(Dataset):
                  var_max=5.0, background_mode="zero", eval_seed=None, maxid=200,
                  cohort=None, mask_downsample="occupancy", mask_occupancy_thr=0.1,
                  class_balanced=True, gpu_realize=False, gpu_realize_max_native=256,
-                 paint_mask_aligned=False):
+                 paint_mask_aligned=False, mu_group_ids=None, mu_group_rho=None,
+                 sd_between_ratio=None):
         assert image_size[0] == image_size[1] == image_size[2], "cubic crops only"
         self.T = int(image_size[0])
         self.k = int(context_size)
@@ -67,6 +70,41 @@ class SynthGmmMaisiDataset(Dataset):
         # eliminates artificial boundary variance from neighboring structures bleeding into the
         # occupancy-expanded mask region. Default False for backward compat.
         self.paint_mask_aligned = bool(paint_mask_aligned)
+        # mu_group_ids/mu_group_rho: inject REALISTIC INTENSITY CORRELATION between a FIXED
+        # subset of label ids every cohort (see src.gpu_gmm_intensity.sample_grouped_uniform
+        # + CT_GROUP_MAISI_IDS/CT_GROUP_RHO, calibrated from real TotalSegmentator CT via
+        # analyze_totalseg_intensity.py) instead of every slot's mu being fully independent.
+        # Motivation: fully-independent per-slot mu lets every label be told apart by shade
+        # alone (e.g. two ribs painted at unrelated brightnesses), which real scans never do
+        # (same-tissue structures share a HU band) and makes localization artificially easy.
+        # Membership is FIXED (the same real MAISI ids every cohort -- reshuffling it per
+        # cohort was tried and rejected, see docs/logs.md: it collapses the real block-
+        # diagonal correlation structure into a flat, anatomy-blind bump). The per-slot
+        # marginal stays EXACTLY Uniform(0,255) either way and the shared VALUE each group
+        # takes is still a fresh random draw every cohort -- no real HU value or persistent
+        # brightness-to-identity mapping is ever injected, only "these ids are the same
+        # tissue type". None/empty (default) = today's fully-independent behavior, unchanged.
+        # mu_group_ids takes 1-based MAISI ids (e.g. CT_GROUP_MAISI_IDS); converted to 0-based
+        # positions into mu[1:] once here (maisi_ids_to_indices) rather than every assemble().
+        self.mu_group_ids = (maisi_ids_to_indices(mu_group_ids) if mu_group_ids else ())
+        self.mu_group_rho = tuple(mu_group_rho) if mu_group_rho else ()
+        assert len(self.mu_group_ids) == len(self.mu_group_rho), \
+            (self.mu_group_ids, self.mu_group_rho)
+        # sd_between_ratio: inject REAL INTRA-COHORT (member-to-member) intensity variance,
+        # currently ~absent (mu[c] is shared verbatim by every member; sd[c] is a per-VOXEL
+        # noise scale, so any organ with >~a few hundred voxels has its per-member mean
+        # converge to mu[c], averaging away). Real CT splits a class's total spread into
+        # between-subject (patient-to-patient, e.g. IV-contrast timing shifts a vessel's whole
+        # characteristic HU) and within-scan voxel texture (what sd[c] already models); their
+        # RATIO is NOT constant across classes (docs/logs.md "real intra-cohort variance
+        # analysis" -- vascular ~1.1, organ/lung ~0.6, bone/muscle ~0.4). Modeled as a second
+        # Gaussian level on top of sd[c]'s existing texture role (unchanged): each MEMBER e
+        # (not just each voxel) gets its own mu_e = mu + ratio*sd*eps_e, eps_e ~ N(0,1) fresh
+        # per member; sd[c] itself is untouched. None (default) = ratio=0 everywhere = today's
+        # behavior exactly (no extra randomness consumed). 'ct' = CT_BETWEEN_WITHIN_GROUPS
+        # preset (6-family lookup, see src.gpu_gmm_intensity). Or pass an explicit
+        # (maxid+1,)-length array.
+        self.between_ratio = resolve_between_ratio(sd_between_ratio, self.maxid)
         # cohort-sampling knobs (distance weights + diversity) -> CohortSampler; empty = defaults.
         # class_balanced (uniform-over-classes vs mask-frequency prior) is a top-level knob
         # mirroring totalseg data.class_balanced, passed alongside the cohort dict.
@@ -81,60 +119,64 @@ class SynthGmmMaisiDataset(Dataset):
                + (f"(thr={self.mask_occupancy_thr})" if self.mask_downsample == "occupancy" else ""))
         _gr = (f"GPU(cap={self.gpu_realize_max_native or 'off'})" if self.gpu_realize else "CPU")
         _pa = f" | paint_align={self.paint_mask_aligned}" if self.paint_mask_aligned else ""
+        _mg = (f" | mu_groups={[len(g) for g in self.mu_group_ids]}@rho{self.mu_group_rho}"
+              if self.mu_group_ids else "")
+        _br = (f" | between_ratio[{self.between_ratio.min():.2f},{self.between_ratio.max():.2f}]"
+              if self.between_ratio is not None else "")
         print(f"SynthGmmMaisiDataset: {len(self.cs.entries)} masks | "
               f"{len(self.cs.classes)} classes | K={self.k} | T={self.T} | "
               f"crop={self.crop_mm}mm | var_max={self.var_max} | mask={_md} | "
-              f"class_balanced={self.cs.class_balanced} | realize={_gr}{_pa} | "
+              f"class_balanced={self.cs.class_balanced} | realize={_gr}{_pa}{_mg}{_br} | "
               f"len={self.length}", flush=True)
 
     def __len__(self):
         return self.length
 
-    def _resample_paint_mask(self, crop_lbl, out_sizes, target_cls):
-        """Native-res multiclass crop (ints) -> (paint_lab, mask) at out_sizes (long tensors).
+    def _resample_paint_mask(self, crop_lbl, out_sizes, pad_lo, target_cls, mu, sd, nrng):
+        """Native-res multiclass crop (ints) -> placed (image (1,T,T,T) f32, mask (T,T,T) long).
 
-        The two play different roles, so they resize differently (mask_downsample only ever
-        applied to a downsample that needs small structures preserved is the MASK):
-          paint_lab: full multiclass, NEAREST. It only drives the per-voxel GMM shade, so it is
-                     treated like an IMAGE — no enlargement; each boundary voxel takes one label.
-          mask:      target-class BINARY under `mask_downsample`. "occupancy" area-pools the
-                     target fraction and keeps voxels clearing mask_occupancy_thr, so a low thr
-                     GROWS a small/thin target (matches totalseg resample_binary); "nearest"
-                     point-samples. Non-empty guard.
+        Mirrors the REAL totalseg image path (src/providers/totalseg.place_image): paint the
+        GMM Gaussian at NATIVE resolution (a continuous field, like a real CT) and resample
+        THAT with trilinear (+ area anti-alias pre-filter) — i.e. treat the painted volume
+        exactly like a real image — instead of nearest-resampling the discrete label and
+        painting after. This gives genuine partial-volume-style blending at organ boundaries
+        (a boundary voxel is a physically-weighted mix of neighboring tissues' colors) instead
+        of a hard nearest-sample cliff, which could disagree with the mask's occupancy
+        footprint (docs/logs.md).
 
-        When `paint_mask_aligned=True`, the paint map is overwritten in mask=1 voxels with the
-        target class, ensuring consistent intensity within the supervision mask (no boundary
-        contamination from neighboring structures). When False (default), rim voxels where
-        mask=1 but paint!=target create partial-volume-like intensity variation."""
-        size = tuple(int(s) for s in out_sizes)
-        paint = F.interpolate(
-            torch.from_numpy(np.ascontiguousarray(crop_lbl, np.float32))[None, None],
-            size=size, mode="nearest")[0, 0].long()
-        if self.mask_downsample == "occupancy":
-            bi = torch.from_numpy(np.ascontiguousarray(crop_lbl == target_cls, np.float32))
-            frac = F.interpolate(bi[None, None], size=size, mode="area")[0, 0]
-            mask = frac >= self.mask_occupancy_thr
-            if not bool(mask.any()) and bool((crop_lbl == target_cls).any()):
-                mask.view(-1)[int(frac.argmax())] = True          # never emit an empty target
-            mask = mask.long()
-        else:
-            mask = (paint == target_cls).long()                   # nearest binary = paint==cls
-        # Align paint map with mask: where mask=1, force paint=target_cls. This eliminates
-        # the artificial variance from neighboring structures bleeding into the expanded mask.
+        The MASK stays a separate resample of the native BINARY target map via
+        `mask_downsample` ("occupancy" area-pools + thresholds at mask_occupancy_thr, so a low
+        thr GROWS a thin/small target, matching totalseg's resample_binary; "nearest" point-
+        samples). Non-empty guard is inside resample_binary.
+
+        When `paint_mask_aligned=True`, the image is overwritten in mask=1 voxels with a fresh
+        draw of the target class's own Gaussian, so the supervised region is never contaminated
+        by a blended neighbor at the boundary (trades the physically-realistic blend for a
+        clean interior signal, same intent as before — see docs/logs.md)."""
+        noise = nrng.standard_normal(crop_lbl.shape).astype(np.float32)
+        paint_native = mu[crop_lbl] + sd[crop_lbl] * noise                     # continuous, native res
+        paint_native = (paint_native - GMM_MEAN) / GMM_STD          # normalize BEFORE resample
+        img = place_image(paint_native, out_sizes, pad_lo, self.T, antialias=True)
+
+        mask = resample_binary(crop_lbl == target_cls, tuple(out_sizes),
+                               mode=self.mask_downsample, occ_thr=self.mask_occupancy_thr)
+        mask = place_label(mask, out_sizes, pad_lo, self.T)
+
         if self.paint_mask_aligned:
-            paint = torch.where(mask.bool(), torch.tensor(target_cls, dtype=paint.dtype), paint)
-        return paint, mask
+            fresh = nrng.standard_normal(tuple(img.shape[1:])).astype(np.float32)
+            target_val = (mu[target_cls] + sd[target_cls] * fresh - GMM_MEAN) / GMM_STD
+            img = torch.where(mask.bool().unsqueeze(0),
+                              torch.from_numpy(target_val).unsqueeze(0), img)
+        return img, mask
 
-    def _crop_paint_mask(self, e, cls, rng, crop_mm):
-        """Organ-centred T³ (paint_lab, mask) (both long) around class `cls` in mask entry `e`."""
+    def _crop_paint_mask(self, e, cls, rng, crop_mm, mu, sd, nrng):
+        """Organ-centred T³ (image (1,T,T,T) f32, mask (T,T,T) long) around class `cls`."""
         arr = np.squeeze(np.load(self.cs.dir / "masks" / e["file"], mmap_mode="r"))
         center = tuple(e["cents"][cls][:3])
         _, crop_lbl, out_sizes, pad_lo, _ = organ_crop_arrays(
             arr, arr, center, e["spacing"], image_size=(self.T,) * 3,
             crop_mm=crop_mm, jitter=self.jitter, rng=rng)
-        paint, mask = self._resample_paint_mask(np.asarray(crop_lbl), out_sizes, cls)
-        return (place_label(paint, out_sizes, pad_lo, self.T),     # (T,T,T) multiclass (paint)
-                place_label(mask, out_sizes, pad_lo, self.T))      # (T,T,T) binary (supervision)
+        return self._resample_paint_mask(np.asarray(crop_lbl), out_sizes, pad_lo, cls, mu, sd, nrng)
 
     def _native_crop(self, e, cls, rng, crop_mm):
         """GPU-realize worker payload: the NATIVE-res multiclass crop (uint8, ids 0..maxid)
@@ -155,11 +197,6 @@ class SynthGmmMaisiDataset(Dataset):
         return (torch.from_numpy(native),
                 torch.tensor(out_sizes, dtype=torch.long),
                 torch.tensor(pad_lo, dtype=torch.long))
-
-    def _paint(self, lab_np, mu, sd, nrng):
-        """Flat shared-id GMM: img = mu[lab] + sd[lab]*noise, then fixed 0-255->z bridge."""
-        img = mu[lab_np] + sd[lab_np] * nrng.standard_normal(lab_np.shape, dtype=np.float32)
-        return (img - GMM_MEAN) / GMM_STD
 
     def __getitem__(self, idx):
         # The spacing batch sampler indexes with (idx, spacing) so every item in a batch
@@ -186,9 +223,17 @@ class SynthGmmMaisiDataset(Dataset):
         crops; `nrng` draws the cohort-shared GMM and the paint noise."""
         cls, cohort = self.cs.sample_cohort(rng)
 
-        # cohort-shared GMM draw (indexed by shared MAISI id 0..maxid); id 0 = air (fixed)
+        # cohort-shared GMM draw (indexed by shared MAISI id 0..maxid); id 0 = air (fixed).
+        # mu[1:] is EITHER fully independent (default) OR grouped-correlated (mu_group_ids
+        # set, FIXED membership) -- see sample_grouped_uniform: same exact per-slot marginal
+        # either way, only the joint structure across those fixed ids changes.
         n = self.maxid + 1
-        mu = nrng.uniform(0.0, 255.0, size=n).astype(np.float32)
+        mu = np.empty(n, dtype=np.float32)
+        if self.mu_group_ids:
+            mu[1:] = sample_grouped_uniform(n - 1, 0.0, 255.0, self.mu_group_ids,
+                                            self.mu_group_rho, nrng)
+        else:
+            mu[1:] = nrng.uniform(0.0, 255.0, size=n - 1)
         sd = np.sqrt(nrng.uniform(0.0, self.var_max, size=n)).astype(np.float32)
         if self.bg_mode == "zero":
             mu[0] = 0.0; sd[0] = 0.0
@@ -198,7 +243,9 @@ class SynthGmmMaisiDataset(Dataset):
         name = MAISI_IDX_TO_CLASS.get(cls, str(cls))
 
         # GPU-realize: ship native crops + geometry + the cohort GMM draw; occupancy
-        # resample + paint happen on GPU (src/gpu_synth_realize.SynthRealizer).
+        # resample + paint (incl. the per-member mu_e perturbation, if between_ratio is set --
+        # a fixed calibration table, so SynthRealizer is constructed with it directly rather
+        # than shipping it per-item) happen on GPU (src/gpu_synth_realize.SynthRealizer).
         if self.gpu_realize:
             natives, outs, pads = [], [], []
             for e in cohort:
@@ -219,10 +266,14 @@ class SynthGmmMaisiDataset(Dataset):
 
         imgs, masks = [], []
         for e in cohort:
-            paint, mask = self._crop_paint_mask(e, cls, rng, crop_mm)
-            img = torch.from_numpy(                                            # paint drives shade
-                self._paint(paint.numpy().astype(np.int64), mu, sd, nrng))[None]  # (1,T,T,T)
-            imgs.append(img.float())
+            # Real intra-cohort variance (docs/logs.md): each MEMBER gets its own mu_e, on top
+            # of the cohort-shared mu -- sd stays the cohort-shared per-voxel texture scale.
+            # Disabled (between_ratio is None) -> mu_e is mu, no extra randomness consumed
+            # (bit-identical to before this feature existed).
+            mu_e = (mu + self.between_ratio * sd * nrng.standard_normal(n).astype(np.float32)
+                   if self.between_ratio is not None else mu)
+            img, mask = self._crop_paint_mask(e, cls, rng, crop_mm, mu_e, sd, nrng)
+            imgs.append(img.float())                                          # (1,T,T,T) trilinear-blended
             masks.append(mask)                                                # (T,T,T) binary (occupancy)
         return {
             "image": imgs[0], "label": masks[0],

@@ -160,6 +160,8 @@ class PatchSet3D(nn.Module):
         nnunet_ts_stages=(2, 3, 4),
         nnunet_ts_random_init: bool = False,
         resenc_n_stages: int = 5,
+        plainconv_ts_n_stages: int = 5,
+        plainconv_ts_features_per_stage=None,
         encoder_input_norm: str = None,
         img_embed_mlp: bool = False,
         encoder_stage: int = None,
@@ -255,11 +257,26 @@ class PatchSet3D(nn.Module):
                                            stages=tuple(nnunet_ts_stages),
                                            frozen=encoder_frozen, device="cpu",
                                            precision=encoder_precision, **_in_norm)
+        elif encoder == "plainconv_ts":
+            # From-scratch nnU-Net PlainConvUNet (the PlainConv twin of resenc_ts). No
+            # plans.json / checkpoint: width is plainconv_ts_features_per_stage if given,
+            # else the same base=32/x2/cap=320 formula resenc_ts uses; n_conv_per_stage=2
+            # throughout (nnU-Net's standard plain-conv schedule), He init. Multi-scale
+            # concat of nnunet_ts_stages resampled to R^3; 1-channel image input, spacing
+            # arg ignored. encoder_input_norm defaults to zscore (per-volume HU) here — this
+            # encoder carries no plans-file CTNormalization stats to reframe into.
+            from src.models.encoders.plainconv_ts import PlainConvTSEncoder   # lazy: avoids import cycle
+            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
+            self.encoder = PlainConvTSEncoder(resolution, n_stages=plainconv_ts_n_stages,
+                                              stages=tuple(nnunet_ts_stages),
+                                              features_per_stage=plainconv_ts_features_per_stage,
+                                              frozen=encoder_frozen, device="cpu",
+                                              precision=encoder_precision, **_in_norm)
         elif encoder == "conv":
             self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
         else:
             raise ValueError(f"unknown arch.encoder {encoder!r} "
-                             f"(conv | primus | tap_ct | nnunet_ts | resenc_ts)")
+                             f"(conv | primus | tap_ct | nnunet_ts | resenc_ts | plainconv_ts)")
         # Encoder feature -> token width e. Default: a single Linear. When the encoder
         # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
         # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width
@@ -311,7 +328,7 @@ class PatchSet3D(nn.Module):
         #                   stage (concat at coarse levels, per-voxel FiLM at the finest), a
         #                   3x3x3 conv per level, then a 1x1x1 head + a token-only residual.
         #                   Spatially coupled (conv receptive field); ~6x the FLOPs.
-        # Both need an encoder exposing unpooled stages (conv | nnunet_ts | resenc_ts).
+        # Both need an encoder exposing unpooled stages (conv | nnunet_ts | resenc_ts | plainconv_ts).
         self.fine_decode = bool(fine_decode)
         self.decoder_kind = str(decoder)
         # int or list: fine_filter sums the projected stages at the finest grid; conv uses
@@ -326,7 +343,7 @@ class PatchSet3D(nn.Module):
             if not getattr(self.encoder, "supports_fine", False):
                 raise ValueError(
                     f"arch.fine_decode needs an encoder exposing unpooled stages; "
-                    f"arch.encoder={encoder!r} has none (use conv | nnunet_ts | resenc_ts)")
+                    f"arch.encoder={encoder!r} has none (use conv | nnunet_ts | resenc_ts | plainconv_ts)")
             for st in self.fine_stage:
                 if not 0 <= st < self.encoder.n_fine_stages:
                     raise ValueError(f"arch.fine_stage {st} out of range "

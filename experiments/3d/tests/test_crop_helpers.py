@@ -59,6 +59,43 @@ def test_resample_binary_occupancy_keeps_thin():
     assert out_near.shape == (2, 2, 2)
 
 
+def test_resample_binary_soft_returns_fraction():
+    # Half of the 8^3 volume filled -> each 4^3-footprint output cell is 50% covered.
+    m = np.zeros((8, 8, 8), dtype=bool)
+    m[:4] = True
+    out = resample_binary(m, (2, 2, 2), mode="soft", occ_thr=0.5)
+    assert out.dtype == torch.float32
+    assert out.min() >= 0.0 and out.max() <= 1.0
+    assert torch.allclose(out[0], torch.full((2, 2), 1.0))   # fully-inside slab
+    assert torch.allclose(out[1], torch.full((2, 2), 0.0))   # fully-outside slab
+
+
+def test_resample_binary_soft_partial_cell():
+    # A 2-voxel-thick sheet in a 4^3 footprint -> fraction 2/4 = 0.5.
+    m = np.zeros((8, 8, 8), dtype=bool)
+    m[0:2, 0:4, 0:4] = True
+    out = resample_binary(m, (2, 2, 2), mode="soft", occ_thr=0.5)
+    assert abs(float(out[0, 0, 0]) - 0.5) < 1e-6
+
+
+def test_resample_binary_soft_nonempty_guard():
+    # A single native voxel -> true fraction 1/64, below occ_thr; peak cell floored so
+    # the structure never vanishes.
+    m = np.zeros((8, 8, 8), dtype=bool)
+    m[0, 0, 0] = True
+    out = resample_binary(m, (2, 2, 2), mode="soft", occ_thr=0.5)
+    assert out.dtype == torch.float32
+    assert float(out.max()) >= 0.5
+    assert float((out > 0).sum()) == 1          # only the peak cell is lifted
+
+
+def test_place_label_preserves_float_dtype():
+    small = torch.full((4, 8, 8), 0.5, dtype=torch.float32)
+    lab = place_label(small, out_sizes=[4, 8, 8], pad_lo=[2, 0, 0], T=8)
+    assert lab.dtype == torch.float32
+    assert lab[0].sum() == 0 and abs(float(lab[2].sum()) - 32.0) < 1e-4
+
+
 def test_place_label_centers():
     small = torch.ones(4, 8, 8, dtype=torch.long)
     lab = place_label(small, out_sizes=[4, 8, 8], pad_lo=[2, 0, 0], T=8)

@@ -20,9 +20,10 @@ def soft_sum(prob, target, eps: float = 1e-6):
 
 
 def hard_sum(prob, gt, eps: float = 1e-6):
-    """Hard Dice SUM + valid-row count: pred>=0.5 vs gt>0."""
+    """Hard Dice SUM + valid-row count: pred>=0.5 vs gt>=0.5 (>=0.5 not >0 so a soft
+    partial-volume target counts a boundary cell as foreground only past the half mark)."""
     p = (prob.detach().flatten(1).float() >= 0.5).float()
-    g = (gt.detach().flatten(1).float() > 0).float()
+    g = (gt.detach().flatten(1).float() >= 0.5).float()
     den = p.sum(1) + g.sum(1); ok = den > eps
     h = torch.where(ok, 2 * (p * g).sum(1) / den.clamp_min(eps), torch.zeros_like(den))
     return h.sum(), ok.sum()

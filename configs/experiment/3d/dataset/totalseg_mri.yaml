@@ -1,0 +1,53 @@
+# @package _global_
+# TotalSegMRI 3D dataset block — composed as `dataset=totalseg_mri` by
+# train.yaml / eval.yaml / plot_dataset_items.py.
+#
+# Routes through the v2 in-context engine (src/incontext_dataset_v2.py) +
+# src/providers/totalseg.py with modality="mri": organ-crop from native
+# `ct_raw.npy`, per-volume MRI z-score from root `ct_stats.json`, mask from
+# the CT-`ALL_CLASSES`-encoded `label.npy` (verified: every MRI class name,
+# incl. merged vertebrae / intervertebral_discs / lung_left|right, is in
+# ALL_CLASSES, so the provider's _ALL_CLASSES_IDX decodes it directly).
+#
+# ONE-TIME DATA PREP (v2 requires ct_raw.npy; MRI also requires ct_stats.json):
+#   python scripts/convert_to_npy.py \
+#     --data /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalsegmri \
+#     --modality mri --store-raw --workers 16
+#   # optional fast image cache (pitch must equal crop_spacing_mm):
+#   #   ... --store-raw --target-spacing 1.5
+#
+# NB meta.csv ships only train/test splits. experiments/3d/train.py hard-codes
+# split="val" for its eval loop, so carve a `val` split into meta.csv before
+# training (eval.py's split=test is fine as-is).
+#
+#   python experiments/3d/plot_dataset_items.py dataset=totalseg_mri --split train
+#   python experiments/3d/eval.py  dataset=totalseg_mri eval.model=medverse
+paths:
+  # Also set in cluster/nfs.yaml; repeated so the group is usable cluster-independently.
+  totalsegmri: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalsegmri
+data:
+  source: totalsegmri            # _TOTALSEG_SOURCES token; _source_root -> is_mri=True
+  dataset: totalsegmri
+  loader_v2: true                # MRI raw-crop path is v2-only (TotalSegProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  crop_spacing_mm: 1.5           # output mm/voxel; FOV = image_size * this
+  train_spacing_range: null
+  max_train_subjects: null
+  max_val_subjects: null
+  class_balanced: true
+  # occupancy area-pool + threshold: MRI here is very anisotropic (slice thickness
+  # 5-15 mm per spacings.json), so thin structures need occupancy to survive the
+  # crop->grid resample. 0.1 = the v2 provider default (keep, or raise to 0.5 if
+  # masks look dilated in plot_dataset_items).
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.1
+  # v2 implements the cross-subject real-task path only; synth / self_context are
+  # design non-goals and ignored under loader_v2. Kept explicit for clarity.
+  p_synth: 0
+  synth_method: null
+  # label_stats.csv `split` column (label_id;category;occurrences;avg_volume;split),
+  # resolved with is_mri=True. Swap for `all` / `benchmark` / an explicit MRI class list.
+  train_classes: train
+  val_classes: val

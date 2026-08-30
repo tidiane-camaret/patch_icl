@@ -30,6 +30,12 @@ data:
   context_size: 3
   crop_spacing_mm: 3
   train_spacing_range: null
+  # Smooth downsample target: keep the native-label area-pool FRACTION in [0,1] instead of
+  # thresholding it to 0/1 (kills the staircased border on sub-cell organs — adrenals etc).
+  # TRAIN only; make_eval_loader maps this back to "occupancy" so Dice/NSD stay hard.
+  # Pair with augmentations.task.mask_interp=bilinear so the GPU affine warp doesn't
+  # re-quantize the fraction. mask_occupancy_thr (0.5, from d1) floors the peak cell.
+  mask_downsample: soft
   # --- TRAIN: the full organ part-set, minus the two pathology classes --------------------
   # ts_organs is 24; kidney_cyst_left/right occur in only 30/25 subjects (vs 571-1033 for the
   # rest) and are ~absent from standard label.npy, so class-balanced sampling would spend 8% of
@@ -57,8 +63,12 @@ data:
   val_classes:   [ts_organs, ts_cardiac, ts_muscles,
                   -kidney_cyst_left, -kidney_cyst_right]
 augmentations:
+  task:
+    mask_interp: bilinear    # warp the soft mask target with bilinear (anti-aliased edge),
+                             # not nearest+floor — see data.mask_downsample
   per_image:
-    affine: 
+    mask_interp: bilinear    # same for the independent per-volume geometry jitter
+    affine:
       p: 0.2
 train:
   # B=8 -> 4. NB max_ds_len_train is a SAMPLE cap (RandomSampler num_samples=1000), not a batch

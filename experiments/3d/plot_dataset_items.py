@@ -93,10 +93,22 @@ def _label_colours(num_labels: int, palette: np.ndarray | None) -> dict[int, lis
     return {i: list(cmap((i - 1) % 10)[:3]) for i in range(1, num_labels + 1)}
 
 
+def _fg_mask(mask, lid: int):
+    """Boolean foreground for label id `lid`. Integer masks: exact `== lid`. Float masks
+    (soft occupancy / partial-volume targets, `data.mask_downsample=soft`): nearest-integer,
+    so a bilinear-warped interior voxel sitting at 0.9999 still counts as label 1 instead of
+    rendering as a hole. Works on torch tensors and numpy arrays."""
+    is_float = (mask.is_floating_point() if torch.is_tensor(mask)
+                else np.issubdtype(mask.dtype, np.floating))
+    if not is_float:
+        return mask == lid
+    return (mask.round() if torch.is_tensor(mask) else np.rint(mask)) == lid
+
+
 def _best_slice(img: torch.Tensor, mask: torch.Tensor):
     """Return (img_slice, mask_slice) at the axial depth with most foreground."""
     img = img.squeeze(0)                       # (D, H, W)
-    fg  = mask > 0
+    fg  = _fg_mask(mask, 1) if mask.is_floating_point() else mask > 0
     z   = int(fg.sum(dim=(1, 2)).argmax()) if fg.any() else img.shape[0] // 2
     return img[z].numpy(), mask[z].numpy()
 
@@ -113,7 +125,7 @@ def _overlay(img_slice: np.ndarray, mask_slice: np.ndarray,
     """Blend a 2-D float image with a per-label colour overlay."""
     rgb = _raw_rgb(img_slice)
     for lid, col in colours.items():
-        fg = mask_slice == lid
+        fg = _fg_mask(mask_slice, lid)
         if fg.any():
             rgb[fg] = (1 - alpha) * rgb[fg] + alpha * np.array(col)
     return np.clip(rgb, 0, 1)

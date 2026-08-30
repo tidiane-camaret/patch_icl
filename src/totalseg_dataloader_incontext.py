@@ -262,26 +262,53 @@ def place_image(crop_ct, out_sizes, pad_lo, T, *, antialias=False):
 
 
 def place_label(label_small, out_sizes, pad_lo, T):
-    """Centre an already-resampled label (spatial dims out_sizes, long) in a
-    background-0 T³ tensor. Returns (T, T, T)."""
+    """Centre an already-resampled label (spatial dims out_sizes) in a background-0 T³
+    tensor, preserving the input dtype (long for occupancy/nearest, float for "soft").
+    Returns (T, T, T)."""
     if all(o == T for o in out_sizes):
         return label_small
-    label_t = torch.zeros(T, T, T, dtype=torch.long)
+    label_t = torch.zeros(T, T, T, dtype=label_small.dtype)
     sl = tuple(slice(p, p + o) for p, o in zip(pad_lo, out_sizes))
     label_t[sl] = label_small
     return label_t
 
 
+def _area_pool_3d(t: torch.Tensor, size: tuple) -> torch.Tensor:
+    """area-pool (B,1,D,H,W) -> `size`, cheaply: identity when already there (F.interpolate
+    "area" still allocates + copies a full ~17 ms pass at 128³ even for a no-op resize —
+    the common case when crop_spacing_mm equals the native pitch), strided avg_pool3d for an
+    exact integer downsample (~7× faster than adaptive), F.interpolate otherwise."""
+    src = tuple(int(s) for s in t.shape[-3:])
+    if src == size:
+        return t
+    if all(s > o and s % o == 0 for s, o in zip(src, size)):
+        k = tuple(s // o for s, o in zip(src, size))
+        return F.avg_pool3d(t, k, k)
+    return F.interpolate(t, size=size, mode="area")
+
+
 def resample_binary(bin_np, size, *, mode, occ_thr):
-    """Resize a binary mask to `size` -> long (0/1). "occupancy" area-pools + thresholds
-    (thin structures survive; non-empty input never returns empty); "nearest" point-samples."""
+    """Resize a binary mask to `size`. "occupancy" area-pools + thresholds -> long 0/1
+    (thin structures survive; non-empty input never returns empty); "nearest" point-samples
+    -> long 0/1; "soft" area-pools and returns the partial-volume FRACTION as float32 in
+    [0, 1] (no threshold), flooring the peak cell(s) to occ_thr so a sub-cell structure
+    never vanishes — a smooth downsample target for the training loss."""
     t = torch.from_numpy(np.ascontiguousarray(bin_np, dtype=np.float32))[None, None]
+    size = tuple(int(s) for s in size)
+    if mode == "soft":
+        frac = _area_pool_3d(t, size)[0, 0].clamp(0.0, 1.0)
+        peak = float(frac.amax())
+        if bool(bin_np.any()) and peak < occ_thr:
+            frac = torch.where(frac >= peak, torch.full_like(frac, occ_thr), frac)
+        return frac
     if mode == "occupancy":
-        frac = F.interpolate(t, size=size, mode="area")[0, 0]
+        frac = _area_pool_3d(t, size)[0, 0]
         out = frac >= occ_thr
         if not bool(out.any()) and bin_np.any():
             out.view(-1)[int(frac.argmax())] = True
         return out.long()
+    if tuple(t.shape[-3:]) == size:
+        return (t[0, 0] > 0.5).long()
     return (F.interpolate(t, size=size, mode="nearest")[0, 0] > 0.5).long()
 
 
@@ -461,7 +488,7 @@ class TotalSegInContextDataset(Dataset):
         #                 voxel, then keep voxels whose fraction >= mask_occupancy_thr. thr
         #                 ->0 preserves every touched voxel (dilates thin parts), 0.5 is a
         #                 majority vote. Guarantees a non-empty mask if the input had any fg.
-        assert mask_downsample in ("nearest", "occupancy"), mask_downsample
+        assert mask_downsample in ("nearest", "occupancy", "soft"), mask_downsample
         self.mask_downsample = mask_downsample
         self.mask_occupancy_thr = float(mask_occupancy_thr)
         self.hu_jitter = (

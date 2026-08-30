@@ -147,7 +147,9 @@ def main():
     S = list(cfg.data.image_size)
     n_tr = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
     n_all = sum(p.numel() for p in net.parameters()) / 1e6
-    print(f"B={B} K={K} size={S} | enc={cfg.arch.encoder} n_stages={cfg.arch.resenc_n_stages} "
+    print(f"B={B} K={K} size={S} | enc={cfg.arch.encoder} "
+          f"n_stages={cfg.arch.get('resenc_n_stages', 'n/a')} "
+          f"frozen={cfg.arch.get('encoder_frozen', 'n/a')} "
           f"stages={list(cfg.arch.nnunet_ts_stages)} | trainable={n_tr:.1f}M / {n_all:.1f}M")
 
     g = torch.Generator(device=DEVICE).manual_seed(0)

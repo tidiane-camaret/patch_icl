@@ -1,0 +1,33 @@
+# @package _global_
+# e4_plainconv_ts — from-scratch nnU-Net PlainConvUNet image encoder, decoupled from any
+# TotalSegmentator plans.json (no plans, no checkpoint). The plain-conv twin of e3_resenc
+# (from-scratch ResidualEncoderUNet) and the general-purpose twin of e2 (plans-tied, frozen
+# PlainConvUNet). Selected as a Hydra group: `encoder=e4_plainconv_ts`. Writes only the
+# encoder-forward `arch.*` keys; the transformer head + optim live in the `model` group
+# (model/m1.yaml). Both merge into one `arch:` block during composition.
+#
+# Width follows the same base=32/x2/cap=320 formula as e3_resenc by default (n_stages=5 ->
+# [32,64,128,256,320], matching e2's stage geometry), overridable per-stage with
+# `arch.plainconv_ts_features_per_stage` (a list, one entry per stage — e.g.
+# `[16,32,64,128,160]` for a narrower net; must match plainconv_ts_n_stages in length, or
+# sets it directly if you don't pass n_stages). n_conv_per_stage=2 throughout (nnU-Net's
+# standard plain-conv schedule) rather than e3_resenc's residual block counts.
+#
+# NOT spacing-aware (conv net, no RoPE): the physical cell scale is set purely by
+# data.crop_spacing_mm.
+#
+# Normalization: no plans-file CTNormalization stats to reframe into (this encoder is
+# plans-free), so encoder_input_norm defaults to zscore (per-volume, HU-space) — pass
+# encoder_input_norm=passthrough to skip normalization entirely (the provider already
+# delivers data.ct_norm-framed images) or =reframe to target a specific CtNormSpec preset.
+arch:
+  encoder: plainconv_ts
+  encoder_frozen: false
+  plainconv_ts_n_stages: 5        # depth knob when features_per_stage is not set
+  plainconv_ts_features_per_stage: null   # e.g. [32,64,128,256,320]; overrides n_stages via its length
+  nnunet_ts_stages: [2, 3, 4]     # multi-scale concat -> out_ch = 128+256+320 = 704 (default width)
+  encoder_input_norm: zscore      # passthrough | reframe | zscore (see header)
+  encoder_precision: bf16         # autocast dtype of the encoder forward
+  enc_dims: [32, 32, 32, 32]      # ignored when encoder=plainconv_ts (schema parity)
+  resolution: 16                  # token grid R; stage 3 is native 16^3 at a 128^3 input
+  img_embed_mlp: true             # MLP img_embed (Linear->GELU->Linear) over the concat-dim feats
