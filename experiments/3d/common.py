@@ -10,6 +10,7 @@ same data the models are trained on.
 import math
 import random
 import sys
+import warnings
 from pathlib import Path
 
 import torch
@@ -205,8 +206,10 @@ def _assert_cascade_supported(cfg) -> None:
         raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
     _sp_f = [float(s) for s in spacings]
     if not all(a > b for a, b in zip(_sp_f, _sp_f[1:])):
-        raise ValueError(f"data.cascade_spacings must be strictly coarse->fine (descending); "
-                         f"got {list(spacings)}")
+        # Spec: warn, don't error -- an equal/fine->coarse ladder is a valid ablation
+        # (e.g. [3, 3] isolates the re-crop effect from the resolution change).
+        warnings.warn(f"data.cascade_spacings is not strictly coarse->fine (descending); "
+                      f"got {list(spacings)} -- intended only for ablations.")
     aug = cfg.get("augmentations", {}) or {}
     if aug.get("enabled", False) and not aug.get("gpu", False):
         raise ValueError(

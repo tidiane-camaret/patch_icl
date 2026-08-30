@@ -71,11 +71,12 @@ def test_allows_enabled_gpu_aug():
     _assert_cascade_supported(_cfg(augmentations={"enabled": True, "gpu": True}))
 
 
-def test_rejects_non_descending_spacings():
-    with pytest.raises(ValueError, match="descending"):
+def test_warns_non_descending_spacings():
+    # Spec: non-descending is a warning, not an error (valid for ablations).
+    with pytest.warns(UserWarning, match="coarse->fine"):
         _assert_cascade_supported(_cfg(data={"cascade_spacings": [1.5, 3], "crop_spacing_mm": 1.5}))
 
 
-def test_rejects_equal_adjacent_spacings():
-    with pytest.raises(ValueError, match="descending"):
+def test_warns_equal_adjacent_spacings():
+    with pytest.warns(UserWarning, match="coarse->fine"):
         _assert_cascade_supported(_cfg(data={"cascade_spacings": [3, 3], "crop_spacing_mm": 3}))
