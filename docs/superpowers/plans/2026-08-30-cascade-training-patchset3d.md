@@ -1366,9 +1366,11 @@ def _pg_entry(pred_native_bool, geom):
 def test_finer_level_overwrites_coarser(tmp_path, monkeypatch):
     # Native volume 1 subject, 1 class. Coarse pred fills a big wrong box; fine pred (smaller
     # geom) fills the correct region -> stitched Dice must beat coarse-only.
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+    idx = _ALL_CLASSES_IDX["liver"]
     D = H = W = 16
     lbl = np.zeros((D, H, W), dtype=np.uint8)
-    lbl[4:8, 4:8, 4:8] = 3                        # class index 3 = "liver" in _ALL_CLASSES_IDX
+    lbl[4:8, 4:8, 4:8] = idx
     subj = tmp_path / "s0"
     subj.mkdir()
     np.save(subj / "label.npy", lbl)
@@ -1391,6 +1393,13 @@ def test_finer_level_overwrites_coarser(tmp_path, monkeypatch):
     d_casc = evaluate._stitched_native_dice_multi([base, fine], str(tmp_path))
     assert d_casc[("s0", "liver")] > d_coarse[("s0", "liver")]
     assert d_casc[("s0", "liver")] == pytest.approx(1.0, abs=1e-6)
+
+
+# _stitched_native_dice_multi(pg_levels, root) generalises _stitched_native_dice:
+#   keys = pg_levels[-1]; require key present in EVERY level; _write_native each level
+#   coarse->fine (list order) onto one native bool volume; Dice vs label.npy == idx.
+#   _stitched_native_dice(base, over, root) := _stitched_native_dice_multi(
+#       [base, over] if over else [base], root)  -- numerically identical to the old 2-arg fn.
 ```
 
 (If `_stitched_native_dice_multi`'s real signature threads `root` differently than a positional `str`, adapt the test call to match the wrapper you keep — the invariant under test is "finer overwrites coarser and raises Dice".)
@@ -1444,7 +1453,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     """
     from collections import defaultdict
     import numpy as np
-    from evaluate import _source_root, _stitched_native_dice_multi, dice_batch
+    from common import _source_root                     # NOTE: _source_root lives in common.py
+    from evaluate import _stitched_native_dice_multi
 
     spacings = [float(s) for s in cfg.data.cascade_spacings]
     N = len(spacings)
