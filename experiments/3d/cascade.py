@@ -28,35 +28,35 @@ def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
 
     centroid_dhw : length-3 (d,h,w) in the augmented grid, or None (empty prob) -> None.
     grid_row     : (T,T,T,3) float sampling grid (grid_sample xyz convention) or None.
-    flips_row    : (3,) bool, per-axis flip (D,H,W order) applied before the warp.
+    flips_row    : (3,) bool, per-axis flip (D,H,W order) applied to the volume before the warp.
     crop_geom_row: (4,3) long [starts, crop_sizes, out_sizes, pad_lo].
-    Returns native voxel (d,h,w), each >= 0. Identity (grid_row None, no flips) reproduces
-    evaluate._predicted_native_center for the same centroid.
+
+    _geometric's forward order is flip(vol) THEN grid_sample(vol, grid) with a flip-free
+    grid, so the inverse is: interpolate `grid` at the augmented centroid (-> coord in the
+    FLIPPED volume), THEN undo the flip, THEN the crop-geom affine. align_corners=False
+    throughout, matching _geometric's affine_grid/grid_sample. Identity (grid_row None,
+    no flips) reproduces evaluate._predicted_native_center for the same centroid.
     """
     if centroid_dhw is None:
         return None
-    g = [float(centroid_dhw[a]) for a in range(3)]                     # d,h,w (augmented)
-
-    flips = [bool(x) for x in (flips_row.tolist() if torch.is_tensor(flips_row) else flips_row)]
-    for a in range(3):
-        if flips[a]:
-            g[a] = (T - 1) - g[a]
+    g = [float(centroid_dhw[a]) for a in range(3)]                     # d,h,w (augmented out)
 
     if grid_row is not None:
-        # Interpolate the (T,T,T,3) grid at the fractional post-unflip coord. Query point in
-        # grid_sample xyz order = (w, h, d) normalized with the align_corners=True pairing.
-        q = torch.tensor(
-            [[[[[2.0 * g[2] / max(1, T - 1) - 1.0,
-                 2.0 * g[1] / max(1, T - 1) - 1.0,
-                 2.0 * g[0] / max(1, T - 1) - 1.0]]]]],
-            dtype=torch.float32)                                       # (1,1,1,1,3)
-        field = grid_row.detach().float().permute(3, 0, 1, 2).unsqueeze(0)  # (1,3,T,T,T)
+        def _n(v):                                                    # voxel -> align_corners=False norm
+            return (2.0 * v + 1.0) / max(1, T) - 1.0
+        q = torch.tensor([[[[[_n(g[2]), _n(g[1]), _n(g[0])]]]]], dtype=torch.float32)  # (x=w,y=h,z=d)
+        field = grid_row.detach().float().permute(3, 0, 1, 2).unsqueeze(0)            # (1,3,T,T,T)
         pre = F.grid_sample(field, q, mode="bilinear", padding_mode="border",
-                            align_corners=True)[0, :, 0, 0, 0]         # (3,) = (x,y,z) norm
+                            align_corners=False)[0, :, 0, 0, 0]        # (3,) = (x,y,z) norm value
         x, y, z = (float(v) for v in pre)
-        g = [(z + 1.0) / 2.0 * (T - 1),                               # d
-             (y + 1.0) / 2.0 * (T - 1),                               # h
-             (x + 1.0) / 2.0 * (T - 1)]                               # w
+        g = [((z + 1.0) * T - 1.0) / 2.0,                             # d  (in the FLIPPED volume)
+             ((y + 1.0) * T - 1.0) / 2.0,                             # h
+             ((x + 1.0) * T - 1.0) / 2.0]                             # w
+
+    flips = [bool(v) for v in (flips_row.tolist() if torch.is_tensor(flips_row) else flips_row)]
+    for a in range(3):
+        if flips[a]:
+            g[a] = (T - 1) - g[a]                                     # undo flip: flipped[i]==pre[(T-1)-i]
 
     starts, crop_sizes, out_sizes, pad_lo = (crop_geom_row[r].tolist() for r in range(4))
     native = [int(round(starts[a] + (g[a] - pad_lo[a]) / max(1, out_sizes[a]) * crop_sizes[a]))

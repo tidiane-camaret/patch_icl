@@ -62,12 +62,11 @@ def test_grid_shift_maps_through():
 def test_directional_grid_maps_x_channel_to_w():
     """Verify that grid's x-channel (normalized) maps to the w output axis, not d.
 
-    Build a grid with pure translation along W only in normalized coords.
-    grid[..., 0] = 0.5 means x-channel = +0.5, which denormalizes to w-component.
-    With identity geometry and centroid at (3.0, 3.0, 3.0):
-    - w should denormalize to approximately 0.5 → (0.5+1)/2 * (T-1) ≈ 6.125
-    - d and h should denormalize to 0 → (0+1)/2 * (T-1) ≈ 3.5
-    This proves x maps to w (not d).
+    align_corners=False denormalization: voxel = ((norm + 1) * T - 1) / 2.
+    With grid[..., 0] = 0.5 (x-channel), centroid (3,3,3), identity geom, T=8:
+    - w (x-channel 0.5): ((0.5+1)*8-1)/2 = 5.5 → rounds to 6
+    - d,h (z,y-channels 0): ((0+1)*8-1)/2 = 3.5 → round to 4
+    Assertion: w > d and w > h (x pulls w toward +x, not d).
     """
     T = 8
     grid_row = torch.zeros(T, T, T, 3)
@@ -77,13 +76,10 @@ def test_directional_grid_maps_x_channel_to_w():
 
     d, h, w = invert_geo_center(centroid, grid_row, torch.zeros(3, dtype=torch.bool), geom, T)
 
-    # Denormalization: (x + 1) / 2 * (T - 1) where x is the grid value
-    # For w (x-channel): (0.5 + 1) / 2 * 7 = 0.75 * 7 = 5.25 → rounds to 5
-    # For d (z-channel): (0 + 1) / 2 * 7 = 0.5 * 7 = 3.5 → rounds to 4
-    # For h (y-channel): (0 + 1) / 2 * 7 = 0.5 * 7 = 3.5 → rounds to 4
-    expected_w = round((0.5 + 1.0) / 2.0 * (T - 1))
-    expected_d = round((0.0 + 1.0) / 2.0 * (T - 1))
-    expected_h = round((0.0 + 1.0) / 2.0 * (T - 1))
+    # With align_corners=False: ((norm + 1) * T - 1) / 2
+    expected_w = round(((0.5 + 1.0) * T - 1.0) / 2.0)
+    expected_d = round(((0.0 + 1.0) * T - 1.0) / 2.0)
+    expected_h = round(((0.0 + 1.0) * T - 1.0) / 2.0)
 
     assert w == expected_w, f"w={w}, expected {expected_w}"
     assert d == expected_d, f"d={d}, expected {expected_d}"
@@ -91,3 +87,20 @@ def test_directional_grid_maps_x_channel_to_w():
     # Key assertion: w should differ from d and h in the expected direction
     assert w > d, f"w ({w}) should be greater than d ({d}) due to +0.5 grid offset"
     assert w > h, f"w ({w}) should be greater than h ({h}) due to +0.5 grid offset"
+
+
+def test_flip_then_grid_inversion_order():
+    """Discriminates correct order (grid-lookup-then-unflip) from wrong (unflip-then-lookup).
+
+    grid[..., 2] = 0.5 displaces along d (z-channel). With flip on d:
+    Correct: interp grid at g_aug (2,3,3) -> d in flipped vol = ((0.5+1)*8-1)/2 = 5.5 ->
+    unflip d -> (8-1)-5.5 = 1.5 -> round 2 -> native (2,4,4).
+    Wrong order would give round(5.5)=6 (no 2nd unflip).
+    """
+    T = 8
+    grid_row = torch.zeros(T, T, T, 3)
+    grid_row[..., 2] = 0.5                                   # z-channel -> d output axis
+    geom = _geom(starts=(0, 0, 0), crop=(8, 8, 8), out=(8, 8, 8), pad=(0, 0, 0))
+    flips = torch.tensor([True, False, False])               # flip d only
+    got = invert_geo_center(np.array([2.0, 3.0, 3.0]), grid_row, flips, geom, T)
+    assert got == (2, 4, 4)
