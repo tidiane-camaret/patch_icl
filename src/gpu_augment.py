@@ -353,6 +353,26 @@ class GpuAugmentor:
         self._step = 0
 
     @torch.no_grad()
+    def apply(self, batch: dict, *, geo_gen: torch.Generator,
+              int_gen: torch.Generator, capture: bool = False):
+        """REAL-mode aug for the cascade runner: shared geometric over target+K contexts
+        (geo_gen), then per-volume intensity (int_gen). Mutates `batch` in place; returns
+        (batch, GeoState|None). Every task is assumed REAL (aug_mode==0) — run_cascade
+        asserts it. Kept separate from __call__ so the non-cascade path stays byte-identical.
+        """
+        cfg = self.cfg
+        vols, masks, B, T = _stack_task(batch)          # tensors already on device
+        if capture:
+            vols, masks, grid, flips = _geometric(
+                vols, masks, group_size=T, cfg=cfg.task, gen=geo_gen, capture=True)
+        else:
+            vols, masks = _geometric(vols, masks, group_size=T, cfg=cfg.task, gen=geo_gen)
+            grid = flips = None
+        vols = _batched_intensity(vols, cfg.intensity, int_gen)
+        _unstack_task(vols, masks, B, T, batch)
+        return batch, (GeoState(grid=grid, flips=flips) if capture else None)
+
+    @torch.no_grad()
     def __call__(self, batch: dict, training: bool) -> dict:
         cfg = self.cfg
         if (not training) or cfg is None or not getattr(cfg, "enabled", False):
