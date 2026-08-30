@@ -188,6 +188,33 @@ def anchor_shapes(cfg):
     return list(_ANCHOR_SHAPES) if shape == "mix" else [shape]
 
 
+def _assert_cascade_supported(cfg) -> None:
+    """Validate data.cascade_spacings / train.cascade_loss_weights. No-op when cascade is off."""
+    d = cfg.data
+    spacings = d.get("cascade_spacings")
+    if not spacings:
+        return
+    if cfg.get("model") != "patchset3d":
+        raise ValueError("data.cascade_spacings requires model=patchset3d.")
+    if not d.get("loader_v2", False):
+        raise ValueError("data.cascade_spacings requires data.loader_v2=true (v2 pipeline).")
+    if d.get("source", "totalseg") not in _TOTALSEG_SOURCES:
+        raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
+                         f"v2 TotalSeg source ({sorted(_TOTALSEG_SOURCES)}).")
+    if len(spacings) < 2:
+        raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
+    if float(spacings[0]) != float(d.get("crop_spacing_mm")):
+        raise ValueError(f"data.cascade_spacings[0]={spacings[0]} must equal "
+                         f"data.crop_spacing_mm={d.get('crop_spacing_mm')} (level-0 geometry).")
+    if d.get("train_spacing_range") is not None:
+        raise ValueError("data.cascade_spacings and data.train_spacing_range are mutually "
+                         "exclusive (both set the per-batch physical spacing).")
+    w = cfg.get("train", {}).get("cascade_loss_weights")
+    if w is not None and len(w) != len(spacings):
+        raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
+                         f"data.cascade_spacings (len {len(spacings)}).")
+
+
 def build_dataset(cfg, split: str):
     """Construct the 3D in-context dataset for `split`, dispatching on cfg.data.source.
 
@@ -523,6 +550,7 @@ def train_loader(cfg) -> DataLoader:
     each (SpacingBatchSampler) for variable-spacing training. Eval never uses it —
     make_eval_loader always crops at the fixed cfg.data.crop_spacing_mm.
     """
+    _assert_cascade_supported(cfg)
     ds = build_dataset(cfg, "train")
     nw = int(cfg.train.workers)
     max_len = cfg.data.get("max_ds_len_train", None)
@@ -566,6 +594,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     routed omnisynth3d/anchor_synth3d ignore it; totalseg_more_labels (a
     TotalSegInContextDataset subclass) honours it too. None = fixed-crop_spacing_mm pass.
     """
+    _assert_cascade_supported(cfg)
     d, e = cfg.data, cfg.eval
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",

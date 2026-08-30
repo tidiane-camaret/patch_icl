@@ -69,7 +69,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from the 2D trainer
 
 from data.totalseg_classes import resolve_classes
-from common import DEVICE, _source_root, train_loader, make_eval_loader, _self_context, eval_cfg
+from common import (DEVICE, _source_root, train_loader, make_eval_loader, _self_context,
+                    eval_cfg, _assert_cascade_supported)
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
@@ -770,6 +771,7 @@ def main(cfg: DictConfig) -> None:
     # on one source and VALIDATE on another (e.g. train synth_gmm_maisi, eval totalseg). No
     # data.val -> vcfg is cfg (val = train source). See common.eval_cfg.
     vcfg = eval_cfg(cfg)
+    _assert_cascade_supported(cfg)
     val_classes = _resolve_classes_for(vcfg, "val_classes")
     # Class names the model trains on (fills the val table's `in_train` flag) — always the
     # TRAIN source, so under a cross-source data.val override every val class reads as unseen
@@ -979,7 +981,8 @@ def main(cfg: DictConfig) -> None:
     print(f"Checkpoints -> {ckpt_path}")
 
     from src.gpu_augment import GpuAugmentor
-    if cfg.augmentations.get("gpu", False):
+    _cascade_on = bool(cfg.data.get("cascade_spacings"))
+    if cfg.augmentations.get("gpu", False) or _cascade_on:
         _, _sc_int, _sc_pi, _ = _self_context(cfg.data, "train")
         gpu_aug = GpuAugmentor(cfg.augmentations,
                                self_context_per_image=bool(_sc_pi),
