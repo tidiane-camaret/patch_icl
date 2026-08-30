@@ -21,7 +21,10 @@ class LoadRequest:
     rng: random.Random                 # per-item RNG (eval determinism or global)
     crop_spacing_mm: float             # physical crop pitch for THIS item
     center: Optional[tuple] = None     # native-voxel crop center; None -> provider default
-                                       # (cascade fine-crop seam; v2 always passes None)
+                                       # (cascade fine-crop seam)
+    jitter: Optional[int] = None       # per-load crop-jitter override (native voxels);
+                                       # None -> provider default self.crop_jitter.
+                                       # Cascade re-crops pass 0 so the predicted COM is exact.
 
 
 @dataclass

@@ -92,6 +92,11 @@ def crop_and_place_cached(img_cache_np, label_np, class_idx, center, T, *,
     return image_t, label_t, geom
 
 
+def _resolve_jitter(req: LoadRequest, default: int) -> int:
+    """Per-load crop-jitter: req.jitter when set, else the provider default."""
+    return int(req.jitter) if req.jitter is not None else int(default)
+
+
 class TotalSegProvider:
     """Source-specific I/O for the totalseg family: scan + bbox caches and a single
     raw_ct organ-crop `load`. Missing ct_raw.npy is a hard error."""
@@ -136,6 +141,7 @@ class TotalSegProvider:
         if center is None:
             D, H, W = label_np.shape
             center = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+        jitter = _resolve_jitter(req, self.crop_jitter)
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
         norm = ((lambda a: normalize_ct(a, self.ct_spec)) if self.modality == "ct"
                 else (lambda a: normalize_mri(a, self._ct_stats[subject])))
@@ -150,7 +156,7 @@ class TotalSegProvider:
                 img_cache_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
                 crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,
                 cache_spacing_mm=float(req.crop_spacing_mm),
-                jitter=self.crop_jitter, rng=req.rng,
+                jitter=jitter, rng=req.rng,
                 mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
                 normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         else:
@@ -161,7 +167,7 @@ class TotalSegProvider:
             image_t, label_t, geom = crop_and_place(
                 image_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
                 crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,
-                jitter=self.crop_jitter, rng=req.rng,
+                jitter=jitter, rng=req.rng,
                 mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
                 normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
