@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # experiments/3d s
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from cascade import invert_geo_center
 from evaluate import _predicted_native_center, _grid_centroid
@@ -127,9 +128,9 @@ class _FakeModel(torch.nn.Module):
     def forward(self, image, context_in, context_out, mode="train", spacing=None):
         self.seen_spacing.append(spacing)
         B = image.shape[0]
-        lg = torch.full((B, 1, self.G, self.G, self.G), -10.0)
+        lg = torch.full((B, 1, self.G, self.G, self.G), -10.0, device=image.device)
         lg[:, :, self.hot[0], self.hot[1], self.hot[2]] = 10.0
-        lg = lg + self.p                                  # keep autograd alive
+        lg = lg + self.p.to(image.device)                 # keep autograd alive
         return {"final_logit": lg}
 
 
@@ -198,3 +199,42 @@ def test_run_cascade_empty_prob_falls_back_to_gt_centroid():
     assert res.centers[1] == [None, None]
     assert res.empty_frac == 1.0
     assert all(c["center"] is None for c in prov.calls)  # every level-1 load GT-centred
+
+
+def test_train_epoch_cascade_smoke(monkeypatch):
+    """train_epoch runs the cascade branch end-to-end on fakes: 2 optimiser steps, finite loss,
+    per-level metric keys present."""
+    import types
+    import train as train_mod
+
+    B, T, G = 2, 8, 4
+    model = _FakeModel(G=G, hot=(1, 1, 1))
+    prov = _FakeProvider(T=T)
+
+    class _Loader:
+        dataset = types.SimpleNamespace(provider=prov)
+        def __iter__(self): return iter([_v2_batch(B=B, T=T), _v2_batch(B=B, T=T)])
+        def __len__(self): return 2
+
+    opt = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    class _Sched:
+        def step(self, *a): pass
+
+    cfg = OmegaConf.create({
+        "model": "patchset3d",
+        "data": {"cascade_spacings": [3.0, 1.5], "cascade_crop_jitter": 0,
+                 "crop_spacing_mm": 3.0},
+        "train": {"seed": 0, "cascade_loss_weights": [1.0, 1.0]},
+    })
+    loss_fn = lambda logit, target: torch.nn.functional.mse_loss(
+        torch.sigmoid(logit.float()), target.float())
+
+    mean_loss, mean_dice, mean_soft, grid = train_mod.train_epoch(
+        model, _Loader(), [opt], _Sched(), step_per_batch=True, loss_fn=loss_fn,
+        cfg=cfg, epoch=0, is_patchset=True, gpu_aug=None)
+
+    assert np.isfinite(mean_loss)
+    assert "loss_r3" in grid and "loss_r1.5" in grid
+    assert "dice_r3" in grid and "dice_r1.5" in grid
+    assert "cascade_empty_frac" in grid

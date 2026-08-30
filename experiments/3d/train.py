@@ -73,6 +73,7 @@ from common import (DEVICE, _source_root, train_loader, make_eval_loader, _self_
                     eval_cfg, _assert_cascade_supported)
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
+from cascade import run_cascade, _cascade_loss
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
 
 
@@ -478,6 +479,10 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     total, dice_sum, soft_run, n = 0.0, 0.0, 0.0, 0
     gh = ghc = gs = gsc = gc = gcc = 0.0          # grid-metric running sums
     rd = None
+    # N-level cascade accumulators (data.cascade_spacings set): per-spacing loss/dice sums and
+    # the mean empty-COM fallback fraction. Empty ({}) / [0.0] on the non-cascade path -> the
+    # end-of-epoch merge below is skipped, so the single-forward path is unaffected.
+    _c_loss_acc, _c_dice_acc, _c_empty_acc = {}, {}, [0.0]
     # Optional per-phase timing: data-wait (perf_counter between steps) + image-encode and
     # attention GPU time (CUDA events on net.encoder / net.transformer, each called once per
     # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
@@ -494,6 +499,62 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     t_prev = time.perf_counter()
     for batch in pbar:
+        cascade_spacings = cfg.data.get("cascade_spacings")
+        if cascade_spacings:
+            # N-level coarse->fine cascade fast-path (data.cascade_spacings). One run_cascade
+            # forward over all levels + a single summed backward; per-spacing metrics are
+            # accumulated and merged into `grid` at the end. `continue` skips the normal
+            # single-forward body entirely.
+            spacings = [float(s) for s in cascade_spacings]
+            gstep = epoch * len(loader) + n
+            for opt in optimizers:
+                opt.zero_grad(set_to_none=True)
+            t_rc = time.perf_counter()
+            with _autocast():
+                res = run_cascade(
+                    model, loader.dataset.provider, batch, gpu_aug, spacings,
+                    device=DEVICE, training=True, step=gstep, seed=int(cfg.train.seed),
+                    jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob)
+                loss, per_level = _cascade_loss(
+                    res, loss_fn, cfg.train.get("cascade_loss_weights"))
+            fine = res.logits[-1].float()
+            if not torch.isfinite(fine).all():
+                raise RuntimeError(f"non-finite cascade forward @ epoch {epoch} step {n}")
+            loss.backward()
+            if cfg.train.get("grad_clip"):
+                torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.train.grad_clip)
+            for opt in optimizers:
+                opt.step()
+            if step_per_batch:
+                scheduler.step()
+
+            total += loss.item()
+            fine_tgt = res.targets[-1]
+            dice_sum += _hard_dice(fine, fine_tgt, is_prob)
+            soft_run += 1.0 - _soft_dice(_to_prob(fine, is_prob), fine_tgt).item()
+            n += 1
+            rd = fine.shape[-1]
+            prob = torch.sigmoid(fine)
+            h, hc = hard_sum(prob, fine_tgt); gh += h; ghc += hc
+            s, sc = soft_sum(prob, fine_tgt); gs += s; gsc += sc
+            c, cc = cos_sum(prob, fine_tgt);  gc += c; gcc += cc
+            for si, sp in enumerate(spacings):
+                _c_loss_acc.setdefault(f"loss_r{sp:g}", 0.0)
+                _c_loss_acc[f"loss_r{sp:g}"] += per_level[si]
+                _c_dice_acc.setdefault(f"dice_r{sp:g}", 0.0)
+                _c_dice_acc[f"dice_r{sp:g}"] += _hard_dice(
+                    res.logits[si].float(), res.targets[si], is_prob)
+            _c_empty_acc[0] += res.empty_frac
+            if prof:
+                tsum.setdefault("recrop", 0.0)
+                tsum["recrop"] += (time.perf_counter() - t_rc) * 1000
+            pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
+                             soft=f"{soft_run/n:.4f}",
+                             lr=f"{optimizers[0].param_groups[0]['lr']:.1e}")
+            if prof:
+                torch.cuda.synchronize()
+                t_prev = time.perf_counter()
+            continue
         if synth_realizer is not None and "native_lbls" in batch:
             # GPU-realize: occupancy resample + SynthSeg paint on device -> fills
             # image/label/context_in/context_out before augmentation (replaces the ~15 s/item
@@ -576,12 +637,22 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         grid[f"dice_ds@{rd}"] = float(gh) / max(float(ghc), 1)
         grid[f"dice_ds_soft@{rd}"] = float(gs) / max(float(gsc), 1)
         grid[f"cossim@{rd}"] = float(gc) / max(float(gcc), 1)
+    # Cascade per-spacing means (only populated when the cascade branch above ran).
+    if _c_loss_acc and n:
+        for k, v in _c_loss_acc.items():
+            grid[k] = v / n
+        for k, v in _c_dice_acc.items():
+            grid[k] = v / n
+        grid["cascade_empty_frac"] = _c_empty_acc[0] / n
     if prof and n:
         pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
         bs = prof_items / n                            # avg batch size
         for k in ("data", "encode", "attn"):
             grid[f"time/{k}_ms"] = tsum[k] / n         # per-step (per-batch) wall time
             grid[f"time/{k}_ms_item"] = tsum[k] / pi   # per-item (÷ batch size): B-comparable
+        if "recrop" in tsum:                           # cascade re-crop I/O (cascade branch only)
+            grid["time/recrop_ms"] = tsum["recrop"] / n
+            grid["time/recrop_ms_item"] = tsum["recrop"] / pi
         tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
                    f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
                    f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
