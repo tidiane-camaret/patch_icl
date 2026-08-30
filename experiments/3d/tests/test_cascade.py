@@ -7,6 +7,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # experiments/3d siblings
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -161,6 +162,77 @@ def _v2_batch(B=2, K=3, T=8):
         "crop_geom": geom.unsqueeze(0).repeat(B, 1, 1),
         "aug_mode": torch.zeros(B, dtype=torch.long),
     }
+
+
+class _CentroidEchoModel(torch.nn.Module):
+    """Returns the (augmented) target image straight through as its logit, so
+    _centroid_from_logit recovers the AUGMENTED target blob centroid. This makes
+    run_cascade's capture->invert seam a closed loop: plant a blob, let the real
+    GpuAugmentor flip+warp it, and check the inverted native centre lands back on
+    the planted voxel."""
+    spacing_aware = False
+
+    def __init__(self):
+        super().__init__()
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None):
+        return {"final_logit": image + self.p.to(image.device)}   # (B,1,T,T,T)
+
+
+def _echo_aug_cfg():
+    return OmegaConf.create({
+        "enabled": True, "gpu": True,
+        "task": {
+            "flip": {"p_d": 1.0, "p_h": 1.0, "p_w": 1.0},           # force every flip
+            "affine": {"p": 1.0, "max_angle_deg": 20.0, "scale_min": 0.9,
+                       "scale_max": 1.1, "max_translate": 0.1},
+            "deform": {"p": 1.0, "control_points": 4, "max_disp": 0.1, "num_steps": 4},
+            "elastic": {"p": 0.0, "alpha": 0.1, "grid_scale": 8},
+            "mask_interp": "bilinear",
+        },
+        "intensity": {
+            "brightness_contrast": {"p": 0.0, "brightness": 0.0,
+                                    "contrast_range": [0.9, 1.1]},
+        },
+    })
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_run_cascade_with_real_augmentor_recovers_planted_centroid(device):
+    """C1 + capture/invert-seam regression guard: run_cascade with a REAL GpuAugmentor
+    (all flips + affine + deform on). The device="cuda" case is the exact C1 repro —
+    the captured grid lives on CUDA while invert_geo_center builds its query tensor."""
+    from src.gpu_augment import GpuAugmentor
+
+    B, K, T = 2, 3, 8
+    dev = torch.device(device)
+    aug = GpuAugmentor(_echo_aug_cfg())
+    batch = _v2_batch(B=B, K=K, T=T)
+    planted = (4, 4, 3)                                   # near-centre so the warp stays <2 vox
+    d, h, w = planted
+    for b in range(B):
+        batch["image"][b, 0, d - 1:d + 2, h - 1:h + 2, w - 1:w + 2] = 1.0   # 3^3 blob
+        batch["label"][b, d - 1:d + 2, h - 1:h + 2, w - 1:w + 2] = 1.0
+    for k in ("image", "label", "context_in", "context_out"):
+        batch[k] = batch[k].to(dev)
+
+    model = _CentroidEchoModel().to(dev)
+    res = run_cascade(model, _FakeProvider(T=T), batch, augmentor=aug,
+                      spacings=[3.0, 1.5], device=dev, training=True,
+                      step=0, seed=0, is_prob=True)
+
+    assert isinstance(res, CascadeResult)
+    assert len(res.centers) == 2 and len(res.centers[1]) == B
+    for b in range(B):
+        nc = res.centers[1][b]
+        assert nc is not None, f"b={b}: COM inversion hit the empty fallback"
+        err = max(abs(nc[a] - planted[a]) for a in range(3))
+        assert err <= 2, f"b={b}: inverted native centre {nc} vs planted {planted} (err {err})"
 
 
 def test_run_cascade_two_levels_no_aug():

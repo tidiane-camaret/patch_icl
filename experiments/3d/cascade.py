@@ -44,7 +44,8 @@ def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
     if grid_row is not None:
         def _n(v):                                                    # voxel -> align_corners=False norm
             return (2.0 * v + 1.0) / max(1, T) - 1.0
-        q = torch.tensor([[[[[_n(g[2]), _n(g[1]), _n(g[0])]]]]], dtype=torch.float32)  # (x=w,y=h,z=d)
+        q = torch.tensor([[[[[_n(g[2]), _n(g[1]), _n(g[0])]]]]],
+                         dtype=torch.float32, device=grid_row.device)  # (x=w,y=h,z=d)
         field = grid_row.detach().float().permute(3, 0, 1, 2).unsqueeze(0)            # (1,3,T,T,T)
         pre = F.grid_sample(field, q, mode="bilinear", padding_mode="border",
                             align_corners=False)[0, :, 0, 0, 0]        # (3,) = (x,y,z) norm value
