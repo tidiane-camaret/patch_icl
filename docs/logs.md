@@ -1,5 +1,44 @@
 # Change log
 
+## 2026-08-30 — N-level coarse→fine cascade training for PatchSet3D (v2 pipeline)
+
+**Motivation:** eval already runs a coarse→fine cascade (predict at r1, re-crop the
+target on the r1 predicted centre-of-mass, predict at r2), but training only ever saw
+one spacing. This trains the model under the conditions it is evaluated in.
+
+**What it does** (`experiments/3d/cascade.py`, new — `run_cascade` + `evaluate_cascade`):
+level 0 crops as today (GT-centred). Each later level re-loads the *target* crop from
+the provider centred on the previous level's predicted centre-of-mass; context crops
+stay GT-centred. Loss is computed independently per level (`train.cascade_loss_weights`,
+one weighted sum, single backward). `PatchSet3D.forward` still runs one level at a time.
+
+**Augmentation replay:** geometric aug params (flip / affine / elastic / deform) are
+sampled once per task at level 0 and replayed at every level by re-seeding `geo_gen`
+identically. `_geometric(..., capture=True)` (`src/gpu_augment.py`) returns the composed
+sampling grid + per-axis flip flags (`GeoState`); `invert_geo_center`
+(`experiments/3d/cascade.py`) maps the predicted COM back through grid-lookup → unflip →
+crop affine to native voxels. Intensity aug stays independent per level.
+
+**Validation:** the training-time val loop runs the same cascade. `val/dice` is the
+**stitched native Dice** — each level's hard prediction is composited back into a
+native-resolution `label.npy == class` volume coarse→fine, each level overwriting the
+previous — and is the checkpoint-selection metric. Per-level reads are logged as
+`train|val/loss_r{s:g}` / `dice_r{s:g}`, plus `val/dice_stitched`.
+
+**Config:** opt-in via `data.cascade_spacings: [s0, s1, …]` (s0 must equal
+`data.crop_spacing_mm`; a non-descending ladder only warns — valid for ablations).
+`_assert_cascade_supported` (`experiments/3d/common.py`) gates it to model=patchset3d +
+v2 loader + TotalSegmentator source and requires `augmentations.enabled ⇒
+augmentations.gpu`. New experiment
+`configs/experiment/3d/experiment/59_organs_cascade_from_scratch.yaml` inherits exp57
+(`cascade_spacings: [3, 1.5]`, `eval.tasks_per_class: 3`). Non-cascade runs are
+byte-identical — the guard and every cascade branch are no-ops when `cascade_spacings`
+is unset.
+
+**Perf note:** each re-cropped level does `B*(K+1)` synchronous provider loads; without
+per-spacing `ct_raw_{s:g}mm.npy` caches these fall back to full-res `ct_raw.npy`
+(~+0.3 s/step at 3 mm). Build them with `scripts/convert_to_npy.py --target-spacing`.
+
 ## 2026-08-30 — Soft (partial-volume) mask downsampling: `mask_downsample=soft` + `task.mask_interp=bilinear`
 
 **Motivation:** the GT mask is downsampled from the native `label.npy` to the crop/token grid
