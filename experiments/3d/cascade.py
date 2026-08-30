@@ -182,8 +182,8 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             for b in range(B):
                 empty_total += 1
                 if geo is not None and geo.grid is not None:
-                    gr = geo.grid.view(B, -1, T, T, T, 3)[b, 0]         # target = row 0 of task
-                    fl = geo.flips.view(B, -1, 3)[b, 0]
+                    gr = geo.grid[b]          # per-task target grid, geo.grid is (B, T, T, T, 3)
+                    fl = geo.flips[b]         # geo.flips is (B, 3)
                 else:
                     gr, fl = None, torch.zeros(3, dtype=torch.bool)
                 nc = invert_geo_center(cens[b], gr, fl, geoms[i][b], T)

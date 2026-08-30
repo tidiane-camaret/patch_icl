@@ -22,10 +22,10 @@ from dataclasses import dataclass
 class GeoState:
     """Captured geometry of one _geometric() call, for cascade COM inversion + replay.
 
-    grid  : (N, D, H, W, 3) float32 sampling grid (affine+elastic+deform composed,
-            grid_sample xyz convention) captured just before grid_sample. None when
-            not captured / no augmentor.
-    flips : (N, 3) bool — per-volume axis flips applied before the warp (D, H, W order).
+    grid  : (G, D, H, W, 3) float32 sampling grid (affine+elastic+deform composed,
+            grid_sample xyz convention) captured just before grid_sample — one row per
+            group (the per-task target), not per volume. None when not captured / no augmentor.
+    flips : (G, 3) bool — per-group axis flips applied before the warp (D, H, W order).
     """
     grid: "torch.Tensor | None"
     flips: "torch.Tensor"
@@ -257,7 +257,8 @@ def _geometric(vols, masks, group_size, cfg, gen, *, capture=False):
     """Shared (group_size=T) or independent (group_size=1) flip/affine/elastic/deform.
 
     capture=True additionally returns (grid, flips): the composed sampling grid (just
-    before grid_sample) and the per-volume flip record, for cascade COM inversion + replay.
+    before grid_sample) and the flip record, one row per group (the per-task target row),
+    for cascade COM inversion + replay.
     """
     N = vols.shape[0]
     device = vols.device
@@ -332,7 +333,9 @@ def _geometric(vols, masks, group_size, cfg, gen, *, capture=False):
     m = m.squeeze(1)
     out_masks = m.clamp(0.0, 1.0) if mask_soft else m.long()
     if capture:
-        return vols, out_masks, captured_grid, flip_rec.repeat_interleave(group_size, dim=0)
+        # Only the per-task target row (row 0 of each group) is ever read downstream
+        # (run_cascade COM inversion); capturing all N rows clones ~384 MiB at exp59 scale.
+        return vols, out_masks, captured_grid[::group_size].contiguous(), flip_rec
     return vols, out_masks
 
 

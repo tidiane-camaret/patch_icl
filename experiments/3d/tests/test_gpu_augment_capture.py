@@ -30,8 +30,9 @@ def test_geometric_capture_shapes():
     out = _geometric(vols, masks, group_size=N, cfg=_task_cfg(deform_p=1.0), gen=g, capture=True)
     assert len(out) == 4
     _v, _m, grid, flips = out
-    assert grid.shape == (N, T, T, T, 3) and grid.dtype == torch.float32
-    assert flips.shape == (N, 3) and flips.dtype == torch.bool
+    # group_size == N -> single group -> capture is one target row (G=1), not N.
+    assert grid.shape == (1, T, T, T, 3) and grid.dtype == torch.float32
+    assert flips.shape == (1, 3) and flips.dtype == torch.bool
 
 
 def test_geometric_no_capture_is_two_tuple():
@@ -92,8 +93,9 @@ def test_apply_returns_geostate_on_capture():
     _, geo = aug.apply(b, geo_gen=torch.Generator().manual_seed(1),
                        int_gen=torch.Generator().manual_seed(2), capture=True)
     assert isinstance(geo, GeoState)
-    assert geo.grid.shape == (2 * 4, 8, 8, 8, 3)   # B*T
-    assert geo.flips.shape == (2 * 4, 3)
+    # B=2, K=3 -> group_size = T = 4, N = B*T = 8, G = B = 2 target rows captured.
+    assert geo.grid.shape == (2, 8, 8, 8, 3)       # (G, D, H, W, 3)
+    assert geo.flips.shape == (2, 3)
 
 
 def test_apply_replay_same_geo_seed_matches_geometry():
