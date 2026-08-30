@@ -15,6 +15,21 @@ from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX, DEFAULT_CT_NORM, reso
 
 REAL, SYNTH, SELF_CONTEXT = 0, 1, 2
 
+from dataclasses import dataclass
+
+
+@dataclass
+class GeoState:
+    """Captured geometry of one _geometric() call, for cascade COM inversion + replay.
+
+    grid  : (N, D, H, W, 3) float32 sampling grid (affine+elastic+deform composed,
+            grid_sample xyz convention) captured just before grid_sample. None when
+            not captured / no augmentor.
+    flips : (N, 3) bool — per-volume axis flips applied before the warp (D, H, W order).
+    """
+    grid: "torch.Tensor | None"
+    flips: "torch.Tensor"
+
 
 def _stack_task(batch: dict) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """batch tensors -> (vols (B*T,1,D,H,W), masks (B*T,D,H,W), B, T). vol b*T+0 = target b."""
@@ -238,22 +253,29 @@ def _batched_intensity(vols, cfg, gen):
     return vols
 
 
-def _geometric(vols, masks, group_size, cfg, gen):
-    """Shared (group_size=T) or independent (group_size=1) flip/affine/elastic."""
+def _geometric(vols, masks, group_size, cfg, gen, *, capture=False):
+    """Shared (group_size=T) or independent (group_size=1) flip/affine/elastic/deform.
+
+    capture=True additionally returns (grid, flips): the composed sampling grid (just
+    before grid_sample) and the per-volume flip record, for cascade COM inversion + replay.
+    """
     N = vols.shape[0]
     device = vols.device
     G = N // group_size                              # number of groups
     assert N % group_size == 0, f"N={N} must be divisible by group_size={group_size}"
     D, H, W = vols.shape[-3:]
 
-    # --- flips: one decision per group, per axis ---
+    # --- flips: one decision per group, per axis (ax_i 0,1,2 -> D,H,W) ---
     fp = cfg.flip
+    flip_rec = torch.zeros(G, 3, dtype=torch.bool, device=device)
     for g in range(G):
         sl = slice(g * group_size, (g + 1) * group_size)
-        for vol_dim, mask_dim, p in [(2, 1, fp.p_d), (3, 2, fp.p_h), (4, 3, fp.p_w)]:
+        for ax_i, (vol_dim, mask_dim, p) in enumerate(
+                [(2, 1, fp.p_d), (3, 2, fp.p_h), (4, 3, fp.p_w)]):
             if _rand(gen, device, 1).item() < p:
                 vols[sl] = vols[sl].flip(vol_dim)
                 masks[sl] = masks[sl].flip(mask_dim)
+                flip_rec[g, ax_i] = True
 
     # --- affine: one theta per group (built with the existing helper) ---
     ac = cfg.affine
@@ -295,6 +317,7 @@ def _geometric(vols, masks, group_size, cfg, gen):
                 sl = slice(g * group_size, (g + 1) * group_size)
                 grid[sl] = (grid[sl] + phi).clamp(-1.0, 1.0)
 
+    captured_grid = grid.detach().float().clone() if capture else None
     grid = grid.to(vols.dtype)
     vols = F.grid_sample(vols, grid, mode="bilinear", padding_mode="border",
                          align_corners=False)
@@ -307,7 +330,10 @@ def _geometric(vols, masks, group_size, cfg, gen):
     m = F.grid_sample(masks.unsqueeze(1).float(), grid, mode=mask_mode,
                       padding_mode="zeros", align_corners=False)
     m = m.squeeze(1)
-    return vols, (m.clamp(0.0, 1.0) if mask_soft else m.long())
+    out_masks = m.clamp(0.0, 1.0) if mask_soft else m.long()
+    if capture:
+        return vols, out_masks, captured_grid, flip_rec.repeat_interleave(group_size, dim=0)
+    return vols, out_masks
 
 
 class GpuAugmentor:
