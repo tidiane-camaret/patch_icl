@@ -28,5 +28,12 @@ data:
 train:
   cascade_loss_weights: [1.0, 1.0]
 
+eval:
+  # The cascade runs 2 forwards + a native-volume stitched-Dice per task, so val cost is
+  # ~2-3x the non-cascade pass. 3 (of 63 val classes) keeps eval under a few minutes; raise
+  # for a fuller generalization read once a run looks promising (exp57 used 20 = ~1260 tasks,
+  # which is ~30 min under the cascade).
+  tasks_per_class: 3
+
 wandb:
   name: 59_organs_cascade_from_scratch
