@@ -36,8 +36,8 @@ size-stalled small-organ regime (adrenals etc. are sub-cell at 3 mm — see
 | How is the level-i target crop produced? | Re-cropped **in the train loop** by calling `provider.load(..., center=predicted_COM, spacing=s_i)` directly — exact eval semantics. |
 | Geometric aug consistency across levels | One set of geometric params per task, **replayed** at every level; **full** flip/affine/elastic/deform support. The level-(i-1) predicted centre-of-mass is mapped back through the composed sampling grid to native voxels. |
 | Number of levels | General **N-level** loop (`data.cascade_spacings: [s0, s1, ...]`); ship + test with 2. |
-| Val loop | Also runs the cascade; reports per-level + stitched native Dice; checkpoint-selection metric becomes the stitched native Dice. |
-| Loss aggregation | `Σ wᵢ · loss_i`, weights configurable (`train.cascade_loss_weights`), single backward. |
+| Val loop | Also runs the cascade. Stitched native Dice composites **all** levels coarse→fine, each overwriting the previous. Logs `dice_r{s}` per level + `dice_stitched`; `dice_stitched` becomes the checkpoint-selection metric. |
+| Loss aggregation | `Σ wᵢ · loss_i`, weights configurable (`train.cascade_loss_weights`), single backward. Per-level metrics logged as `loss_r{s}` / `dice_r{s}`. |
 | Code structure | New `experiments/3d/cascade.py` module, shared by the train loop and the val loop. PatchSet3D.forward stays single-level. |
 | Config | **New** experiment yaml (`59_*`), exp57 left intact. |
 | Throughput | Accept the synchronous in-loop I/O for now; optimise after a first run. |
@@ -254,10 +254,11 @@ When `cfg.data.get("cascade_spacings")`:
 - `loss = sum(w_i * loss_fn(res.logits[i], res.targets[i]) for i in range(N))`;
   `loss.backward()`; optimiser + scheduler steps unchanged.
 - non-finite guard runs on the concatenation of all levels' logits.
-- logging: `train/loss_l{i}`, `train/dice_l{i}` (`_hard_dice` per level),
-  `train/cascade_empty_frac`. `train/loss` = summed loss; `train/dice` = finest level's
-  hard Dice (keeps the existing key meaningful). Grid metrics (`hard_sum`/`soft_sum`/
-  `cos_sum`) computed on the finest level only.
+- logging, keyed by the level's spacing (`{s:g}` mm), not the level index:
+  `train/loss_r{s}`, `train/dice_r{s}` (`_hard_dice` per level, e.g. `train/dice_r3`,
+  `train/dice_r1.5`), `train/cascade_empty_frac`. `train/loss` = summed loss; `train/dice`
+  = finest level's hard Dice (keeps the existing key meaningful). Grid metrics
+  (`hard_sum`/`soft_sum`/`cos_sum`) computed on the finest level only.
 - `profile_timing`: add a `recrop` bucket (perf_counter around the per-level provider
   loads) so the synchronous I/O cost is visible from day one.
 
@@ -273,14 +274,16 @@ Non-cascade path is untouched (the whole block is behind the `cascade_spacings` 
 - per batch: `run_cascade(..., training=False, augmentor=None, want_hard_preds=True)`
   (no aug ⇒ COM inversion == `_predicted_native_center`).
 - per class, aggregate:
-  - per-level native-res hard Dice → `val/dice_l{i}/<class>` and macro `val/dice_l{i}`.
-  - **stitched native Dice**: feed the per-(subj,cls) `(hard_pred, crop_geom)` of level 0
-    as `base_pg` and of the finest level as `over_pg` to `_stitched_native_dice` (extend to
-    fold in intermediate levels: apply them in coarse→fine order, each overwriting the
-    previous) → `val/dice_cascade/<class>` and macro `val/dice_cascade`.
-- `val/dice` (drives best-checkpoint saving) = macro `val/dice_cascade` when cascade is on.
+  - per-level native-res hard Dice → `val/dice_r{s}/<class>` and macro `val/dice_r{s}`
+    (`{s:g}` mm, e.g. `val/dice_r3`, `val/dice_r1.5`).
+  - **stitched native Dice**: composite every level's per-(subj,cls) `(hard_pred,
+    crop_geom)` into the native volume in **coarse→fine order, each level overwriting the
+    previous**, Dice vs `label.npy == class_idx` → `val/dice_stitched/<class>` and macro
+    `val/dice_stitched`. Generalise `_stitched_native_dice` from its current
+    `(base_pg, over_pg)` two-arg form to a list of per-level `pg` dicts applied in order.
+- `val/dice` (drives best-checkpoint saving) = macro `val/dice_stitched` when cascade is on.
 - seen/unseen macro split + `build_sample_table` derive from the stitched per-case Dice
-  (one `case` per (subj,cls) with `dice` = stitched value, plus `dice_l{i}` columns).
+  (one `case` per (subj,cls) with `dice` = stitched value, plus `dice_r{s}` columns).
 - soft-Dice / val-loss reporting: computed at the finest level (comparable scale note like
   the existing one in `validate_mean`).
 
@@ -347,10 +350,9 @@ exp57 stays exactly as it is.
    `subject` / `context_subjects` / `label_name`; it reads them from the batch dict, never
    re-samples. Asserted by construction (no rng class/subject draw in `run_cascade`).
 
-## Open questions for spec review
+## Resolved
 
-- Intermediate-level handling in the stitched native Dice: apply every level coarse→fine
-  (each overwrites the previous), or only level 0 + finest? Design assumes all levels,
-  coarse→fine.
-- `train/dice` and grid metrics reported at the finest level only — acceptable, or log all
-  levels? Design keeps finest for the headline key, `*_l{i}` for the rest.
+- Stitched native Dice composites **all** levels in coarse→fine order, each overwriting the
+  previous.
+- Logged metrics: `dice_r{s}` per level (`{s:g}` mm) and `dice_stitched`. `train/dice` and
+  the grid metrics stay at the finest level as the headline keys; `*_r{s}` carry the rest.
