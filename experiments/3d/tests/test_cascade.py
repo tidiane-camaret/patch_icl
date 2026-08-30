@@ -238,3 +238,56 @@ def test_train_epoch_cascade_smoke(monkeypatch):
     assert "loss_r3" in grid and "loss_r1.5" in grid
     assert "dice_r3" in grid and "dice_r1.5" in grid
     assert "cascade_empty_frac" in grid
+
+
+# ---------------------------------------------------------------------------
+# Task 8: evaluate_cascade
+# ---------------------------------------------------------------------------
+from cascade import evaluate_cascade
+
+
+def _named_batch(names, B=2, T=8):
+    b = _v2_batch(B=B, T=T)
+    b["label_names"] = list(names)
+    return b
+
+
+def test_evaluate_cascade_shapes_and_nan_safe_macro(tmp_path, monkeypatch):
+    """evaluate_cascade returns (rows, cases) shaped like evaluate_classes; every case carries
+    dice + per-spacing dice_r cols; a class absent from _ALL_CLASSES_IDX (all-NaN dice) yields
+    an `error` row, not a NaN mean_dice that would poison the checkpoint macro."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, T = 2, 8
+    idx = _ALL_CLASSES_IDX["liver"]
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = idx
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    model, prov = _FakeModel(G=4, hot=(1, 1, 1)), _FakeProvider(T=T)
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self):
+            return iter([_named_batch(["liver"] * B, B=B, T=T),
+                         _named_batch(["not_a_real_class"] * B, B=B, T=T)])
+        def __len__(self): return 2
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5]}})
+    rows, cases = evaluate_cascade(model, cfg, ["liver", "not_a_real_class"],
+                                   loader=_Loader(), seed=0, is_prob=False)
+
+    assert len(cases) == 2 * B
+    for c in cases:
+        assert set(("class", "subject", "dice", "dice_r3", "dice_r1.5")) <= set(c)
+
+    by_cls = {r["class"]: r for r in rows}
+    assert "mean_dice" in by_cls["liver"] and np.isfinite(by_cls["liver"]["mean_dice"])
+    assert "mean_dice" not in by_cls["not_a_real_class"]
+    assert by_cls["not_a_real_class"]["error"] == "no valid samples"

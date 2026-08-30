@@ -210,7 +210,6 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     N = len(spacings)
     _, root, _ = _source_root(cfg)
     pg_levels = [dict() for _ in range(N)]
-    per_res = defaultdict(dict)                      # (subj,cls) -> {s: native dice}
     order = []                                       # (subj,cls) in loader order
 
     model_net = getattr(model, "model", model)
@@ -231,20 +230,19 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
                 hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
                 geom = res.geoms[li][b].cpu().numpy()
                 pg_levels[li][key] = (np.packbits(hp), tuple(hp.shape), geom)
-            # per-resolution native dice = single-level stitch (that level alone)
-            for li, s in enumerate(spacings):
-                dl = _stitched_native_dice_multi([pg_levels[li]], root)
-                per_res[key][s] = float(dl.get(key, float("nan")))
 
+    # Score once after the loop: each key is stitched independently of arrival order, so the
+    # full cascade stitch and the per-level (per-resolution) stitches are order-invariant.
     stitched = _stitched_native_dice_multi(pg_levels, root)
+    per_res_by_level = [_stitched_native_dice_multi([pg_levels[li]], root) for li in range(N)]
 
     cases_by_class = defaultdict(list)
     for key in order:
         subj, cls = key
         case = {"class": cls, "subject": subj,
                 "dice": round(float(stitched.get(key, float("nan"))), 4)}
-        for s in spacings:
-            case[f"dice_r{s:g}"] = round(per_res[key].get(s, float("nan")), 4)
+        for li, s in enumerate(spacings):
+            case[f"dice_r{s:g}"] = round(float(per_res_by_level[li].get(key, float("nan"))), 4)
         cases_by_class[cls].append(case)
 
     rows, all_cases = [], []
@@ -253,8 +251,11 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
         all_cases.extend(cs)
         if not cs:
             rows.append({"class": cls, "error": "no samples"}); continue
+        dvals = [c["dice"] for c in cs if not np.isnan(c["dice"])]
+        if not dvals:
+            rows.append({"class": cls, "error": "no valid samples"}); continue
         row = {"class": cls,
-               "mean_dice": round(sum(c["dice"] for c in cs) / len(cs), 4),
+               "mean_dice": round(sum(dvals) / len(dvals), 4),
                "n_samples": len(cs)}
         for s in spacings:
             vals = [c[f"dice_r{s:g}"] for c in cs if not np.isnan(c[f"dice_r{s:g}"])]
