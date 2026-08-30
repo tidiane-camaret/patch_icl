@@ -1,0 +1,29 @@
+# @package _global_
+# 59_organs_cascade_from_scratch — exp57 + N-level coarse->fine cascade training.
+#
+#   python experiments/3d/train.py experiment=59_organs_cascade_from_scratch
+#
+# Two levels: predict at 3 mm (GT-centred), re-crop the target on the predicted
+# centre-of-mass, predict at 1.5 mm; independent weighted loss per level, single backward.
+# Geometric augmentation params are sampled once per task and replayed at both levels.
+# Val runs the same cascade; `val/dice` is the stitched native Dice (all levels composited
+# coarse->fine, each overwriting the previous). See
+# docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
+#
+# PRE-REQ: a per-spacing image cache `ct_raw_1.5mm.npy` (and `ct_raw_3mm.npy`) must exist
+# per subject dir, else the provider falls back to full-res ct_raw.npy per re-crop load.
+
+defaults:
+  - 57_organs_encoder_from_scratch
+  - _self_
+
+data:
+  crop_spacing_mm: 3            # == cascade_spacings[0]
+  cascade_spacings: [3, 1.5]    # coarse -> fine
+  cascade_crop_jitter: 0        # re-cropped levels respect the predicted COM exactly
+
+train:
+  cascade_loss_weights: [1.0, 1.0]
+
+wandb:
+  name: 59_organs_cascade_from_scratch
