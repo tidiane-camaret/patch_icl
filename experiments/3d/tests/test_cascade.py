@@ -104,3 +104,97 @@ def test_flip_then_grid_inversion_order():
     flips = torch.tensor([True, False, False])               # flip d only
     got = invert_geo_center(np.array([2.0, 3.0, 3.0]), grid_row, flips, geom, T)
     assert got == (2, 4, 4)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: run_cascade + _cascade_loss
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass as _dc
+
+from cascade import run_cascade, CascadeResult, _cascade_loss
+from src.incontext_dataset_v2 import LoadResult, LoadRequest
+
+
+class _FakeModel(torch.nn.Module):
+    """Returns a fixed low-res logit with all mass at one grid cell; records call spacings."""
+    spacing_aware = False
+
+    def __init__(self, G=4, hot=(1, 1, 1)):
+        super().__init__()
+        self.G, self.hot, self.seen_spacing = G, hot, []
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None):
+        self.seen_spacing.append(spacing)
+        B = image.shape[0]
+        lg = torch.full((B, 1, self.G, self.G, self.G), -10.0)
+        lg[:, :, self.hot[0], self.hot[1], self.hot[2]] = 10.0
+        lg = lg + self.p                                  # keep autograd alive
+        return {"final_logit": lg}
+
+
+class _FakeProvider:
+    """Records every load() call; returns synthetic T^3 crops."""
+    def __init__(self, T=8):
+        self.T, self.calls = T, []
+
+    def load(self, subject, cls, req: LoadRequest):
+        self.calls.append({"subject": subject, "cls": cls, "center": req.center,
+                           "spacing": req.crop_spacing_mm, "jitter": req.jitter})
+        T = self.T
+        geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+        return LoadResult(image=torch.zeros(1, T, T, T), label=torch.zeros(T, T, T),
+                          spacing=torch.full((3,), float(req.crop_spacing_mm)), crop_geom=geom)
+
+
+def _v2_batch(B=2, K=3, T=8):
+    geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+    return {
+        "image": torch.zeros(B, 1, T, T, T),
+        "label": torch.zeros(B, T, T, T),
+        "context_in": torch.zeros(B, K, 1, T, T, T),
+        "context_out": torch.zeros(B, K, T, T, T),
+        "subjects": [f"s{b}" for b in range(B)],
+        "context_subjects": [[f"c{b}_{k}" for k in range(K)] for b in range(B)],
+        "label_names": ["liver"] * B,
+        "crop_geom": geom.unsqueeze(0).repeat(B, 1, 1),
+        "aug_mode": torch.zeros(B, dtype=torch.long),
+    }
+
+
+def test_run_cascade_two_levels_no_aug():
+    B, T, G = 2, 8, 4
+    model, prov = _FakeModel(G=G, hot=(1, 1, 1)), _FakeProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=0, seed=0, jitter=0)
+    assert isinstance(res, CascadeResult)
+    assert len(res.logits) == 2 and len(res.targets) == 2
+    assert res.centers[0] == [None, None]
+    # level-1 target loads: center == inverted COM (identity geom + hot cell 1/G -> native),
+    # contexts loaded with center=None, spacing == 1.5, jitter == 0
+    tgt_calls = [c for c in prov.calls if c["center"] is not None]
+    ctx_calls = [c for c in prov.calls if c["center"] is None]
+    assert len(tgt_calls) == B and all(c["spacing"] == 1.5 for c in tgt_calls)
+    assert all(c["jitter"] == 0 for c in prov.calls)
+    assert len(ctx_calls) == B * 3
+    assert model.seen_spacing == [None] * (2)  # spacing_aware False -> None both levels
+    # loss aggregation helper
+    lf = lambda logit, target: (logit.float().mean() - target.float().mean()) ** 2
+    total, per = _cascade_loss(res, lf, [1.0, 2.0])
+    assert total.requires_grad and len(per) == 2
+
+
+def test_run_cascade_empty_prob_falls_back_to_gt_centroid():
+    B, T = 2, 8
+    model = _FakeModel(G=4)
+    # force an all-background logit -> empty prob -> center None
+    model.forward = lambda image, context_in, context_out, mode="train", spacing=None: {
+        "final_logit": torch.full((image.shape[0], 1, 4, 4, 4), -30.0) + model.p}
+    prov = _FakeProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=1, seed=0)
+    assert res.centers[1] == [None, None]
+    assert res.empty_frac == 1.0
+    assert all(c["center"] is None for c in prov.calls)  # every level-1 load GT-centred

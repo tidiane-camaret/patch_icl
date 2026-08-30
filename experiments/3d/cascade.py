@@ -62,3 +62,143 @@ def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
     native = [int(round(starts[a] + (g[a] - pad_lo[a]) / max(1, out_sizes[a]) * crop_sizes[a]))
               for a in range(3)]
     return tuple(max(0, c) for c in native)
+
+
+INT_OFFSET = 1_000_000  # keep intensity seeds clear of geo seeds across plausible step counts
+
+
+@dataclass
+class CascadeResult:
+    logits: list                  # per level: (B,1,G,G,G)
+    targets: list                 # per level: grid GT (target_like)
+    geoms: list                   # per level: (B,4,3) target crop_geom
+    centers: list                 # len N: centers[0] == [None]*B; centers[i] native COM|None per b
+    hard_preds: list | None       # per level: (B,T,T,T) binary; only when want_hard_preds
+    empty_frac: float             # fraction of (level>=1, b) COM inversions that hit the fallback
+
+
+def _gen(seed_int, device):
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed_int) & 0x7FFF_FFFF_FFFF_FFFF)
+    return g
+
+
+def _centroid_from_logit(logit_b1ghw, T, is_prob):
+    """Per-b prob-weighted centroid (d,h,w) in the T^3 grid, or None when empty.
+
+    logit upsampled to T^3 so the crop-geom affine (which assumes a T^3 prob) applies.
+    """
+    prob = logit_b1ghw.float().clamp(0, 1) if is_prob else torch.sigmoid(logit_b1ghw.float())
+    up = F.interpolate(prob, size=(T, T, T), mode="trilinear", align_corners=False)
+    out = []
+    for b in range(up.shape[0]):
+        out.append(_grid_centroid(up[b, 0].detach().cpu().numpy()))   # np(d,h,w) or None
+    return out
+
+
+def _to_device(batch, device):
+    for k in ("image", "label", "context_in", "context_out"):
+        batch[k] = batch[k].to(device, non_blocking=True)
+    return batch
+
+
+def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitter):
+    """Build one level-i v2 batch: target re-cropped on `centers[b]`, K contexts GT-centred,
+    same subjects/classes as level 0. Runs on the calling thread (synchronous provider I/O)."""
+    subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
+    items = []
+    for b in range(len(subs)):
+        tgt = provider.load(subs[b], clss[b], LoadRequest(
+            rng=random.Random(f"{seed}_{step}_{level}_{b}"), crop_spacing_mm=float(spacing),
+            center=centers[b], jitter=jitter))
+        cin, cout = [], []
+        for k, cs in enumerate(ctxs[b]):
+            r = provider.load(cs, clss[b], LoadRequest(
+                rng=random.Random(f"{seed}_{step}_{level}_{b}_{k}"), crop_spacing_mm=float(spacing),
+                center=None, jitter=jitter))
+            cin.append(r.image); cout.append(r.label)
+        items.append({
+            "image": tgt.image, "label": tgt.label,
+            "context_in": torch.stack(cin), "context_out": torch.stack(cout),
+            "subject": subs[b], "context_subjects": list(ctxs[b]),
+            "label_name": clss[b], "spacing": tgt.spacing,
+            "aug_mode": torch.tensor(0, dtype=torch.long), "crop_geom": tgt.crop_geom,
+        })
+    return incontext_collate_fn(items)
+
+
+def _forward_level(model, batch, spacing):
+    sp = float(spacing) if getattr(model, "spacing_aware", False) else None
+    out = model(batch["image"], context_in=batch["context_in"],
+                context_out=batch["context_out"], mode="train", spacing=sp)
+    return out["final_logit"].float()
+
+
+def _hard_pred_native(logit_b1ghw, T, is_prob):
+    prob = logit_b1ghw.float().clamp(0, 1) if is_prob else torch.sigmoid(logit_b1ghw.float())
+    up = F.interpolate(prob, size=(T, T, T), mode="trilinear", align_corners=False)
+    return (up >= 0.5).float().squeeze(1)                                 # (B,T,T,T)
+
+
+def run_cascade(model, provider, batch, augmentor, spacings, *, device, training,
+                step, seed, jitter=0, is_prob=False, want_hard_preds=False):
+    assert len(spacings) >= 2, "cascade needs >=2 spacings"
+    assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
+    N = len(spacings)
+    T = batch["image"].shape[-1]
+    B = batch["image"].shape[0]
+    geo_seed = seed * 1_000_003 + step
+
+    logits, targets, geoms = [], [], []
+    centers = [[None] * B]
+    hard = [] if want_hard_preds else None
+    empty_hits = empty_total = 0
+
+    cur = _to_device(dict(batch), device)
+    for i in range(N):
+        if i > 0:
+            cur = _recrop_level(provider, batch, centers[i], spacings[i],
+                                step=step, seed=seed, level=i, jitter=jitter)
+            cur = _to_device(cur, device)
+        capture = augmentor is not None and i < N - 1
+        if augmentor is not None:
+            cur, geo = augmentor.apply(
+                cur, geo_gen=_gen(geo_seed, device),
+                int_gen=_gen(geo_seed + INT_OFFSET * (i + 1), device), capture=capture)
+        else:
+            geo = None
+
+        logit = _forward_level(model, cur, spacings[i])
+        tgt = target_like(cur["label"].unsqueeze(1).float(), logit)
+        logits.append(logit); targets.append(tgt)
+        geoms.append(cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"])
+        if want_hard_preds:
+            hard.append(_hard_pred_native(logit, T, is_prob))
+
+        if i < N - 1:
+            cens = _centroid_from_logit(logit, T, is_prob)
+            row = []
+            for b in range(B):
+                empty_total += 1
+                if geo is not None and geo.grid is not None:
+                    gr = geo.grid.view(B, -1, T, T, T, 3)[b, 0]         # target = row 0 of task
+                    fl = geo.flips.view(B, -1, 3)[b, 0]
+                else:
+                    gr, fl = None, torch.zeros(3, dtype=torch.bool)
+                nc = invert_geo_center(cens[b], gr, fl, geoms[i][b], T)
+                if nc is None:
+                    empty_hits += 1
+                row.append(nc)
+            centers.append(row)
+
+    return CascadeResult(logits=logits, targets=targets, geoms=geoms, centers=centers,
+                         hard_preds=hard,
+                         empty_frac=(empty_hits / empty_total if empty_total else 0.0))
+
+
+def _cascade_loss(res: CascadeResult, loss_fn, weights):
+    """Sum_i w_i * loss_fn(logit_i, target_i). Returns (total, [per-level floats])."""
+    per = [loss_fn(res.logits[i], res.targets[i]) for i in range(len(res.logits))]
+    w = list(weights) if weights is not None else [1.0] * len(per)
+    total = sum(float(w[i]) * per[i] for i in range(len(per)))
+    return total, [float(p.detach()) for p in per]
