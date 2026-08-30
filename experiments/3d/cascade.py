@@ -196,6 +196,74 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                          empty_frac=(empty_hits / empty_total if empty_total else 0.0))
 
 
+def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
+    """v2 cascade val pass. Iterates the level-0 val `loader`, runs the N-level cascade with
+    no aug, and returns (rows, cases) shaped like evaluate.evaluate_classes: per class a
+    macro stitched-native Dice as `mean_dice`, plus per-spacing `dice_r{s:g}`.
+    """
+    from collections import defaultdict
+    import numpy as np
+    from common import _source_root                     # NOTE: _source_root lives in common.py
+    from evaluate import _stitched_native_dice_multi
+
+    spacings = [float(s) for s in cfg.data.cascade_spacings]
+    N = len(spacings)
+    _, root, _ = _source_root(cfg)
+    pg_levels = [dict() for _ in range(N)]
+    per_res = defaultdict(dict)                      # (subj,cls) -> {s: native dice}
+    order = []                                       # (subj,cls) in loader order
+
+    model_net = getattr(model, "model", model)
+    model_net.eval()
+    step = 0
+    for batch in loader:
+        with torch.no_grad():
+            res = run_cascade(model, loader.dataset.provider, batch, augmentor=None,
+                              spacings=spacings, device=next(model_net.parameters()).device,
+                              training=False, step=step, seed=seed, jitter=0,
+                              is_prob=is_prob, want_hard_preds=True)
+        step += 1
+        subs, clss = batch["subjects"], batch["label_names"]
+        for b in range(len(subs)):
+            key = (subs[b], clss[b])
+            order.append(key)
+            for li in range(N):
+                hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
+                geom = res.geoms[li][b].cpu().numpy()
+                pg_levels[li][key] = (np.packbits(hp), tuple(hp.shape), geom)
+            # per-resolution native dice = single-level stitch (that level alone)
+            for li, s in enumerate(spacings):
+                dl = _stitched_native_dice_multi([pg_levels[li]], root)
+                per_res[key][s] = float(dl.get(key, float("nan")))
+
+    stitched = _stitched_native_dice_multi(pg_levels, root)
+
+    cases_by_class = defaultdict(list)
+    for key in order:
+        subj, cls = key
+        case = {"class": cls, "subject": subj,
+                "dice": round(float(stitched.get(key, float("nan"))), 4)}
+        for s in spacings:
+            case[f"dice_r{s:g}"] = round(per_res[key].get(s, float("nan")), 4)
+        cases_by_class[cls].append(case)
+
+    rows, all_cases = [], []
+    for cls in list(classes) + [c for c in cases_by_class if c not in set(classes)]:
+        cs = cases_by_class.get(cls, [])
+        all_cases.extend(cs)
+        if not cs:
+            rows.append({"class": cls, "error": "no samples"}); continue
+        row = {"class": cls,
+               "mean_dice": round(sum(c["dice"] for c in cs) / len(cs), 4),
+               "n_samples": len(cs)}
+        for s in spacings:
+            vals = [c[f"dice_r{s:g}"] for c in cs if not np.isnan(c[f"dice_r{s:g}"])]
+            if vals:
+                row[f"dice_r{s:g}"] = round(sum(vals) / len(vals), 4)
+        rows.append(row)
+    return rows, all_cases
+
+
 def _cascade_loss(res: CascadeResult, loss_fn, weights):
     """Sum_i w_i * loss_fn(logit_i, target_i). Returns (total, [per-level floats])."""
     per = [loss_fn(res.logits[i], res.targets[i]) for i in range(len(res.logits))]

@@ -878,30 +878,40 @@ def _unpack_pred(entry):
     return np.unpackbits(packed)[:int(np.prod(shape))].reshape(shape).astype(bool), geom
 
 
+def _stitched_native_dice_multi(pg_levels, root):
+    """Dice on the full native volume: GT vs the composite of pg_levels applied
+    coarse->fine (list order), each level's per-(subj,cls) region overwriting the
+    previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
+    Returns {(subj,cls): dice} over the keys of the LAST level that also appear in
+    every earlier level. Generalises _stitched_native_dice."""
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+    if not pg_levels:
+        return {}
+    out = {}
+    for key in pg_levels[-1]:
+        subj, cls = key
+        idx = _ALL_CLASSES_IDX.get(cls)
+        if idx is None or any(key not in lvl for lvl in pg_levels):
+            continue
+        gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
+        native = np.zeros(gt.shape, dtype=bool)
+        for lvl in pg_levels:                                  # coarse -> fine, each overwrites
+            p, geom = _unpack_pred(lvl[key])
+            _write_native(native, p, geom)
+        inter = 2.0 * np.logical_and(native, gt).sum()
+        denom = int(native.sum()) + int(gt.sum())
+        out[key] = inter / denom if denom > 0 else 1.0
+    return out
+
+
 def _stitched_native_dice(base_pg, over_pg, root):
     """Dice on the full native volume of GT vs the stitched multi-scale prediction.
 
     Builds a native-resolution prediction from the coarse (`base_pg`) pass, then overwrites
     each sample's fine (`over_pg`) region on top (finer replaces coarser), and scores it
     against the native GT (label.npy == class index). `over_pg` empty -> coarse-only baseline.
-    Returns {(subj,cls): dice} over the keys in `over_pg` (or `base_pg` when `over_pg` empty)."""
-    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
-    keys = over_pg or base_pg
-    out = {}
-    for key in keys:
-        subj, cls = key
-        idx = _ALL_CLASSES_IDX.get(cls)
-        if idx is None or key not in base_pg:
-            continue
-        gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
-        native = np.zeros(gt.shape, dtype=bool)
-        bp, bgeom = _unpack_pred(base_pg[key]);  _write_native(native, bp, bgeom)
-        if key in over_pg:
-            op, ogeom = _unpack_pred(over_pg[key]);  _write_native(native, op, ogeom)
-        inter = 2.0 * np.logical_and(native, gt).sum()
-        denom = int(native.sum()) + int(gt.sum())
-        out[key] = inter / denom if denom > 0 else 1.0
-    return out
+    Thin wrapper over `_stitched_native_dice_multi` (numerically identical to the old body)."""
+    return _stitched_native_dice_multi([base_pg, over_pg] if over_pg else [base_pg], root)
 
 
 def _save_cascade_pair(coarse_cache, fine_cache, s_coarse, s_fine, out_dir):

@@ -711,7 +711,19 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     Reuses `loader` (built once in main) so the val dataset isn't rebuilt each epoch.
     Passing `logits_fn`/`loss_fn` adds val soft-Dice + val loss (from single-ROI logits,
     the training criterion on val). Returns (mean_dice, mean_soft_dice, mean_loss, rows, cases).
+
+    With `data.cascade_spacings` set, the N-level cascade val pass replaces the single-ROI
+    loop: `val/dice` := macro stitched-native Dice, and soft/loss are NaN (out of scope for
+    this first cut).
     """
+    if cfg.data.get("cascade_spacings"):
+        from cascade import evaluate_cascade
+        rows, cases = evaluate_cascade(
+            model, cfg, classes, loader=loader, seed=int(cfg.train.seed),
+            is_prob=model_output_is_prob(cfg))
+        valid = [r for r in rows if "mean_dice" in r]
+        mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
+        return mean_dice, float("nan"), float("nan"), rows, cases
     net = getattr(model, "model", model)
     net.eval()
     # NB: for patchset3d, train_forward returns NATIVE-res logits, so val/loss and
@@ -1114,6 +1126,12 @@ def main(cfg: DictConfig) -> None:
             log["val/dice_soft"] = val_soft
             log["val/loss"] = val_loss
             log.update({f"val/dice/{r['class']}": r["mean_dice"] for r in rows if "mean_dice" in r})
+            if cfg.data.get("cascade_spacings"):
+                for s in [float(x) for x in cfg.data.cascade_spacings]:
+                    vals = [r[f"dice_r{s:g}"] for r in rows if f"dice_r{s:g}" in r]
+                    if vals:
+                        log[f"val/dice_r{s:g}"] = sum(vals) / len(vals)
+                log["val/dice_stitched"] = val_dice     # == macro stitched (checkpoint metric)
             # Seen/unseen macro split. data.val_classes may deliberately hold classes the model
             # never trained on, as a generalization control (exp57: 8 trained + 8 held-out, each
             # size-matched to a trained class). REPORTING ONLY — val/dice above stays the plain
