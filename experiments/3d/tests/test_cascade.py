@@ -349,6 +349,92 @@ def test_run_cascade_query_prior_bad_mode_raises():
                     training=True, step=0, seed=0, query_prior="oracle")
 
 
+# --- cascade_query_prior mixture (per-step categorical draw) ------------------
+from cascade import _resolve_prior_spec, PriorSpec
+
+
+def test_resolve_prior_spec_scalar_is_single_mode():
+    assert _resolve_prior_spec("pred") == PriorSpec(("pred",), (1.0,), "pred")
+    assert _resolve_prior_spec(True) == PriorSpec(("pred",), (1.0,), "pred")
+    assert _resolve_prior_spec(False) == PriorSpec(("none",), (1.0,), "none")
+    assert _resolve_prior_spec(None) == PriorSpec(("none",), (1.0,), "none")
+
+
+def test_resolve_prior_spec_mixture_normalizes_gt_alias_and_keeps_weights():
+    spec = _resolve_prior_spec({"modes": ["pred", "none", "gt"], "p": [0.4, 0.4, 0.2]})
+    assert spec.modes == ("pred", "none", "gt_coarse")
+    assert spec.weights == (0.4, 0.4, 0.2)
+    assert spec.eval_mode == "pred"                       # pred present -> deployable default
+
+
+def test_resolve_prior_spec_uniform_when_p_omitted():
+    spec = _resolve_prior_spec({"modes": ["gt_coarse", "none"]})
+    assert spec.weights == (1.0, 1.0)
+    assert spec.eval_mode == "gt_coarse"                  # no pred -> highest weight (first on tie)
+
+
+def test_resolve_prior_spec_explicit_eval_mode():
+    spec = _resolve_prior_spec({"modes": ["pred", "none"], "p": [0.7, 0.3],
+                                "eval_mode": "none"})
+    assert spec.eval_mode == "none"
+
+
+@pytest.mark.parametrize("bad", [
+    {"modes": ["pred", "oracle"]},                        # unknown mode
+    {"modes": ["pred", "none"], "p": [0.5, 0.5, 0.5]},    # p / modes length mismatch
+    {"modes": ["pred", "none"], "p": [0.0, 0.0]},         # zero-sum weights
+    {"modes": []},                                        # empty
+    {"p": [1.0]},                                         # no modes key
+    {"modes": ["pred", "none"], "eval_mode": "gt_fine"},  # eval_mode not in modes
+])
+def test_resolve_prior_spec_rejects_bad(bad):
+    with pytest.raises(ValueError):
+        _resolve_prior_spec(bad)
+
+
+def test_run_cascade_mixture_per_step_draw_is_deterministic_and_populates_used():
+    B, T = 2, 8
+    spec = {"modes": ["gt_fine", "none"], "p": [0.5, 0.5]}
+    seen = []
+    for step in range(12):
+        m = _PriorSpyModel(G=4)
+        res = run_cascade(m, _LabelProvider(T=T), _labeled_batch(B=B, T=T), augmentor=None,
+                          spacings=[3.0, 1.5], device=torch.device("cpu"),
+                          training=True, step=step, seed=0, query_prior=spec)
+        assert res.prior_modes_used[0] is None
+        mode = res.prior_modes_used[1]
+        assert mode in ("gt_fine", "none")
+        # the recorded mode matches what the model actually received
+        assert (m.priors[1] is None) == (mode == "none")
+        seen.append(mode)
+        # same (seed, step) -> same draw
+        res2 = run_cascade(_PriorSpyModel(G=4), _LabelProvider(T=T), _labeled_batch(B=B, T=T),
+                           augmentor=None, spacings=[3.0, 1.5], device=torch.device("cpu"),
+                           training=True, step=step, seed=0, query_prior=spec)
+        assert res2.prior_modes_used[1] == mode
+    assert set(seen) == {"gt_fine", "none"}               # both modes exercised over 12 steps
+
+
+def test_run_cascade_mixture_eval_uses_eval_mode_every_step():
+    B, T = 2, 8
+    spec = {"modes": ["gt_fine", "none"], "p": [0.5, 0.5], "eval_mode": "gt_fine"}
+    for step in range(6):
+        m = _PriorSpyModel(G=4)
+        res = run_cascade(m, _LabelProvider(T=T), _labeled_batch(B=B, T=T), augmentor=None,
+                          spacings=[3.0, 1.5], device=torch.device("cpu"),
+                          training=False, step=step, seed=0, query_prior=spec)
+        assert res.prior_modes_used == [None, "gt_fine"]
+        assert m.priors[1] is not None
+
+
+@pytest.mark.parametrize("qp,want", [("pred", "pred"), (False, "none"), (True, "pred")])
+def test_run_cascade_prior_modes_used_scalar_path(qp, want):
+    res = run_cascade(_PriorSpyModel(G=4), _LabelProvider(T=8), _labeled_batch(B=2, T=8),
+                      augmentor=None, spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=0, seed=0, query_prior=qp)
+    assert res.prior_modes_used == [None, want]
+
+
 def test_run_cascade_empty_prob_falls_back_to_gt_centroid():
     B, T = 2, 8
     model = _FakeModel(G=4)

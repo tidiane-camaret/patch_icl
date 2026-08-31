@@ -1,5 +1,62 @@
 # Change log
 
+## 2026-08-31 — totalsegmri per-spacing image caches + cascade cache-warning fix
+
+**Built** `ct_raw_{6,3,1.5}mm.npy` for all 616 `totalsegmri` subjects
+(`scripts/convert_to_npy.py --data <totalsegmri> --modality mri --source totalseg
+--target-spacing {6,3,1.5} --workers 24`; ~13 GB total). Before this the cascade re-crop
+loads (`data.source=totalsegmri data.cascade_spacings=[6,3,1.5]`) fell back to the full-res
+`ct_raw.npy` (512×512×~76 MRI) + on-the-fly resample every level. Benchmarked on the
+exp59/exp67 config (B=4, K=1, 128³, Blackwell RTX PRO 6000): steady step ~2.4 s → ~1.9 s
+(**~25–30 % faster epoch**), plus the documented ~100 s/val-pass fallback removed. Worker
+sweeps (`train.workers` 8/12/16, `cascade_recrop_workers` 8/16/32, `OMP_NUM_THREADS` 4/48)
+all landed within node noise once cached — the step is GPU-compute-bound on the
+transformer (e=768/h=3072/a=12 × 3 cascade levels). `train.batch_size` 6 and 8 both OOM at
+128³. Suggested sbatch for this job: `--cpus-per-task=24 --mem=64G`, `train.workers=12
+eval.workers=8 cascade_recrop_workers=12`.
+
+**Fixed** `train.py`'s cascade cache-presence warning: it globbed `cfg.paths.totalseg`
+unconditionally, so `data.source=totalsegmri` runs always warned "no ct_raw_1.5mm.npy image
+cache" even when the caches exist under `paths.totalsegmri`. Now uses
+`_source_root(cfg)[1]` (the root the provider actually reads).
+
+## 2026-08-31 — cascade_query_prior mixture (per-step categorical draw)
+
+**Motivation:** `data.cascade_query_prior` was a single fixed mode for the whole run, so
+you couldn't train a prior-injection curriculum / dropout (e.g. mostly `pred`, sometimes
+`none` so the fine level stays robust when the coarse seg is empty, sometimes `gt_coarse`
+as a clean-prior signal).
+
+**What changed** (`experiments/3d/cascade.py`): `data.cascade_query_prior` now also
+accepts a mapping
+
+```yaml
+cascade_query_prior:
+  modes: [pred, none, gt]     # `gt` is an alias for gt_coarse
+  p:     [0.4,  0.4,  0.2]    # optional; omitted → uniform
+  eval_mode: pred             # optional; default = pred if listed, else the max-weight mode
+```
+
+`_resolve_prior_spec()` normalizes both the scalar and the mapping into a `PriorSpec`
+(`modes`, `weights`, `eval_mode`). In `run_cascade`, each level > 0 draws **one** mode per
+`(seed, step, level)` from the categorical when `training=True`, and always uses
+`eval_mode` when `training=False` — so `val/dice` and `infer_nifti` stay deterministic and
+epoch-comparable. The draw is per-step (whole batch shares the mode); `none` keeps the
+model's support-mean-occupancy fallback (a zero prior tensor is *not* the same thing, so a
+per-sample mix within one forward was deliberately not attempted). `CascadeResult` gains
+`prior_modes_used` (len N, `[0]=None`); `train_epoch` logs `cascade_prior_frac/{mode}`.
+
+**Back-compat:** a scalar `cascade_query_prior` (`none|pred|gt_coarse|gt_fine`, bool) is
+unchanged — it resolves to a single-mode spec, train == eval as before.
+`_assert_cascade_supported` (`common.py`) validates the mapping form (unknown mode,
+`p`/`modes` length, zero-sum weights, `eval_mode ∉ modes`). `eval.py` prints the resolved
+mixture + eval_mode and stores a plain-dict copy in the wandb run config.
+
+**Verification:** `experiments/3d/tests/test_cascade.py` (+7 tests: spec normalization,
+`gt` alias, uniform-p default, explicit `eval_mode`, bad-mapping rejection, per-step draw
+determinism + `prior_modes_used`, eval uses `eval_mode`) and `test_cascade_guard.py` (+2).
+Full `experiments/3d/tests/` suite: 108 passed, 1 skipped.
+
 ## 2026-08-30 — N-level coarse→fine cascade training for PatchSet3D (v2 pipeline)
 
 **Motivation:** eval already runs a coarse→fine cascade (predict at r1, re-crop the

@@ -80,3 +80,14 @@ def test_warns_non_descending_spacings():
 def test_warns_equal_adjacent_spacings():
     with pytest.warns(UserWarning, match="coarse->fine"):
         _assert_cascade_supported(_cfg(data={"cascade_spacings": [3, 3], "crop_spacing_mm": 3}))
+
+
+def test_accepts_query_prior_mixture():
+    _assert_cascade_supported(_cfg(data={"cascade_query_prior":
+                                         {"modes": ["pred", "none", "gt"], "p": [0.4, 0.4, 0.2]}}))
+
+
+def test_rejects_query_prior_bad_mixture():
+    with pytest.raises(ValueError, match="cascade_query_prior"):
+        _assert_cascade_supported(_cfg(data={"cascade_query_prior":
+                                             {"modes": ["pred", "oracle"]}}))

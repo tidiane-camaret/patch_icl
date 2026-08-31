@@ -278,7 +278,10 @@ def main(cfg: DictConfig) -> None:
                 # v2 coarse->fine cascade eval (cascade.evaluate_cascade).
                 "cascade_spacings": (list(cfg.data.cascade_spacings)
                                      if cfg.data.get("cascade_spacings") else None),
-                "cascade_query_prior": cfg.data.get("cascade_query_prior"),
+                "cascade_query_prior": OmegaConf.to_container(
+                    cfg.data.get("cascade_query_prior"), resolve=True)
+                    if OmegaConf.is_config(cfg.data.get("cascade_query_prior"))
+                    else cfg.data.get("cascade_query_prior"),
                 "cascade_query_prior_hard": cfg.data.get("cascade_query_prior_hard"),
                 "hydra_choices": dict(HydraConfig.get().runtime.choices)},
     )
@@ -322,9 +325,12 @@ def main(cfg: DictConfig) -> None:
                              "with eval.spacing_sweep / spacing_locator / spacing_cascade.")
         _assert_cascade_supported(cfg)
         spacings = [float(s) for s in cfg.data.cascade_spacings]
-        qp = cfg.data.get("cascade_query_prior", False)
+        from cascade import _resolve_prior_spec
+        _pspec = _resolve_prior_spec(cfg.data.get("cascade_query_prior", False))
+        qp = _pspec.eval_mode if len(_pspec.modes) == 1 else (
+            f"{list(_pspec.modes)}~{list(_pspec.weights)} -> eval_mode={_pspec.eval_mode}")
         qp_hard = " (hard)" if cfg.data.get("cascade_query_prior_hard") else ""
-        print(f"  v2 cascade eval: {spacings} mm  query_prior={qp!r}{qp_hard}  "
+        print(f"  v2 cascade eval: {spacings} mm  query_prior={qp}{qp_hard}  "
               f"split={cfg.eval.split}  recrop_workers={cfg.data.get('cascade_recrop_workers', 16)}\n")
         loader = make_eval_loader(cfg, classes, split=cfg.eval.split)
         rows, all_cases = evaluate_cascade(

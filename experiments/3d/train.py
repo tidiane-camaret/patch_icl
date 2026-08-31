@@ -483,6 +483,7 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # the mean empty-COM fallback fraction. Empty ({}) / [0.0] on the non-cascade path -> the
     # end-of-epoch merge below is skipped, so the single-forward path is unaffected.
     _c_loss_acc, _c_dice_acc, _c_empty_acc = {}, {}, [0.0]
+    _c_prior_acc = {}                      # query_prior mode -> #levels drawn (cascade mixture)
     # Optional per-phase timing: data-wait (perf_counter between steps) + image-encode and
     # attention GPU time (CUDA events on net.encoder / net.transformer, each called once per
     # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
@@ -559,6 +560,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 _c_dice_acc[f"dice_r{sp:g}"] += _hard_dice(
                     res.logits[si].float(), res.targets[si], is_prob)
             _c_empty_acc[0] += res.empty_frac
+            for _m in (res.prior_modes_used or [])[1:]:     # level 0 has no prior
+                _c_prior_acc[_m] = _c_prior_acc.get(_m, 0) + 1
             if prof:
                 prof_items += batch["image"].shape[0]     # per-item = per-step ÷ batch size
                 tsum.setdefault("recrop", 0.0)
@@ -659,6 +662,9 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         for k, v in _c_dice_acc.items():
             grid[k] = v / n
         grid["cascade_empty_frac"] = _c_empty_acc[0] / n
+        _pt = sum(_c_prior_acc.values())
+        for _m, _cnt in _c_prior_acc.items():
+            grid[f"cascade_prior_frac/{_m}"] = _cnt / max(_pt, 1)
     if prof and n:
         pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
         bs = prof_items / n                            # avg batch size
@@ -886,7 +892,8 @@ def main(cfg: DictConfig) -> None:
     loader = train_loader(cfg)
     if cfg.data.get("cascade_spacings"):
         import warnings
-        _sd = next(iter(sorted(Path(cfg.paths.totalseg).glob("s*"))), None)
+        _cache_root = _source_root(cfg)[1]     # the source the provider actually reads (totalsegmri etc.), not always paths.totalseg
+        _sd = next(iter(sorted(Path(_cache_root).glob("s*"))), None)
         for _s in cfg.data.cascade_spacings:
             if _sd is not None and not (_sd / f"ct_raw_{float(_s):g}mm.npy").exists():
                 warnings.warn(
@@ -1141,6 +1148,12 @@ def main(cfg: DictConfig) -> None:
         if len(optimizers) > 1:           # Muon: flat unless train.muon_scheduled
             log["train/lr_muon"] = optimizers[1].param_groups[0]["lr"]
         log.update({f"train/{k}": v for k, v in tr_grid.items()})
+        if cfg.train.get("profile_timing") and any(k.startswith("time/") for k in tr_grid):
+            _steps = max(len(loader), 1)
+            _tk = " ".join(f"{k.split('/', 1)[1]}={tr_grid[k]:.1f}"
+                           for k in sorted(tr_grid) if k.startswith("time/"))
+            tqdm.write(f"  [e{epoch}] epoch={log['time/epoch_s']:.1f}s "
+                       f"steps/s={_steps / max(log['time/epoch_s'], 1e-6):.2f}  {_tk}")
         if drift:
             log.update(drift.read())
 

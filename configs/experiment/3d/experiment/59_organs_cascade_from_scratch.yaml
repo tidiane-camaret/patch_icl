@@ -31,7 +31,15 @@ data:
   #   pred       sigmoid(logit_{i-1}) detached — the real cascade
   #   gt_coarse  level i-1's GT warped — perfect-coarse-seg ceiling (eval is an oracle number)
   #   gt_fine    level i's own GT — perfect-prior ceiling (eval is an oracle number)
-  # Eval uses the SAME mode as train, so gt_* runs report ceilings, not deployable Dice.
+  #   none       no prior — the model falls back to its support-mean occupancy prior
+  # A single mode string keeps train == eval. A mapping instead draws one mode per level>0
+  # per training step from a categorical (prior-injection curriculum / dropout); `gt` is an
+  # alias for gt_coarse. `eval_mode` (default: pred if listed, else the highest-weight mode)
+  # is the one deterministic mode the val/infer cascade runs, so val Dice stays comparable:
+  #   cascade_query_prior:
+  #     modes: [pred, none, gt]
+  #     p:     [0.4,  0.4,  0.2]   # optional; omitted -> uniform
+  #     eval_mode: pred            # optional
   cascade_query_prior: pred
   cascade_query_prior_hard: false     # threshold the prior at 0.5 before the mask embed
 

@@ -81,6 +81,8 @@ class CascadeResult:
     empty_frac: float             # fraction of (level>=1, b) COM inversions that hit the fallback
     figure_levels: list | None = None  # per level: {img,gt,ctx_img,ctx_gt} (B,T,T,T) np; only
     #                                    when want_figure_arrays (post-aug target + 1st context)
+    prior_modes_used: list | None = None  # len N: [0]=None; [i>0]=query_prior mode this level
+    #                                       actually ran (a fixed mode, or the per-step draw)
 
 
 def _gen(seed_int, device):
@@ -279,6 +281,7 @@ def _warp_prior_cropgeom(vol_src, cg_src, cg_dst, T):
 
 
 _PRIOR_MODES = ("none", "pred", "gt_coarse", "gt_fine")
+_GT_ALIAS = {"gt": "gt_coarse"}                            # `gt` shorthand -> coarse-seg prior
 
 
 def _prior_mode(query_prior):
@@ -291,6 +294,69 @@ def _prior_mode(query_prior):
     if m not in _PRIOR_MODES:
         raise ValueError(f"cascade_query_prior={query_prior!r} not in {_PRIOR_MODES}")
     return m
+
+
+@dataclass(frozen=True)
+class PriorSpec:
+    """Resolved data.cascade_query_prior. A scalar mode -> a single-mode spec; a
+    mapping ``{modes: [...], p: [...], eval_mode: ...}`` -> a categorical mixture drawn
+    once per level>0 per training step. `eval_mode` is the deterministic mode used when
+    training=False (so val Dice stays comparable across epochs)."""
+    modes: tuple
+    weights: tuple
+    eval_mode: str
+
+
+def _norm_mode(m):
+    """`gt` -> `gt_coarse`; validate against _PRIOR_MODES."""
+    m = _GT_ALIAS.get(str(m), str(m))
+    if m not in _PRIOR_MODES:
+        raise ValueError(f"cascade_query_prior mode {m!r} not in {_PRIOR_MODES} (or 'gt')")
+    return m
+
+
+def _resolve_prior_spec(query_prior) -> PriorSpec:
+    """Normalize data.cascade_query_prior into a PriorSpec.
+
+    Accepts the historical scalar (bool | None | 'none'|'pred'|'gt_coarse'|'gt_fine') and a
+    mapping form for a per-step random mixture:
+        cascade_query_prior:
+          modes: [pred, none, gt]     # `gt` == gt_coarse
+          p:     [0.4,  0.4,  0.2]    # optional; omitted -> uniform
+          eval_mode: pred             # optional; default = pred if in modes, else max-weight
+    """
+    if query_prior is None or isinstance(query_prior, (bool, str)):
+        m = _prior_mode(query_prior)
+        return PriorSpec((m,), (1.0,), m)
+    # mapping (plain dict or OmegaConf DictConfig) — duck-typed to avoid an omegaconf import.
+    if not hasattr(query_prior, "get") or "modes" not in query_prior:
+        raise ValueError(
+            f"cascade_query_prior={query_prior!r}: expected a mode string "
+            f"({'|'.join(_PRIOR_MODES)}), a bool, or a mapping with a 'modes' list.")
+    modes = tuple(_norm_mode(x) for x in query_prior["modes"])
+    if not modes:
+        raise ValueError("cascade_query_prior.modes is empty")
+    p = query_prior.get("p", None)
+    if p is None:
+        weights = tuple(1.0 for _ in modes)
+    else:
+        weights = tuple(float(x) for x in p)
+        if len(weights) != len(modes):
+            raise ValueError(f"cascade_query_prior.p (len {len(weights)}) must match "
+                             f".modes (len {len(modes)})")
+    if any(w < 0 for w in weights) or sum(weights) <= 0:
+        raise ValueError(f"cascade_query_prior.p={list(weights)} must be non-negative with "
+                         f"a positive sum")
+    em = query_prior.get("eval_mode", None)
+    if em is not None:
+        em = _norm_mode(em)
+        if em not in modes:
+            raise ValueError(f"cascade_query_prior.eval_mode={em!r} must be one of "
+                             f".modes {list(modes)}")
+    else:
+        em = ("pred" if "pred" in modes
+              else modes[max(range(len(weights)), key=weights.__getitem__)])
+    return PriorSpec(modes, weights, em)
 
 
 def _build_query_prior(mode, hard, prev_logit, prev_label, cur_label,
@@ -337,10 +403,11 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     T = batch["image"].shape[-1]
     B = batch["image"].shape[0]
     geo_seed = seed * 1_000_003 + step
-    prior_mode = _prior_mode(query_prior)
+    prior_spec = _resolve_prior_spec(query_prior)
 
     logits, targets, geoms = [], [], []
     centers = [[None] * B]
+    prior_modes_used = [None]                                 # per level (index 0 = level 0)
     hard = [] if want_hard_preds else None
     figs = [] if want_figure_arrays else None
     empty_hits = empty_total = 0
@@ -362,11 +429,22 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             geo = None
 
         prior = None
-        if prior_mode != "none" and i > 0 and prev_logit is not None:
-            cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
-            prior = _build_query_prior(prior_mode, bool(query_prior_hard), prev_logit,
-                                       prev_label, cur["label"], prev_geo, geoms[i - 1],
-                                       cg_cur, T, is_prob)
+        if i > 0:
+            # One mode per level>0: a fixed spec runs its single mode; a mixture draws once
+            # per (seed, step, level) at train time and uses eval_mode at eval time.
+            if len(prior_spec.modes) == 1:
+                mode_i = prior_spec.modes[0]
+            elif training:
+                mode_i = random.Random(f"{seed}_{step}_{i}_qprior").choices(
+                    prior_spec.modes, weights=prior_spec.weights, k=1)[0]
+            else:
+                mode_i = prior_spec.eval_mode
+            prior_modes_used.append(mode_i)
+            if mode_i != "none" and prev_logit is not None:
+                cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
+                prior = _build_query_prior(mode_i, bool(query_prior_hard), prev_logit,
+                                           prev_label, cur["label"], prev_geo, geoms[i - 1],
+                                           cg_cur, T, is_prob)
 
         logit = _forward_level(model, cur, spacings[i], query_prior=prior)
         tgt = target_like(cur["label"].unsqueeze(1).float(), logit)
@@ -403,7 +481,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     return CascadeResult(logits=logits, targets=targets, geoms=geoms, centers=centers,
                          hard_preds=hard,
                          empty_frac=(empty_hits / empty_total if empty_total else 0.0),
-                         figure_levels=figs)
+                         figure_levels=figs, prior_modes_used=prior_modes_used)
 
 
 def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,

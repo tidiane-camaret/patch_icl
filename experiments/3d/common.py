@@ -227,9 +227,14 @@ def _assert_cascade_supported(cfg) -> None:
         raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
                          f"data.cascade_spacings (len {len(spacings)}).")
     qp = d.get("cascade_query_prior", False)
-    if qp not in (True, False, None, "none", "pred", "gt_coarse", "gt_fine"):
-        raise ValueError(f"data.cascade_query_prior={qp!r} must be one of "
-                         f"none|pred|gt_coarse|gt_fine (bool also accepted).")
+    from cascade import _resolve_prior_spec   # lazy: only when a cascade config is present
+    try:
+        _resolve_prior_spec(qp)
+    except (ValueError, TypeError, KeyError) as e:
+        raise ValueError(
+            f"data.cascade_query_prior={qp!r} invalid: {e}. Expected a mode string "
+            f"(none|pred|gt_coarse|gt_fine, bool accepted) or a mapping "
+            f"{{modes: [...], p: [...], eval_mode: ...}} for a per-step mixture.") from e
 
 
 def build_dataset(cfg, split: str):
