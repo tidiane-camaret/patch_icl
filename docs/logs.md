@@ -6502,3 +6502,19 @@ missing on this node, used a Python mirror with the same include/exclude/--delet
 +0.0402, matching the dev-env numbers. NOTE: the env's torch (2.12.1+cu130, kernels
 sm_50..sm_90) has no Blackwell sm_120 kernel — had to force CPU (CUDA_VISIBLE_DEVICES="")
 on this node; the env is meant for Ampere.
+
+## 2026-08-31 — train.val_split config knob (+ empty val-loader guard)
+
+train.py hard-coded split="val" for the training-time validation loop. data.source=totalsegmri
+ships only train/test splits (meta.csv: 561 train / 55 test, 0 val), so the v2 eval provider
+returned 0 subjects -> empty val loader -> validate_mean returned nan for dice/soft/loss and
+val/samples was an empty table, silently, for the whole run.
+
+- configs/experiment/3d/train.yaml: new `train.val_split: val`.
+- train.py main(): builds val_loader with `cfg.train.get("val_split", "val")`; raises
+  RuntimeError if `len(val_loader.dataset) == 0` (names the source/split, tells you to set
+  train.val_split=test).
+- validate_mean(): threads the same val_split into `_self_context` + `evaluate_classes`.
+
+Verified on totalsegmri: val_split=val -> len(dataset)=0 (guard fires); val_split=test ->
+len(dataset)=150 (50 classes x 3 tasks). 91 passed / 1 skipped in experiments/3d/tests.

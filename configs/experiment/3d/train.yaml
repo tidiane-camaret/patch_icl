@@ -20,6 +20,10 @@ train:
   workers: 8
   seed: 42
   eval_every: 1
+  # Split the training-time validation loop runs on. Defaults to "val"; set to "test"
+  # for sources whose meta.csv has no val split (e.g. data.source=totalsegmri, which
+  # ships only train/test) — otherwise the val loader is empty and val_dice is nan.
+  val_split: val
   grad_clip: 1.0
   # Per-step wall-clock breakdown (patchset3d, CUDA): logs train/time/{data,encode,attn}_ms
   # (data-wait, image-encode, attention). CUDA events on encoder/transformer; ~free (loop

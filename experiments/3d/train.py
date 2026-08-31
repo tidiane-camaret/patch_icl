@@ -752,9 +752,10 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # Cross-subject-only aggregation when eval self-context is off: p.eval=0 still lets the
     # context sampler fall back to self-cloning for candidate-less classes (leakage-inflated),
     # so drop those self_ctx rows from the reported means. p.eval>0 = intentional probe, keep.
-    sc_eval_p, *_ = _self_context(eval_cfg(cfg).data, "val")
+    val_split = cfg.train.get("val_split", "val")
+    sc_eval_p, *_ = _self_context(eval_cfg(cfg).data, val_split)
     drop_self_ctx = sc_eval_p == 0.0
-    rows, cases = evaluate_classes(model, cfg, classes, split="val", loader=loader,
+    rows, cases = evaluate_classes(model, cfg, classes, split=val_split, loader=loader,
                                    logits_fn=model.train_forward, loss_fn=loss_fn,
                                    grid_res=getattr(model, "grid_size", None),
                                    output_is_prob=model_output_is_prob(cfg),
@@ -892,7 +893,13 @@ def main(cfg: DictConfig) -> None:
                     f"cascade: no ct_raw_{float(_s):g}mm.npy image cache — provider falls back "
                     f"to full-res ct_raw.npy per re-crop load (slow: ~+0.3 s/step, ~100 s/val). "
                     f"Build the per-spacing caches to remove it.")
-    val_loader = make_eval_loader(vcfg, val_classes, split="val")  # built once, reused every eval
+    val_split = cfg.train.get("val_split", "val")
+    val_loader = make_eval_loader(vcfg, val_classes, split=val_split)  # built once, reused every eval
+    if len(val_loader.dataset) == 0:
+        raise RuntimeError(
+            f"val loader is empty: source={vcfg.data.get('source')!r} has no "
+            f"{val_split!r} split (or no subjects for val_classes). Set "
+            f"train.val_split to an existing split (e.g. test).")
     model, model_name = build_model(cfg)
     is_patchset = model_name == "patchset3d"
     net = getattr(model, "model", model)

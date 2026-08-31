@@ -264,7 +264,10 @@ def resolve_classes(
     Special string values (CT by default; pass ``is_mri=True`` for MRI variants):
       ``"benchmark"``     → BENCHMARK_CLASSES / MRI_BENCHMARK_CLASSES
       ``"not_benchmark"`` → ALL_CLASSES[:117] / MRI_ALL_CLASSES minus the benchmark set
-      ``"balanced"``      → BALANCED_CLASSES (CT only — thickness/category-balanced train set)
+      ``"balanced"``      → BALANCED_CLASSES (thickness/category-balanced train set); with
+                            ``is_mri=True`` it is intersected with MRI_ALL_CLASSES (30 CT-only
+                            members — lung lobes, per-level vertebrae, individual ribs, head/neck
+                            vessels — are dropped, leaving 31 TotalSegMRI-available classes)
       ``"not_balanced"``  → ALL_CLASSES[:117] minus the balanced set (the graded OOD pool)
       ``"ts_organs"`` / ``"ts_vertebrae"`` / ``"ts_cardiac"`` / ``"ts_muscles"`` / ``"ts_ribs"``
                           → the verbatim class list of one TotalSegmentator `total` part model
@@ -315,7 +318,14 @@ def resolve_classes(
         return [c for c in ALL_CLASSES[:117] if c not in bench_set]
 
     if value == "balanced":
-        return list(BALANCED_CLASSES)  # CT only; MRI has no balanced split defined
+        if is_mri:
+            # BALANCED_CLASSES is a CT construction; on MRI keep only the members that exist
+            # in TotalSegMRI (drops lung lobes, per-level vertebrae, individual ribs and the
+            # head/neck vessels — 30 classes — leaving 31). The graded-OOD complement from
+            # balanced_ood_tiers() is CT-only and does not apply here.
+            mri = set(MRI_ALL_CLASSES)
+            return [c for c in BALANCED_CLASSES if c in mri]
+        return list(BALANCED_CLASSES)
 
     if value == "not_balanced":
         bal_set = set(BALANCED_CLASSES)
