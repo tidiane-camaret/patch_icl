@@ -24,6 +24,16 @@ data:
   crop_spacing_mm: 3            # == cascade_spacings[0]
   cascade_spacings: [3, 1.5]    # coarse -> fine
   cascade_crop_jitter: 0        # re-cropped levels respect the predicted COM exactly
+  cascade_recrop_workers: 16    # thread-pool the B*(K+1) re-crop loads per level>0 (0/1 = serial)
+  # Feed level i-1's mask (not just its COM) to level i as the query's mask-token prior,
+  # resampled onto level i's augmented grid (M2 affine warp; see cascade.py::_warp_prior_m2
+  # and results/3d/query_prior_injection/). Modes (default none):
+  #   pred       sigmoid(logit_{i-1}) detached — the real cascade
+  #   gt_coarse  level i-1's GT warped — perfect-coarse-seg ceiling (eval is an oracle number)
+  #   gt_fine    level i's own GT — perfect-prior ceiling (eval is an oracle number)
+  # Eval uses the SAME mode as train, so gt_* runs report ceilings, not deployable Dice.
+  cascade_query_prior: pred
+  cascade_query_prior_hard: false     # threshold the prior at 0.5 before the mask embed
 
 train:
   cascade_loss_weights: [1.0, 1.0]

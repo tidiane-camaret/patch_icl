@@ -113,7 +113,9 @@ def test_flip_then_grid_inversion_order():
 # ---------------------------------------------------------------------------
 from dataclasses import dataclass as _dc
 
-from cascade import run_cascade, CascadeResult, _cascade_loss
+import threading
+
+from cascade import run_cascade, CascadeResult, _cascade_loss, _recrop_level
 from src.incontext_dataset_v2 import LoadResult, LoadRequest
 
 
@@ -258,6 +260,95 @@ def test_run_cascade_two_levels_no_aug():
     assert total.requires_grad and len(per) == 2
 
 
+class _PriorSpyModel(torch.nn.Module):
+    """Records the query_prior tensor it receives per level; otherwise a fixed hot-cell logit."""
+    spacing_aware = False
+
+    def __init__(self, G=4, hot=(1, 1, 1)):
+        super().__init__()
+        self.G, self.hot, self.priors = G, hot, []
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+                query_prior=None):
+        self.priors.append(None if query_prior is None else query_prior.detach().clone())
+        if query_prior is not None:
+            assert float(query_prior.min()) >= 0.0 and float(query_prior.max()) <= 1.0
+        B = image.shape[0]
+        lg = torch.full((B, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        lg[:, :, self.hot[0], self.hot[1], self.hot[2]] = 10.0
+        return {"final_logit": lg + self.p.to(image.device)}
+
+
+class _LabelProvider(_FakeProvider):
+    """_FakeProvider but returns a label with a planted 2x2x2 blob (identity crop_geom)."""
+    def load(self, subject, cls, req):
+        r = super().load(subject, cls, req)
+        lbl = torch.zeros_like(r.label)
+        lbl[1:3, 1:3, 1:3] = 1
+        return LoadResult(image=r.image, label=lbl, spacing=r.spacing, crop_geom=r.crop_geom)
+
+
+def _labeled_batch(B=2, K=3, T=8):
+    b = _v2_batch(B=B, K=K, T=T)
+    b["label"][:, 5:7, 5:7, 5:7] = 1                      # level-0 GT blob (distinct location)
+    return b
+
+
+@pytest.mark.parametrize("mode", ["pred", "gt_coarse", "gt_fine"])
+def test_run_cascade_query_prior_modes(mode):
+    B, T = 2, 8
+    model = _PriorSpyModel(G=4)
+    res = run_cascade(model, _LabelProvider(T=T), _labeled_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=0, seed=0, query_prior=mode)
+    assert model.priors[0] is None                        # level 0 never gets a prior
+    pr = model.priors[1]
+    assert pr.shape == (B, 1, T, T, T) and 0.0 <= float(pr.min()) and float(pr.max()) <= 1.0
+    assert all(torch.isfinite(l).all() for l in res.logits)
+    if mode == "gt_fine":                                 # level-1 own GT, no warp
+        want = _LabelProvider(T=T).load("s", "liver", LoadRequest(rng=None,
+                                        crop_spacing_mm=1.5)).label.float()
+        assert torch.equal(pr[0, 0], want)
+    if mode == "gt_coarse":                               # level-0 GT, identity warp (bilinear)
+        assert torch.allclose(pr[:, 0], _labeled_batch(B=B, T=T)["label"].float(), atol=1e-4)
+
+
+def test_run_cascade_query_prior_hard_thresholds():
+    B, T = 2, 8
+    model = _PriorSpyModel(G=4)
+    run_cascade(model, _LabelProvider(T=T), _labeled_batch(B=B, T=T), augmentor=None,
+                spacings=[3.0, 1.5], device=torch.device("cpu"), training=True, step=0,
+                seed=0, query_prior="pred", query_prior_hard=True)
+    assert set(torch.unique(model.priors[1]).tolist()) <= {0.0, 1.0}
+
+
+@pytest.mark.parametrize("qp", [False, None, "none"])
+def test_run_cascade_query_prior_off(qp):
+    B, T = 2, 8
+    model = _PriorSpyModel(G=4)
+    run_cascade(model, _FakeProvider(T=T), _v2_batch(B=B, T=T), augmentor=None,
+                spacings=[3.0, 1.5], device=torch.device("cpu"),
+                training=True, step=0, seed=0, query_prior=qp)
+    assert model.priors == [None, None]
+
+
+def test_run_cascade_query_prior_true_is_pred():
+    B, T = 2, 8
+    model = _PriorSpyModel(G=4)
+    run_cascade(model, _LabelProvider(T=T), _labeled_batch(B=B, T=T), augmentor=None,
+                spacings=[3.0, 1.5], device=torch.device("cpu"),
+                training=True, step=0, seed=0, query_prior=True)
+    assert model.priors[0] is None and model.priors[1].shape == (B, 1, T, T, T)
+
+
+def test_run_cascade_query_prior_bad_mode_raises():
+    with pytest.raises(ValueError):
+        run_cascade(_PriorSpyModel(G=4), _FakeProvider(T=8), _v2_batch(B=2, T=8),
+                    augmentor=None, spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=True, step=0, seed=0, query_prior="oracle")
+
+
 def test_run_cascade_empty_prob_falls_back_to_gt_centroid():
     B, T = 2, 8
     model = _FakeModel(G=4)
@@ -271,6 +362,79 @@ def test_run_cascade_empty_prob_falls_back_to_gt_centroid():
     assert res.centers[1] == [None, None]
     assert res.empty_frac == 1.0
     assert all(c["center"] is None for c in prov.calls)  # every level-1 load GT-centred
+
+
+class _KeyedProvider:
+    """load() returns a crop whose fill value is a deterministic function of the subject
+    string, so a mis-ordered threaded assembly is caught by a tensor comparison."""
+    def __init__(self, T=8):
+        self.T = T
+
+    @staticmethod
+    def _sig(subject):
+        return float(int(__import__("hashlib").sha1(subject.encode()).hexdigest()[:6], 16) % 997)
+
+    def load(self, subject, cls, req: LoadRequest):
+        T = self.T
+        v = self._sig(subject)
+        geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+        return LoadResult(image=torch.full((1, T, T, T), v),
+                          label=torch.full((T, T, T), v),
+                          spacing=torch.full((3,), float(req.crop_spacing_mm)), crop_geom=geom)
+
+
+class _BarrierProvider:
+    """load() blocks on a shared barrier: it only returns once `barrier.parties` loads are
+    in flight at the same time. The serial path can never reach that count -> timeout."""
+    def __init__(self, T, barrier):
+        self.T, self.barrier = T, barrier
+
+    def load(self, subject, cls, req: LoadRequest):
+        self.barrier.wait()
+        T = self.T
+        geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+        return LoadResult(image=torch.zeros(1, T, T, T), label=torch.zeros(T, T, T),
+                          spacing=torch.full((3,), float(req.crop_spacing_mm)), crop_geom=geom)
+
+
+def test_recrop_level_parallel_output_matches_serial():
+    """recrop_workers>1 assembles a byte-identical batch to the serial path: per-b order,
+    per-k context order and target/context roles are all preserved."""
+    B, K, T = 3, 2, 8
+    batch = _v2_batch(B=B, K=K, T=T)
+    centers = [(4, 4, 4)] * B
+    serial = _recrop_level(_KeyedProvider(T=T), batch, centers, 1.5,
+                           step=2, seed=0, level=1, jitter=0, recrop_workers=1)
+    parallel = _recrop_level(_KeyedProvider(T=T), batch, centers, 1.5,
+                             step=2, seed=0, level=1, jitter=0, recrop_workers=8)
+    for k in ("image", "label", "context_in", "context_out"):
+        assert torch.equal(serial[k], parallel[k]), k
+    assert serial["subjects"] == parallel["subjects"]
+    assert serial["context_subjects"] == parallel["context_subjects"]
+
+
+def test_recrop_level_runs_loads_concurrently():
+    """recrop_workers fans the B*(K+1) provider loads out concurrently: a provider that
+    blocks until every load is in flight completes only when the fan-out is parallel."""
+    B, K, T = 2, 1, 8
+    n_calls = B * (K + 1)
+    prov = _BarrierProvider(T=T, barrier=threading.Barrier(n_calls, timeout=5))
+    batch = _v2_batch(B=B, K=K, T=T)
+    out = _recrop_level(prov, batch, [(4, 4, 4)] * B, 1.5,
+                        step=0, seed=0, level=1, jitter=0, recrop_workers=n_calls)
+    assert out["image"].shape[0] == B
+
+
+def test_run_cascade_forwards_recrop_workers():
+    """run_cascade threads its recrop_workers through to _recrop_level for every level>0."""
+    B, K, T = 2, 1, 8
+    n_calls = B * (K + 1)
+    prov = _BarrierProvider(T=T, barrier=threading.Barrier(n_calls, timeout=5))
+    batch = _v2_batch(B=B, K=K, T=T)
+    res = run_cascade(_FakeModel(G=4, hot=(1, 1, 1)), prov, batch, augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"), training=True,
+                      step=0, seed=0, jitter=0, recrop_workers=n_calls)
+    assert len(res.logits) == 2
 
 
 def test_train_epoch_cascade_smoke(monkeypatch):
@@ -312,14 +476,48 @@ def test_train_epoch_cascade_smoke(monkeypatch):
     assert "cascade_empty_frac" in grid
 
 
+def test_train_epoch_reads_cascade_recrop_workers():
+    """train_epoch's cascade branch forwards data.cascade_recrop_workers to run_cascade:
+    a barrier provider that needs all B*(K+1) loads concurrent completes the epoch."""
+    import types
+    import train as train_mod
+
+    B, K, T = 2, 1, 8
+    n_calls = B * (K + 1)
+    model = _FakeModel(G=4, hot=(1, 1, 1))
+    prov = _BarrierProvider(T=T, barrier=threading.Barrier(n_calls, timeout=5))
+
+    class _Loader:
+        dataset = types.SimpleNamespace(provider=prov)
+        def __iter__(self): return iter([_v2_batch(B=B, K=K, T=T)])
+        def __len__(self): return 1
+
+    class _Sched:
+        def step(self, *a): pass
+
+    cfg = OmegaConf.create({
+        "model": "patchset3d",
+        "data": {"cascade_spacings": [3.0, 1.5], "cascade_crop_jitter": 0,
+                 "crop_spacing_mm": 3.0, "cascade_recrop_workers": n_calls},
+        "train": {"seed": 0, "cascade_loss_weights": [1.0, 1.0]},
+    })
+    loss_fn = lambda logit, target: torch.nn.functional.mse_loss(
+        torch.sigmoid(logit.float()), target.float())
+
+    mean_loss, *_ = train_mod.train_epoch(
+        model, _Loader(), [torch.optim.SGD(model.parameters(), lr=0.0)], _Sched(),
+        step_per_batch=True, loss_fn=loss_fn, cfg=cfg, epoch=0, is_patchset=True, gpu_aug=None)
+    assert np.isfinite(mean_loss)
+
+
 # ---------------------------------------------------------------------------
 # Task 8: evaluate_cascade
 # ---------------------------------------------------------------------------
 from cascade import evaluate_cascade
 
 
-def _named_batch(names, B=2, T=8):
-    b = _v2_batch(B=B, T=T)
+def _named_batch(names, B=2, T=8, K=3):
+    b = _v2_batch(B=B, K=K, T=T)
     b["label_names"] = list(names)
     return b
 
@@ -363,3 +561,32 @@ def test_evaluate_cascade_shapes_and_nan_safe_macro(tmp_path, monkeypatch):
     assert "mean_dice" in by_cls["liver"] and np.isfinite(by_cls["liver"]["mean_dice"])
     assert "mean_dice" not in by_cls["not_a_real_class"]
     assert by_cls["not_a_real_class"]["error"] == "no valid samples"
+
+
+def test_evaluate_cascade_reads_cascade_recrop_workers(tmp_path, monkeypatch):
+    """evaluate_cascade forwards data.cascade_recrop_workers to run_cascade."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, K, T = 2, 1, 8
+    n_calls = B * (K + 1)
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = _ALL_CLASSES_IDX["liver"]
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    prov = _BarrierProvider(T=T, barrier=threading.Barrier(n_calls, timeout=5))
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self): return iter([_named_batch(["liver"] * B, B=B, T=T, K=K)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "cascade_recrop_workers": n_calls}})
+    rows, cases = evaluate_cascade(_FakeModel(G=4, hot=(1, 1, 1)), cfg, ["liver"],
+                                   loader=_Loader(), seed=0, is_prob=False)
+    assert len(cases) == B

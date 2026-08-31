@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling common/evalu
 
 from data.totalseg_classes import resolve_classes
 from src.benchmark_models import load_model
-from common import DEVICE, _source_root
+from common import DEVICE, _source_root, _assert_cascade_supported, make_eval_loader
 from evaluate import measure_flops, evaluate_classes, evaluate_spacing_sweep, build_sample_table
 
 
@@ -40,7 +40,12 @@ _FIDELITY_KEYS = ("image_size", "crop_spacing_mm", "use_crop", "context_size",
                   # raw_ct changes intensity normalization; self_context changes how the K
                   # contexts are built (p.eval>0 => self-context leakage). Neither is restored
                   # from the checkpoint, so both drift silently without this. See docs/logs.md.
-                  "raw_ct", "self_context")
+                  "raw_ct", "self_context",
+                  # v2 cascade (cascade.py): a checkpoint trained coarse->fine with a query-mask
+                  # prior must be evaluated the same way (see the data.cascade_spacings branch
+                  # in main), else the fine level runs without the prior it was trained on and
+                  # Dice is understated. None of these are restored from the checkpoint.
+                  "cascade_spacings", "cascade_query_prior", "cascade_query_prior_hard")
 
 
 def _warn_uninherited_data(cfg: DictConfig) -> None:
@@ -270,6 +275,11 @@ def main(cfg: DictConfig) -> None:
                 "spacing_sweep": spacing_sweep,
                 "spacing_locator": bool(cfg.eval.get("spacing_locator")),
                 "spacing_cascade": bool(cfg.eval.get("spacing_cascade")),
+                # v2 coarse->fine cascade eval (cascade.evaluate_cascade).
+                "cascade_spacings": (list(cfg.data.cascade_spacings)
+                                     if cfg.data.get("cascade_spacings") else None),
+                "cascade_query_prior": cfg.data.get("cascade_query_prior"),
+                "cascade_query_prior_hard": cfg.data.get("cascade_query_prior_hard"),
                 "hydra_choices": dict(HydraConfig.get().runtime.choices)},
     )
     run_name = (wandb.run.name if wandb.run is not None else None) or cfg.wandb.name or model_name
@@ -294,7 +304,33 @@ def main(cfg: DictConfig) -> None:
     sweep = cfg.eval.get("spacing_sweep")
     locator = bool(cfg.eval.get("spacing_locator"))
     cascade = bool(cfg.eval.get("spacing_cascade"))
-    if sweep:
+    v2_cascade = bool(cfg.data.get("cascade_spacings"))
+    if v2_cascade:
+        # v2 coarse->fine cascade eval — the standalone twin of train.py's cascade val pass
+        # (cascade.evaluate_cascade / run_cascade). Re-crops each level on the previous level's
+        # predicted COM and, when data.cascade_query_prior is set, feeds the previous mask as
+        # the query prior (M2 warp). Reports macro stitched-native Dice + per-level dice_r{s}.
+        # Distinct from eval.spacing_cascade (the older pairwise, COM-only, v1-loader path),
+        # which is intentionally left untouched.
+        from cascade import evaluate_cascade
+        from train import model_output_is_prob
+        if model_name != "patchset3d":
+            raise ValueError(f"data.cascade_spacings eval requires eval.model=patchset3d "
+                             f"(got {model_name!r}).")
+        if sweep or locator or cascade:
+            raise ValueError("data.cascade_spacings (v2 cascade eval) is mutually exclusive "
+                             "with eval.spacing_sweep / spacing_locator / spacing_cascade.")
+        _assert_cascade_supported(cfg)
+        spacings = [float(s) for s in cfg.data.cascade_spacings]
+        qp = cfg.data.get("cascade_query_prior", False)
+        qp_hard = " (hard)" if cfg.data.get("cascade_query_prior_hard") else ""
+        print(f"  v2 cascade eval: {spacings} mm  query_prior={qp!r}{qp_hard}  "
+              f"split={cfg.eval.split}  recrop_workers={cfg.data.get('cascade_recrop_workers', 16)}\n")
+        loader = make_eval_loader(cfg, classes, split=cfg.eval.split)
+        rows, all_cases = evaluate_cascade(model, cfg, classes, loader=loader,
+                                           seed=cfg.eval.seed,
+                                           is_prob=bool(model_output_is_prob(cfg)))
+    elif sweep:
         _assert_sweep_supported(cfg)
         spacings = list(sweep)
         tag = ("  (+ coarse->fine locator)" if locator else "") + \
@@ -326,12 +362,17 @@ def main(cfg: DictConfig) -> None:
         cont_str = (f"  cont={row['mean_containment']:.3f} (orc={row['mean_containment_oracle']:.3f})"
                     if "mean_containment" in row else "")
         nsd_str = f"  nsd={row['mean_nsd']:.3f}" if "mean_nsd" in row else ""
+        # v2 cascade rows carry per-level stitched Dice as dice_r{s:g} (coarse..fine).
+        lvl = [(k[6:], row[k]) for k in row if k.startswith("dice_r")]
+        lvl_str = ("  [" + " ".join(f"{s}mm={d:.3f}" for s, d in lvl) + "]") if lvl else ""
         print(f"  {cls:<35s}{sp_str}  dice={row['mean_dice']:.3f} ± {row['std_dice']:.3f}"
-              f"{nsd_str}  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}")
+              f"{nsd_str}  {row['mean_time_ms']:.0f}ms/sample  n={row['n_samples']}{cont_str}{lvl_str}")
         if wb_on:
             # Only mean_dice per class; std_dice / mean_time_ms are inferable from the
             # per-sample `cases` table, so we don't duplicate them as scalar series.
             wandb.log({f"class/{cls}/mean_dice{sp_key}": row["mean_dice"]})
+            for s, d in lvl:
+                wandb.log({f"class/{cls}/dice_r{s}": d})
             if "mean_nsd" in row:
                 wandb.log({f"class/{cls}/mean_nsd{sp_key}": row["mean_nsd"]})
             if "mean_containment" in row:
@@ -366,6 +407,16 @@ def main(cfg: DictConfig) -> None:
                     print(f"    {s:g}mm : {md:.4f}  (n_classes={len(vs)})")
                     if wb_on:
                         wandb.log({f"mean_dice@{s:g}": round(md, 4)})
+        if v2_cascade:
+            # Aggregate per-level curve: mean stitched Dice over classes at each cascade level.
+            print("  cascade level -> mean stitched dice:")
+            for s in spacings:
+                vs = [r[f"dice_r{s:g}"] for r in valid if f"dice_r{s:g}" in r]
+                if vs:
+                    md = sum(vs) / len(vs)
+                    print(f"    {s:g}mm : {md:.4f}  (n_classes={len(vs)})")
+                    if wb_on:
+                        wandb.log({f"mean_dice_r{s:g}": round(md, 4)})
         if locator:
             print("  pair (coarse->fine) : mean_containment (oracle, gap, n, empty):")
             for r in valid:
@@ -405,8 +456,9 @@ def main(cfg: DictConfig) -> None:
     sweep_col = ",spacing" if sweep else ""
     loc_col = ",locator_to,mean_containment,mean_containment_oracle,mean_loc_err_mm" if locator else ""
     casc_col = ",cascade_from,coarse_only_dice" if cascade else ""
+    casc2_col = ("," + ",".join(f"dice_r{s:g}" for s in spacings)) if v2_cascade else ""
     nsd_col = ",mean_nsd,std_nsd" if any("mean_nsd" in r for r in rows) else ""
-    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{nsd_col}{sweep_col}{loc_col}{casc_col}"]
+    csv = [f"model,class,mean_dice,std_dice,mean_time_ms,gflops,n_samples{nsd_col}{sweep_col}{loc_col}{casc_col}{casc2_col}"]
     csv += [f"{model_name},{r['class']},{r['mean_dice']},{r['std_dice']},"
             f"{r.get('mean_time_ms','')},{r.get('gflops','')},{r['n_samples']}"
             + (f",{r.get('mean_nsd','')},{r.get('std_nsd','')}" if nsd_col else "")
@@ -414,6 +466,7 @@ def main(cfg: DictConfig) -> None:
             + (f",{r.get('locator_to','')},{r.get('mean_containment','')},"
                f"{r.get('mean_containment_oracle','')},{r.get('mean_loc_err_mm','')}" if locator else "")
             + (f",{r.get('cascade_from','')},{r.get('coarse_only_dice','')}" if cascade else "")
+            + ("," + ",".join(str(r.get(f'dice_r{s:g}', '')) for s in spacings) if v2_cascade else "")
             for r in rows if "mean_dice" in r]
     (out_dir / "eval.csv").write_text("\n".join(csv) + "\n")
     print(f"  Saved -> {out_dir}")

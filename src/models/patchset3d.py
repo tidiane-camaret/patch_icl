@@ -442,6 +442,17 @@ class PatchSet3D(nn.Module):
                                             self.resolution, p) for k in range(K)], dim=1)
         return tiles.reshape(B, K * self.N, p ** 3)
 
+    def _prior_occupancy(self, prior):
+        """Cascade coarse-level prior (B,1,D,H,W) soft prob -> query mask-token input
+        (B, N, p³), the same _down_to / _mask_tiles_3d path _occupancy uses for the
+        support masks. Replaces the support-mean prior on the query when threaded in."""
+        B = prior.shape[0]
+        p = self.mask_patch_size
+        prior = prior.reshape(B, 1, *prior.shape[-3:]).float()
+        if p == 1:
+            return _down_to(prior, self.resolution).reshape(B, self.N, 1)
+        return _mask_tiles_3d(prior, self.resolution, p)      # (B, N, p³)
+
     def _tokens(self, feat, occ, ijk, mask=None):
         img = self.img_embed(feat)
         msk = self.mask_embed(occ)
@@ -516,12 +527,15 @@ class PatchSet3D(nn.Module):
             return None
         return torch.rand(B, M, device=device) < ratio
 
-    def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None):
+    def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None):
         B, N = sup_feat.shape[0], self.N
         dev = sup_feat.device
         mask_support = self._sample_mask(B, K * N, self.token_mask_ratio_support, dev)
         mask_query = self._sample_mask(B, N, self.token_mask_ratio_query, dev)
-        qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
+        if query_prior is not None:                          # cascade: coarse-level prediction
+            qry_occ = self._prior_occupancy(query_prior).to(sup_occ.dtype)
+        else:
+            qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)
         qry_ijk = self.ijk_base.unsqueeze(0).expand(B, N, 3)
 
@@ -634,7 +648,11 @@ class PatchSet3D(nn.Module):
             logit = F.interpolate(logit, size=(gs, gs, gs), mode="trilinear", align_corners=False)
         return logit
 
-    def forward(self, image, context_in, context_out, mode="train", spacing=None):
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+                query_prior=None):
+        """query_prior: optional (B,1,D,H,W) soft probability volume, already resampled onto
+        THIS forward's grid frame (the cascade runner does the geometric warp). When given it
+        replaces the support-mean prior on the query's mask token — see _attn / _prior_occupancy."""
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
@@ -650,7 +668,8 @@ class PatchSet3D(nn.Module):
             feat_map = self._encode(x, spacing)                        # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
         q, mask_support, mask_query = self._attn(
-            sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing)
+            sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing,
+            query_prior=query_prior)
         logit = self._decode(q, fine)
         return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query}
 
@@ -666,18 +685,24 @@ class PatchSet3D(nn.Module):
             kw.update(fine_rows=fine_rows, fine_stage=self.fine_stage)
         return self.encoder(x, **kw)
 
-    def _native_logit(self, image, context_in, context_out, spacing=None):
+    def _native_logit(self, image, context_in, context_out, spacing=None, query_prior=None):
         dev = next(self.parameters()).device
         image = image.to(dev); context_in = context_in.to(dev); context_out = context_out.to(dev)
-        logit = self.forward(image, context_in, context_out, spacing=spacing)["final_logit"].float()
+        if query_prior is not None:
+            query_prior = query_prior.to(dev)
+        logit = self.forward(image, context_in, context_out, spacing=spacing,
+                             query_prior=query_prior)["final_logit"].float()
         return F.interpolate(logit, size=image.shape[-3:], mode="trilinear", align_corners=False)
 
-    def train_forward(self, target_img, context_imgs, context_masks, spacing=None):
+    def train_forward(self, target_img, context_imgs, context_masks, spacing=None,
+                      query_prior=None):
         """Native-resolution logits (B,1,D,H,W) — used by the val soft-Dice / loss path."""
-        return self._native_logit(target_img, context_imgs, context_masks, spacing=spacing)
+        return self._native_logit(target_img, context_imgs, context_masks, spacing=spacing,
+                                  query_prior=query_prior)
 
     @torch.no_grad()
-    def predict(self, target_img, context_imgs, context_masks, spacing=None):
+    def predict(self, target_img, context_imgs, context_masks, spacing=None, query_prior=None):
         """Native binary mask (B,D,H,W) — used by the eval Dice path."""
-        logit = self._native_logit(target_img, context_imgs, context_masks, spacing=spacing)
+        logit = self._native_logit(target_img, context_imgs, context_masks, spacing=spacing,
+                                   query_prior=query_prior)
         return (torch.sigmoid(logit) >= 0.5).float().squeeze(1)

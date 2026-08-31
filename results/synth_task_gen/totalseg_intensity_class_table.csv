@@ -1,4 +1,5 @@
-class,n_present,frac_present,mean_hu,between_subj_std_hu,within_subj_voxel_std_hu
+class,n_present,frac_present,mean_HU,between_subj_std_HU,within_subj_voxel_std_HU
+body,1228,1.0000,-38.29,25.71,134.12
 spinal_cord,1182,0.9625,22.20,10.22,55.66
 autochthon_left,1131,0.9210,24.99,22.08,61.26
 autochthon_right,1130,0.9202,23.65,22.57,63.21

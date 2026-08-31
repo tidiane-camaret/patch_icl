@@ -35,9 +35,58 @@ augmentations.gpu`. New experiment
 byte-identical — the guard and every cascade branch are no-ops when `cascade_spacings`
 is unset.
 
-**Perf note:** each re-cropped level does `B*(K+1)` synchronous provider loads; without
-per-spacing `ct_raw_{s:g}mm.npy` caches these fall back to full-res `ct_raw.npy`
-(~+0.3 s/step at 3 mm). Build them with `scripts/convert_to_npy.py --target-spacing`.
+**Perf note:** each re-cropped level does `B*(K+1)` provider loads. They are fanned out
+over a process-lifetime thread pool (`data.cascade_recrop_workers`, default 16; `0`/`1` =
+serial) — `provider.load` is GIL-releasing (`np.load(mmap)` + `F.interpolate`/`avg_pool3d`),
+so threads give real parallelism with no tensor pickling; torch intra-op is pinned to 1 for
+the fan-out. Train and val cascade both use it. Without per-spacing `ct_raw_{s:g}mm.npy`
+caches the loads still fall back to full-res `ct_raw.npy` (~+0.3 s/step at 3 mm serial, less
+once threaded); build them with `scripts/convert_to_npy.py --target-spacing`.
+
+## 2026-08-30 — "body" pseudo-class added to the real-HU intensity analysis (MAISI id 200 calibration)
+
+**Motivation:** MAISI's label vocabulary has 8 classes with no TotalSegmentator equivalent
+(`data/class_registry.py`, category `MAISI-only`): `body` (id 200), `airway` (132), `hepatic
+vessel` (25), `hepatic/pancreatic tumor` (26/24), `bone lesion` (128), `colon cancer
+primaries` (27), `lung tumor` (23). In the GMM-synth pipeline (`src/gpu_gmm_intensity.py`)
+these fall through to the uncalibrated default in all three places — U(0,255) marginal `mu`,
+absent from every `CT_GROUP_MAISI_IDS` correlation group, and the global 0.48 in
+`CT_BETWEEN_WITHIN_GROUPS`. `body` is the worst offender: it's the container fill in **100 %**
+of bank crops, so every synthetic volume's soft-tissue background is a random brightness
+unrelated to fat/muscle. `analyze_totalseg_intensity.py` couldn't calibrate it because
+`label.npy` has no body class.
+
+**Body masks generated:** `experiments/3d/synth_task_generation/gen_body_masks.py` ran
+TotalSegmentator's `body` task on all 1228 totalseg CT subjects (Blackwell GPU, ~14.6 s/case,
+4.95 h, 0 failures), saving `pred_body.npy` (uint8 0/1) per subject on the same
+`nib.as_closest_canonical` grid as `label.npy` (shape-asserted before save).
+
+**Analysis change:** `analyze_totalseg_intensity.py` gains a `body` pseudo-class (on by
+default for `--dataset totalseg`, `--no_body` to skip). Fed by each subject's `pred_body.npy`
+restricted to voxels **inside the envelope but outside every one of the 117 labels** (fat /
+muscle / skin / connective tissue — exactly what MAISI id 200 paints). Stored as one extra
+column at index `N_BINS`; separate cache `totalseg_intensity_stats_body.npz`.
+
+**Result (`body`, n=1228, 100 % coverage):**
+- mean **−38.3 HU**, between-subject std **25.7 HU**, within-subject voxel std **134.1 HU**
+- **between/within ratio ≈ 0.19** — near the floor of the observed 0.2–1.6 range (just below
+  the trachea/spinal_cord family at 0.30). Real soft-tissue HU is very stable patient-to-
+  patient; the wide within-subject spread is just the fat(−100)↔muscle(+40)↔unlabeled-viscera
+  mixture inside one scan.
+- k=3 factor fit: communality **R²=0.15** (loadings PC1..3 = −0.26/+0.21/−0.18) — `body`
+  barely participates in the shared brightness/contrast factor; almost all its variance is
+  class-independent residual (resid_std 0.92). In the dist≤0.4 de-bias clustering it stays a
+  **singleton** (doesn't merge with the abdominal-organ or any other cluster).
+- Adding the row left the other 116 classes' PCA essentially unchanged (PC1 0.375, k=3
+  R²=0.569, mean|r|=0.303).
+
+**Takeaway for the generator:** `body` (id 200) wants a near-constant `mu` ≈ 128 on the
+0-255 scale (≈ −38 HU mapped through the fixed `GMM_MEAN/STD` bridge) with a *small*
+between-cohort spread and *no* correlation-group membership — i.e. give it a calibrated
+tight marginal rather than U(0,255), and family ratio ~0.2 (or reuse the
+trachea/spinal_cord 0.30 bucket) for `sd_between_ratio`. `airway` (132, 66 % coverage) is the
+next priority and can copy trachea's calibration; the 6 tumour/lesion ids (≤8 %) are low
+priority, proxy off their host organ if wanted.
 
 ## 2026-08-30 — Soft (partial-volume) mask downsampling: `mask_downsample=soft` + `task.mask_interp=bilinear`
 
@@ -6177,3 +6226,198 @@ formula is wired correctly end-to-end.
   vascular, ~18x for bone/muscle) once enabled -- members are now visibly separated in shade,
   by an amount that itself carries the real per-family calibration (vascular separates most,
   bone/muscle least), matching the physiological finding this feature was built to encode.
+
+## 2026-08-31 — cascade query_prior: baseline coarse-level read at 6 mm
+
+Prep for injecting the full level-i prediction mask (not just its COM) as a prior into
+level i+1 of the PatchSet3D cascade (exp59). Planned injection: `patchset3d.forward(...,
+query_prior=None)` -> replaces the support-mean `qry_occ` at patchset3d.py:524 via the
+existing `_down_to`/`mask_embed` path (no new params, R^3 token count preserved); the
+level i-1 -> level i geometric warp lives in `experiments/3d/cascade.py`.
+
+Step 1 baseline (`results/3d/query_prior_injection/`, script + 10 figures + table): the
+`2026-08-31_66_train_spacing_range_3_6/best.pt` checkpoint (arch encoder=plainconv_ts,
+e768/l4/a12, R16, mask_patch 8, feat_norm=self) predicted at 6 mm, no aug, one val case
+per class. Findings: localisation always correct (no gross misses); **systematic
+over-segmentation** (pred vox > GT vox 8/10, floor ~150-500 vox); large organs already fine
+(spleen/kidney_r/liver/lung lobe Dice 0.76-0.92); sub-cell structures collapse to the floor
+(gallbladder 43->512 vox Dice 0.08, adrenals 3-19 vox Dice <=0.08). So the coarse level
+gives a trustworthy *where* + loose over-inclusive *extent* -- the prior should carry
+location into the fine level; small-organ recovery still rides on the 1.5 mm re-crop.
+
+## 2026-08-31 (cont.) — cascade query_prior: warping the coarse pred onto the fine aug grid
+
+`results/3d/query_prior_injection/warp_probe.py`. Structural finding: run_cascade
+(cascade.py:227) reuses the SAME geo_gen seed at every level, so _geometric's
+flip/affine/elastic/deform grid is level-INVARIANT (measured max|grid0-grid1|=0.0,
+flips_equal, affine-fit residual 3.6e-7). Only the crop (crop_geom, native-CT voxel units)
+differs between levels -> that's the frame to compose through.
+
+Warp methods (place 6mm pred on the 3mm augmented grid, aug ON: flip 0.5/axis, affine
+0.5/±30°, no elastic/deform), GT-warp-vs-fine-GT Dice / COM offset / cost:
+  M0 crop-geom compose only          0.37 / 45.7mm / 0.3ms
+  M1 + flip axis-reversal both ends  0.60 / 16.4mm / 0.5ms
+  M2 + closed-form affine conjugation 0.87 / 2.7mm / 1.4ms   <- use this
+M2 chain: g1 -> [R g1 + t] -> flip1 -> cropgeom1_fwd -> nativeCT -> cropgeom0_inv -> flip0
+-> [R^-1(.-t)] -> g0 ; grid_sample(vol6, normalize(g0)). R,t fit by lstsq on a 16^3 strided
+sub-lattice of the captured grid. COM Δ 2.7mm ~= half a 6mm voxel (discretisation floor); the
+0.87 Dice ceiling is 6mm->3mm resolution loss, not misplacement. Cost negligible vs ~800ms
+encoder step. Next iter (only if elastic/deform get enabled): M3 = iterative fixed-point
+inversion of the nonlinear grid part, seeded from the M2 affine.
+
+## 2026-08-31 (cont.) — cascade query_prior: M3 nonlinear warp inversion
+
+Added M3 to warp_probe.py: M2 + LM-damped Newton inversion of the composed grid, for when
+augmentations.task.deform.p/elastic.p > 0 (both OFF in exp57/59 today). Newton:
+x <- x + (J(x)+1e-2 I)^-1 (y - Φ(x)), J = grid Jacobian via torch.gradient, seed = affine
+inverse, clamp x to [-1.2,1.2]. Φ,J read from the captured grid by grid_sample. The 1e-2 I
+damping is load-bearing: _geometric clamps grid to [-1,1], so J is exactly singular past the
+border. First-order fixed points (affine-preconditioned; inverse-consistent w<--ψ(z+w)) both
+FAIL at calibrated deform strength (‖∇ψ‖≳1) -- need 2nd order.
+
+Results (forced calibrated deform max_disp=0.15 p=1, + flips + ±30° rot):
+  M2            Dice 0.15 / COM 42mm / 1.4ms   (affine-only inverse: collapses)
+  M3 5 iter     Dice 0.81 / COM  4mm / 10ms    (knee)
+  M3 8 iter     Dice 0.82 / COM  3mm / 15ms
+Deform OFF: M3 == M2 (Dice 0.863 vs 0.865, Newton resid 2.5e-7) -> no regression, safe to
+always use. Cost 10-15ms vs ~800ms encoder step.
+
+Decision: ship M2 for query_prior placement (exp57/59 = affine-only aug, M2 exact @1.4ms);
+keep M3 behind the same path (it IS M2 when deform off) for future deform-enabled runs, 5
+Newton iters.
+
+## 2026-08-31 (cont.) — cascade query_prior: warp coverage over 21 low-dice classes
+
+warp_probe.py extended to an explicit class list (thin vessels / sub-cell organs / cervical
+vertebrae / ribs from the bottom of wandb/latest-run val/dice, + spleen/liver controls),
+tasks_per_class=3, deform off. 63 cases. GT-based fidelity (independent of model skill).
+
+M2 global: GT-warp Dice 0.56, COM Δ 4.8mm. Compact structures land at COM Δ 2.4-4.7mm ≈ half
+a 6mm voxel (discretisation floor) REGARDLESS of size/difficulty (adrenal 3vox 4.7mm, liver
+9877vox 2.6mm). Only outliers: elongated thin structures (iliac/subclavian artery 9-16mm, ribs
+6-8mm, portal vein 5.7mm) — figures show the warped pred DOES sit on the fine GT, the large
+COM Δ / low Dice is a FOV mismatch (6mm 768mm-FOV crop vs 3mm 384mm-FOV crop recentred on
+predicted COM contain different sub-segments of a long tube), not misplacement. Harmless for a
+prior. M0/M1 still bad (0.19/42mm, 0.31/21mm). M2==M3 (deform off). Cost M2 1.8ms / M3 10.7ms.
+
+Conclusion stands: ship M2 for query_prior placement.
+
+## 2026-08-31 (cont.) — cascade query_prior: next-level crop centre from warped pred?
+
+Q: replace invert_geo_center(COM(logit_i)) with COM of the de-warped level-i pred. Answer:
+identical for affine aug (prob-weighted COM is linear, commutes with the affine aug/flip/
+crop-geom inverse chain). Probe (63 cases): deform off -> |current center - warped-COM center|
+= 0.000 native voxels (all cases, exactly); deform p=1 -> mean 15.6 / max 118 native voxels.
+So only matters under nonlinear deform, where volume-de-warp-then-COM is the unbiased choice
+(Φ^-1(COM(p)) != COM(Φ^-1(p)) for nonlinear Φ). Not circular: de-warp target is native-CT
+space (needs only level-i's own crop_geom/geo). Decision: keep invert_geo_center(COM) for
+affine (exp57/59); switch to COM(M3-dewarp) iff deform/elastic enabled, alongside M2->M3 for
+the prior placement. Helper _dewarp_native added to warp_probe.py.
+
+## 2026-08-31 (cont.) — cascade query_prior: implemented (M2 warp + wiring)
+
+Feeds level i-1's full prediction to level i as the query's mask-token prior.
+
+src/models/patchset3d.py:
+- forward(..., query_prior=None): optional (B,1,D,H,W) soft prob on THIS forward's grid.
+- _attn(..., query_prior): when given, qry_occ = _prior_occupancy(prior) (same _down_to /
+  _mask_tiles_3d path as the support masks) instead of the support-mean prior. No new params,
+  R^3 token count unchanged, checkpoint-compatible. None -> identical to before.
+- _prior_occupancy() added; train_forward/predict/_native_logit gained a pass-through kwarg.
+
+experiments/3d/cascade.py:
+- _warp_prior_m2(): M2 affine-conjugation warp of the coarse pred onto level i's aug grid
+  (grid+flips are level-invariant under run_cascade's shared geo_gen seed; only crop_geom
+  differs). _warp_prior_cropgeom() for the no-aug (val) path. _build_query_prior() = detach
+  -> sigmoid -> interpolate to T -> warp.
+- run_cascade(..., query_prior=False): for i>0, builds the prior from prev level's logit
+  (DETACHED - each level keeps its own loss) and passes it to _forward_level, which forwards
+  query_prior into model() only when non-None (fake models in tests unaffected).
+- evaluate_cascade threads cfg.data.cascade_query_prior.
+
+experiments/3d/train.py: cascade run_cascade call passes cfg.data.cascade_query_prior.
+configs/.../59_organs_cascade_from_scratch.yaml: data.cascade_query_prior: true (default false).
+
+Tests: tests/test_patchset3d.py (+3: prior shifts logits / None unchanged, p>1, backward),
+experiments/3d/tests/test_cascade.py (+2: prior threaded to level 1 only, off by default).
+50 passed. End-to-end smoke on the 66_3_6 ckpt (bf16, B=1): level 1 gets a (1,1,128^3) prior
+in [0,1], logits finite, train(M2)+val(crop-geom) paths both run.
+
+## 2026-08-31 (cont.) — cascade query_prior: discrete source modes
+
+data.cascade_query_prior is now an enum (bool back-compat: false->none, true->pred):
+  none       support-mean fallback (baseline)
+  pred       sigmoid(logit_{i-1}) detached, M2-warped (the real cascade)
+  gt_coarse  level i-1's aug GT, M2-warped onto level i's grid — perfect-coarse-seg ceiling
+  gt_fine    level i's own aug GT, no warp — perfect-prior ceiling
+Plus data.cascade_query_prior_hard (bool) — threshold the prior at 0.5 before the mask embed.
+Eval uses the SAME mode as train, so gt_* runs report oracle ceilings (config comment says so).
+
+cascade.py: _prior_mode() normalizes; _build_query_prior(mode, hard, prev_logit, prev_label,
+cur_label, ...) picks the source (prev_label = level i-1's cur["label"], kept per iter) ->
+warp -> optional hard. run_cascade gained query_prior_hard. train.py + evaluate_cascade thread
+both keys; _assert_cascade_supported validates the enum. 59_organs_cascade_from_scratch.yaml
+set to `pred`.
+
+Tests: parametrized modes (shape/range, level-0 None, gt_fine == level-1 label exact,
+gt_coarse == level-0 label under identity warp), hard->{0,1}, bool/none aliases, bad-mode
+raises. 51 passed. Smoke on 66_3_6 ckpt (bf16, B=1): all 4 modes build a (1,1,128^3) prior in
+[0,1], logits finite; pred mean 0.0041 > gt_coarse/gt_fine ~0.0028 (matches the known coarse
+over-segmentation).
+
+## 2026-08-31 (cont.) — cascade query_prior: profiled test run
+
+exp59 + cascade_query_prior=pred + decoder=conv, weights-only from 66_3_6, [6,3]mm,
+train_classes=balanced val_classes=all, Blackwell RTX PRO 6000 97GiB, .venv_blackwell.
+
+COMPILE-ON OOMs: arch.compile=true (default) -> CUDA OOM ~94.5GiB during the inductor compile
+pass (decoder=conv ~6x decode x 2 cascade levels x grad x dynamic compile). OOM at B=8 AND B=4.
+Ran eager (compile=false) B=2 to profile. Config not launchable as written; fixes: eager,
+B<=2, decoder=fine_filter, grad checkpoint, narrower features_per_stage/fine_proj_dim.
+
+Timing (eager B=2): build 9s; first step 6.2s (cuDNN autotune); steady 0.69s/step (0.35s/item,
+~1.7x single-level exp57's 0.21s/item); eval warm-up ~28s; ~0.54s/cascade-task; total ~172s
+for 40 steps + 234-task eval. M2 warp itself ~1.4ms/vol (invisible). Full eval (10x117=1170
+tasks) ~10min, recrop-I/O-bound -> build ct_raw_3mm.npy caches.
+
+Resources: train GPU 95-100% util, 28.9GiB mem flat, 320-410W, RSS ~27GiB, 107 thr/13 proc.
+Eval GPU bursty 0-100% (~40% mean), power peaks 534W (~TDP), RSS ~44GiB (23 forkserver
+workers), proc CPU >1000% during _stitched_native_dice_multi numpy scoring, 914 threads, load
+13.8. Host RAM ~72GiB/7% of ~1TB. val_dice 0.4080 after 40 warm-start steps ~= ckpt 0.4094.
+Tools: scratchpad/ressample.py (psutil+nvidia-smi 1.5s sampler).
+
+## 2026-08-31 (cont.) — eval.py: wire the v2 cascade (evaluate_cascade) as a standalone eval
+
+Review: the eval pipeline had TWO disjoint cascade codepaths. `eval.spacing_cascade`
+(eval.py -> evaluate.evaluate_spacing_sweep(cascade=True), also infer_nifti.py) is the OLD
+one: pairwise COM-only handoff via `_predicted_native_center`, v1 `use_crop` loader +
+`dataset._pred_centers`, no `query_prior`, no aug-aware inversion. The v2 cascade
+(`data.cascade_spacings` -> cascade.run_cascade / evaluate_cascade: N-level, single backward,
+aug-invariant grid, M2 mask-prior warp, `cascade_query_prior` none|pred|gt_coarse|gt_fine)
+was reachable ONLY from train.py's val step. So an exp59 / query_prior checkpoint could not
+be evaluated standalone with the prior it was trained on.
+
+Change (new path added, stale one left untouched per request):
+- eval.py `main()`: new `v2_cascade = bool(cfg.data.get("cascade_spacings"))` branch, BEFORE
+  the spacing_sweep branch. Guards: eval.model must be patchset3d; mutually exclusive with
+  spacing_sweep/locator/spacing_cascade; runs `_assert_cascade_supported(cfg)`. Builds the
+  level-0 loader with `make_eval_loader(cfg, classes, split=cfg.eval.split)` (its existing
+  loader_v2 branch) and calls `evaluate_cascade(model, cfg, classes, loader=, seed=
+  cfg.eval.seed, is_prob=model_output_is_prob(cfg))` — same call train.py:validate_mean makes.
+- eval.py reporting: per-class line now appends `[{s}mm={dice}]` per level; summary prints a
+  "cascade level -> mean stitched dice" curve + `mean_dice_r{s}` wandb scalars; eval.csv gains
+  `dice_r{s:g}` columns; wandb config logs cascade_spacings / cascade_query_prior[_hard].
+- eval.py `_FIDELITY_KEYS` += cascade_spacings, cascade_query_prior, cascade_query_prior_hard
+  so `_warn_uninherited_data` flags a v2-cascade checkpoint evaluated without matching data.*
+  overrides (the exact "plausible-but-wrong" case that fn exists to catch).
+- cascade.py `evaluate_cascade`: rows now schema-complete vs evaluate_classes — added
+  `std_dice` (np.std over per-case dice) and `mean_time_ms` (wall time of each run_cascade
+  batch / batch size, cuda-synced; whole-cascade cost, not one forward); per-case `time_ms`.
+
+Left as-is: eval.spacing_cascade, evaluate_spacing_sweep(cascade=), infer_nifti.py /
+infer_cli.py (deployment path still COM-only, no query_prior).
+
+Tests: experiments/3d/tests/ cascade suites 49 pass (test_cascade 26, guard/sweep/config/
+stitch 23). Config smoke: `eval` + `experiment=59_organs_cascade_from_scratch
+eval.model=patchset3d` composes, `_assert_cascade_supported` passes. No live end-to-end run
+(a full exp59 training job, PID 26301, was holding 72 GiB on the only GPU).

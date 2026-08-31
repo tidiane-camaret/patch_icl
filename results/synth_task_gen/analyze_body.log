@@ -1,0 +1,71 @@
+extract[totalseg]: 1228 subjects (ct), 32 workers, +body pseudo-class
+  200/1228
+  400/1228
+  600/1228
+  800/1228
+  1000/1228
+  1200/1228
+extract[totalseg]: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_stats_body.npz
+analyze: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_class_table.csv
+
+class                            n   frac   mean_HU  std_HU(between)  voxel_std(within)
+body                          1228   1.00     -38.3             25.7              134.1
+spinal_cord                   1182   0.96      22.2             10.2               55.7
+autochthon_left               1131   0.92      25.0             22.1               61.3
+autochthon_right              1130   0.92      23.7             22.6               63.2
+aorta                         1102   0.90     180.8            132.4               99.4
+esophagus                     1032   0.84      -5.1             59.7              176.9
+lung_upper_lobe_left          1022   0.83    -780.5             83.7              161.5
+costal_cartilages             1013   0.82     120.2             36.5              101.5
+lung_lower_lobe_left           999   0.81    -722.5            128.2              186.9
+lung_lower_lobe_right          983   0.80    -730.2            132.5              186.3
+inferior_vena_cava             975   0.79      85.4             46.3               57.5
+sternum                        945   0.77     226.3             79.7              216.7
+liver                          935   0.76      75.2             26.8               47.2
+heart                          910   0.74     141.6             90.5               95.8
+colon                          907   0.74    -185.9            158.2              323.3
+analyze: dropping 6 classes with <30 subjects present: ['hip_implant', 'intervertebral_discs', 'kidney_cyst_right', 'lung_left', 'lung_right', 'vertebrae']
+
+analyze: 117 core classes (coverage 30-1228 subjects each)
+analyze: cross-class correlation (pairwise-complete, min 15 co-occurring subjects/pair): mean|r|=0.303, max r=0.979, min r=-0.685; 10 pairs too sparse -> set to 0
+analyze: PCA explained variance ratio (of between-subject, cross-class spread):
+  PC1: 0.375  (cumulative 0.375)
+  PC2: 0.112  (cumulative 0.487)
+  PC3: 0.082  (cumulative 0.569)
+  PC4: 0.040  (cumulative 0.609)
+  PC5: 0.038  (cumulative 0.647)
+  PC6: 0.030  (cumulative 0.677)
+analyze: PC1 loading sign pattern: 1% positive (one shared factor (brightness/contrast))
+  top |loading| classes on PC1:
+    vertebrae_C1                 -0.141
+    vertebrae_C2                 -0.137
+    rib_left_2                   -0.136
+    vertebrae_C3                 -0.136
+    rib_left_3                   -0.135
+    vertebrae_T4                 -0.134
+    vertebrae_T1                 -0.134
+    rib_right_3                  -0.133
+
+analyze: k=3-factor fit -> R^2=0.569 of between-subject cross-class variance explained (per-class range 0.01-0.94)
+analyze: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_factors.npz (mean_c, std_c, loadings[3,117], resid_std for a k=3-factor draw:
+    z ~ N(0, I_3)  (one draw per cohort, like today's cohort_gen)
+    mu_c = mean_c + std_c * (loadings[:,c] @ z + resid_std[c] * eps_c),  eps_c ~ N(0,1))
+analyze: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_{corr,scree,loadings}.png
+
+analyze: intensity-only clustering (avg-linkage, 1-corr dist<=0.4) -> 30 clusters from 117 classes (top sizes [54, 12, 11, 10, 3, 2, 2, 1, 1, 1])
+    cluster of 54: ['clavicula_left', 'clavicula_right', 'hip_left', 'hip_right', 'rib_left_2', 'rib_left_3', '...']
+    cluster of 12: ['aorta', 'atrial_appendage_left', 'brachiocephalic_trunk', 'common_carotid_artery_left', 'common_carotid_artery_right', 'heart', '...']
+    cluster of 11: ['adrenal_gland_left', 'adrenal_gland_right', 'iliac_vena_left', 'iliac_vena_right', 'inferior_vena_cava', 'kidney_left', '...']
+    cluster of 10: ['autochthon_left', 'autochthon_right', 'gluteus_maximus_left', 'gluteus_maximus_right', 'gluteus_medius_left', 'gluteus_medius_right', '...']
+    cluster of 3: ['lung_lower_lobe_right', 'lung_middle_lobe_right', 'lung_upper_lobe_right']
+    cluster of 2: ['brachiocephalic_vein_right', 'superior_vena_cava']
+analyze: DEDUPED (30 intensity-clusters) explained variance (mean|r|=0.121):
+  PC1: 0.151  (cumulative 0.151)
+  PC2: 0.100  (cumulative 0.251)
+  PC3: 0.067  (cumulative 0.318)
+  PC4: 0.062  (cumulative 0.380)
+  PC5: 0.054  (cumulative 0.434)
+  PC6: 0.052  (cumulative 0.486)
+analyze: de-biased per-class fit -> R^2=0.486 (vs 0.569 un-debiased; per-class range 0.01-0.83)
+analyze: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_factors_debiased.npz (same shape/use as the non-debiased file, one row per real class, but loadings come from the 30-cluster dedup fit above instead of the raw 117-class fit)
+analyze: wrote /home/dpxuser/dev/patch_icl/results/synth_task_gen/totalseg_intensity_{corr,scree,loadings}_dedup.png

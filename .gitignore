@@ -53,3 +53,8 @@ results/3d/*.csv
 .superpowers/
 
 **/.ipynb_checkpoints/
+results/3d/query_prior_injection/**/*.png
+results/3d/query_prior_injection/baseline_6mm_no_prior/00_spleen_s0045.png
+results/synth_task_gen/*.png
+results/synth_task_gen/*.npz
+results/synth_task_gen/totalseg_intensity_loadings.png

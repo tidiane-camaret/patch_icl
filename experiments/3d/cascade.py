@@ -10,6 +10,9 @@ See docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
 from __future__ import annotations
 
 import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -103,24 +106,80 @@ def _to_device(batch, device):
     return batch
 
 
-def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitter):
+_RECROP_POOL = None
+_RECROP_POOL_SIZE = 0
+_RECROP_POOL_LOCK = threading.Lock()
+
+
+def _recrop_pool(workers):
+    """Process-lifetime ThreadPoolExecutor for the re-crop fan-out, grown on demand.
+    Threads (not processes): provider.load is np.load(mmap) + F.interpolate/avg_pool3d,
+    all GIL-releasing, so there is real parallelism and no tensor pickling. Sized once per
+    run from data.cascade_recrop_workers and then reused every step."""
+    global _RECROP_POOL, _RECROP_POOL_SIZE
+    with _RECROP_POOL_LOCK:
+        if _RECROP_POOL is None or _RECROP_POOL_SIZE < workers:
+            if _RECROP_POOL is not None:
+                _RECROP_POOL.shutdown(wait=False)
+            _RECROP_POOL = ThreadPoolExecutor(max_workers=workers,
+                                              thread_name_prefix="recrop")
+            _RECROP_POOL_SIZE = workers
+        return _RECROP_POOL
+
+
+def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitter,
+                  recrop_workers=1):
     """Build one level-i v2 batch: target re-cropped on `centers[b]`, K contexts GT-centred,
-    same subjects/classes as level 0. Runs on the calling thread (synchronous provider I/O)."""
+    same subjects/classes as level 0.
+
+    The B*(K+1) provider loads are independent (each carries its own per-(b[,k]) seeded RNG),
+    so with recrop_workers > 1 they are fanned out over a thread pool. Results are reassembled
+    in task order, so the collated batch is byte-identical to the serial (recrop_workers=1)
+    path regardless of completion order."""
     subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
+    sp = float(spacing)
+
+    # Flat load list: per b, the target (k == -1) then its K contexts, in order.
+    tasks = []
+    for b in range(len(subs)):
+        tasks.append((b, -1, subs[b], centers[b], f"{seed}_{step}_{level}_{b}"))
+        for k, cs in enumerate(ctxs[b]):
+            tasks.append((b, k, cs, None, f"{seed}_{step}_{level}_{b}_{k}"))
+
+    def _load(t):
+        b, _k, subj, center, rk = t
+        return provider.load(subj, clss[b], LoadRequest(
+            rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
+
+    if recrop_workers and recrop_workers > 1 and len(tasks) > 1:
+        # Pin torch intra-op to 1 for the fan-out: many small F.interpolate/avg_pool3d calls
+        # would each spawn cpu_count() threads and oversubscribe. Safe -- _recrop_level is a
+        # hard sync point in the step (GPU idle, nothing else in this process runs).
+        n_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            pool = _recrop_pool(min(int(recrop_workers), len(tasks)))
+            results = list(pool.map(_load, tasks))
+        finally:
+            torch.set_num_threads(n_threads)
+    else:
+        results = [_load(t) for t in tasks]
+
+    slots = [{"tgt": None, "cin": [], "cout": []} for _ in range(len(subs))]
+    for (b, k, *_), r in zip(tasks, results):
+        if k == -1:
+            slots[b]["tgt"] = r
+        else:
+            slots[b]["cin"].append(r.image)
+            slots[b]["cout"].append(r.label)
+
     items = []
     for b in range(len(subs)):
-        tgt = provider.load(subs[b], clss[b], LoadRequest(
-            rng=random.Random(f"{seed}_{step}_{level}_{b}"), crop_spacing_mm=float(spacing),
-            center=centers[b], jitter=jitter))
-        cin, cout = [], []
-        for k, cs in enumerate(ctxs[b]):
-            r = provider.load(cs, clss[b], LoadRequest(
-                rng=random.Random(f"{seed}_{step}_{level}_{b}_{k}"), crop_spacing_mm=float(spacing),
-                center=None, jitter=jitter))
-            cin.append(r.image); cout.append(r.label)
+        tgt = slots[b]["tgt"]
         items.append({
             "image": tgt.image, "label": tgt.label,
-            "context_in": torch.stack(cin), "context_out": torch.stack(cout),
+            "context_in": torch.stack(slots[b]["cin"]),
+            "context_out": torch.stack(slots[b]["cout"]),
             "subject": subs[b], "context_subjects": list(ctxs[b]),
             "label_name": clss[b], "spacing": tgt.spacing,
             "aug_mode": torch.tensor(0, dtype=torch.long), "crop_geom": tgt.crop_geom,
@@ -128,11 +187,136 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     return incontext_collate_fn(items)
 
 
-def _forward_level(model, batch, spacing):
+def _forward_level(model, batch, spacing, query_prior=None):
     sp = float(spacing) if getattr(model, "spacing_aware", False) else None
+    kw = {"query_prior": query_prior} if query_prior is not None else {}
     out = model(batch["image"], context_in=batch["context_in"],
-                context_out=batch["context_out"], mode="train", spacing=sp)
+                context_out=batch["context_out"], mode="train", spacing=sp, **kw)
     return out["final_logit"].float()
+
+
+# --------------------------------------------------------------------------------------------
+# query_prior placement — resample level i-1's prediction onto level i's augmented grid.
+# run_cascade reuses the SAME geo_gen seed at every level, so the augmentation grid (affine +
+# flip + deform) is level-INVARIANT: one GeoState serves both ends and only the crop
+# (crop_geom, native-CT voxel units) differs. M2 = closed-form affine conjugation, exact for
+# affine-only aug (flips + rotation). See results/3d/query_prior_injection/README.md.
+# --------------------------------------------------------------------------------------------
+
+def _prior_lattice(T, dev):
+    a = torch.arange(T, device=dev, dtype=torch.float32)
+    d, h, w = torch.meshgrid(a, a, a, indexing="ij")
+    return torch.stack([d, h, w], dim=-1)                     # (T,T,T,3) voxel (d,h,w)
+
+
+def _fit_grid_affine(grid_row, T, dev, stride=8):
+    """3x4 affine A (xyz) with grid ≈ [x,y,z,1] @ A.T, fit on a strided sub-lattice of the
+    captured sampling grid (exact for affine-only aug; residual grows with deform/elastic)."""
+    idx = torch.arange(0, T, stride, device=dev)
+    a = (2.0 * idx.float() + 1.0) / T - 1.0
+    d, h, w = torch.meshgrid(a, a, a, indexing="ij")
+    base = torch.stack([w, h, d, torch.ones_like(d)], dim=-1).reshape(-1, 4)
+    tgt = grid_row[idx][:, idx][:, :, idx].reshape(-1, 3).to(dev)
+    return torch.linalg.lstsq(base, tgt).solution.T           # (3,4)
+
+
+def _crop_compose(g_dst, cg_dst_b, cg_src_b):
+    """(...,3) consumer native-crop voxel (d,h,w) -> producer native-crop voxel, through the
+    shared native-CT frame. crop_geom row = [starts, crop_sizes, out_sizes, pad_lo]."""
+    s1, k1, o1, p1 = (cg_dst_b[r] for r in range(4))
+    s0, k0, o0, p0 = (cg_src_b[r] for r in range(4))
+    pnt = s1 + (g_dst - p1) / o1 * k1                          # native-CT voxel
+    return p0 + (pnt - s0) / k0 * o0                           # producer native-crop voxel
+
+
+def _warp_prior_m2(vol_src, cg_src, cg_dst, geo, T):
+    """M2 warp: vol_src (B,1,T,T,T) on the producer (level i-1) augmented grid -> resampled
+    onto the consumer (level i) augmented grid. geo = the shared GeoState (grid + flips).
+    Per-b closed-form: aug_dst -> [R g + t] -> flip -> cropgeom compose -> flip -> [R^-1(.-t)]
+    -> aug_src, then one grid_sample."""
+    B, dev = vol_src.shape[0], vol_src.device
+    cg_src = cg_src.to(dev).float()
+    cg_dst = cg_dst.to(dev).float()
+    base = _prior_lattice(T, dev)
+    out = []
+    for b in range(B):
+        A = _fit_grid_affine(geo.grid[b], T, dev)
+        R, t = A[:, :3], A[:, 3]
+        fl = [bool(v) for v in geo.flips[b]]
+        n = (2.0 * base + 1.0) / T - 1.0                       # consumer output, normalized
+        n = (n.flip(-1) @ R.T + t).flip(-1)                    # shared grid affine (fwd)
+        for a in range(3):                                     # flip == negate in norm coords
+            if fl[a]:
+                n[..., a] = -n[..., a]
+        g_dst = ((n + 1.0) * T - 1.0) / 2.0                    # consumer native-crop voxel
+        g_src = _crop_compose(g_dst, cg_dst[b], cg_src[b])     # producer native-crop voxel
+        n0 = (2.0 * g_src + 1.0) / T - 1.0
+        for a in range(3):
+            if fl[a]:
+                n0[..., a] = -n0[..., a]
+        n0 = (n0.flip(-1) - t) @ torch.linalg.inv(R).T        # invert shared grid affine
+        out.append(F.grid_sample(vol_src[b:b + 1], n0[None], mode="bilinear",
+                                 padding_mode="zeros", align_corners=False))
+    return torch.cat(out, 0)
+
+
+def _warp_prior_cropgeom(vol_src, cg_src, cg_dst, T):
+    """No-aug prior warp (augmentor is None): crop-geom compose only — M2 with an identity
+    grid, exact. Used by the val cascade pass."""
+    B, dev = vol_src.shape[0], vol_src.device
+    cg_src = cg_src.to(dev).float()
+    cg_dst = cg_dst.to(dev).float()
+    base = _prior_lattice(T, dev)
+    out = []
+    for b in range(B):
+        g_src = _crop_compose(base, cg_dst[b], cg_src[b])
+        n0 = ((2.0 * g_src + 1.0) / T - 1.0).flip(-1)
+        out.append(F.grid_sample(vol_src[b:b + 1], n0[None], mode="bilinear",
+                                 padding_mode="zeros", align_corners=False))
+    return torch.cat(out, 0)
+
+
+_PRIOR_MODES = ("none", "pred", "gt_coarse", "gt_fine")
+
+
+def _prior_mode(query_prior):
+    """Normalize data.cascade_query_prior (bool back-compat: False/None -> none, True -> pred)."""
+    if query_prior is True:
+        return "pred"
+    if query_prior is False or query_prior is None:
+        return "none"
+    m = str(query_prior)
+    if m not in _PRIOR_MODES:
+        raise ValueError(f"cascade_query_prior={query_prior!r} not in {_PRIOR_MODES}")
+    return m
+
+
+def _build_query_prior(mode, hard, prev_logit, prev_label, cur_label,
+                       prev_geo, cg_prev, cg_cur, T, is_prob):
+    """Soft prior on level i's grid (B,1,T,T,T) for query_prior, per `mode`:
+      pred       sigmoid(logit_{i-1}) detached, warped (M2 / crop-geom) onto level i's grid
+      gt_coarse  level i-1's augmented GT warped the same way — perfect-coarse-seg ceiling
+      gt_fine    level i's own augmented GT, already on this grid (no warp) — perfect-prior ceiling
+    `hard` thresholds the result at 0.5. The pred prior is DETACHED (each level keeps its own
+    loss). The geometric warp runs fp32 (autocast off) so the coordinate maths keep sub-voxel
+    precision under bf16."""
+    B = prev_logit.shape[0]
+    with torch.autocast(device_type=prev_logit.device.type, enabled=False):
+        if mode == "gt_fine":
+            p = cur_label.detach().float().reshape(B, 1, *cur_label.shape[-3:]).clamp(0, 1)
+        else:
+            if mode == "pred":
+                src = prev_logit.detach().float()
+                src = src.clamp(0, 1) if is_prob else torch.sigmoid(src)
+            else:                                            # gt_coarse
+                src = prev_label.detach().float().reshape(B, 1, *prev_label.shape[-3:]).clamp(0, 1)
+            if src.shape[-1] != T:
+                src = F.interpolate(src, size=(T, T, T), mode="trilinear", align_corners=False)
+            if prev_geo is not None and getattr(prev_geo, "grid", None) is not None:
+                p = _warp_prior_m2(src, cg_prev, cg_cur, prev_geo, T)
+            else:
+                p = _warp_prior_cropgeom(src, cg_prev, cg_cur, T)
+        return (p >= 0.5).float() if hard else p
 
 
 def _hard_pred_native(logit_b1ghw, T, is_prob):
@@ -142,24 +326,28 @@ def _hard_pred_native(logit_b1ghw, T, is_prob):
 
 
 def run_cascade(model, provider, batch, augmentor, spacings, *, device, training,
-                step, seed, jitter=0, is_prob=False, want_hard_preds=False):
+                step, seed, jitter=0, is_prob=False, want_hard_preds=False,
+                recrop_workers=1, query_prior=False, query_prior_hard=False):
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
     N = len(spacings)
     T = batch["image"].shape[-1]
     B = batch["image"].shape[0]
     geo_seed = seed * 1_000_003 + step
+    prior_mode = _prior_mode(query_prior)
 
     logits, targets, geoms = [], [], []
     centers = [[None] * B]
     hard = [] if want_hard_preds else None
     empty_hits = empty_total = 0
+    prev_logit = prev_geo = prev_label = None                 # for the query_prior warp
 
     cur = _to_device(dict(batch), device)
     for i in range(N):
         if i > 0:
             cur = _recrop_level(provider, batch, centers[i], spacings[i],
-                                step=step, seed=seed, level=i, jitter=jitter)
+                                step=step, seed=seed, level=i, jitter=jitter,
+                                recrop_workers=recrop_workers)
             cur = _to_device(cur, device)
         capture = augmentor is not None and i < N - 1
         if augmentor is not None:
@@ -169,10 +357,18 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         else:
             geo = None
 
-        logit = _forward_level(model, cur, spacings[i])
+        prior = None
+        if prior_mode != "none" and i > 0 and prev_logit is not None:
+            cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
+            prior = _build_query_prior(prior_mode, bool(query_prior_hard), prev_logit,
+                                       prev_label, cur["label"], prev_geo, geoms[i - 1],
+                                       cg_cur, T, is_prob)
+
+        logit = _forward_level(model, cur, spacings[i], query_prior=prior)
         tgt = target_like(cur["label"].unsqueeze(1).float(), logit)
         logits.append(logit); targets.append(tgt)
         geoms.append(cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"])
+        prev_logit, prev_geo, prev_label = logit, geo, cur["label"]
         if want_hard_preds:
             hard.append(_hard_pred_native(logit, T, is_prob))
 
@@ -200,7 +396,9 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
 def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     """v2 cascade val pass. Iterates the level-0 val `loader`, runs the N-level cascade with
     no aug, and returns (rows, cases) shaped like evaluate.evaluate_classes: per class a
-    macro stitched-native Dice as `mean_dice`, plus per-spacing `dice_r{s:g}`.
+    macro stitched-native Dice as `mean_dice` (+ `std_dice`, `mean_time_ms`, `n_samples`),
+    plus per-spacing `dice_r{s:g}`; per-case `time_ms` is the wall time of the case's cascade
+    batch divided by the batch size (whole-cascade cost, not a single forward).
     """
     from collections import defaultdict
     import numpy as np
@@ -212,21 +410,36 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     _, root, _ = _source_root(cfg)
     pg_levels = [dict() for _ in range(N)]
     order = []                                       # (subj,cls) in loader order
+    times = {}                                       # (subj,cls) -> per-sample cascade ms
 
     model_net = getattr(model, "model", model)
     model_net.eval()
+    dev = next(model_net.parameters()).device
     step = 0
+    t_cascade = n_seen = 0.0
     for batch in loader:
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         with torch.no_grad():
             res = run_cascade(model, loader.dataset.provider, batch, augmentor=None,
-                              spacings=spacings, device=next(model_net.parameters()).device,
+                              spacings=spacings, device=dev,
                               training=False, step=step, seed=seed, jitter=0,
-                              is_prob=is_prob, want_hard_preds=True)
+                              is_prob=is_prob, want_hard_preds=True,
+                              recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
+                              query_prior=cfg.data.get("cascade_query_prior", False),
+                              query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)))
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
         step += 1
         subs, clss = batch["subjects"], batch["label_names"]
+        dt_ms = (time.perf_counter() - t0) * 1e3
+        per_sample_ms = dt_ms / max(len(subs), 1)
+        t_cascade += dt_ms; n_seen += len(subs)
         for b in range(len(subs)):
             key = (subs[b], clss[b])
             order.append(key)
+            times[key] = round(per_sample_ms, 1)
             for li in range(N):
                 hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
                 geom = res.geoms[li][b].cpu().numpy()
@@ -237,11 +450,14 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     stitched = _stitched_native_dice_multi(pg_levels, root)
     per_res_by_level = [_stitched_native_dice_multi([pg_levels[li]], root) for li in range(N)]
 
+    mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")
+
     cases_by_class = defaultdict(list)
     for key in order:
         subj, cls = key
         case = {"class": cls, "subject": subj,
-                "dice": round(float(stitched.get(key, float("nan"))), 4)}
+                "dice": round(float(stitched.get(key, float("nan"))), 4),
+                "time_ms": times.get(key, float("nan"))}
         for li, s in enumerate(spacings):
             case[f"dice_r{s:g}"] = round(float(per_res_by_level[li].get(key, float("nan"))), 4)
         cases_by_class[cls].append(case)
@@ -257,6 +473,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
             rows.append({"class": cls, "error": "no valid samples"}); continue
         row = {"class": cls,
                "mean_dice": round(sum(dvals) / len(dvals), 4),
+               "std_dice": round(float(np.std(dvals)), 4),
+               "mean_time_ms": mean_ms,
                "n_samples": len(cs)}
         for s in spacings:
             vals = [c[f"dice_r{s:g}"] for c in cs if not np.isnan(c[f"dice_r{s:g}"])]

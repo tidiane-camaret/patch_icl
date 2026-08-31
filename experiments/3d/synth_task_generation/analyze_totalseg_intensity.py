@@ -11,6 +11,13 @@ label.npy, BEFORE any normalization or intensity augmentation -- one np.bincount
 subject (weighted sum + sum-of-squares + voxel count). Cached to
 results/synth_task_gen/totalseg_intensity_stats.npz so re-analysis is instant.
 
+For totalseg CT this also adds a "body" pseudo-class (disable with --no_body): label.npy has
+no class for the soft-tissue envelope, but MAISI's id 200 ("body" container fill) paints it
+around every organ, so it had no real-HU calibration. Fed by each subject's pred_body.npy
+(TotalSegmentator `body` task, produced by gen_body_masks.py, on the label.npy grid),
+restricted to voxels inside the envelope but outside every one of the 117 labels. Cached
+separately as totalseg_intensity_stats_body.npz.
+
 Stage 2 (analyze): by default uses ALL classes with >= --min_n subjects present (i.e. the
 whole 122-class ALL_CLASSES vocabulary, not just one part-set) -- pass --classes to restrict
 to an explicit list (e.g. --classes ts_organs). TotalSegmentator subjects come from
@@ -75,13 +82,24 @@ DATASETS = {
 }
 OUT = Path(__file__).resolve().parents[3] / "results" / "synth_task_gen"
 N_BINS = len(ALL_CLASSES) + 1  # +1 for background id 0
+# Optional extra pseudo-class "body" (--with_body, CT only): the soft-tissue envelope that
+# ALL_CLASSES has no label for but MAISI's id 200 ("body" container fill) does -- fed by each
+# subject's pred_body.npy (TotalSegmentator `body` task, on the label.npy grid) restricted to
+# voxels INSIDE the envelope but OUTSIDE every one of the 117 labels (fat/muscle/skin/
+# connective tissue -- exactly what id 200 paints around the organs). Stored as one extra
+# column at index N_BINS in the stats arrays; class id/name = N_BINS / "body".
+BODY_COL = N_BINS
 
 
 def _subject_stats(args):
     """One np.bincount pass: (sum, sumsq, count) of intensity per label id, for one subject.
     CT: raw HU as-is. MRI: clip+zscore via that subject's own ct_stats.json entry first (no
-    absolute unit otherwise) -- `stats` is None for CT, the subject's stats dict for MRI."""
-    root, subj, stats = args
+    absolute unit otherwise) -- `stats` is None for CT, the subject's stats dict for MRI.
+
+    With `with_body` (CT only) one extra column is appended (index BODY_COL) for the "body"
+    pseudo-class: HU over pred_body.npy voxels that carry NO label (envelope minus every one
+    of the 117 classes). 0/0/0 if pred_body.npy is missing or off-grid."""
+    root, subj, stats, with_body = args
     d = Path(root) / subj
     try:
         ct = np.asarray(np.load(d / "ct_raw.npy", mmap_mode="r"), dtype=np.float64)
@@ -95,14 +113,27 @@ def _subject_stats(args):
     s = np.bincount(lbl, weights=ct, minlength=N_BINS)[:N_BINS]
     ss = np.bincount(lbl, weights=ct * ct, minlength=N_BINS)[:N_BINS]
     c = np.bincount(lbl, minlength=N_BINS)[:N_BINS]
+    if with_body:
+        sb = ssb = cb = 0.0
+        if stats is None:                            # CT only: pred_body is on the label grid
+            try:
+                body = np.load(d / "pred_body.npy", mmap_mode="r").ravel().astype(bool)
+            except (FileNotFoundError, EOFError, ValueError, OSError):
+                body = None
+            if body is not None and body.shape == lbl.shape:
+                v = ct[body & (lbl == 0)]            # envelope minus every labeled class
+                sb, ssb, cb = float(v.sum()), float((v * v).sum()), float(v.size)
+        s = np.append(s, sb); ss = np.append(ss, ssb); c = np.append(c, cb)
     return subj, (s, ss, c)
 
 
-def extract(dataset="totalseg", recompute=False, workers=32):
-    """Stage 1: subjects x (N_BINS) sum/sumsq/count matrices, cached per dataset."""
+def extract(dataset="totalseg", recompute=False, workers=32, with_body=False):
+    """Stage 1: subjects x (N_BINS [+1 if with_body]) sum/sumsq/count matrices, cached per
+    dataset. `with_body` adds the pred_body.npy-fed "body" pseudo-class column and writes a
+    distinct `_body`-tagged cache so it never collides with the plain run."""
     root, modality = DATASETS[dataset]["root"], DATASETS[dataset]["modality"]
     OUT.mkdir(parents=True, exist_ok=True)
-    cache = OUT / f"{dataset}_intensity_stats.npz"
+    cache = OUT / f"{dataset}_intensity_stats{'_body' if with_body else ''}.npz"
     if cache.exists() and not recompute:
         z = np.load(cache, allow_pickle=True)
         print(f"extract[{dataset}]: loaded cache {cache} ({len(z['subjects'])} subjects)")
@@ -118,14 +149,17 @@ def extract(dataset="totalseg", recompute=False, workers=32):
                        if p.is_dir() and (p / "label.npy").exists()
                        and (p / "ct_raw.npy").exists()
                        and (modality != "mri" or p.name in mri_stats))
-    print(f"extract[{dataset}]: {len(subjects)} subjects ({modality}), {workers} workers")
-    sums = np.zeros((len(subjects), N_BINS))
-    sumsqs = np.zeros((len(subjects), N_BINS))
-    counts = np.zeros((len(subjects), N_BINS))
+    nb = N_BINS + (1 if with_body else 0)
+    print(f"extract[{dataset}]: {len(subjects)} subjects ({modality}), {workers} workers"
+          f"{', +body pseudo-class' if with_body else ''}")
+    sums = np.zeros((len(subjects), nb))
+    sumsqs = np.zeros((len(subjects), nb))
+    counts = np.zeros((len(subjects), nb))
     idx = {s: i for i, s in enumerate(subjects)}
     done = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_subject_stats, (root, s, mri_stats.get(s))) for s in subjects]
+        futs = [ex.submit(_subject_stats, (root, s, mri_stats.get(s), with_body))
+                for s in subjects]
         for fut in as_completed(futs):
             subj, res = fut.result()
             if res is not None:
@@ -217,9 +251,11 @@ def _dedup_signal(Zstd, names, groups):
 def class_mean_matrix(sums, sumsqs, counts, min_voxels=20):
     """(sum,sumsq,count) -> (mean_hu, voxel_var, present, frac_present, class_names), each
     (n_subj, n_classes) except class_names/frac_present (n_classes,). Shared by analyze() and
-    analyze_merged() so both datasets build this identically."""
-    class_ids = np.arange(1, N_BINS)
-    class_names = np.array(ALL_CLASSES)
+    analyze_merged() so both datasets build this identically. A trailing "body" column (arrays
+    wider than N_BINS, from extract(with_body=True)) is picked up as one extra class."""
+    has_body = sums.shape[1] > N_BINS
+    class_ids = np.arange(1, N_BINS + (1 if has_body else 0))
+    class_names = np.array(ALL_CLASSES + (["body"] if has_body else []))
     present = counts[:, class_ids] >= min_voxels                      # (n_subj, n_classes)
     frac_present = present.mean(0)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -546,6 +582,11 @@ if __name__ == "__main__":
                     help="avg-linkage cut on 1-corr distance for the de-bias clustering "
                          "(lower = fewer/tighter clusters, e.g. 0.15 merges only near-duplicates "
                          "like left/right vertebrae; higher merges more loosely-related classes)")
+    p.add_argument("--no_body", action="store_true",
+                    help="totalseg CT only: skip the extra 'body' pseudo-class (HU of each "
+                         "subject's pred_body.npy minus every one of the 117 labels -- the "
+                         "soft-tissue envelope MAISI id 200 paints but label.npy has no class "
+                         "for). Included by default; writes a separate _body-tagged stats cache.")
     args = p.parse_args()
 
     classes = None
@@ -560,8 +601,9 @@ if __name__ == "__main__":
                        k_factors=args.k_factors, cluster_dist=args.cluster_dist,
                        tag=(args.tag or "_merged"))
     else:
+        with_body = (args.dataset == "totalseg") and not args.no_body
         subjects, sums, sumsqs, counts = extract(dataset=args.dataset, recompute=args.recompute,
-                                                 workers=args.workers)
+                                                 workers=args.workers, with_body=with_body)
         modality = DATASETS[args.dataset]["modality"]
         analyze(subjects, sums, sumsqs, counts,
                 min_frac=args.min_frac, min_voxels=args.min_voxels, k_factors=args.k_factors,

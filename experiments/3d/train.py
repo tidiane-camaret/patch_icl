@@ -519,7 +519,10 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 res = run_cascade(
                     model, loader.dataset.provider, batch, _aug, spacings,
                     device=DEVICE, training=True, step=gstep, seed=int(cfg.train.seed),
-                    jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob)
+                    jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob,
+                    recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
+                    query_prior=cfg.data.get("cascade_query_prior", False),
+                    query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)))
                 # Fail fast on a non-finite forward at ANY level, BEFORE the loss: a NaN
                 # reaching F.binary_cross_entropy trips an async device assert with a useless
                 # later stack (cf. the non-cascade guard).

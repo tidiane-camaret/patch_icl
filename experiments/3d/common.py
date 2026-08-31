@@ -226,6 +226,10 @@ def _assert_cascade_supported(cfg) -> None:
     if w is not None and len(w) != len(spacings):
         raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
                          f"data.cascade_spacings (len {len(spacings)}).")
+    qp = d.get("cascade_query_prior", False)
+    if qp not in (True, False, None, "none", "pred", "gt_coarse", "gt_fine"):
+        raise ValueError(f"data.cascade_query_prior={qp!r} must be one of "
+                         f"none|pred|gt_coarse|gt_fine (bool also accepted).")
 
 
 def build_dataset(cfg, split: str):

@@ -54,6 +54,40 @@ def test_predict_and_train_forward_native_shape():
     assert set(torch.unique(pred).tolist()) <= {0.0, 1.0}
 
 
+def test_query_prior_feeds_the_query_mask_token():
+    """query_prior=None is deterministic + unchanged; a prior shifts the logits (query path)."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_decode_size=2)
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16)
+    base = m(img, context_in=cin, context_out=cout)["final_logit"]
+    assert torch.equal(base, m(img, context_in=cin, context_out=cout)["final_logit"])
+    prior = torch.rand(img.shape[0], 1, 16, 16, 16)
+    with_prior = m(img, context_in=cin, context_out=cout, query_prior=prior)["final_logit"]
+    assert with_prior.shape == base.shape
+    assert not torch.allclose(with_prior, base)
+
+
+def test_query_prior_mask_patch_size_gt1():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=2, mask_patch_decode_size=2)
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout,
+            query_prior=torch.rand(2, 1, 16, 16, 16))["final_logit"]
+    assert out.shape == (2, 1, 8, 8, 8)
+
+
+def test_query_prior_backward_reaches_all_params():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout,
+            query_prior=torch.rand(2, 1, 16, 16, 16))["final_logit"]
+    out.mean().backward()
+    grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
+    assert all(grads) and len(grads) > 0
+
+
 def test_token_masking_noop_when_ratios_zero():
     """Default ratios (0.0): masks are None even in train mode; logit shape unchanged."""
     m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
