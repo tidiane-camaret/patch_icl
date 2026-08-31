@@ -1,9 +1,10 @@
-"""General CLI for nifti in-context cascade inference (patchset3d spacing_cascade).
+"""General CLI for nifti in-context cascade inference (patchset3d v2 cascade).
 
 Runnable by anyone who can activate the shared `patchset` conda env — no repo checkout
 needed (the code is vendored into the env; see docs). Predicts a target organ mask from
 one or more context (image, binary-mask) nifti pairs for the same organ, via the
-4mm->1.5mm coarse->fine cascade. GT-free for the target; pass --gt to also report Dice.
+coarse->fine v2 cascade (cascade.run_cascade: COM re-crop + query-mask prior per level).
+GT-free for the target; pass --gt to also report Dice.
 
     patchset-infer \
         --target tgt_ct.nii.gz \
@@ -38,7 +39,9 @@ def _build_cfg(args):
         f"eval.model={args.model}",
         f"eval.checkpoint={args.checkpoint}",
         f"eval.feat_norm={args.feat_norm}",
-        f"eval.spacing_sweep=[{args.crop_spacings}]",
+        # ++: the base eval `data` group is struct and lacks these v2-cascade keys.
+        f"++data.cascade_spacings=[{args.crop_spacings}]",
+        f"++data.cascade_query_prior={args.query_prior}",
         f"data.mask_downsample={args.mask_downsample}",
         f"data.mask_occupancy_thr={args.mask_occupancy_thr}",
         "wandb.project=null",
@@ -78,6 +81,10 @@ def build_parser():
                          "cascade's field-of-view schedule (T*mm per pass), NOT the input's "
                          "native voxel spacing (that is read from the nifti affine). "
                          "Match the checkpoint's training crops; default 4,1.5")
+    ap.add_argument("--query-prior", dest="query_prior", default="pred",
+                    help="v2 cascade query-mask prior mode fed to level i>0: none|pred "
+                         "(default pred). Match how the checkpoint was trained "
+                         "(data.cascade_query_prior).")
     ap.add_argument("--model", default="patchset3d", help="eval.model (default patchset3d)")
     ap.add_argument("--feat-norm", dest="feat_norm", default="self",
                     help="patchset3d feature-norm mode (default self)")

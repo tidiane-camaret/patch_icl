@@ -47,10 +47,11 @@ eval:
   # crop on the volume centre). Reported alongside the GT-centred fine pass (oracle).
   # Adds one extra fine pass per descending pair; needs model.train_forward (soft prob).
   spacing_cascade: false
-  # Save one 2x5 coarse->fine panel per class under <out_dir>/figures/cascade/ when
-  # spacing_cascade is on (coarse img/GT/pred + fine/oracle bboxes, fine img/GT/pred, and
-  # the fine pred refitted into the coarse frame). Needs save_figures=true. See
-  # experiments/3d/evaluate.py:save_cascade_figure.
+  # Save one 2x5 coarse->fine panel per class under <out_dir>/figures/cascade/ (coarse
+  # img/GT/pred + fine/oracle bboxes, fine img/GT/pred, and the fine pred refitted into the
+  # coarse frame). Needs save_figures=true. Honoured by BOTH cascade eval paths: the older
+  # eval.spacing_cascade sweep and the v2 data.cascade_spacings run (N-1 panels/class for
+  # N>2 levels). See experiments/3d/evaluate.py:save_cascade_figure.
   cascade_figures: false
   # Normalized Surface Dice tolerance (mm). Each eval case also reports NSD@tol — the
   # fraction of the GT/pred surfaces lying within `tol` mm of each other (voxel-count /

@@ -327,9 +327,10 @@ def main(cfg: DictConfig) -> None:
         print(f"  v2 cascade eval: {spacings} mm  query_prior={qp!r}{qp_hard}  "
               f"split={cfg.eval.split}  recrop_workers={cfg.data.get('cascade_recrop_workers', 16)}\n")
         loader = make_eval_loader(cfg, classes, split=cfg.eval.split)
-        rows, all_cases = evaluate_cascade(model, cfg, classes, loader=loader,
-                                           seed=cfg.eval.seed,
-                                           is_prob=bool(model_output_is_prob(cfg)))
+        rows, all_cases = evaluate_cascade(
+            model, cfg, classes, loader=loader, seed=cfg.eval.seed,
+            is_prob=bool(model_output_is_prob(cfg)), fig_dir=fig_dir,
+            cascade_figures=bool(cfg.eval.get("cascade_figures", False)))
     elif sweep:
         _assert_sweep_supported(cfg)
         spacings = list(sweep)

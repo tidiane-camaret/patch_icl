@@ -79,6 +79,8 @@ class CascadeResult:
     centers: list                 # len N: centers[0] == [None]*B; centers[i] native COM|None per b
     hard_preds: list | None       # per level: (B,T,T,T) binary; only when want_hard_preds
     empty_frac: float             # fraction of (level>=1, b) COM inversions that hit the fallback
+    figure_levels: list | None = None  # per level: {img,gt,ctx_img,ctx_gt} (B,T,T,T) np; only
+    #                                    when want_figure_arrays (post-aug target + 1st context)
 
 
 def _gen(seed_int, device):
@@ -327,7 +329,8 @@ def _hard_pred_native(logit_b1ghw, T, is_prob):
 
 def run_cascade(model, provider, batch, augmentor, spacings, *, device, training,
                 step, seed, jitter=0, is_prob=False, want_hard_preds=False,
-                recrop_workers=1, query_prior=False, query_prior_hard=False):
+                recrop_workers=1, query_prior=False, query_prior_hard=False,
+                want_figure_arrays=False):
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
     N = len(spacings)
@@ -339,6 +342,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     logits, targets, geoms = [], [], []
     centers = [[None] * B]
     hard = [] if want_hard_preds else None
+    figs = [] if want_figure_arrays else None
     empty_hits = empty_total = 0
     prev_logit = prev_geo = prev_label = None                 # for the query_prior warp
 
@@ -371,6 +375,14 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         prev_logit, prev_geo, prev_label = logit, geo, cur["label"]
         if want_hard_preds:
             hard.append(_hard_pred_native(logit, T, is_prob))
+        if want_figure_arrays:
+            # Post-aug target volume + 1st context, on this level's T³ grid (CPU numpy).
+            figs.append({
+                "img":     cur["image"][:, 0].detach().float().cpu().numpy(),
+                "gt":      cur["label"].detach().float().cpu().numpy(),
+                "ctx_img": cur["context_in"][:, 0, 0].detach().float().cpu().numpy(),
+                "ctx_gt":  cur["context_out"][:, 0].detach().float().cpu().numpy(),
+            })
 
         if i < N - 1:
             cens = _centroid_from_logit(logit, T, is_prob)
@@ -390,20 +402,27 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
 
     return CascadeResult(logits=logits, targets=targets, geoms=geoms, centers=centers,
                          hard_preds=hard,
-                         empty_frac=(empty_hits / empty_total if empty_total else 0.0))
+                         empty_frac=(empty_hits / empty_total if empty_total else 0.0),
+                         figure_levels=figs)
 
 
-def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
+def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
+                     fig_dir=None, cascade_figures=False):
     """v2 cascade val pass. Iterates the level-0 val `loader`, runs the N-level cascade with
     no aug, and returns (rows, cases) shaped like evaluate.evaluate_classes: per class a
     macro stitched-native Dice as `mean_dice` (+ `std_dice`, `mean_time_ms`, `n_samples`),
     plus per-spacing `dice_r{s:g}`; per-case `time_ms` is the wall time of the case's cascade
     batch divided by the batch size (whole-cascade cost, not a single forward).
+
+    cascade_figures=True (needs fig_dir): save one coarse->fine panel per class under
+    fig_dir/cascade/ — reuses evaluate.save_cascade_figure via _save_cascade_pair, one panel
+    per consecutive spacing pair (so N-1 panels per class for N>2 levels). Captures the first
+    sample seen per requested class.
     """
     from collections import defaultdict
     import numpy as np
     from common import _source_root                     # NOTE: _source_root lives in common.py
-    from evaluate import _stitched_native_dice_multi
+    from evaluate import _stitched_native_dice_multi, _save_cascade_pair
 
     spacings = [float(s) for s in cfg.data.cascade_spacings]
     N = len(spacings)
@@ -411,6 +430,9 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
     pg_levels = [dict() for _ in range(N)]
     order = []                                       # (subj,cls) in loader order
     times = {}                                       # (subj,cls) -> per-sample cascade ms
+    want_figs = bool(cascade_figures and fig_dir is not None)
+    fig_want = set(classes) if want_figs else set()  # classes still needing a panel
+    fig_cache = [dict() for _ in range(N)]           # level -> {(subj,cls): arrays} for figures
 
     model_net = getattr(model, "model", model)
     model_net.eval()
@@ -428,7 +450,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
                               is_prob=is_prob, want_hard_preds=True,
                               recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
                               query_prior=cfg.data.get("cascade_query_prior", False),
-                              query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)))
+                              query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)),
+                              want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()
         step += 1
@@ -444,6 +467,22 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
                 hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
                 geom = res.geoms[li][b].cpu().numpy()
                 pg_levels[li][key] = (np.packbits(hp), tuple(hp.shape), geom)
+            if clss[b] in fig_want:                        # first sample of a requested class
+                fig_want.discard(clss[b])
+                T = res.hard_preds[0].shape[-1]
+                for li in range(N):
+                    fl = res.figure_levels[li]
+                    lg = res.logits[li][b:b + 1].float()
+                    prob = lg.clamp(0, 1) if is_prob else torch.sigmoid(lg)
+                    prob = F.interpolate(prob, size=(T, T, T), mode="trilinear",
+                                         align_corners=False)[0, 0].cpu().numpy()
+                    fig_cache[li][key] = {
+                        "img": fl["img"][b], "gt": fl["gt"][b],
+                        "pred": res.hard_preds[li][b].cpu().numpy(),
+                        "prob": prob, "geom": res.geoms[li][b].cpu().numpy(),
+                        "ctx_img": fl["ctx_img"][b], "ctx_gt": fl["ctx_gt"][b],
+                        "spacing": spacings[li],
+                    }
 
     # Score once after the loop: each key is stitched independently of arrival order, so the
     # full cascade stitch and the per-level (per-resolution) stitches are order-invariant.
@@ -481,6 +520,16 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob):
             if vals:
                 row[f"dice_r{s:g}"] = round(sum(vals) / len(vals), 4)
         rows.append(row)
+
+    if want_figs:
+        from pathlib import Path
+        out = Path(fig_dir) / "cascade"
+        for i in range(N - 1):
+            _save_cascade_pair(fig_cache[i], fig_cache[i + 1],
+                               spacings[i], spacings[i + 1], out)
+        n_cls = len(set(classes)) - len(fig_want)
+        print(f"  [cascade-fig] saved {n_cls * (N - 1)} panel(s) -> {out}")
+
     return rows, all_cases
 
 

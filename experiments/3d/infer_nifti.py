@@ -1,5 +1,11 @@
 """Nifti in-context cascade inference — predict a target organ mask from context
-(image, binary-mask) nifti pairs via the 4mm->1.5mm cascade, GT-free for the target.
+(image, binary-mask) nifti pairs via the coarse->fine cascade, GT-free for the target.
+
+Runs the SAME N-level cascade as training / eval: cascade.run_cascade over a small
+in-memory NiftiProvider (each level re-crops the target on the previous level's predicted
+centre-of-mass and, when data.cascade_query_prior is set, feeds the previous mask as the
+query prior). The hard per-level predictions are stitched coarse->fine into the target's
+native volume and written back on the target's on-disk grid.
 
 See docs/superpowers/specs/2026-08-12-nifti-incontext-cascade-inference-design.md.
 """
@@ -23,8 +29,10 @@ from src.totalseg_dataset import normalize_ct
 from src.totalseg_dataloader_incontext import (
     organ_crop_arrays, place_image, place_label, resample_binary,
 )
+from src.incontext_dataset_v2 import LoadRequest, LoadResult
 from eval import _build_model, _warn_uninherited_data
-from evaluate import _write_native, _predicted_native_center, dice_binary
+from evaluate import _write_native, dice_binary
+from cascade import run_cascade, _recrop_level
 from common import DEVICE
 
 
@@ -63,15 +71,60 @@ def prep_target(ct, sp, center, *, T, crop_mm):
 
 
 def prep_context(ct, mask, sp, center, *, T, crop_mm, mask_downsample, occ_thr):
-    """Native (CT, binary mask) + centre -> (img_t (1,T,T,T), mask_t (T,T,T) long)."""
+    """Native (CT, binary mask) + centre -> (img_t (1,T,T,T), mask_t (T,T,T) long,
+    crop_geom (4,3))."""
     assert ct.shape == mask.shape, f"context ct {ct.shape} != mask {mask.shape}"
-    crop_ct, crop_mask, out_sizes, pad_lo, _ = organ_crop_arrays(
+    crop_ct, crop_mask, out_sizes, pad_lo, geom = organ_crop_arrays(
         ct, mask, center, sp, image_size=(T, T, T), crop_mm=crop_mm,
         jitter=0, rng=random.Random(0))
     img_t = place_image(crop_ct, out_sizes, pad_lo, T)
     mask_small = resample_binary(np.asarray(crop_mask) > 0, tuple(out_sizes),
                                  mode=mask_downsample, occ_thr=occ_thr)
-    return img_t, place_label(mask_small, out_sizes, pad_lo, T)
+    return img_t, place_label(mask_small, out_sizes, pad_lo, T), geom
+
+
+_FG = "__fg__"   # single-binary-organ label key (multi-label uses str(id))
+
+
+class NiftiProvider:
+    """In-memory VolumeProvider for cascade.run_cascade over already-loaded nifti arrays.
+
+    subject keys: 'tgt' (the target CT, GT-free -> zero label) and 'ctx{k}' (context k).
+    `cls` is the label id as a string, or _FG for single binary mode. Level-0 target crop
+    falls back to the volume centre; run_cascade passes an explicit native-voxel centre for
+    every finer level. Contexts always self-centre on their own mask centroid."""
+
+    def __init__(self, tgt_ct, tgt_sp, contexts, *, T, mask_downsample, occ_thr):
+        self.tgt_ct = tgt_ct
+        self.tgt_sp = list(tgt_sp)
+        self.contexts = contexts                      # [(ct_norm, id_mask, spacing), ...]
+        self.T = int(T)
+        self.mask_downsample = mask_downsample
+        self.occ_thr = float(occ_thr)
+        self.tgt_center0 = tuple(s // 2 for s in tgt_ct.shape)
+
+    def subjects_for(self, cls):                      # unused on the run_cascade path
+        return ["tgt"]
+
+    def load(self, subject, cls, req: LoadRequest) -> LoadResult:
+        sp = float(req.crop_spacing_mm)
+        spacing = torch.full((3,), sp, dtype=torch.float32)
+        if subject == "tgt":
+            center = req.center if req.center is not None else self.tgt_center0
+            img_t, geom = prep_target(self.tgt_ct, self.tgt_sp, center, T=self.T, crop_mm=sp)
+            label_t = torch.zeros((self.T, self.T, self.T), dtype=torch.long)
+        else:
+            k = int(subject[3:])                      # 'ctx0' -> 0
+            c_ct, c_idmask, c_sp = self.contexts[k]
+            binmask = (c_idmask > 0) if cls == _FG else (c_idmask == int(cls))
+            center = req.center if req.center is not None else mask_centroid(binmask)
+            img_t, label_t, geom = prep_context(
+                c_ct, binmask, c_sp, center, T=self.T, crop_mm=sp,
+                mask_downsample=self.mask_downsample, occ_thr=self.occ_thr)
+        if not torch.is_tensor(geom):
+            geom = torch.as_tensor(np.asarray(geom), dtype=torch.long)
+        return LoadResult(image=img_t, label=label_t, spacing=spacing,
+                          crop_geom=geom.long())
 
 
 def _resample_gt(gt, shape):
@@ -189,11 +242,18 @@ def _output_label_table(gt_path, context_pairs, keep_ids):
 
 def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
                   gt_path=None, out_path=None):
-    """Run the coarse->fine in-context cascade on nifti files (GT-free target).
+    """Run the v2 coarse->fine in-context cascade on nifti files (GT-free target).
+
+    Wraps cascade.run_cascade over an in-memory NiftiProvider: level 0 crops the target on
+    the volume centre; each finer level re-crops it on the previous level's predicted COM and
+    (when data.cascade_query_prior is set, default 'pred') feeds the previous mask as the
+    query prior. Runs patchset3d only (run_cascade needs the {'final_logit'} forward).
 
     cfg            : OmegaConf cfg (same surface as experiments/3d/eval.py). Uses
-                     data.image_size / mask_downsample / mask_occupancy_thr and
-                     eval.model / eval.checkpoint / eval.spacing_sweep.
+                     data.image_size / mask_downsample / mask_occupancy_thr /
+                     cascade_spacings / cascade_query_prior[_hard] / cascade_recrop_workers
+                     and eval.model / eval.checkpoint. Falls back to eval.spacing_sweep for
+                     the spacing schedule when data.cascade_spacings is unset.
     target_path    : target CT .nii.gz.
     context_pairs  : list[(image_path, mask_path)] for the same organ(s), K = len. Each
                      mask is binarized (>0) in single-label mode, or read as an id-valued
@@ -222,12 +282,25 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
 
     _warn_uninherited_data(cfg)
     model = _build_model(cfg)
+    if hasattr(model, "eval"):
+        model.eval()
     T = int(cfg.data.image_size[0])
     crop_ds = cfg.data.get("mask_downsample", "occupancy")
     crop_thr = float(cfg.data.get("mask_occupancy_thr", 0.1))
-    spacings = [float(s) for s in cfg.eval.spacing_sweep]
+    sched = cfg.data.get("cascade_spacings") or cfg.eval.get("spacing_sweep")
+    if not sched:
+        raise ValueError("predict_nifti needs data.cascade_spacings (or eval.spacing_sweep)")
+    spacings = [float(s) for s in sched]
+    if len(spacings) < 2:
+        raise ValueError(f"cascade needs >=2 spacings, got {spacings}")
+    qp = cfg.data.get("cascade_query_prior", "pred")
+    qp_hard = bool(cfg.data.get("cascade_query_prior_hard", False))
+    recrop_workers = int(cfg.data.get("cascade_recrop_workers", 1))
+    from train import model_output_is_prob
+    is_prob = bool(model_output_is_prob(cfg))
+    N = len(spacings)
 
-    # --- load target + contexts once (arrays reused across passes/labels) -------
+    # --- load target + contexts once (arrays reused across labels) -------------
     tgt_ct, affine = load_nifti(target_path)
     tgt_ct = normalize_ct(tgt_ct)
     tgt_sp = voxel_spacing(affine)
@@ -238,6 +311,7 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         c_ct, c_aff = load_nifti(img_p)
         c_msk, _ = load_nifti(msk_p)
         contexts.append((normalize_ct(c_ct), np.asarray(c_msk), voxel_spacing(c_aff)))
+    K = len(contexts)
 
     multilabel = label_ids is not None
     if not multilabel:
@@ -252,49 +326,31 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
     if not labels:
         raise ValueError("no labels to segment (empty label_ids / no non-zero context ids)")
 
-    # per-label context: binary mask (== id, or >0 for single) + its centroid, once.
-    tasks = []
-    for lab in labels:
-        ctx = []
-        for c_ct, c_ml, c_sp in contexts:
-            b = (c_ml > 0) if lab is None else (c_ml == lab)
-            ctx.append((c_ct, b, c_sp, mask_centroid(b)))
-        tasks.append({"label": lab, "ctx": ctx, "passes": []})
+    provider = NiftiProvider(tgt_ct, tgt_sp, contexts, T=T,
+                             mask_downsample=crop_ds, occ_thr=crop_thr)
+    tasks = [{"label": lab, "passes": []} for lab in labels]
 
-    # --- coarse->fine cascade, batched over labels ------------------------------
-    for i, s in enumerate(spacings):
-        prepped = []                                       # (task, tgt_img, geom, ctx_in, ctx_out)
-        for task in tasks:
-            if i == 0:
-                center = tuple(sz // 2 for sz in shape)    # coarse: volume centre
-            else:
-                # Hard-predict centroid (not soft prob like eval's cascade) — one forward per
-                # pass, model-agnostic; intentional divergence documented in the design spec.
-                prev_pred, prev_geom = task["passes"][-1]
-                c = _predicted_native_center(
-                    torch.from_numpy(prev_pred.astype(np.float32)),
-                    torch.from_numpy(prev_geom.astype(np.int64)))
-                center = tuple(sz // 2 for sz in shape) if c == "volume_center" else c
-
-            tgt_img, geom = prep_target(tgt_ct, tgt_sp, center, T=T, crop_mm=s)
-            ctx_in, ctx_out = [], []
-            for c_ct, c_bin, c_sp, c_center in task["ctx"]:
-                im, mk = prep_context(c_ct, c_bin, c_sp, c_center, T=T, crop_mm=s,
-                                      mask_downsample=crop_ds, occ_thr=crop_thr)
-                ctx_in.append(im)
-                ctx_out.append(mk)
-            prepped.append((task, tgt_img, geom, ctx_in, ctx_out))
-
-        for chunk in _iter_chunks(prepped, batch_size):
-            target_b = torch.stack([p[1] for p in chunk]).to(DEVICE)             # (B,1,T,T,T)
-            ctx_in_b = torch.stack([torch.stack(p[3]) for p in chunk]).to(DEVICE)   # (B,K,1,T,T,T)
-            ctx_out_b = torch.stack([torch.stack(p[4]) for p in chunk]).to(DEVICE)  # (B,K,T,T,T)
-            kw = {"spacing": s} if getattr(model, "spacing_aware", False) else {}
-            with torch.no_grad():
-                preds = model.predict(target_b, ctx_in_b, ctx_out_b, **kw)        # (B,T,T,T)
-            preds = preds.cpu().numpy()
-            for j, (task, _, geom, _, _) in enumerate(chunk):
-                task["passes"].append((preds[j], geom.numpy()))
+    # --- coarse->fine cascade (cascade.run_cascade), batched over labels -------
+    for chunk in _iter_chunks(tasks, batch_size):
+        B = len(chunk)
+        meta = {
+            "subjects": ["tgt"] * B,
+            "context_subjects": [[f"ctx{k}" for k in range(K)] for _ in range(B)],
+            "label_names": [(_FG if t["label"] is None else str(t["label"])) for t in chunk],
+        }
+        # Level-0 batch: target on the volume centre (center=None), contexts self-centred.
+        batch0 = _recrop_level(provider, meta, [None] * B, spacings[0],
+                               step=0, seed=0, level=0, jitter=0,
+                               recrop_workers=recrop_workers)
+        with torch.no_grad():
+            res = run_cascade(model, provider, batch0, augmentor=None, spacings=spacings,
+                              device=DEVICE, training=False, step=0, seed=0, jitter=0,
+                              is_prob=is_prob, want_hard_preds=True,
+                              recrop_workers=recrop_workers,
+                              query_prior=qp, query_prior_hard=qp_hard)
+        for j, task in enumerate(chunk):
+            task["passes"] = [(res.hard_preds[li][j].cpu().numpy().astype(bool),
+                               res.geoms[li][j].cpu().numpy()) for li in range(N)]
 
     gt_ml = None
     if gt_path is not None:

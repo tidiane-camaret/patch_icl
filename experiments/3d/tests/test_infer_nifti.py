@@ -53,10 +53,11 @@ def test_prep_context_shapes():
     ct = np.zeros((40, 40, 40), dtype=np.float32)
     mask = np.zeros((40, 40, 40), dtype=bool)
     mask[18:22, 18:22, 18:22] = True
-    img_t, mask_t = prep_context(ct, mask, [1.0, 1.0, 1.0], (20, 20, 20),
-                                 T=8, crop_mm=1.0, mask_downsample="occupancy", occ_thr=0.1)
+    img_t, mask_t, geom = prep_context(ct, mask, [1.0, 1.0, 1.0], (20, 20, 20),
+                                       T=8, crop_mm=1.0, mask_downsample="occupancy", occ_thr=0.1)
     assert img_t.shape == (1, 8, 8, 8)
     assert mask_t.shape == (8, 8, 8)
+    assert geom.shape == (4, 3)
     assert mask_t.sum() > 0                    # organ survives into the crop
 
 
@@ -83,25 +84,28 @@ def test_load_nifti_canonicalizes():
 from omegaconf import OmegaConf  # noqa: E402
 
 
-class _StubModel:
-    """Minimal model with .predict: emits a centred cube in the T³ grid (independent of
-    input), so the cascade wiring/stitch/metrics can be exercised without a checkpoint."""
+class _StubModel(torch.nn.Module):
+    """Minimal patchset3d-shaped model: forward -> {'final_logit'} with a centred cube in the
+    T³ grid (input-independent), so the run_cascade wiring/stitch/metrics can be exercised
+    without a checkpoint."""
     spacing_aware = False
 
-    def predict(self, target_img, context_imgs, context_masks, **kw):
-        B, _, T, _, _ = target_img.shape
-        out = torch.zeros(B, T, T, T)
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+                query_prior=None):
+        B, _, T, _, _ = image.shape
+        out = torch.full((B, 1, T, T, T), -20.0)
         q = T // 4
-        out[:, q:T - q, q:T - q, q:T - q] = 1.0
-        return out
+        out[:, :, q:T - q, q:T - q, q:T - q] = 20.0
+        return {"final_logit": out}
 
 
 def _cfg():
     return OmegaConf.create({
         "data": {"image_size": [16, 16, 16], "crop_spacing_mm": 1.5,
                  "use_crop": True, "mask_downsample": "occupancy",
-                 "mask_occupancy_thr": 0.1, "source": "totalseg"},
-        "eval": {"model": "stub", "checkpoint": None, "spacing_sweep": [4, 1.5]},
+                 "mask_occupancy_thr": 0.1, "source": "totalseg",
+                 "cascade_spacings": [4, 1.5], "cascade_query_prior": "pred"},
+        "eval": {"model": "stub", "checkpoint": None},
     })
 
 
@@ -168,15 +172,17 @@ def test_predict_nifti_output_matches_target_orientation(tmp_path, monkeypatch):
     assert recanon.shape == shape and recanon.any()
 
 
-class _EchoStubModel:
-    """Model whose prediction echoes the (single) context mask in the grid, so different
+class _EchoStubModel(torch.nn.Module):
+    """Model whose prediction echoes the (first) context mask in the grid, so different
     labels yield different-shaped/placed predictions — lets us check the batch dim pairs
     each target with the RIGHT context (no cross-task contamination) and exercises the
     small-organ-wins overlap combine."""
     spacing_aware = False
 
-    def predict(self, target_img, context_imgs, context_masks, **kw):
-        return (context_masks[:, 0] > 0.5).float()          # (B,T,T,T)
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+                query_prior=None):
+        logit = (context_out[:, 0] > 0.5).float().unsqueeze(1) * 40.0 - 20.0   # (B,1,T,T,T)
+        return {"final_logit": logit}
 
 
 def _combine_small_wins(natives_by_label, shape):

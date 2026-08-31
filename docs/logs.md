@@ -6421,3 +6421,84 @@ Tests: experiments/3d/tests/ cascade suites 49 pass (test_cascade 26, guard/swee
 stitch 23). Config smoke: `eval` + `experiment=59_organs_cascade_from_scratch
 eval.model=patchset3d` composes, `_assert_cascade_supported` passes. No live end-to-end run
 (a full exp59 training job, PID 26301, was holding 72 GiB on the only GPU).
+
+## 2026-08-31 (cont.) — v2 cascade eval: cascade figure panels
+
+The stale `eval.spacing_cascade` path saved a 2x5 coarse->fine panel per class
+(`figures/cascade/<cls>_<s0>to<s1>mm.png`) when `eval.cascade_figures=true`: cols =
+coarse img+GT / coarse pred+fine&oracle bbox / fine img+GT / fine pred / fine-pred-refit
+-into-coarse+GT; rows = target, 1st context. Mechanism: `evaluate_classes` stashes the
+first sample per class into a `figure_cache` dict ({img,gt,pred,prob,ctx_img,ctx_gt,geom}),
+coarse+fine passes fill two caches, `_save_cascade_pair` pairs them by class and calls
+`save_cascade_figure` (fine->coarse remap via `_refit_into_coarse` on both crop_geoms, with
+a `refit(fine GT) vs coarse GT` dice guardrail printed).
+
+The v2 `evaluate_cascade` never touched `evaluate_classes`, so it had no figure path.
+Added (reusing `_save_cascade_pair` / `save_cascade_figure` verbatim):
+- cascade.py `run_cascade(..., want_figure_arrays=False)`: when set, collects per level a
+  `{img,gt,ctx_img,ctx_gt}` dict of post-aug (B,T,T,T) CPU-numpy arrays (target vol + 1st
+  context); returned as `CascadeResult.figure_levels`. None otherwise -> zero cost for the
+  train loop.
+- cascade.py `evaluate_cascade(..., fig_dir=None, cascade_figures=False)`: captures the
+  first sample seen per requested class into per-level caches (adds pred = hard_preds[li],
+  prob = sigmoid(logit) upsampled to T, geom = geoms[li]); `want_figure_arrays` is toggled
+  off once every class is captured. After the loop, `_save_cascade_pair` is called for each
+  consecutive spacing pair -> N-1 panels/class for N>2 levels (one panel for the usual 2).
+- eval.py v2_cascade branch passes `fig_dir` + `cascade_figures=cfg.eval.cascade_figures`.
+- eval.yaml `cascade_figures` comment: now honoured by both cascade eval paths.
+
+Tested live: `eval.py eval.model=patchset3d
+eval.checkpoint=.../2026-08-31_67_cascade_qprior_pred/best.pt
+experiment=59_organs_cascade_from_scratch data.context_size=1 data.crop_spacing_mm=6
+data.cascade_spacings=[6,3] data.val_classes=[liver] eval.split=test eval.tasks_per_class=3
+eval.cascade_figures=true` -> `figures/cascade/liver_6to3mm.png` written, guardrail
+`refit(fine GT) vs coarse GT dice=0.932`, liver dice 6mm 0.875 -> 3mm 0.903 (prior wired).
+Panel renders correctly (visually verified). Test artifact dir removed.
+
+Tests: +2 in test_cascade.py (test_run_cascade_figure_arrays_opt_in,
+test_evaluate_cascade_saves_cascade_figures); experiments/3d/tests/ + test_patchset3d.py
+104 pass.
+
+## 2026-08-31 (cont.) — infer_nifti: switch nifti inference to the v2 cascade
+
+infer_nifti.py (the `patchset-infer` CLI) ran its own hand-rolled cascade: COM-only
+handoff (`_predicted_native_center`), level-0 volume-centred, NO query_prior — a checkpoint
+trained with cascade_query_prior=pred was run without its prior. Replaced with
+cascade.run_cascade:
+
+- New `NiftiProvider` (VolumeProvider) over the already-loaded target + K context arrays.
+  subject keys 'tgt' / 'ctx{k}'; `cls` = label-id string (or `_FG` for single binary).
+  `load()` reuses prep_target / prep_context (prep_context now also returns crop_geom).
+  Target level-0 crop = volume centre; contexts always self-centre on their mask centroid.
+- `predict_nifti` builds a level-0 v2 batch via cascade._recrop_level(provider, meta, ...),
+  then one `run_cascade(..., query_prior=<mode>, want_hard_preds=True)` per batch_size chunk
+  of labels. Per label -> `task["passes"] = [(hard_preds[li][j], geoms[li][j]) for li]`, so
+  the downstream stitch (`_native_from_passes`), coarse-only baseline, multi-label
+  small-organ-wins combine, orientation round-trip, and Caret LabelTable code are UNCHANGED.
+- Spacing schedule now from `data.cascade_spacings` (falls back to `eval.spacing_sweep`);
+  query-prior from `data.cascade_query_prior` (default 'pred') / `_hard`;
+  `data.cascade_recrop_workers` (default 1). patchset3d only (run_cascade needs the
+  {'final_logit'} forward) — no runtime guard, documented.
+- infer_cli.py: `--crop-spacings` -> `++data.cascade_spacings`; new `--query-prior`
+  (default pred) -> `++data.cascade_query_prior` (++ because the base eval `data` group is
+  struct and lacks these keys). eval.py `_FIDELITY_KEYS` already carries the cascade keys so
+  `_warn_uninherited_data` flags a train/infer mismatch.
+- Removed the stale `_predicted_native_center` import/use from infer_nifti.
+
+Tested live (exp67 ckpt 2026-08-31_67_cascade_qprior_pred, plainconv_ts, feat_norm=self):
+  infer_cli --target s0311/ct --context s0308/ct s0308/liver --crop-spacings 6,3
+  --query-prior pred --gt s0311/liver
+  -> dice 0.9417  coarse_only 0.9014  gain +0.0403 ; wrote (292,164,292) uint8 {0,1} nifti,
+  affine+shape == target, RAS, Dice recomputed from the saved file = 0.9417.
+
+Tests: test_infer_nifti.py stubs -> nn.Module forward returning {'final_logit'};
+prep_context 3-tuple unpack; _cfg() gains cascade_spacings/cascade_query_prior. All 14 pass;
+experiments/3d/tests/ + test_patchset3d.py 104 pass.
+
+Re-vendored into the `patchset` conda env (scripts/sync_patchset_env.sh — but rsync is
+missing on this node, used a Python mirror with the same include/exclude/--delete rules;
+513 src files, 167 updated, 27 stale removed). `patchset-infer --help` shows the new
+--query-prior flag; a full run (same s0311 liver case) gave dice 0.9420 / coarse 0.9018 /
++0.0402, matching the dev-env numbers. NOTE: the env's torch (2.12.1+cu130, kernels
+sm_50..sm_90) has no Blackwell sm_120 kernel — had to force CPU (CUDA_VISIBLE_DEVICES="")
+on this node; the env is meant for Ampere.

@@ -563,6 +563,55 @@ def test_evaluate_cascade_shapes_and_nan_safe_macro(tmp_path, monkeypatch):
     assert by_cls["not_a_real_class"]["error"] == "no valid samples"
 
 
+def test_run_cascade_figure_arrays_opt_in():
+    """want_figure_arrays=True -> figure_levels is a per-level list of {img,gt,ctx_img,ctx_gt}
+    (B,T,T,T) post-aug arrays; default keeps it None."""
+    B, T = 2, 8
+    model, prov = _FakeModel(G=4, hot=(1, 1, 1)), _FakeProvider(T=T)
+    off = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device="cpu", training=False, step=0, seed=0)
+    assert off.figure_levels is None
+
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device="cpu", training=False, step=0, seed=0,
+                      want_figure_arrays=True)
+    assert isinstance(res.figure_levels, list) and len(res.figure_levels) == 2
+    for fl in res.figure_levels:
+        assert set(fl) == {"img", "gt", "ctx_img", "ctx_gt"}
+        for v in fl.values():
+            assert v.shape == (B, T, T, T)
+
+
+def test_evaluate_cascade_saves_cascade_figures(tmp_path, monkeypatch):
+    """cascade_figures=True + fig_dir -> one <cls>_<s0>to<s1>mm.png per requested class under
+    fig_dir/cascade/ (reusing evaluate.save_cascade_figure)."""
+    pytest.importorskip("matplotlib")
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, T = 2, 8
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = _ALL_CLASSES_IDX["liver"]
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=_FakeProvider(T=T))
+        def __iter__(self): return iter([_named_batch(["liver"] * B, B=B, T=T)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [6.0, 3.0]}})
+    fig_dir = tmp_path / "figures"
+    evaluate_cascade(_FakeModel(G=4, hot=(1, 1, 1)), cfg, ["liver"], loader=_Loader(),
+                     seed=0, is_prob=False, fig_dir=fig_dir, cascade_figures=True)
+    saved = list((fig_dir / "cascade").glob("*.png"))
+    assert [p.name for p in saved] == ["liver_6to3mm.png"]
+    assert saved[0].stat().st_size > 0
+
+
 def test_evaluate_cascade_reads_cascade_recrop_workers(tmp_path, monkeypatch):
     """evaluate_cascade forwards data.cascade_recrop_workers to run_cascade."""
     import common
