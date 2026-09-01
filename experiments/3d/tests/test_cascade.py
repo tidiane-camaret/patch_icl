@@ -725,3 +725,48 @@ def test_evaluate_cascade_reads_cascade_recrop_workers(tmp_path, monkeypatch):
     rows, cases = evaluate_cascade(_FakeModel(G=4, hot=(1, 1, 1)), cfg, ["liver"],
                                    loader=_Loader(), seed=0, is_prob=False)
     assert len(cases) == B
+
+
+# ---------------------------------------------------------------------------
+# Task 4: cascade _recrop_level GPU-realize branch (levels >= 1)
+# ---------------------------------------------------------------------------
+class _NativeCropProvider:
+    """Fake provider exposing load_native_crop -> NativeCrop with identity geom."""
+    def __init__(self, T=8):
+        from src.providers.totalseg import NativeCrop
+        self.T, self._NC = T, NativeCrop
+        self.calls = []
+
+    def subjects_for(self, cls):
+        return ["s0", "s1", "c0_0", "c0_1", "c0_2", "c1_0", "c1_1", "c1_2"]
+
+    def load_native_crop(self, subject, cls, req):
+        self.calls.append({"subject": subject, "center": req.center,
+                           "spacing": req.crop_spacing_mm, "jitter": req.jitter})
+        T = self.T
+        geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+        lbl = torch.zeros(T, T, T, dtype=torch.uint8); lbl[1:3, 1:3, 1:3] = 7
+        return self._NC(image=torch.zeros(T, T, T, dtype=torch.float16), label=lbl,
+                        class_idx=7, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+                        crop_geom=geom, crop_spacing_mm=float(req.crop_spacing_mm),
+                        decim=(1, 1, 1))
+
+
+@pytest.mark.parametrize("spacings", [[3.0, 1.5], [6.0, 3.0, 1.5]])
+def test_run_cascade_realize_crop_multilevel(spacings):
+    from src.totalseg_dataset import resolve_ct_norm
+    B, T, G = 2, 8, 4
+    model, prov = _FakeModel(G=G, hot=(1, 1, 1)), _NativeCropProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=spacings, device=torch.device("cpu"),
+                      training=True, step=0, seed=0, jitter=0,
+                      realize_crop=True, mask_downsample="occupancy", occ_thr=0.1,
+                      ct_spec=resolve_ct_norm(None))
+    N = len(spacings)
+    assert len(res.logits) == N and len(res.centers) == N
+    assert res.centers[0] == [None] * B
+    for i in range(1, N):
+        assert len(res.centers[i]) == B
+    # every re-crop level went through load_native_crop
+    assert len(prov.calls) == (N - 1) * B * (1 + 3)
+    assert all(c["jitter"] == 0 for c in prov.calls)

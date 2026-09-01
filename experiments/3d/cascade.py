@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from src.gpu_augment import GeoState
+from src.gpu_realize_crop import realize_native_crops, _regroup
 from src.incontext_dataset_v2 import LoadRequest
 from src.totalseg_dataloader_incontext import incontext_collate_fn
 from grid_metrics import target_like
@@ -131,15 +132,42 @@ def _recrop_pool(workers):
         return _RECROP_POOL
 
 
+def _run_pool(fn, tasks, workers):
+    """Map `fn` over `tasks`, returning results in task order.
+
+    With `workers > 1` (and >1 task) the calls fan out over the process-lifetime re-crop
+    thread pool; torch intra-op is pinned to 1 for the duration so the many small
+    F.interpolate/avg_pool3d calls don't each spawn cpu_count() threads and oversubscribe
+    (safe -- the caller is a hard sync point in the step: GPU idle, nothing else runs).
+    Otherwise a plain serial list-comp. Result list is identical either way -- completion
+    order is never observable."""
+    if workers and workers > 1 and len(tasks) > 1:
+        n_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            pool = _recrop_pool(min(int(workers), len(tasks)))
+            return list(pool.map(fn, tasks))
+        finally:
+            torch.set_num_threads(n_threads)
+    return [fn(t) for t in tasks]
+
+
 def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitter,
-                  recrop_workers=1):
+                  recrop_workers=1, realize_crop=False, mask_downsample="occupancy",
+                  occ_thr=0.1, ct_spec=None, device=None):
     """Build one level-i v2 batch: target re-cropped on `centers[b]`, K contexts GT-centred,
     same subjects/classes as level 0.
 
     The B*(K+1) provider loads are independent (each carries its own per-(b[,k]) seeded RNG),
     so with recrop_workers > 1 they are fanned out over a thread pool. Results are reassembled
     in task order, so the collated batch is byte-identical to the serial (recrop_workers=1)
-    path regardless of completion order."""
+    path regardless of completion order.
+
+    realize_crop: load NativeCrop payloads (provider.load_native_crop, from the RAM cache) and
+    resample them on `device` via realize_native_crops, instead of the provider.load +
+    incontext_collate_fn CPU path. Both branches return the same batch-dict keys
+    (image/label/context_in/context_out/spacing/crop_geom + subjects/context_subjects/
+    label_names/aug_mode); crop_geom flows through untouched from each row's target crop."""
     subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
     sp = float(spacing)
 
@@ -150,24 +178,29 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
         for k, cs in enumerate(ctxs[b]):
             tasks.append((b, k, cs, None, f"{seed}_{step}_{level}_{b}_{k}"))
 
+    if realize_crop:
+        def _load_nc(t):
+            b, _k, subj, center, rk = t
+            return provider.load_native_crop(subj, clss[b], LoadRequest(
+                rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
+
+        flat = _run_pool(_load_nc, tasks, recrop_workers)
+        members = _regroup(flat, len(subs), 1 + len(ctxs[0]))   # [target, ctx0..ctxK-1] per b
+        out = realize_native_crops(members, T=batch["image"].shape[-1],
+                                   mask_downsample=mask_downsample, occ_thr=occ_thr,
+                                   ct_spec=ct_spec, device=device)
+        out["subjects"] = list(subs)
+        out["context_subjects"] = [list(c) for c in ctxs]
+        out["label_names"] = list(clss)
+        out["aug_mode"] = torch.zeros(len(subs), dtype=torch.long)
+        return out
+
     def _load(t):
         b, _k, subj, center, rk = t
         return provider.load(subj, clss[b], LoadRequest(
             rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
 
-    if recrop_workers and recrop_workers > 1 and len(tasks) > 1:
-        # Pin torch intra-op to 1 for the fan-out: many small F.interpolate/avg_pool3d calls
-        # would each spawn cpu_count() threads and oversubscribe. Safe -- _recrop_level is a
-        # hard sync point in the step (GPU idle, nothing else in this process runs).
-        n_threads = torch.get_num_threads()
-        torch.set_num_threads(1)
-        try:
-            pool = _recrop_pool(min(int(recrop_workers), len(tasks)))
-            results = list(pool.map(_load, tasks))
-        finally:
-            torch.set_num_threads(n_threads)
-    else:
-        results = [_load(t) for t in tasks]
+    results = _run_pool(_load, tasks, recrop_workers)
 
     slots = [{"tgt": None, "cin": [], "cout": []} for _ in range(len(subs))]
     for (b, k, *_), r in zip(tasks, results):
@@ -396,7 +429,8 @@ def _hard_pred_native(logit_b1ghw, T, is_prob):
 def run_cascade(model, provider, batch, augmentor, spacings, *, device, training,
                 step, seed, jitter=0, is_prob=False, want_hard_preds=False,
                 recrop_workers=1, query_prior=False, query_prior_hard=False,
-                want_figure_arrays=False):
+                want_figure_arrays=False, realize_crop=False,
+                mask_downsample="occupancy", occ_thr=0.1, ct_spec=None):
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
     N = len(spacings)
@@ -418,8 +452,10 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         if i > 0:
             cur = _recrop_level(provider, batch, centers[i], spacings[i],
                                 step=step, seed=seed, level=i, jitter=jitter,
-                                recrop_workers=recrop_workers)
-            cur = _to_device(cur, device)
+                                recrop_workers=recrop_workers, realize_crop=realize_crop,
+                                mask_downsample=mask_downsample, occ_thr=occ_thr,
+                                ct_spec=ct_spec, device=device)
+            cur = _to_device(cur, device)   # no-op for realize output (already on device)
         capture = augmentor is not None and i < N - 1
         if augmentor is not None:
             cur, geo = augmentor.apply(
