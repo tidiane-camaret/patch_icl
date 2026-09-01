@@ -168,3 +168,34 @@ def test_batch_and_context_shapes():
     assert int(ctx.sum()) == 64 and int(ctx[0:4, 0:4, 0:4].sum()) == 64
     assert int(tgt[0, 0, 0]) == 0 and int(ctx[0, 0, 0]) == 1
     assert torch.equal(out["label"][0], out["label"][1])       # identical rows stack cleanly
+
+
+def test_engine_emits_native_crop_payload(tmp_path):
+    import random
+    from src.incontext_dataset_v2 import InContextDataset, LoadRequest
+    from src.providers.totalseg import NativeCrop
+
+    T = 8
+    geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+
+    class P:
+        classes = ["liver"]
+        def subjects_for(self, cls): return ["a", "b", "c", "d"]
+        def load_native_crop(self, subject, cls, req):
+            return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16),
+                              label=torch.zeros(T, T, T, dtype=torch.uint8),
+                              class_idx=3, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+                              crop_geom=geom, crop_spacing_mm=req.crop_spacing_mm,
+                              decim=(1, 1, 1))
+
+    ds = InContextDataset(P(), context_size=3, class_balanced=False,
+                          crop_spacing_mm=3.0, gpu_realize_crop=True)
+    ds.samples = [("a", "liver")]
+    item = ds[0]
+    assert "image" not in item and "native_crop" in item
+    assert len(item["native_crop"]) == 4                # target + 3 contexts
+    assert all(isinstance(x, NativeCrop) for x in item["native_crop"])
+    assert item["subject"] == "a" and item["label_name"] == "liver"
+    assert set(item["context_subjects"]) <= {"b", "c", "d"}
+    assert len(item["context_subjects"]) == 3
+    assert int(item["aug_mode"]) == 0

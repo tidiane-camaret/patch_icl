@@ -46,7 +46,7 @@ class InContextDataset(Dataset):
 
     def __init__(self, provider, context_size=3, class_balanced=False,
                  aug_cfg=None, defer_aug=False, crop_spacing_mm=1.5, eval_seed=None,
-                 max_tasks_per_class=None):
+                 max_tasks_per_class=None, gpu_realize_crop=False):
         self.provider = provider
         self.context_size = int(context_size)
         self.class_balanced = bool(class_balanced)
@@ -54,6 +54,10 @@ class InContextDataset(Dataset):
         self.defer_aug = bool(defer_aug)
         self.crop_spacing_mm = float(crop_spacing_mm)
         self.eval_seed = eval_seed
+        # gpu_realize_crop: emit an imageless `native_crop` payload (provider.load_native_crop)
+        # that the cascade train loop resamples + paints on-GPU (src/gpu_realize_crop). Non-cohort
+        # train path only; the engine skips CPU aug for imageless items.
+        self.gpu_realize_crop = bool(gpu_realize_crop)
         # Cohort providers (e.g. synth_gmm) sample a whole K+1 cohort + a shared appearance
         # jointly, which the independent target+context load path below cannot express. They
         # implement the optional `assemble_task` hook instead; the engine then owns only aug +
@@ -122,6 +126,33 @@ class InContextDataset(Dataset):
             subj = rng.choice(self.provider.subjects_for(cls))
         else:
             subj, cls = self.samples[idx]
+
+        if self.gpu_realize_crop:
+            req = LoadRequest(rng=rng, crop_spacing_mm=crop_spacing)
+            tgt = self.provider.load_native_crop(subj, cls, req)
+            ctx, ctx_subjects = [], []
+            candidates = [s for s in self.provider.subjects_for(cls) if s != subj]
+            for cs in _lazy_shuffle(rng, candidates):
+                if len(ctx) >= self.context_size:
+                    break
+                try:
+                    nc = self.provider.load_native_crop(cs, cls, LoadRequest(rng, crop_spacing))
+                except Exception:
+                    continue
+                ctx.append(nc); ctx_subjects.append(cs)
+            if not ctx:
+                warnings.warn("InContextDataset: no context candidates; self-context "
+                              "fallback (metrics leakage-inflated).", stacklevel=2)
+                ctx.append(tgt); ctx_subjects.append(subj)
+            while len(ctx) < self.context_size:
+                i = rng.randrange(len(ctx))
+                ctx.append(ctx[i]); ctx_subjects.append(ctx_subjects[i])
+            # No "image" key: the engine skips CPU aug for imageless items; the real
+            # context ids ride along so cascade._recrop_level can re-crop the same
+            # contexts at level >= 1.
+            return {"native_crop": [tgt, *ctx], "subject": subj,
+                    "context_subjects": ctx_subjects, "label_name": cls,
+                    "aug_mode": torch.tensor(0, dtype=torch.long)}
 
         req = LoadRequest(rng=rng, crop_spacing_mm=crop_spacing)
         tgt = self.provider.load(subj, cls, req)

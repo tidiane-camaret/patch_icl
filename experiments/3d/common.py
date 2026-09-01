@@ -283,6 +283,9 @@ def build_dataset(cfg, split: str):
         is_train = split == "train"
         class_spec = d.train_classes if is_train else d.val_classes
         classes = resolve_classes(class_spec, root, is_mri=is_mri)
+        # Cascade runs default ram_cache + gpu_realize_crop ON (the level-0 native-crop
+        # payload path); a non-cascade config leaves both flags off -> byte-identical v2 path.
+        _casc = bool(d.get("cascade_spacings"))
         provider = TotalSegProvider(
             root=root, classes=classes, image_size=tuple(d.image_size),
             split=split, max_subjects=(d.get("max_train_subjects") if is_train
@@ -292,14 +295,17 @@ def build_dataset(cfg, split: str):
             mask_downsample=d.get("mask_downsample", "occupancy"),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"),
-            ct_norm=d.get("ct_norm"))
+            ct_norm=d.get("ct_norm"),
+            ram_cache=bool(d.get("ram_cache", _casc)),
+            ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
         return InContextDataset(
             provider, context_size=d.context_size,
             class_balanced=(is_train and d.get("class_balanced", False)),
             aug_cfg=(cfg.augmentations if is_train else None),
             defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
-            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))))
+            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))),
+            gpu_realize_crop=(is_train and bool(d.get("gpu_realize_crop", _casc))))
 
     if cfg.data.get("source", "totalseg") == "omnisynth3d":
         from src.datasets.omniSynth.dataset3d import OmniSynth3DICLDataset
@@ -581,9 +587,14 @@ def train_loader(cfg) -> DataLoader:
             if max_len is not None else RandomSampler(ds))
     # gpu_realize ships variable-shape native crops -> a list-preserving collate; the
     # SynthRealizer paints them on GPU in the train loop. Otherwise the default stacking collate.
+    _casc_realize = (bool(cfg.data.get("cascade_spacings"))
+                     and bool(cfg.data.get("gpu_realize_crop", True)))
     if cfg.data.get("source") == "synth_gmm_maisi" and cfg.data.get("gpu_realize", False):
         from src.gpu_synth_realize import synth_gpu_collate_fn
         collate = synth_gpu_collate_fn
+    elif _casc_realize:
+        from src.gpu_realize_crop import native_crop_collate_fn
+        collate = native_crop_collate_fn
     else:
         collate = incontext_collate_fn
     common = dict(num_workers=nw, collate_fn=collate,
@@ -659,6 +670,9 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         # Eval GT stays HARD: "soft" (a smooth training target) maps back to "occupancy"
         # so the Dice / NSD metrics (which treat any >0 voxel as foreground) are unchanged.
         _eval_md = d.get("mask_downsample", "occupancy")
+        # Share the RAM-cache singleton with the train provider under cascade (same default);
+        # eval never emits native-crop payloads (gpu_realize_crop stays off) -- run_cascade's
+        # val pass owns any realize itself.
         provider = TotalSegProvider(
             root=root, classes=list(classes), image_size=tuple(d.image_size),
             split=split, max_subjects=e.get("n_subjects", None),
@@ -667,7 +681,9 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
             mask_downsample=("occupancy" if _eval_md == "soft" else _eval_md),
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"),
-            ct_norm=d.get("ct_norm"))
+            ct_norm=d.get("ct_norm"),
+            ram_cache=bool(d.get("ram_cache", bool(d.get("cascade_spacings")))),
+            ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
         ds_v2 = InContextDataset(
             provider, context_size=d.context_size, class_balanced=False,
             aug_cfg=None, crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
