@@ -74,6 +74,7 @@ from common import (DEVICE, _source_root, train_loader, make_eval_loader, _self_
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from cascade import run_cascade, _cascade_loss
+from src.totalseg_dataset import resolve_ct_norm
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
 
 
@@ -470,7 +471,7 @@ class EncoderDrift:
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-                is_patchset=False, gpu_aug=None, synth_realizer=None):
+                is_patchset=False, gpu_aug=None, synth_realizer=None, crop_realizer=None):
     """optimizers is a list: [AdamW] for medverse, [AdamW, Muon] for patchset3d (the
     scheduler drives AdamW = optimizers[0]; Muon is unscheduled, cf. experiments/2d/train.py)."""
     net = getattr(model, "model", model)
@@ -507,6 +508,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             # accumulated and merged into `grid` at the end. `continue` skips the normal
             # single-forward body entirely.
             spacings = [float(s) for s in cascade_spacings]
+            # Level-0 GPU realize: the v2 loader ships an imageless native_crop payload when
+            # data.gpu_realize_crop is on; turn it into a finished batch dict on device before
+            # run_cascade. No-op (crop_realizer is None) on the CPU-collated cascade path.
+            if crop_realizer is not None and "native_crop" in batch:
+                batch = crop_realizer(batch)
             gstep = epoch * len(loader) + n
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
@@ -523,7 +529,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                     jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob,
                     recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
                     query_prior=cfg.data.get("cascade_query_prior", False),
-                    query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)))
+                    query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)),
+                    realize_crop=bool(cfg.data.get("gpu_realize_crop", True)),
+                    mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
+                    occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
+                    ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")))
                 # Fail fast on a non-finite forward at ANY level, BEFORE the loss: a NaN
                 # reaching F.binary_cross_entropy trips an async device assert with a useless
                 # later stack (cf. the non-cascade guard).
@@ -1134,12 +1144,29 @@ def main(cfg: DictConfig) -> None:
     else:
         synth_realizer = None
 
+    # GPU-realize the cascade level-0 train batches: the v2 loader ships imageless
+    # `native_crop` payloads (data.gpu_realize_crop, default on under data.cascade_spacings);
+    # realize_cascade_level0 resamples / normalizes / centre-pads them on device before
+    # run_cascade. None (unchanged path) unless the cascade + realize are both on.
+    if _cascade_on and bool(cfg.data.get("gpu_realize_crop", True)):
+        from cascade import realize_cascade_level0
+        _rc_T = int(cfg.data.image_size[0])
+        _rc_md = cfg.data.get("mask_downsample", "occupancy")
+        _rc_thr = float(cfg.data.get("mask_occupancy_thr", 0.1))
+        _rc_spec = resolve_ct_norm(cfg.data.get("ct_norm"))
+        def crop_realizer(batch, _dev=DEVICE):
+            return realize_cascade_level0(batch, T=_rc_T, mask_downsample=_rc_md,
+                                          occ_thr=_rc_thr, ct_spec=_rc_spec, device=_dev)
+    else:
+        crop_realizer = None
+
     best = resume_best
     for epoch in range(resume_epoch, cfg.train.epochs):
         t0 = time.perf_counter()
         loss, tr_dice, tr_soft, tr_grid = train_epoch(
             model, loader, optimizers, scheduler, step_per_batch, loss_fn, cfg, epoch,
-            is_patchset=is_patchset, gpu_aug=gpu_aug, synth_realizer=synth_realizer)
+            is_patchset=is_patchset, gpu_aug=gpu_aug, synth_realizer=synth_realizer,
+            crop_realizer=crop_realizer)
         log = {"epoch": epoch, "train/loss": loss, "train/dice": tr_dice,
                "train/dice_soft": tr_soft,
                "train/lr": optimizer.param_groups[0]["lr"], "time/epoch_s": time.perf_counter() - t0}

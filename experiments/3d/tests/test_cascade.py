@@ -546,7 +546,7 @@ def test_train_epoch_cascade_smoke(monkeypatch):
     cfg = OmegaConf.create({
         "model": "patchset3d",
         "data": {"cascade_spacings": [3.0, 1.5], "cascade_crop_jitter": 0,
-                 "crop_spacing_mm": 3.0},
+                 "crop_spacing_mm": 3.0, "gpu_realize_crop": False},
         "train": {"seed": 0, "cascade_loss_weights": [1.0, 1.0]},
     })
     loss_fn = lambda logit, target: torch.nn.functional.mse_loss(
@@ -584,7 +584,8 @@ def test_train_epoch_reads_cascade_recrop_workers():
     cfg = OmegaConf.create({
         "model": "patchset3d",
         "data": {"cascade_spacings": [3.0, 1.5], "cascade_crop_jitter": 0,
-                 "crop_spacing_mm": 3.0, "cascade_recrop_workers": n_calls},
+                 "crop_spacing_mm": 3.0, "cascade_recrop_workers": n_calls,
+                 "gpu_realize_crop": False},
         "train": {"seed": 0, "cascade_loss_weights": [1.0, 1.0]},
     })
     loss_fn = lambda logit, target: torch.nn.functional.mse_loss(
@@ -635,7 +636,8 @@ def test_evaluate_cascade_shapes_and_nan_safe_macro(tmp_path, monkeypatch):
                          _named_batch(["not_a_real_class"] * B, B=B, T=T)])
         def __len__(self): return 2
 
-    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5]}})
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False}})
     rows, cases = evaluate_cascade(model, cfg, ["liver", "not_a_real_class"],
                                    loader=_Loader(), seed=0, is_prob=False)
 
@@ -689,7 +691,8 @@ def test_evaluate_cascade_saves_cascade_figures(tmp_path, monkeypatch):
         def __iter__(self): return iter([_named_batch(["liver"] * B, B=B, T=T)])
         def __len__(self): return 1
 
-    cfg = OmegaConf.create({"data": {"cascade_spacings": [6.0, 3.0]}})
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [6.0, 3.0],
+                                     "gpu_realize_crop": False}})
     fig_dir = tmp_path / "figures"
     evaluate_cascade(_FakeModel(G=4, hot=(1, 1, 1)), cfg, ["liver"], loader=_Loader(),
                      seed=0, is_prob=False, fig_dir=fig_dir, cascade_figures=True)
@@ -721,7 +724,8 @@ def test_evaluate_cascade_reads_cascade_recrop_workers(tmp_path, monkeypatch):
         def __len__(self): return 1
 
     cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
-                                     "cascade_recrop_workers": n_calls}})
+                                     "cascade_recrop_workers": n_calls,
+                                     "gpu_realize_crop": False}})
     rows, cases = evaluate_cascade(_FakeModel(G=4, hot=(1, 1, 1)), cfg, ["liver"],
                                    loader=_Loader(), seed=0, is_prob=False)
     assert len(cases) == B
@@ -770,3 +774,28 @@ def test_run_cascade_realize_crop_multilevel(spacings):
     # every re-crop level went through load_native_crop
     assert len(prov.calls) == (N - 1) * B * (1 + 3)
     assert all(c["jitter"] == 0 for c in prov.calls)
+
+
+def test_realize_cascade_level0_shape_contract():
+    from cascade import realize_cascade_level0
+    from src.totalseg_dataset import resolve_ct_norm
+    from src.providers.totalseg import NativeCrop
+    B, K, T = 2, 3, 8
+    geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+    def nc():
+        lbl = torch.zeros(T, T, T, dtype=torch.uint8); lbl[1:4, 1:4, 1:4] = 7
+        return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16), label=lbl,
+                          class_idx=7, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+                          crop_geom=geom, crop_spacing_mm=3.0, decim=(1, 1, 1))
+    batch = {"native_crop": [[nc() for _ in range(K + 1)] for _ in range(B)],
+             "subjects": ["s0", "s1"],
+             "context_subjects": [["c0"] * K, ["c1"] * K],
+             "label_names": ["liver", "liver"],
+             "aug_mode": torch.zeros(B, dtype=torch.long)}
+    out = realize_cascade_level0(batch, T=T, mask_downsample="occupancy", occ_thr=0.1,
+                                 ct_spec=resolve_ct_norm(None), device=torch.device("cpu"))
+    assert out["image"].shape == (B, 1, T, T, T)
+    assert out["context_in"].shape == (B, K, 1, T, T, T)
+    assert out["label"].shape == (B, T, T, T)
+    assert out["crop_geom"].shape == (B, 4, 3)
+    assert out["subjects"] == ["s0", "s1"]

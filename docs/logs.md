@@ -1,5 +1,17 @@
 # Change log
 
+## 2026-09-01 — cascade RAM cache + GPU crop/realize
+
+`data.ram_cache` preloads ct_raw.npy + label.npy for all 1228 subjects into a
+fork-COW read-only singleton (`src/providers/volume_cache.py`); `data.gpu_realize_crop`
+makes `TotalSegProvider.load_native_crop` ship raw integer-decimated crops that
+`src/gpu_realize_crop.realize_native_crops` resamples/normalizes/places on device.
+`cascade.py` uses it for levels >=1 (`run_cascade(realize_crop=True)`) and the cascade
+train loader ships imageless `native_crop` payloads that `train_epoch` realizes for
+level 0. Both default on when `data.cascade_spacings` is set. Non-cascade v2 paths
+unchanged. Removes the ~0.3 s/step synchronous NFS re-crop and the ~100 s/val-pass.
+Spec: docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.
+
 ## 2026-08-31 — totalsegmri per-spacing image caches + cascade cache-warning fix
 
 **Built** `ct_raw_{6,3,1.5}mm.npy` for all 616 `totalsegmri` subjects

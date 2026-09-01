@@ -226,6 +226,11 @@ def _assert_cascade_supported(cfg) -> None:
     if w is not None and len(w) != len(spacings):
         raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
                          f"data.cascade_spacings (len {len(spacings)}).")
+    if d.get("gpu_realize_crop", True) and not d.get("ram_cache", True):
+        raise ValueError(
+            "data.cascade_spacings with data.gpu_realize_crop=true requires data.ram_cache=true "
+            "(the RAM cache is what removes the NFS re-crop cost; realize over mmap is slower). "
+            "See docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.")
     qp = d.get("cascade_query_prior", False)
     from cascade import _resolve_prior_spec   # lazy: only when a cascade config is present
     try:

@@ -91,3 +91,14 @@ def test_rejects_query_prior_bad_mixture():
     with pytest.raises(ValueError, match="cascade_query_prior"):
         _assert_cascade_supported(_cfg(data={"cascade_query_prior":
                                              {"modes": ["pred", "oracle"]}}))
+
+
+def test_cascade_realize_requires_ram_cache():
+    # Explicit ram_cache: false on a gpu_realize_crop cascade run -> hard error.
+    with pytest.raises(ValueError, match="ram_cache"):
+        _assert_cascade_supported(_cfg(data={"gpu_realize_crop": True, "ram_cache": False}))
+
+
+def test_cascade_realize_default_ok():
+    # Neither key set under a cascade config -> both default true -> no raise.
+    _assert_cascade_supported(_cfg())

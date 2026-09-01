@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from src.gpu_augment import GeoState
 from src.gpu_realize_crop import realize_native_crops, _regroup
 from src.incontext_dataset_v2 import LoadRequest
+from src.totalseg_dataset import resolve_ct_norm
 from src.totalseg_dataloader_incontext import incontext_collate_fn
 from grid_metrics import target_like
 from evaluate import _grid_centroid, _predicted_native_center
@@ -426,6 +427,24 @@ def _hard_pred_native(logit_b1ghw, T, is_prob):
     return (up >= 0.5).float().squeeze(1)                                 # (B,T,T,T)
 
 
+def realize_cascade_level0(batch, *, T, mask_downsample, occ_thr, ct_spec, device):
+    """native_crop_collate_fn batch -> standard collated batch dict, on `device`.
+
+    Thin wrapper over realize_native_crops: resamples/normalizes/places the level-0
+    NativeCrop payloads, then re-attaches the passthrough id lists + aug_mode from
+    the collated batch so run_cascade's level-0 handling is byte-identical to the
+    finished-tensor collate path (same keys: image/label/context_in/context_out/
+    spacing/crop_geom + subjects/context_subjects/label_names/aug_mode)."""
+    out = realize_native_crops(batch["native_crop"], T=T, mask_downsample=mask_downsample,
+                               occ_thr=occ_thr, ct_spec=ct_spec, device=device)
+    out["subjects"] = list(batch["subjects"])
+    out["context_subjects"] = [list(c) for c in batch["context_subjects"]]
+    out["label_names"] = list(batch["label_names"])
+    out["aug_mode"] = batch.get(
+        "aug_mode", torch.zeros(len(out["subjects"]), dtype=torch.long)).to(device)
+    return out
+
+
 def run_cascade(model, provider, batch, augmentor, spacings, *, device, training,
                 step, seed, jitter=0, is_prob=False, want_hard_preds=False,
                 recrop_workers=1, query_prior=False, query_prior_hard=False,
@@ -565,6 +584,10 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                               recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
                               query_prior=cfg.data.get("cascade_query_prior", False),
                               query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)),
+                              realize_crop=bool(cfg.data.get("gpu_realize_crop", True)),
+                              mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
+                              occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
+                              ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
                               want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()

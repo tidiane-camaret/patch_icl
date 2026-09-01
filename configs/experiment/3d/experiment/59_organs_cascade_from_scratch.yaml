@@ -10,11 +10,11 @@
 # coarse->fine, each overwriting the previous). See
 # docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
 #
-# IMAGE CACHES (measured): without per-spacing `ct_raw_{s:g}mm.npy` caches (ct_raw_3mm.npy,
-# ct_raw_1.5mm.npy) the provider falls back to the full-res ct_raw.npy on every re-crop load.
-# On this cluster only ct_raw_6mm.npy exists, so each step does ~B*(K+1) synchronous full-res
-# loads (~195 ms at 3 mm, ~18-26 ms at 1.5 mm) ≈ +0.3 s/step and ~100 s per val pass. Build
-# the caches (scripts/ downsample) to remove it — training is correct without them, just slow.
+# DATA PATH: this run holds ct_raw.npy + label.npy for ALL subjects in a fork-shared RAM
+# cache (~35 GB; data.ram_cache) and does every crop resample / placement / normalization
+# on the GPU for both cascade levels (data.gpu_realize_crop). No ct_raw_{s}mm.npy caches
+# are needed. Recommend a >= 96 GB node. Set data.ram_cache=false to fall back to the NFS
+# mmap + CPU crop path (slow). See docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.
 
 defaults:
   - 57_organs_encoder_from_scratch
@@ -25,6 +25,8 @@ data:
   cascade_spacings: [3, 1.5]    # coarse -> fine
   cascade_crop_jitter: 0        # re-cropped levels respect the predicted COM exactly
   cascade_recrop_workers: 16    # thread-pool the B*(K+1) re-crop loads per level>0 (0/1 = serial)
+  ram_cache: true              # preload ct_raw.npy + label.npy for all subjects (fork-COW singleton)
+  gpu_realize_crop: true       # resample / normalize / place every cascade crop on the GPU
   # Feed level i-1's mask (not just its COM) to level i as the query's mask-token prior,
   # resampled onto level i's augmented grid (M2 affine warp; see cascade.py::_warp_prior_m2
   # and results/3d/query_prior_injection/). Modes (default none):
