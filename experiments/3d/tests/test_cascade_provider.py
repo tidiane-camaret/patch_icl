@@ -110,3 +110,37 @@ def test_load_native_crop_consumes_rng_once(tmp_path):
         crop_mm=1.5, jitter=3, rng=r2)
     # r1 advanced by exactly that one call and no further
     assert r1.random() == r2.random()
+
+
+def test_load_native_crop_label_is_partial_volume_fraction(tmp_path):
+    """The payload label is a per-class FRACTION built pre-decimation, not a point sample."""
+    import random
+
+    from src.incontext_dataset_v2 import LoadRequest
+
+    prov = _tiny_provider(tmp_path, spacing=3.0, T=8)     # decim=(2,2,2)
+    nc = prov.load_native_crop(
+        "s0", "liver",
+        LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=(10, 10, 10), jitter=0))
+    assert nc.decim == (2, 2, 2)
+    assert nc.has_fg is True
+    assert nc.label_frac.shape == tuple(nc.out_sizes)      # already at out_sizes
+    f = nc.label_frac.float()
+    assert 0.0 <= float(f.min()) and float(f.max()) <= 1.0
+    # a 4^3 native cube under a 2x pool covers 8 whole cells -> total fraction mass = 8
+    assert abs(float(f.sum()) - 4 ** 3 / 8) < 1e-3
+    # image is HU-clipped to the ct_spec window BEFORE the decimation average
+    assert float(nc.image.float().max()) <= prov.ct_spec.clip_hi + 1e-3
+
+
+def test_provider_is_not_pickled_with_its_ram_cache(tmp_path):
+    """forkserver/spawn eval workers pickle the dataset -> the provider. The RAM cache
+    (tens of GB in a real run) must never ride along; workers only call load()."""
+    import pickle
+
+    prov = _tiny_provider(tmp_path, spacing=1.5, T=8)
+    assert prov._ram is not None and len(prov._ram) >= 1     # cache really is populated
+    blob = pickle.dumps(prov)
+    assert len(blob) < 100_000, f"pickled provider is {len(blob)} bytes (cache leaked in?)"
+    assert pickle.loads(blob)._ram is None
+    assert prov._ram is not None                             # the live provider keeps it

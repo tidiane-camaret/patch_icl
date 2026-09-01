@@ -749,9 +749,9 @@ class _NativeCropProvider:
                            "spacing": req.crop_spacing_mm, "jitter": req.jitter})
         T = self.T
         geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
-        lbl = torch.zeros(T, T, T, dtype=torch.uint8); lbl[1:3, 1:3, 1:3] = 7
-        return self._NC(image=torch.zeros(T, T, T, dtype=torch.float16), label=lbl,
-                        class_idx=7, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+        frac = torch.zeros(T, T, T, dtype=torch.float16); frac[1:3, 1:3, 1:3] = 1.0
+        return self._NC(image=torch.zeros(T, T, T, dtype=torch.float16), label_frac=frac,
+                        class_idx=7, has_fg=True, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
                         crop_geom=geom, crop_spacing_mm=float(req.crop_spacing_mm),
                         decim=(1, 1, 1))
 
@@ -783,9 +783,9 @@ def test_realize_cascade_level0_shape_contract():
     B, K, T = 2, 3, 8
     geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
     def nc():
-        lbl = torch.zeros(T, T, T, dtype=torch.uint8); lbl[1:4, 1:4, 1:4] = 7
-        return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16), label=lbl,
-                          class_idx=7, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+        frac = torch.zeros(T, T, T, dtype=torch.float16); frac[1:4, 1:4, 1:4] = 1.0
+        return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16), label_frac=frac,
+                          class_idx=7, has_fg=True, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
                           crop_geom=geom, crop_spacing_mm=3.0, decim=(1, 1, 1))
     batch = {"native_crop": [[nc() for _ in range(K + 1)] for _ in range(B)],
              "subjects": ["s0", "s1"],

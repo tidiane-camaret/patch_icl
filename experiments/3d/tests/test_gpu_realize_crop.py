@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from src.incontext_dataset_v2 import LoadRequest
-from src.providers.totalseg import crop_and_place, NativeCrop
+from src.providers.totalseg import crop_and_place, build_native_crop, NativeCrop
 from src.totalseg_dataloader_incontext import organ_crop_arrays, _area_pool_3d
 from src.totalseg_dataset import resolve_ct_norm, normalize_ct
 from src.gpu_realize_crop import realize_native_crops, native_crop_collate_fn, _regroup
@@ -23,26 +23,34 @@ def _smooth_vol(D=24):
     return g.astype(np.float16)
 
 
-def _native_crop_from(image_np, label_np, cls_idx, center, T, spacing):
+def _native_crop_from(image_np, label_np, cls_idx, center, T, spacing, spec=None):
+    """Same payload TotalSegProvider.load_native_crop builds (shared build_native_crop)."""
     crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
         image_np, label_np, center, [1.5, 1.5, 1.5], image_size=(T, T, T),
         crop_mm=spacing, jitter=0, rng=random.Random(0))
-    crop_sizes = geom[1].tolist()
-    decim = tuple(max(1, int(cs) // max(1, int(o))) for cs, o in zip(crop_sizes, out_sizes))
-    it = torch.from_numpy(np.ascontiguousarray(crop_ct))
-    lt = torch.from_numpy(np.ascontiguousarray(crop_lbl))
-    if any(d > 1 for d in decim):
-        it = F.avg_pool3d(it.float()[None, None], decim, decim)[0, 0].half()
-        lt = lt[:: decim[0], :: decim[1], :: decim[2]].contiguous()
-    return NativeCrop(image=it, label=lt, class_idx=cls_idx, out_sizes=list(out_sizes),
-                      pad_lo=list(pad_lo), crop_geom=geom, crop_spacing_mm=spacing, decim=decim)
+    return build_native_crop(crop_ct, crop_lbl, cls_idx, out_sizes, pad_lo, geom,
+                             crop_spacing_mm=spacing,
+                             ct_spec=(spec if spec is not None else resolve_ct_norm(None)))
 
 
-def _reference(image_np, label_np, cls_idx, center, T, spacing, md, thr, spec):
+def _fake_nc(T, class_idx=7, fg=None, spacing=3.0):
+    """Minimal hand-built NativeCrop for shape/plumbing tests (no provider I/O)."""
+    geom = torch.tensor([[0, 0, 0], [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+    frac = torch.zeros(T, T, T, dtype=torch.float16)
+    if fg is not None:
+        frac[fg] = 1.0
+    return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16), label_frac=frac,
+                      class_idx=class_idx, has_fg=bool(frac.any()),
+                      out_sizes=[T, T, T], pad_lo=[0, 0, 0], crop_geom=geom,
+                      crop_spacing_mm=spacing, decim=(1, 1, 1))
+
+
+def _reference(image_np, label_np, cls_idx, center, T, spacing, md, thr, spec,
+               antialias=False):
     return crop_and_place(
         image_np, label_np, cls_idx, center, T, crop_spacing_mm=spacing,
         native_spacing=(1.5, 1.5, 1.5), jitter=0, rng=random.Random(0),
-        mask_downsample=md, occ_thr=thr,
+        mask_downsample=md, occ_thr=thr, antialias=antialias,
         normalize_fn=lambda a: normalize_ct(a, spec))
 
 
@@ -84,7 +92,10 @@ def test_occupancy_never_empty():
 
 
 def test_regroup_and_collate():
-    assert _regroup(list(range(6)), 2, 3) == [[0, 1, 2], [3, 4, 5]]
+    # grouping is by each task's own row index, not by a B*(K+1) stride
+    assert _regroup(list(range(6)), [0, 0, 0, 1, 1, 1], 2) == [[0, 1, 2], [3, 4, 5]]
+    # a ragged K (row 0 has 2 members, row 1 has 4) still groups correctly
+    assert _regroup(list(range(6)), [0, 0, 1, 1, 1, 1], 2) == [[0, 1], [2, 3, 4, 5]]
     spec = resolve_ct_norm(None)
     img = _smooth_vol(24); lbl = np.zeros((24, 24, 24), np.uint8); lbl[10:14, 10:14, 10:14] = 3
     nc = _native_crop_from(img, lbl, 3, (12, 12, 12), 8, 1.5)
@@ -183,8 +194,9 @@ def test_engine_emits_native_crop_payload(tmp_path):
         def subjects_for(self, cls): return ["a", "b", "c", "d"]
         def load_native_crop(self, subject, cls, req):
             return NativeCrop(image=torch.zeros(T, T, T, dtype=torch.float16),
-                              label=torch.zeros(T, T, T, dtype=torch.uint8),
-                              class_idx=3, out_sizes=[T, T, T], pad_lo=[0, 0, 0],
+                              label_frac=torch.zeros(T, T, T, dtype=torch.float16),
+                              class_idx=3, has_fg=False,
+                              out_sizes=[T, T, T], pad_lo=[0, 0, 0],
                               crop_geom=geom, crop_spacing_mm=req.crop_spacing_mm,
                               decim=(1, 1, 1))
 
@@ -199,3 +211,109 @@ def test_engine_emits_native_crop_payload(tmp_path):
     assert set(item["context_subjects"]) <= {"b", "c", "d"}
     assert len(item["context_subjects"]) == 3
     assert int(item["aug_mode"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Hard parity fixture (review finding I2): the smooth-ramp / even-aligned-cube
+# cases above are degenerate -- box and trilinear agree exactly, nothing exceeds
+# the clip window, and cubes survive 2x subsampling. This one has additive noise,
+# a supra-clip_hi bone shell, and an OFF-grid rotated ellipsoid label, so it
+# catches (a) a point-sampled instead of partial-volume mask and (b) a
+# CT-normalize applied after (rather than before) the decimation/resample.
+# ---------------------------------------------------------------------------
+
+def _hard_volume(D=48, seed=0):
+    """Smooth base + additive noise + a spherical shell far ABOVE clip_hi (2500 HU)."""
+    rng = np.random.default_rng(seed)
+    ax = np.linspace(-600, 300, D, dtype=np.float32)
+    base = ax[:, None, None] + 0.4 * ax[None, :, None] + 0.7 * ax[None, None, :]
+    base = base + rng.normal(0, 120, size=(D, D, D)).astype(np.float32)
+    zz, yy, xx = np.meshgrid(*[np.arange(D, dtype=np.float32)] * 3, indexing="ij")
+    r = np.sqrt((zz - 23.4) ** 2 + (yy - 24.6) ** 2 + (xx - 22.7) ** 2)
+    base[(r > 9.3) & (r < 12.7)] = 2500.0                  # > clip_hi
+    return base.astype(np.float16)
+
+
+def _off_grid_ellipsoid(D, center, radii):
+    """Rotated, non-integer-centred ellipsoid -- no axis is voxel- or even-aligned."""
+    zz, yy, xx = np.meshgrid(*[np.arange(D, dtype=np.float32)] * 3, indexing="ij")
+    p = np.stack([zz - center[0], yy - center[1], xx - center[2]], 0)
+    cz, sz = np.cos(0.37), np.sin(0.37)
+    cy, sy = np.cos(0.61), np.sin(0.61)
+    M = (np.array([[1, 0, 0], [0, cy, -sy], [0, sy, cy]], np.float32)
+         @ np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], np.float32))
+    q = np.tensordot(M, p, axes=(1, 0))
+    return sum((q[i] / radii[i]) ** 2 for i in range(3)) <= 1.0
+
+
+def test_hard_parity_noise_supraclip_offgrid_ellipsoid_decim2():
+    """decim=2 (3 mm from a 1.5 mm grid): full parity vs crop_and_place."""
+    spec = resolve_ct_norm(None)
+    D, T, s = 48, 16, 3.0
+    img = _hard_volume(D)
+    lbl = np.zeros((D, D, D), np.uint8)
+    lbl[_off_grid_ellipsoid(D, (23.4, 24.6, 22.7), (5.3, 3.7, 4.9))] = 3
+    center = (D // 2, D // 2, D // 2)
+    nc = _native_crop_from(img, lbl, 3, center, T, s, spec)
+    assert nc.decim == (2, 2, 2) and nc.has_fg
+
+    soft = realize_native_crops([[nc]], T=T, mask_downsample="soft", occ_thr=0.5,
+                                ct_spec=spec, device="cpu")
+    ref_i, ref_soft, ref_g = _reference(img, lbl, 3, center, T, s, "soft", 0.5, spec)
+    d = (soft["image"][0] - ref_i).abs()
+    assert torch.equal(soft["crop_geom"][0], ref_g)
+    assert d.max() < 2e-2, f"image max|d|={d.max():.4f}"
+    assert d.mean() < 2e-3, f"image mean|d|={d.mean():.5f}"
+    dm = (soft["label"][0] - ref_soft.float()).abs()
+    assert dm.max() < 1e-4, f"soft mask max|d|={dm.max():.5f}"
+
+    occ = realize_native_crops([[nc]], T=T, mask_downsample="occupancy", occ_thr=0.5,
+                               ct_spec=spec, device="cpu")
+    _, ref_occ, _ = _reference(img, lbl, 3, center, T, s, "occupancy", 0.5, spec)
+    a, b = occ["label"][0].bool(), ref_occ.bool()
+    assert int(b.sum()) > 0
+    dice = (2 * (a & b).sum() / (a.sum() + b.sum())).item()
+    assert dice == 1.0, f"occupancy dice={dice:.4f} (ours {int(a.sum())} vs ref {int(b.sum())})"
+
+
+def test_hard_parity_small_label_survives_decim4():
+    """decim=4 (6 mm) + a few-native-voxel label: a strided subsample would drop it."""
+    spec = resolve_ct_norm(None)
+    D, T, s = 48, 16, 6.0
+    img = _hard_volume(D)
+    lbl = np.zeros((D, D, D), np.uint8)
+    lbl[_off_grid_ellipsoid(D, (23.4, 24.6, 22.7), (1.6, 1.3, 1.9))] = 3
+    assert 0 < int((lbl == 3).sum()) < 30            # genuinely sub-cell at 6 mm
+    center = (D // 2, D // 2, D // 2)
+    nc = _native_crop_from(img, lbl, 3, center, T, s, spec)
+    assert nc.decim == (4, 4, 4) and nc.has_fg
+    assert nc.pad_lo[0] > 0                          # also exercises the centre-pad branch
+
+    occ = realize_native_crops([[nc]], T=T, mask_downsample="occupancy", occ_thr=0.5,
+                               ct_spec=spec, device="cpu")
+    _, ref_occ, ref_g = _reference(img, lbl, 3, center, T, s, "occupancy", 0.5, spec)
+    assert int(occ["label"][0].sum()) > 0, "small class vanished under decimation"
+    a, b = occ["label"][0].bool(), ref_occ.bool()
+    dice = (2 * (a & b).sum() / (a.sum() + b.sum())).item()
+    assert dice == 1.0, f"occupancy dice={dice:.4f}"
+    assert torch.equal(occ["crop_geom"][0], ref_g)
+
+    soft = realize_native_crops([[nc]], T=T, mask_downsample="soft", occ_thr=0.5,
+                                ct_spec=spec, device="cpu")
+    _, ref_soft, _ = _reference(img, lbl, 3, center, T, s, "soft", 0.5, spec)
+    assert float(soft["label"][0].sum()) > 0
+    dm = (soft["label"][0] - ref_soft.float()).abs()
+    assert dm.max() < 1e-4, f"soft mask max|d|={dm.max():.5f}"
+
+    # Image parity at decim=4 is against the ANTIALIASED reference. `place_image`'s
+    # default (antialias=False) trilinear point-samples: at scale 4 it weights only the
+    # middle 2 of every 4 voxels per axis, so on a noisy volume it aliases. The realize
+    # path area-pools (avg over all 4), which is what antialias=True does. The two agree
+    # exactly at decim<=2 (trilinear x0.5 IS the 2^3 box average) -- see the decim=2 test.
+    di = (soft["image"][0]
+          - _reference(img, lbl, 3, center, T, s, "soft", 0.5, spec, antialias=True)[0]).abs()
+    assert di.max() < 2e-2, f"image max|d|={di.max():.4f}"
+    # The residual is dominated by the air-pad constant: place_image fills with the
+    # FULL-RES normalized crop min, the realize path with the DECIMATED crop's min
+    # (~2 HU higher once 4^3 voxels are averaged). ~4e-3 in normalized units.
+    assert di.mean() < 5e-3, f"image mean|d|={di.mean():.5f}"

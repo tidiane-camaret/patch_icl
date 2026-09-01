@@ -55,7 +55,14 @@ the acute cost — but under this design it is converted too (see Scope).
    The plain single-level v2 train/eval loaders keep the current CPU worker crop.
 5. **Correctness bar**: semantic equivalence (interpolation-tolerance image error, exact
    occupancy/soft semantics, byte-identical `crop_geom`) — not bit-parity. `exp59` is
-   from-scratch; no in-flight run to reproduce.
+   from-scratch; no in-flight run to reproduce. Verified by a **hard fixture**
+   (`test_gpu_realize_crop.py`): additive noise + a spherical shell far above `clip_hi`
+   + an off-grid rotated ellipsoid label, at `decim` 2 and 4. `decim=2` bar: normalized
+   image `max|Δ| < 2e-2` / `mean|Δ| < 2e-3`, `soft` mask `max|Δ| < 1e-4`, `occupancy`
+   Dice `== 1.0`, `crop_geom` byte-identical. `decim=4` additionally asserts a few-voxel
+   label survives decimation and checks image parity against the **antialiased**
+   reference (`crop_and_place(antialias=True)`), since `place_image`'s point-sampling
+   trilinear aliases at scale 4 on a noisy volume while the realize path area-pools.
 6. **Naming**: reuse the pattern, not the code — `data.gpu_realize_crop` flag, new
    `src/gpu_realize_crop.py` sibling of `src/gpu_synth_realize.py`.
 7. **Coarser-level H2D**: integer-decimate the RAM crop toward `out_sizes` with an
@@ -66,6 +73,23 @@ the acute cost — but under this design it is converted too (see Scope).
    factor is derived per-axis from the crop, not from the spacing.
 8. **Singleton**: one process-lifetime cache shared by the train provider and the separate
    eval-loader provider (both constructed before any fork).
+10. **Pickle / defaults / MRI** (final review):
+    - `TotalSegProvider.__getstate__` returns `{**self.__dict__, "_ram": None}` — a
+      `spawn`/`forkserver` eval worker pickles the dataset→provider, and shipping the
+      tens-of-GB cache would blow up every worker. Workers only call `load()` (mmap,
+      never touches `_ram`); `load_native_crop` runs in the main process, which keeps
+      its `_ram`. `fork` workers are unaffected (COW, no pickle).
+    - `ram_cache` default follows the **resolved** `gpu_realize_crop`, not
+      `cascade_spacings`: `load_native_crop` is the cache's only reader, so a config
+      with `gpu_realize_crop=false` (or the eval loader, which never realizes) would
+      pay a multi-minute 35 GB NFS preload nothing consumes. `make_eval_loader`
+      defaults `ram_cache=False`. `_assert_cascade_supported` also errors when
+      `gpu_realize_crop` is truthy and `cascade_spacings` is unset (the payload has no
+      consumer without the cascade loop).
+    - **MRI rejected**: `_assert_cascade_supported` raises `ValueError` for
+      `source == "totalsegmri"` + `gpu_realize_crop` (the `NativeCrop` payload carries
+      no modality and `realize_native_crops` applies the CT fingerprint
+      unconditionally); `load_native_crop` passes `ct_spec=None` for a non-CT modality.
 
 ## Architecture
 
@@ -113,9 +137,10 @@ def get_cache(root, subjects, *, max_subjects=None, workers=16) -> dict[str, dic
 ```python
 @dataclass
 class NativeCrop:
-    image: torch.Tensor      # (d,h,w) fp16, native-pitch, integer-decimated toward T
-    label: torch.Tensor      # (d,h,w) uint8, SAME decimation as image
+    image: torch.Tensor      # (d,h,w) fp16, native-pitch, HU-clipped to ct_spec, avg-pool decimated toward T
+    label_frac: torch.Tensor # (d,h,w) fp16 in [0,1] — target-class partial-volume fraction, SAME decimation
     class_idx: int
+    has_fg: bool             # target class present in the NATIVE crop (measured pre-decimation)
     out_sizes: list[int]     # from organ_crop_arrays
     pad_lo: list[int]
     crop_geom: torch.Tensor  # (4,3) i64 — identical to crop_and_place's
@@ -123,6 +148,7 @@ class NativeCrop:
     decim: tuple[int,int,int]
 
 def load_native_crop(self, subject, cls, req: LoadRequest) -> NativeCrop:
+    # thin wrapper: organ_crop_arrays for geometry, then module fn build_native_crop(...)
     ...
 ```
 
@@ -136,12 +162,25 @@ def load_native_crop(self, subject, cls, req: LoadRequest) -> NativeCrop:
 - `decim[a] = max(1, floor(crop_sizes[a] / out_sizes[a]))` — per-axis, derived from the
   crop geometry, not the pitch. Guarantees the decimated crop stays ≥ `out_sizes`
   (GPU never has to upsample), handles `[6,3,1.5]` (decim 4/2/1) and non-2× ratios, and
-  self-limits to 1 when the crop is already small (clamped by the volume dims). Apply
-  strided `avg_pool3d` (image) and area-pool→uint8 (label — multi-class, class selection
-  happens on GPU) by `decim`; the remainder is dropped (prefilter only, GPU `F.interpolate`
-  to exact `out_sizes` fixes final geometry). `crop_geom` is computed from the **native**
-  crop and passed through untouched.
-- No `normalize_ct`, no `F.interpolate` to `out_sizes`, no placement — all GPU.
+  self-limits to 1 when the crop is already small (clamped by the volume dims).
+- **Image**: HU-`.clamp(clip_lo, clip_hi)` to the `ct_spec` window **first** (the clip
+  does not commute with the decimation mean, and the reference `crop_and_place`
+  normalizes before it resamples), then strided `avg_pool3d` by `decim`. The z-score is
+  deferred to the GPU. `np.array(...)` (always copies) lifts the crop out of the
+  read-only cache — never `np.ascontiguousarray` (which would alias an already-contiguous
+  slice).
+- **Label**: the target-class binary is built at **native crop resolution**
+  (`crop_lbl == class_idx`) and `avg_pool3d`-decimated by `decim` into a **partial-volume
+  fraction** (`label_frac`). For integer factors this composes exactly with the GPU's
+  final `_area_pool_3d` to `out_sizes` — the two pools chain into the single
+  native→`out_sizes` area pool the reference does. `has_fg` = class present
+  pre-decimation, so the never-empty / soft peak-floor guards still fire for a structure
+  that is sub-cell after decimation. No multi-class label survives in the payload and no
+  class selection happens on GPU.
+- The remainder past an integer `decim` is dropped (prefilter only — the GPU
+  `F.interpolate` / `_area_pool_3d` to exact `out_sizes` fixes final geometry).
+  `crop_geom` is computed from the **native** crop and passed through untouched.
+- No z-score, no `F.interpolate` to `out_sizes`, no placement — all GPU.
 
 ### Component B2 — `src/gpu_realize_crop.py`
 
@@ -155,19 +194,27 @@ def realize_native_crops(
          spacing (B,3) f32, crop_geom (B,4,3) i64}."""
 ```
 
-Per member, on `device`, autocast disabled:
+Per member, on `device`, autocast disabled (`realize_native_crops` wraps its whole body
+in `with torch.autocast(device_type=dev.type, enabled=False)` — the callers sit inside
+the training step's autocast region and the resample/normalize must stay fp32):
 
-- **image**: `src = crop.float()[None,None]`; `F.interpolate(src, out_sizes,
-  mode="area")` if any axis downsamples else `mode="trilinear", align_corners=False`;
-  GPU `normalize_ct` = `((x.clamp(clip_lo, clip_hi) - mean) / std)`; scatter into
-  `torch.full((1,T,T,T), float(img.min()))` at `pad_lo` — the *resampled* member's own
-  normalized min, byte-for-byte the rule `place_image` (`totalseg_dataloader_incontext.py`)
-  and `_resample_member` (`gpu_synth_realize.py:91`) already use for the air pad.
-- **mask**: `binm = (crop == class_idx).float()[None,None]`; `frac = _area_pool_3d(binm,
-  out_sizes)` (GPU); then branch ported verbatim from `resample_binary`:
-  - `soft`: `frac.clamp(0,1)`; if `binm.any()` and `peak < occ_thr` → lift the peak
+- **image**: `src = normalize_ct_gpu(crop, ct_spec)[None,None]` = `((x.clamp(clip_lo,
+  clip_hi) - mean) / std)` applied **BEFORE** any resample (the z-score/clip does not
+  commute with the area/trilinear average, and the reference `crop_and_place` normalizes
+  the crop before placing it); `air = float(src.min())` captured here, on the
+  **pre-resample** normalized crop; then area-prefilter to `min(out, src)` and
+  `F.interpolate` to `out_sizes` (`mode="area"` if any axis downsamples else
+  `"trilinear", align_corners=False`); scatter into `torch.full((1,T,T,T), air)` at
+  `pad_lo` — matching `place_image`'s `crop_ct.min()` air rule
+  (`totalseg_dataloader_incontext.py`) and `_resample_member` (`gpu_synth_realize.py:91`).
+  There is no second `normalize_ct` call after the resample.
+- **mask**: `frac = _area_pool_3d(nc.label_frac.float()[None,None], out_sizes)` (GPU) —
+  the payload's per-class partial-volume fraction pooled the rest of the way to
+  `out_sizes`; then branch ported verbatim from `resample_binary`, gated on
+  `nc.has_fg` (measured pre-decimation) rather than a live `binm.any()`:
+  - `soft`: `frac.clamp(0,1)`; if `has_fg` and `peak < occ_thr` → lift the peak
     cell(s) to `occ_thr`. Output f32.
-  - `occupancy`: `out = frac >= occ_thr`; if empty and `binm.any()` →
+  - `occupancy`: `out = frac >= occ_thr`; if empty and `has_fg` →
     `out.view(-1)[frac.argmax()] = True`. Output i64.
   - scatter into `torch.zeros((T,T,T))` at `pad_lo`.
 - Ragged `out_sizes` across members → per-member Python loop (B·(K+1) ≈ 32 tiny GPU

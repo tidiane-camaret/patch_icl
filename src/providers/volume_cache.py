@@ -7,6 +7,7 @@ workers, so every fork shares the buffers copy-on-write. Consumers must slice +
 """
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -38,10 +39,15 @@ def get_cache(root, subjects, *, max_subjects=None, workers=16) -> dict:
     if max_subjects is not None:
         todo = todo[: max(0, int(max_subjects) - len(store))]
     if todo:
+        t0, n, nbytes = time.perf_counter(), 0, 0
         with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as ex:
             for s, payload in ex.map(lambda s: _load_one(root, s), todo):
                 if payload is not None:
                     store[s] = payload
+                    n += 1
+                    nbytes += payload["ct_raw"].nbytes + payload["label"].nbytes
+        print(f"[volume_cache] loaded {n} subjects ({nbytes / 1e9:.1f} GB resident) "
+              f"in {time.perf_counter() - t0:.1f}s", flush=True)
     return store
 
 

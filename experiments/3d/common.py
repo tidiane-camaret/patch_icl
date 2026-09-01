@@ -194,6 +194,11 @@ def _assert_cascade_supported(cfg) -> None:
     d = cfg.data
     spacings = d.get("cascade_spacings")
     if not spacings:
+        if d.get("gpu_realize_crop"):
+            raise ValueError(
+                "data.gpu_realize_crop=true requires data.cascade_spacings (the native-crop "
+                "payload is only consumed by the cascade train loop; without it the loader "
+                "would ship NativeCrop dataclasses into the default stacking collate).")
         return
     if cfg.get("model") != "patchset3d":
         raise ValueError("data.cascade_spacings requires model=patchset3d.")
@@ -226,11 +231,17 @@ def _assert_cascade_supported(cfg) -> None:
     if w is not None and len(w) != len(spacings):
         raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
                          f"data.cascade_spacings (len {len(spacings)}).")
-    if d.get("gpu_realize_crop", True) and not d.get("ram_cache", True):
+    _gr = bool(d.get("gpu_realize_crop", True))   # under cascade the default is ON
+    if _gr and d.get("ram_cache") is not None and not d.get("ram_cache"):
         raise ValueError(
             "data.cascade_spacings with data.gpu_realize_crop=true requires data.ram_cache=true "
             "(the RAM cache is what removes the NFS re-crop cost; realize over mmap is slower). "
             "See docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.")
+    if _gr and d.get("source", "totalseg") == "totalsegmri":
+        raise ValueError(
+            "GPU realize does not yet support per-subject MRI normalization (the NativeCrop "
+            "payload carries no modality and realize_native_crops applies the CT fingerprint "
+            "unconditionally); set data.gpu_realize_crop=false for MRI cascade runs.")
     qp = d.get("cascade_query_prior", False)
     from cascade import _resolve_prior_spec   # lazy: only when a cascade config is present
     try:
@@ -288,9 +299,12 @@ def build_dataset(cfg, split: str):
         is_train = split == "train"
         class_spec = d.train_classes if is_train else d.val_classes
         classes = resolve_classes(class_spec, root, is_mri=is_mri)
-        # Cascade runs default ram_cache + gpu_realize_crop ON (the level-0 native-crop
-        # payload path); a non-cascade config leaves both flags off -> byte-identical v2 path.
+        # Cascade train runs default gpu_realize_crop ON (the level-0 native-crop payload
+        # path); a non-cascade config leaves it off -> byte-identical v2 path. ram_cache
+        # follows the RESOLVED gpu_realize_crop: `load_native_crop` is its only reader, so
+        # anything else would pay a multi-minute 35 GB NFS preload nothing touches.
         _casc = bool(d.get("cascade_spacings"))
+        _realize = (split == "train") and bool(d.get("gpu_realize_crop", _casc))
         provider = TotalSegProvider(
             root=root, classes=classes, image_size=tuple(d.image_size),
             split=split, max_subjects=(d.get("max_train_subjects") if is_train
@@ -301,7 +315,7 @@ def build_dataset(cfg, split: str):
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"),
             ct_norm=d.get("ct_norm"),
-            ram_cache=bool(d.get("ram_cache", _casc)),
+            ram_cache=bool(d.get("ram_cache", _realize)),
             ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
         return InContextDataset(
             provider, context_size=d.context_size,
@@ -310,7 +324,7 @@ def build_dataset(cfg, split: str):
             defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
             eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))),
-            gpu_realize_crop=(is_train and bool(d.get("gpu_realize_crop", _casc))))
+            gpu_realize_crop=_realize)
 
     if cfg.data.get("source", "totalseg") == "omnisynth3d":
         from src.datasets.omniSynth.dataset3d import OmniSynth3DICLDataset
@@ -675,9 +689,11 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
         # Eval GT stays HARD: "soft" (a smooth training target) maps back to "occupancy"
         # so the Dice / NSD metrics (which treat any >0 voxel as foreground) are unchanged.
         _eval_md = d.get("mask_downsample", "occupancy")
-        # Share the RAM-cache singleton with the train provider under cascade (same default);
-        # eval never emits native-crop payloads (gpu_realize_crop stays off) -- run_cascade's
-        # val pass owns any realize itself.
+        # The eval loader never emits native-crop payloads (gpu_realize_crop is off here),
+        # and `load()` never reads `_ram`, so ram_cache defaults OFF: preloading here would
+        # cost a multi-minute 35 GB NFS read nothing consumes. Set data.ram_cache=true
+        # explicitly to opt in. (The provider also drops `_ram` on pickle, so forkserver
+        # eval workers never receive it -- see TotalSegProvider.__getstate__.)
         provider = TotalSegProvider(
             root=root, classes=list(classes), image_size=tuple(d.image_size),
             split=split, max_subjects=e.get("n_subjects", None),
@@ -687,7 +703,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
             mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
             modality=("mri" if is_mri else "ct"),
             ct_norm=d.get("ct_norm"),
-            ram_cache=bool(d.get("ram_cache", bool(d.get("cascade_spacings")))),
+            ram_cache=bool(d.get("ram_cache", False)),
             ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
         ds_v2 = InContextDataset(
             provider, context_size=d.context_size, class_balanced=False,

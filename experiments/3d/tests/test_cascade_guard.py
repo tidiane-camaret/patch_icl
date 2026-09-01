@@ -102,3 +102,23 @@ def test_cascade_realize_requires_ram_cache():
 def test_cascade_realize_default_ok():
     # Neither key set under a cascade config -> both default true -> no raise.
     _assert_cascade_supported(_cfg())
+
+
+def test_rejects_mri_source_with_gpu_realize():
+    # NativeCrop carries no modality and realize_native_crops applies the CT fingerprint
+    # unconditionally -> MRI would be silently CT-normalized. Hard error instead.
+    with pytest.raises(ValueError, match="MRI"):
+        _assert_cascade_supported(_cfg(data={"source": "totalsegmri"}))
+
+
+def test_allows_mri_source_without_gpu_realize():
+    _assert_cascade_supported(_cfg(data={"source": "totalsegmri",
+                                         "gpu_realize_crop": False}))
+
+
+def test_rejects_gpu_realize_without_cascade_spacings():
+    # native-crop payloads only have a consumer under the cascade train loop; without
+    # cascade_spacings the loader would push NativeCrop dataclasses into default_collate.
+    with pytest.raises(ValueError, match="cascade_spacings"):
+        _assert_cascade_supported(_cfg(data={"cascade_spacings": None,
+                                             "gpu_realize_crop": True}))

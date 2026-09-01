@@ -12,6 +12,20 @@ level 0. Both default on when `data.cascade_spacings` is set. Non-cascade v2 pat
 unchanged. Removes the ~0.3 s/step synchronous NFS re-crop and the ~100 s/val-pass.
 Spec: docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.
 
+**Final-review fixes (same day):** `TotalSegProvider.__getstate__` drops `_ram` so
+`spawn`/`forkserver` eval workers never pickle the cache. `NativeCrop.label`
+(multiclass, strided-subsampled → point-sampled coarse mask) → `NativeCrop.label_frac`,
+a per-class partial-volume fraction built pre-decimation via `build_native_crop` +
+`avg_pool3d`, composing exactly with the GPU `_area_pool_3d` for integer factors; new
+`has_fg` flag drives the never-empty / peak-floor guards. `realize_native_crops` now
+z-scores before the non-integer resample (HU clip moved into `build_native_crop` before
+the integer decimation) and air-pads with the pre-resample min; runs autocast-disabled.
+`_assert_cascade_supported` rejects `totalsegmri` + `gpu_realize_crop` and
+`gpu_realize_crop` without `cascade_spacings`; `ram_cache` default follows the resolved
+`gpu_realize_crop` (eval loader defaults it off). `_regroup` groups by each task's row
+index. Hard parity fixture (noise + supra-`clip_hi` shell + off-grid ellipsoid) at
+`decim` 2 and 4 added as the RED gate.
+
 ## 2026-08-31 — totalsegmri per-spacing image caches + cascade cache-warning fix
 
 **Built** `ct_raw_{6,3,1.5}mm.npy` for all 616 `totalsegmri` subjects

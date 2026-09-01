@@ -31,13 +31,17 @@ from src.totalseg_dataset import (_ALL_CLASSES_IDX, normalize_ct, normalize_mri,
 class NativeCrop:
     """Native-pitch organ crop + its geometry, integer-decimated toward out_sizes.
 
-    NO normalize, NO resample-to-out_sizes, NO centre-placement: those happen on
-    the GPU downstream. `decim` is chosen per-axis so the decimated grid stays
-    >= out_sizes (the GPU step only ever downsamples).
+    NO z-score, NO resample-to-out_sizes, NO centre-placement: those happen on the
+    GPU downstream. `decim` is chosen per-axis so the decimated grid stays
+    >= out_sizes (the GPU step only ever downsamples). The image IS already HU-clipped
+    to the ct_spec window (clip does not commute with the decimation mean, so it has to
+    happen first — see `build_native_crop`), and the label is already reduced to the
+    target class as a partial-volume FRACTION, never a point sample.
     """
-    image: torch.Tensor            # (d,h,w) fp16, decimated crop
-    label: torch.Tensor           # (d,h,w) uint8, multiclass, SAME decimation
+    image: torch.Tensor           # (d,h,w) fp16, clipped HU, decimated crop
+    label_frac: torch.Tensor      # (d,h,w) fp16 in [0,1], per-class partial-volume fraction
     class_idx: int                # merged-label index of `cls` (-1 if unknown)
+    has_fg: bool                  # class present in the NATIVE crop (pre-decimation)
     out_sizes: list               # from organ_crop_arrays
     pad_lo: list                  # from organ_crop_arrays
     crop_geom: torch.Tensor       # (4,3) int64 — identical to crop_and_place's
@@ -45,21 +49,44 @@ class NativeCrop:
     decim: tuple                  # per-axis integer decimation factor (>=1)
 
 
-def _decim_int_pool(arr_t, decim, *, is_label):
-    """Strided integer downsample of a (d,h,w) tensor by `decim` (per-axis int>=1).
-
-    Image: avg_pool3d (area prefilter). Label: strided subsample — max/area pooling
-    a multiclass volume is ill-defined, and the GPU occupancy/soft resample re-derives
-    the class fraction from whatever native detail survives (decim keeps the survivor
-    grid >= out_sizes).
-    """
+def _decim_avg_pool(arr_t, decim):
+    """Integer avg-pool downsample of a (d,h,w) float tensor by `decim` (per-axis int>=1)."""
     if all(d == 1 for d in decim):
         return arr_t
-    if is_label:
-        return arr_t[::decim[0], ::decim[1], ::decim[2]].contiguous()
-    x = arr_t.float()[None, None]
-    x = F.avg_pool3d(x, kernel_size=decim, stride=decim)
-    return x[0, 0].to(arr_t.dtype)
+    return F.avg_pool3d(arr_t[None, None], kernel_size=decim, stride=decim)[0, 0]
+
+
+def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
+                      crop_spacing_mm, ct_spec=None):
+    """Assemble a `NativeCrop` payload from an `organ_crop_arrays` result.
+
+    `decim[a] = crop_sizes[a] // out_sizes[a]` (>=1), so the payload grid stays >=
+    out_sizes and the GPU realize only ever downsamples.
+
+    Image: HU-clipped to `ct_spec` FIRST (clamp does not commute with the mean, and the
+    reference `crop_and_place` normalizes before it resamples), then avg-pooled by `decim`.
+    Label: the target-class binary mask is built at NATIVE resolution and avg-pooled by
+    `decim` into a partial-volume fraction — the composition of that pool with the GPU's
+    final `_area_pool_3d` to out_sizes reproduces the reference's single native->out_sizes
+    area pool for integer factors. `has_fg` records class presence pre-decimation so the
+    never-empty / soft peak-floor guards still fire for sub-cell structures.
+    """
+    crop_sizes = geom[1].tolist()
+    decim = tuple(max(1, int(cs) // max(1, int(o)))
+                  for cs, o in zip(crop_sizes, out_sizes))
+    # np.array (not ascontiguousarray) always copies -> never aliases the read-only RAM cache
+    img_t = torch.from_numpy(np.array(crop_ct)).float()
+    if ct_spec is not None:
+        img_t = img_t.clamp(ct_spec.clip_lo, ct_spec.clip_hi)
+    binm = torch.from_numpy(np.array(crop_lbl) == class_idx)
+    has_fg = bool(binm.any())
+    img_t = _decim_avg_pool(img_t, decim)
+    frac_t = _decim_avg_pool(binm.float(), decim)
+    return NativeCrop(image=img_t.half(), label_frac=frac_t.half(),
+                      class_idx=int(class_idx), has_fg=has_fg,
+                      out_sizes=list(out_sizes), pad_lo=list(pad_lo),
+                      crop_geom=geom, crop_spacing_mm=float(crop_spacing_mm),
+                      decim=decim)
 
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
@@ -175,6 +202,18 @@ class TotalSegProvider:
             subs = sorted({s for lst in self._label_to_subjects.values() for s in lst})
             self._ram = get_cache(self.root, subs, max_subjects=ram_cache_max_subjects)
 
+    def __getstate__(self):
+        """Never ship the RAM cache through pickle.
+
+        DataLoader workers started with `spawn`/`forkserver` (the eval loaders, so they
+        don't inherit the parent CUDA context) pickle the dataset -> the provider. The
+        cache is a process-lifetime singleton holding every subject loaded so far (tens of
+        GB); pickling it would blow up every worker. Workers only ever call `load()`, which
+        reads npy via mmap and never consults `_ram`; `load_native_crop` (the only reader)
+        runs in the main process, which keeps its `_ram`. `fork` workers are unaffected
+        (no pickling, copy-on-write pages)."""
+        return {**self.__dict__, "_ram": None}
+
     # --- public API ---------------------------------------------------------
     def subjects_for(self, cls):
         return self._label_to_subjects.get(cls, [])
@@ -242,19 +281,13 @@ class TotalSegProvider:
             image_np, label_np, center, list(native_sp),
             image_size=(self.T, self.T, self.T), crop_mm=req.crop_spacing_mm,
             jitter=jitter, rng=req.rng)
-        crop_sizes = geom[1].tolist()
-        decim = tuple(max(1, int(cs) // max(1, int(o)))
-                      for cs, o in zip(crop_sizes, out_sizes))
-        # slice a small owned copy out of the (read-only) cache before touching it
-        img_t = torch.from_numpy(np.ascontiguousarray(crop_ct))    # fp16
-        lbl_t = torch.from_numpy(np.ascontiguousarray(crop_lbl))   # uint8
-        img_t = _decim_int_pool(img_t, decim, is_label=False)
-        lbl_t = _decim_int_pool(lbl_t, decim, is_label=True)
-        return NativeCrop(image=img_t, label=lbl_t,
-                          class_idx=_ALL_CLASSES_IDX.get(cls, -1),
-                          out_sizes=list(out_sizes), pad_lo=list(pad_lo),
-                          crop_geom=geom, crop_spacing_mm=float(req.crop_spacing_mm),
-                          decim=decim)
+        # build_native_crop copies the (read-only, possibly cached) slices out.
+        # ct_spec only for CT: MRI needs per-subject stats, which the GPU realize path
+        # does not carry -- common._assert_cascade_supported rejects MRI + gpu_realize_crop.
+        return build_native_crop(
+            crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
+            crop_spacing_mm=float(req.crop_spacing_mm),
+            ct_spec=(self.ct_spec if self.modality == "ct" else None))
 
     # --- subjects + caches --------------------------------------------------
     def _subjects(self, split, meta_csv, max_subjects):

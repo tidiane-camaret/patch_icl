@@ -186,7 +186,9 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
                 rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
 
         flat = _run_pool(_load_nc, tasks, recrop_workers)
-        members = _regroup(flat, len(subs), 1 + len(ctxs[0]))   # [target, ctx0..ctxK-1] per b
+        # group by each task's own row index (tasks are emitted target-then-contexts
+        # per b, so each row stays [target, ctx0..ctxK-1] even if K varies per row)
+        members = _regroup(flat, [t[0] for t in tasks], len(subs))
         out = realize_native_crops(members, T=batch["image"].shape[-1],
                                    mask_downsample=mask_downsample, occ_thr=occ_thr,
                                    ct_spec=ct_spec, device=device)

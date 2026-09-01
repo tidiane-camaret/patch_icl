@@ -14,15 +14,16 @@
 
 - **Native grid is 1.5 mm isotropic for all 1228 subjects.** `ct_raw.npy` (fp16) *is* the 1.5 mm volume; `label.npy` (uint8, all 117 classes) is on the same grid. No `ct_raw_1.5mm.npy` is built.
 - **RAM cache holds `ct_raw.npy` + `label.npy` only** — no 3 mm cache. Coarser levels decimate from the cached 1.5 mm array.
-- **Fork-COW correctness:** every cached array MUST be `arr.flags.writeable = False`; consumers slice + `.contiguous()` a small copy out, never mutate the cache.
-- **Correctness bar = semantic equivalence**, not bit-parity: normalized-image `max|Δ|` < 2e-2 vs `crop_and_place`; `occupancy` mask Dice == 1.0; `soft` mask `max|Δ|` < 1e-4; `crop_geom` byte-identical (`torch.equal`).
+- **Fork-COW correctness:** every cached array MUST be `arr.flags.writeable = False`; `build_native_crop` lifts a small owned copy out with `np.array(...)` (never `np.ascontiguousarray`, which would alias an already-contiguous slice), never mutates the cache.
+- **Correctness bar = semantic equivalence**, not bit-parity: normalized-image `max|Δ|` < 2e-2 / `mean|Δ|` < 2e-3 vs `crop_and_place`; `occupancy` mask Dice == 1.0; `soft` mask `max|Δ|` < 1e-4; `crop_geom` byte-identical (`torch.equal`). Verified by a hard fixture (noise + supra-`clip_hi` shell + off-grid rotated ellipsoid label) at `decim` 2 and 4; at `decim=4` image parity is vs the antialiased reference (`crop_and_place(antialias=True)`).
 - **`crop_geom` is computed on CPU by `organ_crop_arrays` from the native grid and passed through untouched** — `invert_geo_center`, the M2 prior warp, `_stitched_native_dice_multi` all depend on it being unchanged.
-- **Air pad value = the resampled member's own normalized `img.min()`** (matches `place_image` and `gpu_synth_realize.py:91`).
+- **Normalize / clip / air-pad order:** the z-score (`normalize_ct_gpu`) is applied on the GPU BEFORE the non-integer resample; the HU `.clamp(clip_lo, clip_hi)` is applied in `build_native_crop` BEFORE the integer decimation `avg_pool3d` (clip does not commute with the mean); the air pad is the **pre-resample** normalized crop min (matches `place_image`'s `crop_ct.min()` rule and `gpu_synth_realize.py:91`).
+- **Target-class mask is a partial-volume fraction, never a point sample:** the class-binary is built at native crop resolution and `avg_pool3d`-decimated into `NativeCrop.label_frac`, which composes exactly with the GPU's final `_area_pool_3d` to `out_sizes` for integer factors. `NativeCrop.has_fg` (class presence pre-decimation) drives the never-empty / soft peak-floor guards.
 - **Decimation factor is per-axis, from geometry not pitch:** `decim[a] = max(1, floor(crop_sizes[a] / out_sizes[a]))`.
 - **Any `cascade_spacings`** of length ≥ 2, arbitrary pitch ratios (`[3,1.5]`, `[6,3,1.5]`, non-2×). Nothing assumes 2 levels or power-of-two ratios.
 - **Determinism:** `organ_crop_arrays` consumes `req.rng` exactly once (crop jitter). `load_native_crop` must not consume it a second time — eval determinism (`InContextDataset` per-item `eval_seed` RNG) depends on it.
 - **CT frame:** `CtNormSpec` from `src/totalseg_dataset.py` (`resolve_ct_norm`); default `fingerprint_1228` = `clip_lo=-1007, clip_hi=1573, mean=-167.3, std=505.8`. `CtNormSpec.norm_min == (clip_lo-mean)/std`.
-- **New behaviour is gated:** `data.ram_cache` and `data.gpu_realize_crop`. Both default **on** when `data.cascade_spacings` is set (opt out with `=false`); off otherwise. Non-cascade v2 train/eval loaders never take these paths.
+- **New behaviour is gated:** `data.gpu_realize_crop` defaults **on** when `data.cascade_spacings` is set (opt out with `=false`), off otherwise; the train `data.ram_cache` default **follows the resolved `gpu_realize_crop`** (its only reader is `load_native_crop`), and `make_eval_loader` defaults `ram_cache=False`. `_assert_cascade_supported` also errors on `gpu_realize_crop` without `cascade_spacings`, and on `gpu_realize_crop` + `source=totalsegmri`. `TotalSegProvider.__getstate__` drops `_ram` so `spawn`/`forkserver` eval workers never pickle the cache. Non-cascade v2 train/eval loaders never take these paths.
 - **Run tests with** `PATH="/software/anaconda3/envs/git/bin:$PATH"` for git; pytest from repo root. GPU-free tests only (`device="cpu"`) — the dev node has no GPU.
 - **Log the change in `docs/logs.md`** (project rule).
 
@@ -221,8 +222,9 @@ EOF
 - Produces:
   - `TotalSegProvider.__init__(..., ram_cache=False, ram_cache_max_subjects=None)` — when `ram_cache`, calls `get_cache(self.root, <this provider's subject list>, max_subjects=ram_cache_max_subjects)` and stores it as `self._ram`. Otherwise `self._ram = None`.
   - `NativeCrop` dataclass (module-level in `src/providers/totalseg.py`): fields
-    `image: torch.Tensor` `(d,h,w)` fp16, `label: torch.Tensor` `(d,h,w)` uint8 (multi-class, not yet class-selected), `class_idx: int`, `out_sizes: list[int]`, `pad_lo: list[int]`, `crop_geom: torch.Tensor` `(4,3)` int64, `crop_spacing_mm: float`, `decim: tuple[int,int,int]`.
-  - `TotalSegProvider.load_native_crop(subject, cls, req: LoadRequest) -> NativeCrop` — geometry via `organ_crop_arrays` (consumes `req.rng` once); crop pulled from `self._ram[subject]` if present else `np.load(mmap)`; integer-decimated per `decim[a] = max(1, crop_sizes[a] // out_sizes[a])` with `_area_pool_3d`-style strided `avg_pool3d` on the image and area-pool on the label; NO normalize, NO resample-to-`out_sizes`, NO placement. `crop_geom` identical to what `crop_and_place` returns for the same args.
+    `image: torch.Tensor` `(d,h,w)` fp16 (HU-clipped to `ct_spec`, avg-pool decimated), `label_frac: torch.Tensor` `(d,h,w)` fp16 in `[0,1]` (target-class partial-volume fraction, same decimation), `class_idx: int`, `has_fg: bool` (class present in the NATIVE crop, pre-decimation), `out_sizes: list[int]`, `pad_lo: list[int]`, `crop_geom: torch.Tensor` `(4,3)` int64, `crop_spacing_mm: float`, `decim: tuple[int,int,int]`.
+  - `build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *, crop_spacing_mm, ct_spec=None) -> NativeCrop` — module fn: HU-`.clamp(clip_lo, clip_hi)` the image BEFORE the decimation `avg_pool3d` (clip does not commute with the mean); build the class-binary at NATIVE resolution and `avg_pool3d`-decimate it into `label_frac`; `has_fg` from the pre-decimation binary; `np.array(...)` (always copies) out of the read-only cache.
+  - `TotalSegProvider.load_native_crop(subject, cls, req: LoadRequest) -> NativeCrop` — thin wrapper: geometry via `organ_crop_arrays` (consumes `req.rng` once); crop pulled from `self._ram[subject]` if present else `np.load(mmap)`; then `build_native_crop(...)` with `decim[a] = max(1, crop_sizes[a] // out_sizes[a])` and `ct_spec=self.ct_spec` for CT / `None` for MRI. NO z-score, NO resample-to-`out_sizes`, NO placement. `crop_geom` identical to what `crop_and_place` returns for the same args.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -319,9 +321,10 @@ from src.providers.volume_cache import get_cache
 
 @dataclass
 class NativeCrop:
-    image: torch.Tensor            # (d,h,w) fp16, native-pitch, integer-decimated toward out_sizes
-    label: torch.Tensor           # (d,h,w) uint8, multiclass, SAME decimation as image
+    image: torch.Tensor            # (d,h,w) fp16, native-pitch, HU-clipped, avg-pool decimated toward out_sizes
+    label_frac: torch.Tensor      # (d,h,w) fp16 in [0,1], target-class partial-volume fraction, SAME decimation
     class_idx: int
+    has_fg: bool                  # target class present in the NATIVE crop (pre-decimation)
     out_sizes: list                # from organ_crop_arrays
     pad_lo: list
     crop_geom: torch.Tensor        # (4,3) int64 — identical to crop_and_place's
@@ -329,20 +332,38 @@ class NativeCrop:
     decim: tuple
 
 
-def _decim_int_pool(arr_t, decim, *, is_label):
-    """Strided integer downsample of a (d,h,w) tensor by `decim` (per-axis int>=1).
-    Image: avg_pool3d (area prefilter). Label: max-pool of a one-hot is wrong for
-    multiclass, so area-pool the float then round is also wrong — instead take a
-    strided subsample of the label (occupancy/soft resample on GPU re-derives the
-    fraction from whatever native detail survives; decim is chosen so the survivor
-    grid is still >= out_sizes)."""
+def _decim_avg_pool(arr_t, decim):
+    """Integer avg-pool downsample of a (d,h,w) float tensor by `decim` (per-axis int>=1)."""
     if all(d == 1 for d in decim):
         return arr_t
-    if is_label:
-        return arr_t[:: decim[0], :: decim[1], :: decim[2]].contiguous()
-    x = arr_t.float()[None, None]
-    x = F.avg_pool3d(x, kernel_size=decim, stride=decim)
-    return x[0, 0].to(arr_t.dtype)
+    return F.avg_pool3d(arr_t[None, None], kernel_size=decim, stride=decim)[0, 0]
+
+
+def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
+                      crop_spacing_mm, ct_spec=None):
+    """Assemble a NativeCrop from an organ_crop_arrays result.
+
+    Image: HU-.clamp(clip_lo, clip_hi) to ct_spec FIRST (clip does not commute with the
+    decimation mean, and crop_and_place normalizes before it resamples), then avg-pool
+    by `decim`. Label: the class-binary is built at NATIVE resolution and avg-pooled by
+    `decim` into a partial-volume FRACTION — that pool composed with the GPU's final
+    _area_pool_3d to out_sizes reproduces the reference's single native->out_sizes area
+    pool for integer factors. `has_fg` = class present pre-decimation (drives the
+    never-empty / soft peak-floor guards). np.array (never np.ascontiguousarray) so the
+    read-only RAM cache is always copied, never aliased."""
+    crop_sizes = geom[1].tolist()
+    decim = tuple(max(1, int(cs) // max(1, int(o))) for cs, o in zip(crop_sizes, out_sizes))
+    img_t = torch.from_numpy(np.array(crop_ct)).float()
+    if ct_spec is not None:
+        img_t = img_t.clamp(ct_spec.clip_lo, ct_spec.clip_hi)
+    binm = torch.from_numpy(np.array(crop_lbl) == class_idx)
+    has_fg = bool(binm.any())
+    img_t = _decim_avg_pool(img_t, decim)
+    frac_t = _decim_avg_pool(binm.float(), decim)
+    return NativeCrop(image=img_t.half(), label_frac=frac_t.half(),
+                      class_idx=int(class_idx), has_fg=has_fg,
+                      out_sizes=list(out_sizes), pad_lo=list(pad_lo),
+                      crop_geom=geom, crop_spacing_mm=float(crop_spacing_mm), decim=decim)
 ```
 
 ```python
@@ -365,17 +386,10 @@ def _decim_int_pool(arr_t, decim, *, is_label):
             image_np, label_np, center, list(native_sp),
             image_size=(self.T, self.T, self.T), crop_mm=req.crop_spacing_mm,
             jitter=jitter, rng=req.rng)
-        crop_sizes = geom[1].tolist()
-        decim = tuple(max(1, int(cs) // max(1, int(o))) for cs, o in zip(crop_sizes, out_sizes))
-        img_t = torch.from_numpy(np.ascontiguousarray(crop_ct))          # fp16
-        lbl_t = torch.from_numpy(np.ascontiguousarray(crop_lbl))         # uint8
-        img_t = _decim_int_pool(img_t, decim, is_label=False)
-        lbl_t = _decim_int_pool(lbl_t, decim, is_label=True)
-        return NativeCrop(image=img_t, label=lbl_t,
-                          class_idx=_ALL_CLASSES_IDX.get(cls, -1),
-                          out_sizes=list(out_sizes), pad_lo=list(pad_lo),
-                          crop_geom=geom, crop_spacing_mm=float(req.crop_spacing_mm),
-                          decim=decim)
+        return build_native_crop(
+            crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
+            crop_spacing_mm=float(req.crop_spacing_mm),
+            ct_spec=(self.ct_spec if self.modality == "ct" else None))
 ```
 
 ```python
@@ -426,7 +440,7 @@ EOF
       "context_in": (B,K,1,T,T,T) f32, "context_out": (B,K,T,T,T) …,
       "spacing": (B,3) f32, "crop_geom": (B,4,3) int64}` — `crop_geom` taken from the target member.
   - `native_crop_collate_fn(batch: list[dict]) -> dict` — for `InContextDataset` items shaped `{"native_crop": [NativeCrop … K+1], "subject", "context_subjects", "label_name", "aug_mode"}` (no `"image"`). Keeps `native_crop` as a `B`-list; stacks `aug_mode`; passes through `subjects`/`label_names`/`context_subjects` lists. Output key `"native_crop"` (list of `B` lists).
-  - `_regroup(flat, B, Kp1) -> list[list]` — reshape a flat length-`B*(K+1)` list into `B` lists of `K+1`.
+  - `_regroup(flat, bvals, B) -> list[list]` — group a flat per-task list into `B` row-lists by each task's own row index `bvals[i]` (not a `B*(K+1)` stride), so a ragged `K` never shuffles across rows. `_recrop_level` passes `[t[0] for t in tasks]`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -559,37 +573,45 @@ def normalize_ct_gpu(t: torch.Tensor, spec) -> torch.Tensor:
     return ((t.float().clamp(spec.clip_lo, spec.clip_hi) - spec.mean) / spec.std)
 
 
-def _regroup(flat, B, Kp1):
-    return [list(flat[b * Kp1:(b + 1) * Kp1]) for b in range(B)]
+def _regroup(flat, bvals, B):
+    """Flat per-task list + each task's row index -> B lists (target first).
+    Grouped by the task's own `b`, not a B*(K+1) stride, so a row with a different K
+    can never shuffle into its neighbour."""
+    out = [[] for _ in range(B)]
+    for v, b in zip(flat, bvals):
+        out[int(b)].append(v)
+    return out
 
 
 @torch.no_grad()
 def _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device):
     size = tuple(int(s) for s in nc.out_sizes)
-    src = nc.image.to(device).float()[None, None]
+    # z-score FIRST (clip does not commute with the resample average, and crop_and_place
+    # normalizes the crop before placing it); air pad = the PRE-resample normalized min.
+    src = normalize_ct_gpu(nc.image.to(device), ct_spec)[None, None]
+    air = float(src.min())
     pre = tuple(min(o, s) for o, s in zip(size, src.shape[2:]))
     if pre != tuple(src.shape[2:]):
         src = F.interpolate(src, size=pre, mode="area")
     img = (src if tuple(src.shape[2:]) == size else
-           F.interpolate(src, size=size, mode="trilinear", align_corners=False))
-    img = normalize_ct_gpu(img[0, 0], ct_spec)                          # (d,h,w) f32
+           F.interpolate(src, size=size, mode="trilinear", align_corners=False))[0, 0]
 
-    binm = (nc.label.to(device).long() == int(nc.class_idx)).float()[None, None]
-    frac = _area_pool_3d(binm, size)[0, 0].clamp(0.0, 1.0)
+    # the payload's per-class partial-volume fraction, pooled the rest of the way
+    frac = _area_pool_3d(nc.label_frac.to(device).float()[None, None], size)[0, 0].clamp(0.0, 1.0)
     if mask_downsample == "soft":
         peak = float(frac.amax())
-        if bool(binm.any()) and peak < occ_thr:
+        if nc.has_fg and peak < occ_thr:                # has_fg measured pre-decimation
             frac = torch.where(frac >= peak, torch.full_like(frac, occ_thr), frac)
         mask = frac                                                     # f32
     else:                                                              # occupancy
         m = frac >= occ_thr
-        if not bool(m.any()) and bool(binm.any()):
+        if not bool(m.any()) and nc.has_fg:
             m.view(-1)[int(frac.argmax())] = True
         mask = m.long()
 
     if size == (T, T, T):
         return img[None], mask
-    fi = torch.full((T, T, T), float(img.min()), device=device)
+    fi = torch.full((T, T, T), air, device=device)     # pre-resample normalized air
     fm = torch.zeros(T, T, T, dtype=mask.dtype, device=device)
     sl = tuple(slice(int(p), int(p) + s) for p, s in zip(nc.pad_lo, size))
     fi[sl] = img
@@ -599,18 +621,23 @@ def _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device):
 
 @torch.no_grad()
 def realize_native_crops(members, *, T, mask_downsample, occ_thr, ct_spec, device):
-    B, Kp1 = len(members), len(members[0])
-    imgs, masks = [], []
-    for b in range(B):
-        mi, mm = [], []
-        for t in range(Kp1):
-            i, m = _realize_member(members[b][t], T, mask_downsample, occ_thr, ct_spec, device)
-            mi.append(i); mm.append(m)
-        imgs.append(torch.stack(mi)); masks.append(torch.stack(mm))
-    img = torch.stack(imgs).float()                                    # (B,K+1,1,T,T,T)
-    msk = torch.stack(masks)                                           # (B,K+1,T,T,T)
-    geom = torch.stack([members[b][0].crop_geom.to(device) for b in range(B)])
-    sp = torch.stack([torch.full((3,), float(members[b][0].crop_spacing_mm)) for b in range(B)])
+    # autocast explicitly DISABLED: the callers sit inside the training step's autocast
+    # region and the resample/normalize must stay fp32 (data pipeline, not the model).
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    with torch.autocast(device_type=dev.type, enabled=False):
+        B = len(members)
+        imgs, masks = [], []
+        for b in range(B):
+            mi, mm = [], []
+            for nc in members[b]:                       # ragged K tolerated
+                i, m = _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device)
+                mi.append(i); mm.append(m)
+            imgs.append(torch.stack(mi)); masks.append(torch.stack(mm))
+        img = torch.stack(imgs).float()                                # (B,K+1,1,T,T,T)
+        msk = torch.stack(masks)                                       # (B,K+1,T,T,T)
+        geom = torch.stack([members[b][0].crop_geom.to(device) for b in range(B)])
+        sp = torch.stack([torch.full((3,), float(members[b][0].crop_spacing_mm))
+                          for b in range(B)])
     return {"image": img[:, 0], "context_in": img[:, 1:],
             "label": msk[:, 0], "context_out": msk[:, 1:],
             "spacing": sp.to(device), "crop_geom": geom}
