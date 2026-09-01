@@ -10,18 +10,56 @@ import json
 import os
 import pickle
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from src.incontext_dataset_v2 import LoadRequest, LoadResult
+from src.providers.volume_cache import get_cache
 from src.totalseg_dataloader_incontext import (
     organ_crop_arrays, place_image, place_label, resample_binary,
     _bbox_for_subject, _IDX_TO_CLASS,
 )
 from src.totalseg_dataset import (_ALL_CLASSES_IDX, normalize_ct, normalize_mri,
                                   resolve_ct_norm)
+
+
+@dataclass
+class NativeCrop:
+    """Native-pitch organ crop + its geometry, integer-decimated toward out_sizes.
+
+    NO normalize, NO resample-to-out_sizes, NO centre-placement: those happen on
+    the GPU downstream. `decim` is chosen per-axis so the decimated grid stays
+    >= out_sizes (the GPU step only ever downsamples).
+    """
+    image: torch.Tensor            # (d,h,w) fp16, decimated crop
+    label: torch.Tensor           # (d,h,w) uint8, multiclass, SAME decimation
+    class_idx: int                # merged-label index of `cls` (-1 if unknown)
+    out_sizes: list               # from organ_crop_arrays
+    pad_lo: list                  # from organ_crop_arrays
+    crop_geom: torch.Tensor       # (4,3) int64 — identical to crop_and_place's
+    crop_spacing_mm: float
+    decim: tuple                  # per-axis integer decimation factor (>=1)
+
+
+def _decim_int_pool(arr_t, decim, *, is_label):
+    """Strided integer downsample of a (d,h,w) tensor by `decim` (per-axis int>=1).
+
+    Image: avg_pool3d (area prefilter). Label: strided subsample — max/area pooling
+    a multiclass volume is ill-defined, and the GPU occupancy/soft resample re-derives
+    the class fraction from whatever native detail survives (decim keeps the survivor
+    grid >= out_sizes).
+    """
+    if all(d == 1 for d in decim):
+        return arr_t
+    if is_label:
+        return arr_t[::decim[0], ::decim[1], ::decim[2]].contiguous()
+    x = arr_t.float()[None, None]
+    x = F.avg_pool3d(x, kernel_size=decim, stride=decim)
+    return x[0, 0].to(arr_t.dtype)
 
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
@@ -104,7 +142,7 @@ class TotalSegProvider:
     def __init__(self, root, classes, image_size, split=None, meta_csv=None,
                  max_subjects=None, crop_spacing_mm=1.5, crop_jitter=None,
                  mask_downsample="occupancy", mask_occupancy_thr=0.1, modality="ct",
-                 ct_norm=None):
+                 ct_norm=None, ram_cache=False, ram_cache_max_subjects=None):
         assert modality in ("ct", "mri"), modality
         # The one CT frame the whole pipeline runs in (see src/totalseg_dataset.CtNormSpec).
         self.ct_spec = resolve_ct_norm(ct_norm)
@@ -129,6 +167,13 @@ class TotalSegProvider:
         self._bbox = self._load_or_build_bbox()
         self._spacings = self._load_spacings()
         self._ct_stats = self._load_ct_stats() if modality == "mri" else {}
+
+        # Optional process-lifetime RAM cache of native volumes, preloaded here in
+        # the main process so DataLoader forks share the buffers copy-on-write.
+        self._ram = None
+        if ram_cache:
+            subs = sorted({s for lst in self._label_to_subjects.values() for s in lst})
+            self._ram = get_cache(self.root, subs, max_subjects=ram_cache_max_subjects)
 
     # --- public API ---------------------------------------------------------
     def subjects_for(self, cls):
@@ -172,6 +217,44 @@ class TotalSegProvider:
                 normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
         return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom)
+
+    def load_native_crop(self, subject, cls, req: LoadRequest) -> "NativeCrop":
+        """Native-pitch organ crop + geometry, integer-decimated toward out_sizes.
+
+        No normalize / no resample / no placement — the GPU realize step does those.
+        `crop_geom` is byte-identical to `crop_and_place`'s for the same args, and
+        `req.rng` is consumed exactly once (inside `organ_crop_arrays`).
+        """
+        if getattr(self, "_ram", None) is not None and subject in self._ram:
+            image_np = self._ram[subject]["ct_raw"]
+            label_np = self._ram[subject]["label"]
+        else:
+            subj_dir = self.root / subject
+            label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
+            image_np = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
+        center = req.center
+        if center is None:
+            D, H, W = label_np.shape
+            center = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+        jitter = _resolve_jitter(req, self.crop_jitter)
+        native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
+        crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+            image_np, label_np, center, list(native_sp),
+            image_size=(self.T, self.T, self.T), crop_mm=req.crop_spacing_mm,
+            jitter=jitter, rng=req.rng)
+        crop_sizes = geom[1].tolist()
+        decim = tuple(max(1, int(cs) // max(1, int(o)))
+                      for cs, o in zip(crop_sizes, out_sizes))
+        # slice a small owned copy out of the (read-only) cache before touching it
+        img_t = torch.from_numpy(np.ascontiguousarray(crop_ct))    # fp16
+        lbl_t = torch.from_numpy(np.ascontiguousarray(crop_lbl))   # uint8
+        img_t = _decim_int_pool(img_t, decim, is_label=False)
+        lbl_t = _decim_int_pool(lbl_t, decim, is_label=True)
+        return NativeCrop(image=img_t, label=lbl_t,
+                          class_idx=_ALL_CLASSES_IDX.get(cls, -1),
+                          out_sizes=list(out_sizes), pad_lo=list(pad_lo),
+                          crop_geom=geom, crop_spacing_mm=float(req.crop_spacing_mm),
+                          decim=decim)
 
     # --- subjects + caches --------------------------------------------------
     def _subjects(self, split, meta_csv, max_subjects):
