@@ -160,9 +160,9 @@ Per member, on `device`, autocast disabled:
 - **image**: `src = crop.float()[None,None]`; `F.interpolate(src, out_sizes,
   mode="area")` if any axis downsamples else `mode="trilinear", align_corners=False`;
   GPU `normalize_ct` = `((x.clamp(clip_lo, clip_hi) - mean) / std)`; scatter into
-  `torch.full((1,T,T,T), air)` at `pad_lo`, where `air` is the existing normalized-floor
-  property `(clip_lo - mean) / std` (`totalseg_dataset.py:46`) — matching `place_image`'s
-  post-normalization `crop_ct.min()` air fill.
+  `torch.full((1,T,T,T), float(img.min()))` at `pad_lo` — the *resampled* member's own
+  normalized min, byte-for-byte the rule `place_image` (`totalseg_dataloader_incontext.py`)
+  and `_resample_member` (`gpu_synth_realize.py:91`) already use for the air pad.
 - **mask**: `binm = (crop == class_idx).float()[None,None]`; `frac = _area_pool_3d(binm,
   out_sizes)` (GPU); then branch ported verbatim from `resample_binary`:
   - `soft`: `frac.clamp(0,1)`; if `binm.any()` and `peak < occ_thr` → lift the peak
