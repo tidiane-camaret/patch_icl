@@ -1,5 +1,5 @@
 # @package _global_
-# 59_organs_cascade_from_scratch — exp57 + N-level coarse->fine cascade training.
+# 68_cascade_6_3_1_5 — exp57 + N-level coarse->fine cascade training.
 #
 #   python experiments/3d/train.py experiment=59_organs_cascade_from_scratch
 #
@@ -18,11 +18,15 @@
 
 defaults:
   - 57_organs_encoder_from_scratch
+  - override /encoder: e4_plainconv_ts
   - _self_
 
 data:
-  crop_spacing_mm: 3            # == cascade_spacings[0]
-  cascade_spacings: [3, 1.5]    # coarse -> fine
+  context_size: 1
+  train_classes: balanced
+  val_classes: all 
+  crop_spacing_mm: 6            # == cascade_spacings[0]
+  cascade_spacings: [6,3,1.5]    # coarse -> fine
   cascade_crop_jitter: 0        # level>0 re-crop jitter (voxels): 0 = exact predicted COM;
                                 # null / absent -> T//4 (like data.crop_jitter)
   cascade_recrop_workers: 16    # thread-pool the B*(K+1) re-crop loads per level>0 (0/1 = serial)
@@ -43,27 +47,30 @@ data:
   #     modes: [pred, none, gt]
   #     p:     [0.4,  0.4,  0.2]   # optional; omitted -> uniform
   #     eval_mode: pred            # optional
-  cascade_query_prior: pred
+  cascade_query_prior: 
+    modes: [pred,none,gt]
+    p:     [0.6,0.3,0.1]
+    eval_mode: pred
   cascade_query_prior_hard: false     # threshold the prior at 0.5 before the mask embed
 
 arch:
   encoder_input_norm: zscore
   plainconv_ts_features_per_stage: [32,64,256,512]
-  nnunet_ts_stages:: [2,3] 
+  nnunet_ts_stages: [2,3] 
   e: 768
   h: 3072
   a: 12 
   decoder: conv
 
 train:
-  cascade_loss_weights: [1.0, 1.0]
+  cascade_loss_weights: [1,1,1]
 
 eval:
   # The cascade runs 2 forwards + a native-volume stitched-Dice per task, so val cost is
   # ~2-3x the non-cascade pass. 3 (of 63 val classes) keeps eval under a few minutes; raise
   # for a fuller generalization read once a run looks promising (exp57 used 20 = ~1260 tasks,
   # which is ~30 min under the cascade).
-  tasks_per_class: 3
+  tasks_per_class: 10
 
 wandb:
-  name: 59_organs_cascade_from_scratch
+  name: 68_cascade_6_3_1_5

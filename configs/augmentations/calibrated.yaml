@@ -48,6 +48,25 @@ augmentations:
       max_disp: 0.15                # ≈ real inter-case nonrigid RMS 0.14 (normalized units)
       num_steps: 6                  # strictly diffeomorphic at max_disp≤0.15
 
+  # -------------------------------------------------------------- goal_mask
+  # Rewrites a task's TARGET + every CONTEXT mask with ONE shared op, redefining the
+  # segmentation goal ("segment the eroded organ" / "...the boundary"). Runs after the
+  # geometric warp, TRAIN only, replayed identically across cascade levels. Radii are
+  # mm -> voxels via the crop pitch (same physical size at every cascade level, invariant
+  # to cascade_crop_jitter). One draw per BATCH (per_task=true -> one per task).
+  # p=0.0 -> off, byte-identical. See src/mask_transforms.py.
+  goal_mask:
+    p: 0.0
+    per_task: false
+    ball: false                    # true -> Euclidean ball SE (slower, isotropic)
+    ops: [dilate, erode]           # sampled uniformly; also: boundary, sobel
+    dilate:   {radius_mm: [1.0, 4.0]}
+    # min_keep: erosion never removes more than (1 - min_keep) of a mask's foreground,
+    # per mask, so small organs keep a core instead of vanishing (0.0 = no floor).
+    erode:    {radius_mm: [1.0, 4.0], min_keep: 0.3}
+    boundary: {width_mm:  [1.0, 3.0], min_keep: 0.3}
+    # sobel takes no parameters (3D Sobel gradient magnitude, per-sample normalised)
+
   # ------------------------------------------------------------- per_image
   # INDEPENDENT transform per volume (breaks correspondence). OFF by default —
   # it's a pose-invariance lever (see experiment 42), not part of the realism

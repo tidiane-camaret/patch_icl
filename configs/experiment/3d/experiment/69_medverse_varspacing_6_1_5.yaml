@@ -1,0 +1,81 @@
+# @package _global_
+# 69_medverse_varspacing_6_1_5 — Medverse on exp 68's data / task / schedule, but WITHOUT
+# the coarse->fine cascade: one single-forward Medverse trained on the same [1.5, 6] mm
+# variable-spacing crop regime, as the architecture baseline for the patchset3d cascade run
+# (experiment=68_cascade_6_3_1_5).
+#
+#   python experiments/3d/train.py experiment=69_medverse_varspacing_6_1_5
+#
+# CONSTRUCTION — inherit 68 wholesale (so the DATA selection, augmentation, eval config and
+# the training SCHEDULE stay identical to the patchset3d run), then:
+#   - override /model: medverse        released Medverse U-Net (level=1, no AR; 128^3 native)
+#                                      in place of PatchSet3D + from-scratch PlainConv.
+#   - data.cascade_spacings: null      turn the N-level cascade OFF -> the normal
+#                                      single-forward train / val path.
+#   - data.gpu_realize_crop: false     _assert_cascade_supported (common.py) hard-errors on
+#                                      gpu_realize_crop=true without a cascade.
+#   - data.ram_cache: false            the non-cascade provider.load() path never consults
+#                                      the RAM cache (src/providers/totalseg.py:211) — only
+#                                      the cascade's load_native_crop does — so 'true' would
+#                                      just burn minutes preloading ~35 GB nothing reads.
+#   - data.train_spacing_range: [1.5, 6.0]   replaces the cascade: per-batch log-uniform
+#                                      crop pitch (SpacingBatchSampler). Medverse never
+#                                      receives the spacing signal (train.py threads it into
+#                                      spacing-aware models only) -> "train blind on the
+#                                      same variable-spacing crops", exactly the exp 37
+#                                      design. provider.load() resamples on the fly from
+#                                      ct_raw.npy — no per-spacing caches to build.
+#   - data.crop_spacing_mm: 3          EVAL pitch (train_spacing_range is TRAIN-only; eval is
+#                                      always a single fixed spacing). The cascade's middle
+#                                      level; FOV = 128*3 = 384 mm, mid of the [192, 768] mm
+#                                      range training sees.
+#
+# SCHEDULE — `override /model: medverse` swaps the m1 GROUP file (which is where exp 68's
+# adamw / cosine / wd 0.01 / bce_dice actually come from) for medverse.yaml's native recipe
+# (adam / plateau / wd 0 / smooth_l1). The exp 68 schedule knobs that lived in that group
+# are therefore RE-STATED below to restore parity. Knobs set in the 48 / 57 experiment
+# bodies still resolve on their own: epochs 400, batch_size 4, grad_clip 1.0, eval_every 10,
+# warmup_epochs 5, no_decay_norm_bias true. Muon / LAWA / encoder_lr_scale / fine_decode /
+# query_prior are all `is_patchset`-gated in train.py and no-op for medverse.
+#
+# STABILITY — Medverse's output head is an UNBOUNDED plain conv; bce_dice under an
+# Adam-family optimizer is the exact regime where it diverged to Inf -> NaN in exp 31 / 38
+# (docs/logs.md 2026-07-29). lr is set to Medverse-native 3e-5 — the ONE deliberate break
+# from exp 68's 7e-5. The out-of-bounds anchor (train.oob_weight, default 10) + grad_clip
+# 1.0 + the non-finite-forward abort in train.py stay as guards. Start from released weights
+# (checkpoint=orig_weights); never resume from a collapse-edge best.pt.
+
+defaults:
+  - 68_cascade_6_3_1_5
+  - override /model: medverse
+  - _self_
+
+data:
+  # --- disable the cascade ---------------------------------------------------------------
+  cascade_spacings: null
+  gpu_realize_crop: false
+  ram_cache: false
+  # --- single-forward variable-spacing training (exp 37 regime) ------------------------
+  train_spacing_range: [1.5, 6.0]   # per-batch log-uniform crop pitch; [6, 1.5] is equivalent
+  crop_spacing_mm: 3                # fixed EVAL pitch (mid of the trained range)
+  context_size: 1                  # K=1, matches the patchset3d run (inherited from 68)
+  # cascade-only keys from 68, now inert — pinned null for a clean resolved config
+  cascade_query_prior: null
+
+train:
+  # --- restore exp 68 / m1 schedule (dropped when /model: medverse replaced the m1 group) ---
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.01
+  loss: bce_dice
+  dice_weight: 1.0
+  warmup_epochs: 5
+  # --- the one deliberate deviation from exp 68 (lr 7e-5): Medverse-native lr for stability ---
+  lr: 3.0e-5
+  # --- Medverse weight source: released Medverse.ckpt, gentle finetune --------------------
+  checkpoint: orig_weights
+  # cascade-only, inert without data.cascade_spacings
+  cascade_loss_weights: null
+
+wandb:
+  name: 69_medverse_varspacing_6_1_5

@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from src.augmentations import _make_affine_theta, _svf_displacement
+from src.mask_transforms import apply_goal_op, mm_to_vox
 from src.totalseg_dataset import CT_NORM_MIN, CT_NORM_MAX, DEFAULT_CT_NORM, resolve_ct_norm
 
 REAL, SYNTH, SELF_CONTEXT = 0, 1, 2
@@ -253,6 +254,69 @@ def _batched_intensity(vols, cfg, gen):
     return vols
 
 
+def _cfg_get(cfg, key, default=None):
+    """Read `key` from a DictConfig (.get) or a plain namespace (getattr) uniformly."""
+    if cfg is None:
+        return default
+    return cfg.get(key, default) if hasattr(cfg, "get") else getattr(cfg, key, default)
+
+
+def _goal_range(cfg, op):
+    """[lo, hi] mm for a goal op: `radius_mm` (dilate/erode) or `width_mm` (boundary)."""
+    sub = cfg.get(op, None) if hasattr(cfg, "get") else getattr(cfg, op, None)
+    key = "width_mm" if op == "boundary" else "radius_mm"
+    v = None if sub is None else (sub.get(key, None) if hasattr(sub, "get") else getattr(sub, key, None))
+    if v is None:
+        return (1.0, 3.0)
+    if isinstance(v, (int, float)):
+        return (0.0, float(v))
+    return (float(v[0]), float(v[1]))
+
+
+def _goal_mask_transform(masks, group_size, cfg, gen, spacing_mm):
+    """Rewrite each task's TARGET + CONTEXT masks with one shared goal op (dilate / erode /
+    boundary / sobel), redefining the segmentation goal. `masks` is (N,D,H,W) task-major
+    (row g*group_size = task g's target). One parameter draw per BATCH by default; set
+    `cfg.per_task=true` for an independent draw per task (G extra pooling calls).
+
+    Radii are mm -> voxels via `spacing_mm`, so the op is identical across cascade levels
+    (run_cascade replays the same goal seed) and invariant to data.cascade_crop_jitter.
+    No-op (returns `masks` unchanged) when cfg is None, p<=0, or spacing_mm is None."""
+    if cfg is None or spacing_mm is None:
+        return masks
+    p = float(cfg.get("p", 0.0)) if hasattr(cfg, "get") else float(getattr(cfg, "p", 0.0))
+    if p <= 0.0:
+        return masks
+    ops = list(cfg.get("ops", ("dilate", "erode")) if hasattr(cfg, "get")
+               else getattr(cfg, "ops", ("dilate", "erode")))
+    ball = bool(cfg.get("ball", False)) if hasattr(cfg, "get") else bool(getattr(cfg, "ball", False))
+    per_task = bool(cfg.get("per_task", False)) if hasattr(cfg, "get") else bool(getattr(cfg, "per_task", False))
+    device = masks.device
+    masks = masks.float()                          # goal ops (boundary/sobel) return fractions
+    G = masks.shape[0] // group_size
+
+    def _draw_and_apply(chunk):
+        if torch.rand((), generator=gen, device=device).item() >= p:
+            return chunk
+        op = ops[torch.randint(len(ops), (1,), generator=gen, device=device).item()]
+        r_vox = 0
+        if op != "sobel":
+            lo, hi = _goal_range(cfg, op)
+            r_mm = lo + (hi - lo) * torch.rand((), generator=gen, device=device).item()
+            r_vox = max(1, mm_to_vox(r_mm, spacing_mm))
+        # erode/boundary: min_keep floors how much foreground erosion may remove per mask,
+        # so a small organ keeps a core instead of vanishing. Read from cfg.<op>.min_keep.
+        mk = float(_cfg_get(_cfg_get(cfg, op), "min_keep", 0.0) or 0.0)
+        return apply_goal_op(chunk, op, radius_vox=r_vox, ball=ball, min_keep=mk)
+
+    if not per_task:
+        return _draw_and_apply(masks)
+    for g in range(G):
+        sl = slice(g * group_size, (g + 1) * group_size)
+        masks[sl] = _draw_and_apply(masks[sl])
+    return masks
+
+
 def _geometric(vols, masks, group_size, cfg, gen, *, capture=False):
     """Shared (group_size=T) or independent (group_size=1) flip/affine/elastic/deform.
 
@@ -357,11 +421,14 @@ class GpuAugmentor:
 
     @torch.no_grad()
     def apply(self, batch: dict, *, geo_gen: torch.Generator,
-              int_gen: torch.Generator, capture: bool = False):
+              int_gen: torch.Generator, capture: bool = False,
+              goal_gen: torch.Generator | None = None):
         """REAL-mode aug for the cascade runner: shared geometric over target+K contexts
-        (geo_gen), then per-volume intensity (int_gen). Mutates `batch` in place; returns
-        (batch, GeoState|None). Every task is assumed REAL (aug_mode==0) — run_cascade
-        asserts it. Kept separate from __call__ so the non-cascade path stays byte-identical.
+        (geo_gen), then the goal-mask transform on target+contexts (goal_gen, seed held
+        constant across cascade levels), then per-volume intensity (int_gen). Mutates
+        `batch` in place; returns (batch, GeoState|None). Every task is assumed REAL
+        (aug_mode==0) — run_cascade asserts it. Kept separate from __call__ so the
+        non-cascade path stays byte-identical.
         """
         cfg = self.cfg
         vols, masks, B, T = _stack_task(batch)          # tensors already on device
@@ -371,6 +438,11 @@ class GpuAugmentor:
         else:
             vols, masks = _geometric(vols, masks, group_size=T, cfg=cfg.task, gen=geo_gen)
             grid = flips = None
+        gm_cfg = _cfg_get(cfg, "goal_mask")
+        if gm_cfg is not None and goal_gen is not None:
+            sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
+            masks = _goal_mask_transform(masks, group_size=T, cfg=gm_cfg, gen=goal_gen,
+                                         spacing_mm=sp)
         vols = _batched_intensity(vols, cfg.intensity, int_gen)
         _unstack_task(vols, masks, B, T, batch)
         return batch, (GeoState(grid=grid, flips=flips) if capture else None)
@@ -385,6 +457,12 @@ class GpuAugmentor:
         gen = torch.Generator(device=device)
         gen.manual_seed(self._seed + self._step)
         self._step += 1
+
+        # goal_mask ops (boundary/sobel) return fractional masks; promote the whole stack to
+        # float up-front so the per-mode `masks[vidx] = m` write-backs don't truncate.
+        _gm = _cfg_get(cfg, "goal_mask")
+        if _gm is not None and float(_cfg_get(_gm, "p", 0.0)) > 0.0 and not masks.is_floating_point():
+            masks = masks.float()
 
         modes = batch.get("aug_mode", torch.zeros(B, dtype=torch.long, device=device))
         modes = modes.to(device)
@@ -401,6 +479,10 @@ class GpuAugmentor:
                 v = _batched_intensity(v, cfg.synth, gen)
             else:  # REAL or SELF_CONTEXT
                 v, m = _geometric(v, m, group_size=T, cfg=cfg.task, gen=gen)
+                gm_cfg = _cfg_get(cfg, "goal_mask")
+                if gm_cfg is not None:
+                    sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
+                    m = _goal_mask_transform(m, group_size=T, cfg=gm_cfg, gen=gen, spacing_mm=sp)
                 if mode == REAL or self.self_context_intensity:
                     v = _batched_intensity(v, cfg.intensity, gen)
                 if mode == SELF_CONTEXT and self.self_context_per_image:

@@ -14,6 +14,32 @@ data:
   train_spacing_range: null     # fixed 2 mm crops (no SpacingBatchSampler); eval always fixed
   mask_downsample: occupancy    # area-pool + threshold (keeps thin masks under downsampling)
   mask_occupancy_thr: 0.5       # foreground-fraction threshold
+  # NON-CASCADE query-prior injection (single-forward analogue of data.cascade_query_prior).
+  # At a fraction of TRAIN steps, seed the query's mask token with the target mask instead of
+  # the support-mean occupancy prior, so the model learns to consume a spatial prior channel.
+  # Train-only: eval always runs prior-free (no GT to leak; val/dice stays comparable). See
+  # experiments/3d/query_prior.py.
+  #   none                             no prior — support-mean (unchanged; the default)
+  #   gt                               every step: the (augmented) target GT as the prior
+  #   {modes: [none, gt], p: [.5,.5]}  per-step seeded categorical draw over modes
+  query_prior: none
+  # Query-prior PERTURBATION (cascade + non-cascade): degrade ONLY the mask fed to the query
+  # mask token so an oracle / GT prior looks like a real upstream segmentation. Applied after
+  # the prior is built (post-warp for the cascade), before the optional hard threshold. Radii
+  # in mm -> voxels via the level's crop pitch: identical across cascade levels, invariant to
+  # cascade_crop_jitter. One parameter draw per prior build. TRAIN only (cascade eval keeps
+  # the real `pred` prior intact). p=0.0 -> off. See src/mask_transforms.py::perturb_prior_mask.
+  #   dilate_mm / erode_mm : [lo, hi] random morphology radius (mm); the larger draw wins
+  #   shift_mm             : [lo, hi] rigid sub-voxel translation magnitude (mm), random dir
+  #   noise_std            : [lo, hi] additive-Gaussian sigma on the soft prior, then clamp
+  prior_perturb:
+    p: 0.0
+    ball: false
+    dilate_mm: [0.0, 4.0]
+    erode_mm:  [0.0, 4.0]
+    erode_min_keep: 0.3          # erosion leaves >= this fraction of the prior's fg (0.0 = no floor)
+    shift_mm:  [0.0, 6.0]
+    noise_std: [0.0, 0.3]
   # The ONE CT normalization frame for the whole pipeline (provider applies it at crop time;
   # GPU augmentor clamps to it; a passthrough encoder trusts it). A preset name
   # (fingerprint_1228 | d297) or an inline {clip_lo,clip_hi,mean,std}. null = fingerprint_1228

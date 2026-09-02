@@ -74,6 +74,7 @@ from common import (DEVICE, _source_root, train_loader, make_eval_loader, _self_
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from cascade import run_cascade, _cascade_loss
+from query_prior import resolve_query_prior_spec, draw_query_prior_mode, build_query_prior
 from src.totalseg_dataset import resolve_ct_norm
 from pfn_train import Muon, lawa_average   # noqa: E402  (2D trainer shared utilities)
 
@@ -485,6 +486,13 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # end-of-epoch merge below is skipped, so the single-forward path is unaffected.
     _c_loss_acc, _c_dice_acc, _c_empty_acc = {}, {}, [0.0]
     _c_prior_acc = {}                      # query_prior mode -> #levels drawn (cascade mixture)
+    # Non-cascade query-prior injection (data.query_prior): a fraction of steps seed the query
+    # mask token with the target GT instead of the support-mean prior. Train-only; eval always
+    # runs prior-free. Inert (qp_on False) on the pure-`none` default and the cascade path.
+    qp_spec = resolve_query_prior_spec(cfg.data.get("query_prior", None))
+    qp_on = is_patchset and qp_spec.active and not cfg.data.get("cascade_spacings")
+    qp_perturb = cfg.data.get("prior_perturb", None)   # shared with the cascade prior path
+    _qp_acc = {}                           # query_prior mode -> #steps drawn (non-cascade)
     # Optional per-phase timing: data-wait (perf_counter between steps) + image-encode and
     # attention GPU time (CUDA events on net.encoder / net.transformer, each called once per
     # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
@@ -508,11 +516,25 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             # accumulated and merged into `grid` at the end. `continue` skips the normal
             # single-forward body entirely.
             spacings = [float(s) for s in cascade_spacings]
+            # data.cascade_crop_jitter: null / absent -> T//4 (matches data.crop_jitter's
+            # provider default); an explicit int overrides (0 = re-crop exactly on the
+            # predicted COM). Applied to every level>0 re-crop inside run_cascade.
+            _ccj = cfg.data.get("cascade_crop_jitter", None)
+            cascade_jitter = (int(_ccj) if _ccj is not None
+                              else int(cfg.data.image_size[0]) // 4)
+            if prof:
+                torch.cuda.synchronize()
+                tsum["data"] += (time.perf_counter() - t_prev) * 1000
             # Level-0 GPU realize: the v2 loader ships an imageless native_crop payload when
             # data.gpu_realize_crop is on; turn it into a finished batch dict on device before
             # run_cascade. No-op (crop_realizer is None) on the CPU-collated cascade path.
             if crop_realizer is not None and "native_crop" in batch:
+                _t_r0 = time.perf_counter()
                 batch = crop_realizer(batch)
+                if prof:
+                    torch.cuda.synchronize()
+                    tsum.setdefault("realize0", 0.0)
+                    tsum["realize0"] += (time.perf_counter() - _t_r0) * 1000
             gstep = epoch * len(loader) + n
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
@@ -526,14 +548,15 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 res = run_cascade(
                     model, loader.dataset.provider, batch, _aug, spacings,
                     device=DEVICE, training=True, step=gstep, seed=int(cfg.train.seed),
-                    jitter=int(cfg.data.get("cascade_crop_jitter", 0)), is_prob=is_prob,
+                    jitter=cascade_jitter, is_prob=is_prob,
                     recrop_workers=int(cfg.data.get("cascade_recrop_workers", 16)),
                     query_prior=cfg.data.get("cascade_query_prior", False),
                     query_prior_hard=bool(cfg.data.get("cascade_query_prior_hard", False)),
                     realize_crop=bool(cfg.data.get("gpu_realize_crop", True)),
                     mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
                     occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
-                    ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")))
+                    ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
+                    prior_perturb=cfg.data.get("prior_perturb", None))
                 # Fail fast on a non-finite forward at ANY level, BEFORE the loss: a NaN
                 # reaching F.binary_cross_entropy trips an async device assert with a useless
                 # later stack (cf. the non-cascade guard).
@@ -544,6 +567,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                             f"(spacing {spacings[_li]:g})")
                 loss, per_level = _cascade_loss(
                     res, loss_fn, cfg.train.get("cascade_loss_weights"))
+            if prof:
+                torch.cuda.synchronize()
+                tsum.setdefault("cascade", 0.0)
+                tsum["cascade"] += (time.perf_counter() - t_rc) * 1000
+                _t_bwd = time.perf_counter()
             fine = res.logits[-1].float()
             loss.backward()
             if cfg.train.get("grad_clip"):
@@ -573,9 +601,12 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             for _m in (res.prior_modes_used or [])[1:]:     # level 0 has no prior
                 _c_prior_acc[_m] = _c_prior_acc.get(_m, 0) + 1
             if prof:
+                torch.cuda.synchronize()
                 prof_items += batch["image"].shape[0]     # per-item = per-step ÷ batch size
-                tsum.setdefault("recrop", 0.0)
+                tsum.setdefault("recrop", 0.0)            # legacy key: zero_grad -> opt.step total
                 tsum["recrop"] += (time.perf_counter() - t_rc) * 1000
+                tsum.setdefault("bwd", 0.0)
+                tsum["bwd"] += (time.perf_counter() - _t_bwd) * 1000
             pbar.set_postfix(loss=f"{total/n:.4f}", dice=f"{dice_sum/n:.4f}",
                              soft=f"{soft_run/n:.4f}",
                              lr=f"{optimizers[0].param_groups[0]['lr']:.1e}")
@@ -611,7 +642,20 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 img_in = batch["image"] if gpu_aug is not None else batch["image"].to(DEVICE, non_blocking=True)
                 cin = batch["context_in"] if gpu_aug is not None else batch["context_in"].to(DEVICE, non_blocking=True)
                 cout = batch["context_out"] if gpu_aug is not None else batch["context_out"].to(DEVICE, non_blocking=True)
-                out = model(img_in, context_in=cin, context_out=cout, mode="train", spacing=spacing)
+                qp = None
+                if qp_on:
+                    qp_mode = draw_query_prior_mode(qp_spec, f"{cfg.train.seed}_{epoch}_{n}")
+                    _qp_acc[qp_mode] = _qp_acc.get(qp_mode, 0) + 1
+                    _qp_gen = torch.Generator(device=DEVICE)
+                    _qp_gen.manual_seed(int(cfg.train.seed) + epoch * 100_003 + n)
+                    _qp_sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
+                    qp = build_query_prior(qp_mode, lbl, perturb_cfg=qp_perturb,
+                                           spacing_mm=_qp_sp, gen=_qp_gen)
+                # Pass the kwarg only when a prior is actually built (mirrors
+                # cascade._forward_level) so torch.compile keeps one graph for the no-prior case.
+                qp_kw = {"query_prior": qp} if qp is not None else {}
+                out = model(img_in, context_in=cin, context_out=cout, mode="train",
+                            spacing=spacing, **qp_kw)
                 logits = out["final_logit"].float()                    # (B,1,Rd,Rd,Rd)
                 target = target_like(lbl.unsqueeze(1), logits)         # GT pooled to grid
             else:
@@ -675,6 +719,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         _pt = sum(_c_prior_acc.values())
         for _m, _cnt in _c_prior_acc.items():
             grid[f"cascade_prior_frac/{_m}"] = _cnt / max(_pt, 1)
+    # Non-cascade query-prior mode mix (only populated when data.query_prior injects a prior).
+    if _qp_acc and n:
+        _qt = sum(_qp_acc.values())
+        for _m, _cnt in _qp_acc.items():
+            grid[f"query_prior_frac/{_m}"] = _cnt / max(_qt, 1)
     if prof and n:
         pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
         bs = prof_items / n                            # avg batch size
@@ -686,9 +735,21 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                        f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
                        f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
                        f"encode {tsum['encode']/pi:4.0f}ms | attn {tsum['attn']/pi:4.0f}ms")
-        if "recrop" in tsum:                           # cascade re-crop I/O (cascade branch only)
-            grid["time/recrop_ms"] = tsum["recrop"] / n
-            grid["time/recrop_ms_item"] = tsum["recrop"] / pi
+        if "recrop" in tsum:                           # cascade branch only
+            # data       = host wait for the next native_crop / collated batch
+            # realize0   = crop_realizer (level-0 GPU resample/normalize/place)
+            # cascade    = run_cascade (all levels: recrop loads + realize + fwd + loss)
+            # bwd        = backward + grad-clip + opt.step
+            # recrop (legacy key) = cascade + bwd (zero_grad -> opt.step wall time)
+            for k in ("data", "realize0", "cascade", "bwd", "recrop"):
+                if k in tsum:
+                    grid[f"time/{k}_ms"] = tsum[k] / n
+                    grid[f"time/{k}_ms_item"] = tsum[k] / pi
+            tqdm.write(
+                f"  [e{epoch}] cascade per-step (ms): "
+                f"data {tsum.get('data', 0)/n:5.0f} | realize0 {tsum.get('realize0', 0)/n:5.0f} | "
+                f"run_cascade {tsum.get('cascade', 0)/n:5.0f} | bwd {tsum.get('bwd', 0)/n:5.0f} "
+                f"|| step total {(tsum.get('data', 0)+tsum.get('realize0', 0)+tsum['recrop'])/n:5.0f}")
     return total / max(n, 1), dice_sum / max(n, 1), soft_run / max(n, 1), grid
 
 
@@ -900,16 +961,25 @@ def main(cfg: DictConfig) -> None:
           f"| sched={cfg.train.get('scheduler','plateau')} | val classes={len(val_classes)}")
 
     loader = train_loader(cfg)
-    if cfg.data.get("cascade_spacings"):
+    # The per-spacing ct_raw_{s}mm.npy image caches only accelerate the CPU provider.load()
+    # re-crop path. They are irrelevant when data.gpu_realize_crop is on (default under
+    # cascade): training re-crops entirely from the RAM cache via load_native_crop + GPU
+    # realize and never calls provider.load(); the cascade val pass still loads level 0 on
+    # CPU, but that is a deliberate non-goal (see the 2026-09-01 cascade RAM-cache spec).
+    # Also skip the native 1.5 mm pitch — every TotalSeg subject is 1.5 mm isotropic, so
+    # ct_raw.npy *is* the 1.5 mm volume and ct_raw_1.5mm.npy is intentionally never built.
+    if cfg.data.get("cascade_spacings") and not bool(cfg.data.get("gpu_realize_crop", True)):
         import warnings
         _cache_root = _source_root(cfg)[1]     # the source the provider actually reads (totalsegmri etc.), not always paths.totalseg
         _sd = next(iter(sorted(Path(_cache_root).glob("s*"))), None)
         for _s in cfg.data.cascade_spacings:
+            if float(_s) == 1.5:
+                continue
             if _sd is not None and not (_sd / f"ct_raw_{float(_s):g}mm.npy").exists():
                 warnings.warn(
                     f"cascade: no ct_raw_{float(_s):g}mm.npy image cache — provider falls back "
                     f"to full-res ct_raw.npy per re-crop load (slow: ~+0.3 s/step, ~100 s/val). "
-                    f"Build the per-spacing caches to remove it.")
+                    f"Build the per-spacing caches, or set data.gpu_realize_crop=true, to remove it.")
     val_split = cfg.train.get("val_split", "val")
     val_loader = make_eval_loader(vcfg, val_classes, split=val_split)  # built once, reused every eval
     if len(val_loader.dataset) == 0:

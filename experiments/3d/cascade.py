@@ -71,6 +71,8 @@ def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
 
 
 INT_OFFSET = 1_000_000  # keep intensity seeds clear of geo seeds across plausible step counts
+GOAL_OFFSET = 7_000_000  # goal-mask seed: constant across levels (clear of INT_OFFSET*(i+1))
+PERTURB_OFFSET = 13_000_000  # query-prior perturbation seed (per level; train-only)
 
 
 @dataclass
@@ -396,14 +398,19 @@ def _resolve_prior_spec(query_prior) -> PriorSpec:
 
 
 def _build_query_prior(mode, hard, prev_logit, prev_label, cur_label,
-                       prev_geo, cg_prev, cg_cur, T, is_prob):
+                       prev_geo, cg_prev, cg_cur, T, is_prob,
+                       perturb_cfg=None, spacing_mm=None, perturb_gen=None):
     """Soft prior on level i's grid (B,1,T,T,T) for query_prior, per `mode`:
       pred       sigmoid(logit_{i-1}) detached, warped (M2 / crop-geom) onto level i's grid
       gt_coarse  level i-1's augmented GT warped the same way — perfect-coarse-seg ceiling
       gt_fine    level i's own augmented GT, already on this grid (no warp) — perfect-prior ceiling
     `hard` thresholds the result at 0.5. The pred prior is DETACHED (each level keeps its own
     loss). The geometric warp runs fp32 (autocast off) so the coordinate maths keep sub-voxel
-    precision under bf16."""
+    precision under bf16.
+
+    `perturb_cfg` (data.prior_perturb): when set, degrade the built prior with
+    perturb_prior_mask (dilate/erode/shift/noise, radii in mm via `spacing_mm`) BEFORE the
+    optional hard threshold — makes an oracle/gt prior look like a real upstream seg."""
     B = prev_logit.shape[0]
     with torch.autocast(device_type=prev_logit.device.type, enabled=False):
         if mode == "gt_fine":
@@ -420,6 +427,9 @@ def _build_query_prior(mode, hard, prev_logit, prev_label, cur_label,
                 p = _warp_prior_m2(src, cg_prev, cg_cur, prev_geo, T)
             else:
                 p = _warp_prior_cropgeom(src, cg_prev, cg_cur, T)
+        if perturb_cfg is not None and perturb_gen is not None and spacing_mm is not None:
+            from src.mask_transforms import perturb_prior_mask
+            p = perturb_prior_mask(p, perturb_cfg, float(spacing_mm), perturb_gen)
         return (p >= 0.5).float() if hard else p
 
 
@@ -451,7 +461,8 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                 step, seed, jitter=0, is_prob=False, want_hard_preds=False,
                 recrop_workers=1, query_prior=False, query_prior_hard=False,
                 want_figure_arrays=False, realize_crop=False,
-                mask_downsample="occupancy", occ_thr=0.1, ct_spec=None):
+                mask_downsample="occupancy", occ_thr=0.1, ct_spec=None,
+                prior_perturb=None):
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
     N = len(spacings)
@@ -481,7 +492,8 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         if augmentor is not None:
             cur, geo = augmentor.apply(
                 cur, geo_gen=_gen(geo_seed, device),
-                int_gen=_gen(geo_seed + INT_OFFSET * (i + 1), device), capture=capture)
+                int_gen=_gen(geo_seed + INT_OFFSET * (i + 1), device), capture=capture,
+                goal_gen=_gen(geo_seed + GOAL_OFFSET, device))
         else:
             geo = None
 
@@ -499,9 +511,12 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             prior_modes_used.append(mode_i)
             if mode_i != "none" and prev_logit is not None:
                 cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
-                prior = _build_query_prior(mode_i, bool(query_prior_hard), prev_logit,
-                                           prev_label, cur["label"], prev_geo, geoms[i - 1],
-                                           cg_cur, T, is_prob)
+                prior = _build_query_prior(
+                    mode_i, bool(query_prior_hard), prev_logit, prev_label, cur["label"],
+                    prev_geo, geoms[i - 1], cg_cur, T, is_prob,
+                    perturb_cfg=(prior_perturb if training else None),
+                    spacing_mm=spacings[i],
+                    perturb_gen=_gen(geo_seed + PERTURB_OFFSET + i, device))
 
         logit = _forward_level(model, cur, spacings[i], query_prior=prior)
         tgt = target_like(cur["label"].unsqueeze(1).float(), logit)

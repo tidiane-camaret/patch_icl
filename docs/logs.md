@@ -1,5 +1,179 @@
 # Change log
 
+## 2026-09-02 — exp 69: Medverse baseline for the exp 68 cascade (variable-spacing, no cascade)
+
+`configs/experiment/3d/experiment/69_medverse_varspacing_6_1_5.yaml` — the single-forward
+Medverse architecture baseline for `experiment=68_cascade_6_3_1_5` (patchset3d + from-scratch
+PlainConv + 3-level coarse->fine cascade). Inherits 68 wholesale so the DATA selection
+(`loader_v2`, `train_classes=balanced`, `val_classes=all`, `context_size=1`, `mask_downsample=soft`,
+128^3), augmentation (`calibrated` + the 48/57 trims) and eval config are byte-identical to
+the patchset run, then:
+- `override /model: medverse` — released Medverse U-Net (level=1, no AR).
+- `data.cascade_spacings: null` + `data.gpu_realize_crop: false` + `data.ram_cache: false` —
+  turn the cascade OFF. `_assert_cascade_supported` hard-errors on `gpu_realize_crop` without
+  a cascade; the non-cascade `provider.load()` path never reads `_ram`
+  (`src/providers/totalseg.py:211`), so `ram_cache=true` would only burn a ~35 GB preload.
+- `data.train_spacing_range: [1.5, 6.0]` replaces the cascade — per-batch log-uniform crop
+  pitch (SpacingBatchSampler). Medverse never receives the spacing signal (train.py threads
+  it into spacing-aware models only) => "train blind on the same variable-spacing crops",
+  the exp 37 design. `provider.load()` resamples on the fly from `ct_raw.npy`; no per-spacing
+  caches needed.
+- `data.crop_spacing_mm: 3` — fixed EVAL pitch (train_spacing_range is train-only), the
+  cascade's middle level; FOV 384 mm, mid of the trained [192, 768] mm range.
+
+SCHEDULE: `override /model: medverse` swaps the *m1 group file* (where exp 68's
+adamw/cosine/wd0.01/bce_dice actually live) for `medverse.yaml`'s native recipe
+(adam/plateau/wd0/smooth_l1), so the exp-68 schedule knobs are RE-STATED in the body:
+`optimizer=adamw`, `scheduler=cosine`, `weight_decay=0.01`, `loss=bce_dice`, `dice_weight=1.0`,
+`warmup_epochs=5`. Resolves alongside the 48/57 bodies: `epochs=400`, `batch_size=4`,
+`grad_clip=1.0`, `eval_every=10`. Muon/LAWA/encoder_lr_scale/fine_decode/query_prior are all
+`is_patchset`-gated and no-op for medverse; the inherited `arch.*` (plainconv_ts, e:768 ...)
+is inert.
+
+STABILITY: bce_dice + an Adam-family optimizer on Medverse's UNBOUNDED conv head is the
+exp 31/38 divergence regime (docs/logs.md 2026-07-29). `train.lr: 3.0e-5` (Medverse-native)
+is the ONE deliberate break from exp 68's 7e-5. Guards stay on: `train.oob_weight` defaults
+to 10 in `build_loss` (out-of-bounds anchor), `grad_clip=1.0`, and the non-finite-forward
+abort in `train_epoch`. `checkpoint: orig_weights` (finetune released weights; never resume
+from a collapse-edge best.pt). Config-only; verified via `--cfg job --resolve`.
+Run: `python experiments/3d/train.py experiment=69_medverse_varspacing_6_1_5`
+
+## 2026-09-02 — mask transforms: goal-mask aug + query-prior perturbation
+
+Common toolkit + two entry points, all radii in **mm** (converted to voxels per call
+with the grid pitch, so an op is identical across cascade levels and invariant to
+`data.cascade_crop_jitter` — jitter moves the crop centre, not the pitch).
+
+**`src/mask_transforms.py`** (new) — batched GPU ops on soft masks in [0,1] (4D or 5D):
+`dilate` / `erode` (`F.max_pool3d` L∞ ball; `ball=True` -> Euclidean ball via one
+`conv3d`), `boundary` (morph gradient), `sobel_edge` (3D Sobel magnitude, per-sample
+normalised), `translate` (sub-voxel `grid_sample`), `add_gaussian_noise`, `mm_to_vox`,
+`apply_goal_op`, and `perturb_prior_mask` (composes random dilate|erode + shift + noise;
+one draw per call).
+
+**Entry point 1 — goal-mask transform** (`src/gpu_augment.py::_goal_mask_transform`):
+rewrites a task's TARGET + every CONTEXT mask with ONE shared op (redefines the goal:
+"segment the eroded organ" / "...the boundary"). Fires after `_geometric` in
+`GpuAugmentor.apply` (cascade, seeded from `geo_seed + GOAL_OFFSET` held constant across
+levels -> physically identical op at every level) and `.__call__` REAL/SELF_CONTEXT
+branch. TRAIN only (eval passes no augmentor). One draw per BATCH by default;
+`per_task: true` -> one per task. Config: `augmentations.goal_mask` (added to
+`calibrated.yaml` + `multiverseg_v2.yaml`), `p: 0.0` -> off / byte-identical. Masks are
+promoted to float when the op is active (boundary/sobel are fractional) — `_stack_task`
+already floats soft masks, so this only matters for `occupancy` runs.
+
+**Entry point 2 — query-prior perturbation** (`perturb_prior_mask`): degrades ONLY the
+mask fed to the query mask token. Wired into `experiments/3d/query_prior.py::build_query_prior`
+(non-cascade, after the `gt` prior is built) and `cascade.py::_build_query_prior` (cascade,
+after the M2/crop-geom warp, before the optional hard threshold). Applies to any built
+prior regardless of mode. TRAIN only — cascade eval keeps the real `pred` prior intact
+(`prior_perturb if training else None`). `run_cascade` gained a `prior_perturb=` param;
+train.py passes `cfg.data.get("prior_perturb")` to both paths. Config: `data.prior_perturb`
+in `d1.yaml`, `p: 0.0` -> off.
+
+`GOAL_OFFSET = 7_000_000`, `PERTURB_OFFSET = 13_000_000` in cascade.py (clear of
+`INT_OFFSET*(i+1)`).
+
+**Verified:** `src/mask_transforms.py` unit tests (dilate/erode monotone + correct
+direction, boundary shell has 0 interior, sobel normalised [0,1], translate moves
+centroid, noise clamps, 4D/5D both, `mm_to_vox(3,6)=0` -> coarse-level sub-voxel op is a
+no-op); CPU integration of both wired paths (goal op transforms label + context_out
+identically: blob fg 515->2079 dilate / ->25 erode; `p=0` byte-identical; prior perturb
+changes the prior, `None` cfg = identity); `pytest test_cascade.py` 51 pass,
+`test_gpu_augment.py`/`test_train_augment.py`/`test_gpu_augment_capture.py` 29 pass.
+Full GPU train smoke pending — the dev GPU is occupied by a live run (exp68
+`67_cascade_jitter`); the non-cascade smoke reached the model forward (all new code paths
+executed) before OOMing on the *encoder* activation alloc under that external pressure.
+
+**Follow-up — `erode` `min_keep` floor.** Plain erosion deletes small organs entirely
+(adrenals / gallbladder -> 0 vox at radius 6 mm). Added `min_keep` (fraction of a mask's
+own foreground erosion must leave): when >0, `erode` runs `r` one-voxel steps and stops,
+*per sample*, before the next step would breach the floor — a small object keeps a core,
+a large one still gets the full radius. `min_keep=0` -> the old single-shot erosion,
+byte-identical. Forwarded through `boundary`, `apply_goal_op`, `_goal_mask_transform`
+(reads `augmentations.goal_mask.{erode,boundary}.min_keep`) and `perturb_prior_mask`
+(reads `data.prior_perturb.erode_min_keep`); config default `0.3`. Verified per-sample in
+a batched call: big 7153->2943 (floor 2145), small 123->123 (untouched), tiny 7->7.
+`experiments/3d/plot_goal_mask_transforms.py` gained `--min_keep`.
+
+## 2026-09-02 — non-cascade query-prior injection (step 1: GT prior)
+
+Single-forward analogue of `data.cascade_query_prior`. At a configurable fraction of
+TRAIN steps, seed the query's mask token with the target mask instead of the
+support-mean occupancy prior, so the model learns to consume a spatial prior channel it
+can be handed at inference (scribble / atlas / bbox / cheap coarse pass).
+
+**New `experiments/3d/query_prior.py`:** `resolve_query_prior_spec` (scalar `none|gt`,
+bool, or `{modes, p}` mapping → `QueryPriorSpec`), `draw_query_prior_mode` (single mode
+for a fixed spec, else a `Random(f"{seed}_{epoch}_{step}").choices` categorical draw),
+`build_query_prior` (`gt` → `label.unsqueeze(1).float().clamp(0,1)`; `none` → None). The
+target GT is already on the query's T³ crop grid, so **no geometric warp** — the model's
+`_prior_occupancy` downsamples it to the R³ mask-token lattice. `_QP_MODES = (none, gt)`;
+step 2 adds perturbed-GT modes here (dilate / erode / coarsen / component-drop / jitter).
+
+**`experiments/3d/train.py`:** non-cascade branch resolves the spec once
+(`qp_on = is_patchset and spec.active and not cascade_spacings`), draws a mode per step,
+builds the prior from `lbl`, and passes `query_prior=` to `model(...)` **only when a
+prior is built** (mirrors `cascade._forward_level` → torch.compile keeps one graph for
+the no-prior case). Per-epoch mode mix logged as `query_prior_frac/{mode}` (wandb).
+
+**Train-only.** Eval always runs prior-free (support-mean): `val/dice` stays comparable
+to a prior-free run and there is no GT to leak at inference. A `val/dice` that collapses
+across epochs under `query_prior=gt` is the expected "model learned to copy the prior"
+signal — the motivation for step 2's perturbations.
+
+**Config:** `data.query_prior: none` documented in `configs/experiment/3d/dataset/d1.yaml`
+(default `none` → `active=False` → zero behaviour change). Override e.g.
+`+data.query_prior=gt` or `+data.query_prior='{modes:[none,gt],p:[0.5,0.5]}'`.
+
+Smoke test (nora-odin, exp57 non-cascade, mixture `[none,gt] p=[.5,.5]`, seed 42, 4
+steps): drew `[none, gt, none, none]` — the `gt` step ran `model(..., query_prior=tensor)`
+through `_prior_occupancy` with no error; loss decreased 2.96→2.74; eval + `Done.` clean.
+
+## 2026-09-02 — cascade realize: stale cache warning + per-phase step timing
+
+Two follow-ups to the 2026-09-01 RAM-cache / GPU-realize path, both in
+`experiments/3d/train.py`.
+
+**1. Stale `ct_raw_{s}mm.npy` warning.** `main()` warned "no ct_raw_{s}mm.npy image
+cache — provider falls back to full-res ct_raw.npy per re-crop load (slow: ~+0.3 s/step,
+~100 s/val)" whenever `cascade_spacings` was set and a per-spacing cache was missing —
+with no `gpu_realize_crop` check. Under `gpu_realize_crop=true` (the default for cascade)
+training re-crops entirely from the RAM cache via `load_native_crop` + GPU realize and
+never calls `provider.load()` (the only reader of those caches), so the warning was a
+false alarm. It also fired for the native 1.5 mm pitch, for which `ct_raw_1.5mm.npy` is
+intentionally never built (every TotalSeg subject is 1.5 mm isotropic → `ct_raw.npy` IS
+the 1.5 mm volume). Fix: gate the whole block on `not gpu_realize_crop` and `continue`
+for `_s == 1.5`. The cascade *val* level-0 pass still uses the CPU `provider.load()` path
+(eval GPU-realize is a documented non-goal), but that is not what the message implied.
+
+**2. `train.profile_timing` cascade breakdown.** The cascade branch only reported one
+`time/recrop_ms` that actually spanned `zero_grad → opt.step`. Split into
+`time/{data,realize0,cascade,bwd}_ms` (+ `_ms_item`) with `torch.cuda.synchronize()` at
+each boundary (inside `if prof:` → zero overhead when off), and a `[eN] cascade per-step`
+line: `data` (host wait) | `realize0` (`crop_realizer` level-0 GPU resample) |
+`run_cascade` (all levels: recrop loads + realize + fwd + loss) | `bwd`.
+
+**Investigation (nora-odin, RTX PRO 6000 Blackwell, exp68 `[6,3,1.5]`, B=4 K=1 128^3,
+12 steps/epoch, arch.compile=true):**
+
+| path | data | realize0 | run_cascade | bwd | epoch |
+|---|---|---|---|---|---|
+| `ram_cache+gpu_realize_crop=true` | 285 | 4 | 820 | 881 | **23.9 s** |
+| both `false` (CPU mmap re-crop) | 130 | 0 | 1140 | 880 | **25.8 s** |
+
+`realize0` is ~4 ms — negligible. The step is GPU-compute-bound (`bwd` ~880 ms +
+`run_cascade` forwards). The RAM cache + GPU realize is ~2 s/epoch *faster* here than the
+CPU path (`run_cascade` 820 vs 1140 ms: the CPU `provider.load()` trilinear re-crop is
+slower than RAM-slice + GPU area-pool). A reported "22 s CPU vs 28 s realize" regression
+did NOT reproduce on this node — likely host-RAM pressure from the ~50 GB resident cache,
+NFS page-cache state, or CPU-core contention on the reporting node, or val-inclusive
+timing (`time/epoch_s` excludes val). Tried moving the re-crop decimation to the GPU
+(`load_native_crop(decimate=False)` → raw native crop → GPU `_area_pool_3d`): `run_cascade`
+942 ms, epoch 25.5 s — a pessimization (bigger H2D + fp32 GPU resample on the busy step,
+vs the CPU `avg_pool3d` which overlaps the previous level's forward). Reverted; only the
+warning fix + instrumentation kept.
+
 ## 2026-09-01 — cascade RAM cache + GPU crop/realize
 
 `data.ram_cache` preloads ct_raw.npy + label.npy for all 1228 subjects into a
@@ -6601,3 +6775,41 @@ val/samples was an empty table, silently, for the whole run.
 
 Verified on totalsegmri: val_split=val -> len(dataset)=0 (guard fires); val_split=test ->
 len(dataset)=150 (50 classes x 3 tasks). 91 passed / 1 skipped in experiments/3d/tests.
+
+## 2026-09-02 — data.cascade_crop_jitter: null -> T//4 (was 0)
+
+train.py's cascade branch resolved `jitter=int(cfg.data.get("cascade_crop_jitter", 0))`,
+so an unset key meant 0 (exact predicted-COM re-crop) and an explicit `null` crashed
+(`int(None)`). Now `null` / absent resolves to `T//4` (`cfg.data.image_size[0] // 4`),
+matching `data.crop_jitter`'s provider-side default; an explicit int still overrides
+(0 = exact COM). Only the train loop is affected — `evaluate_cascade` keeps its hard-coded
+`jitter=0` so `val/dice` stays a reproducible exact-COM stitched Dice.
+
+- experiments/3d/train.py: resolve `cascade_jitter` once per cascade step, pass it to
+  `run_cascade`.
+- configs .../experiment/{68_cascade_6_3_1_5,59_organs_cascade_from_scratch}.yaml: comment
+  now documents the null -> T//4 fallback (values unchanged, still explicit 0).
+
+Existing configs (68, 59) and the cascade tests all set `cascade_crop_jitter: 0`
+explicitly, so behavior there is unchanged; the new default only reaches configs that omit
+the key.
+
+### verify: query-prior alignment under cascade_crop_jitter
+
+Checked that `data.cascade_crop_jitter > 0` (now the null default) keeps the injected
+`data.cascade_query_prior` mask registered with the re-cropped target. Mechanism:
+`organ_crop_arrays` bakes the jitter offset into `crop_geom[0]` (starts); `run_cascade`
+passes that geom as `cg_cur` into `_build_query_prior`; `_crop_compose` maps prev->cur
+crop voxels through the shared native-CT frame using BOTH starts, so a jitter shift of
+`cg_cur.starts` by delta translates the warped prior by exactly -delta — the same shift
+the jittered image/label crop undergoes. Holds for the no-aug path (`_warp_prior_cropgeom`,
+val) and the aug path (`_warp_prior_m2`): jitter enters only via `cg_dst` starts, the aug
+grid is level-invariant (shared geo_seed) and lives in the normalized T^3 crop frame, so
+the two are orthogonal.
+
+New tests in experiments/3d/tests/test_cascade.py:
+- test_query_prior_warp_follows_crop_jitter_offset[delta] — unit: 1:1 crop-geom, prior
+  blob shifts by exactly -delta.
+- test_query_prior_gt_coarse_stays_aligned_under_crop_jitter — e2e run_cascade, gt_coarse
+  prior IoU vs the re-cropped GT stays >0.7 at jitter 0 and 4 (misaligned would be ~0.14).
+50 passed / 1 skipped.

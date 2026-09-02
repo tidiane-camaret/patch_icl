@@ -115,7 +115,8 @@ from dataclasses import dataclass as _dc
 
 import threading
 
-from cascade import run_cascade, CascadeResult, _cascade_loss, _recrop_level
+from cascade import (run_cascade, CascadeResult, _cascade_loss, _recrop_level,
+                     _warp_prior_cropgeom)
 from src.incontext_dataset_v2 import LoadResult, LoadRequest
 
 
@@ -347,6 +348,125 @@ def test_run_cascade_query_prior_bad_mode_raises():
         run_cascade(_PriorSpyModel(G=4), _FakeProvider(T=8), _v2_batch(B=2, T=8),
                     augmentor=None, spacings=[3.0, 1.5], device=torch.device("cpu"),
                     training=True, step=0, seed=0, query_prior="oracle")
+
+
+# --- query_prior stays aligned under data.cascade_crop_jitter -----------------
+# The jitter shifts a level's crop origin (crop_geom[0] = starts). The prior warp
+# composes prev -> native-CT -> cur through BOTH crop_geoms, so a jittered `cg_cur`
+# must translate the injected prior by exactly the opposite offset to keep it
+# registered with the (jittered) re-cropped target.
+
+@pytest.mark.parametrize("delta", [0, 1, 3, -2])
+def test_query_prior_warp_follows_crop_jitter_offset(delta):
+    """_warp_prior_cropgeom (no-aug path): with a 1:1 crop-geom, moving cg_dst.starts by
+    `delta` (the jitter) vs cg_src.starts must shift the warped prior by exactly -delta."""
+    T, S0 = 12, 20
+    mk = lambda s: torch.tensor([[s, s, s], [T, T, T], [T, T, T], [0, 0, 0]],
+                                dtype=torch.long)[None]
+    cg_src, cg_dst = mk(S0), mk(S0 + delta)
+
+    vol = torch.zeros(1, 1, T, T, T)
+    p = (6, 5, 7)
+    vol[0, 0, p[0], p[1], p[2]] = 1.0
+
+    out = _warp_prior_cropgeom(vol, cg_src, cg_dst, T)
+    hot = (out[0, 0] > 0.5).nonzero()
+    assert hot.shape[0] == 1, f"delta={delta}: expected 1 hot voxel, got {hot.shape[0]}"
+    got = tuple(int(v) for v in hot[0])
+    want = tuple(c - delta for c in p)
+    assert got == want, f"delta={delta}: prior at {got}, expected {want}"
+
+
+class _GeomProvider:
+    """Geometry-faithful crop provider: slices a shared native volume with a planted
+    organ blob, honoring req.center + req.jitter, and returns the TRUE crop_geom.
+    1:1 native<->grid (out_sizes == T) isolates the jitter translation from resample."""
+    def __init__(self, T=16, native=60, blob_c=(30, 30, 30), blob_r=4):
+        self.T, self.N, self.blob_center = T, native, blob_c
+        self.vol = torch.zeros(native, native, native)
+        c, r = blob_c, blob_r
+        self.vol[c[0] - r:c[0] + r, c[1] - r:c[1] + r, c[2] - r:c[2] + r] = 1.0
+        self.calls = []
+
+    def load(self, subject, cls, req: LoadRequest):
+        T, N = self.T, self.N
+        center = req.center if req.center is not None else self.blob_center
+        j = int(req.jitter or 0)
+        starts = []
+        for a in range(3):
+            ideal, smax = int(center[a]) - T // 2, N - T
+            lo, hi = min(max(0, ideal - j), smax), min(max(0, ideal + j), smax)
+            starts.append(req.rng.randint(lo, hi) if req.rng is not None
+                          else max(0, min(ideal, smax)))
+        d0, h0, w0 = starts
+        crop = self.vol[d0:d0 + T, h0:h0 + T, w0:w0 + T].clone()
+        geom = torch.tensor([starts, [T, T, T], [T, T, T], [0, 0, 0]], dtype=torch.long)
+        self.calls.append({"center": req.center, "jitter": req.jitter, "starts": starts})
+        return LoadResult(image=crop[None], label=crop.clone(),
+                          spacing=torch.full((3,), float(req.crop_spacing_mm)), crop_geom=geom)
+
+
+def _geom_batch(prov, B=2, K=2):
+    import random
+    T = prov.T
+    imgs, lbls, cin, cout, geoms = [], [], [], [], []
+    for b in range(B):
+        r = prov.load(f"s{b}", "liver", LoadRequest(rng=random.Random(b), crop_spacing_mm=3.0,
+                                                    center=prov.blob_center, jitter=0))
+        imgs.append(r.image); lbls.append(r.label); geoms.append(r.crop_geom)
+        ci, co = [], []
+        for k in range(K):
+            rk = prov.load(f"c{b}_{k}", "liver", LoadRequest(
+                rng=random.Random(100 + b * K + k), crop_spacing_mm=3.0,
+                center=prov.blob_center, jitter=0))
+            ci.append(rk.image); co.append(rk.label)
+        cin.append(torch.stack(ci)); cout.append(torch.stack(co))
+    return {
+        "image": torch.stack(imgs), "label": torch.stack(lbls),
+        "context_in": torch.stack(cin), "context_out": torch.stack(cout),
+        "subjects": [f"s{b}" for b in range(B)],
+        "context_subjects": [[f"c{b}_{k}" for k in range(K)] for b in range(B)],
+        "label_names": ["liver"] * B,
+        "crop_geom": torch.stack(geoms),
+        "aug_mode": torch.zeros(B, dtype=torch.long),
+    }
+
+
+def test_query_prior_gt_coarse_stays_aligned_under_crop_jitter():
+    """End-to-end run_cascade: with jitter>0 the level-1 target is re-cropped on the
+    predicted COM PLUS a random offset. The gt_coarse prior (level-0 GT warped onto
+    level-1's grid via cg_cur) must follow that offset and stay registered with the
+    re-cropped GT — same IoU as the no-jitter baseline."""
+    T, B, K = 16, 2, 2
+    prov = _GeomProvider(T=T)
+
+    class _ImgSpy(_PriorSpyModel):
+        def forward(self, image, context_in, context_out, mode="train", spacing=None,
+                    query_prior=None):
+            self.imgs = getattr(self, "imgs", [])
+            self.imgs.append(image.detach().clone())
+            return super().forward(image, context_in, context_out, mode, spacing, query_prior)
+
+    def _iou(a, b):
+        a, b = a.bool(), b.bool()
+        u = (a | b).sum().item()
+        return (a & b).sum().item() / u if u else 0.0
+
+    runs = {}
+    for J in (0, 4):
+        m = _ImgSpy(G=5, hot=(2, 2, 2))
+        run_cascade(m, prov, _geom_batch(prov, B, K), augmentor=None, spacings=[3.0, 3.0],
+                    device=torch.device("cpu"), training=True, step=0, seed=0, jitter=J,
+                    query_prior="gt_coarse", is_prob=False)
+        runs[J] = m
+
+    # jitter genuinely perturbed the level-1 crop (else the test is vacuous)
+    assert not torch.equal(runs[0].imgs[1], runs[4].imgs[1]), "jitter=4 did not move the crop"
+    for J in (0, 4):
+        m = runs[J]
+        prior_l1, gt_l1 = m.priors[1][:, 0], m.imgs[1][:, 0]          # (B,T,T,T)
+        iou = min(_iou(prior_l1[b] > 0.5, gt_l1[b] > 0.5) for b in range(B))
+        assert iou > 0.7, f"J={J}: query-prior misaligned with re-cropped GT (IoU {iou:.2f})"
 
 
 # --- cascade_query_prior mixture (per-step categorical draw) ------------------
