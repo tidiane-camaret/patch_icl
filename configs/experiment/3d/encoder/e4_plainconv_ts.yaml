@@ -26,7 +26,7 @@ arch:
   plainconv_ts_n_stages: 5        # depth knob when features_per_stage is not set
   plainconv_ts_features_per_stage: null   # e.g. [32,64,128,256,320]; overrides n_stages via its length
   nnunet_ts_stages: [2, 3, 4]     # multi-scale concat -> out_ch = 128+256+320 = 704 (default width)
-  encoder_input_norm: zscore      # passthrough | reframe | zscore (see header)
+  encoder_input_norm: zscore      # passthrough | reframe | zscore | instance (see header)
   encoder_precision: bf16         # autocast dtype of the encoder forward
   enc_dims: [32, 32, 32, 32]      # ignored when encoder=plainconv_ts (schema parity)
   resolution: 16                  # token grid R; stage 3 is native 16^3 at a 128^3 input

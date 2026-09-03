@@ -33,7 +33,7 @@ class LoadResult:
     label: torch.Tensor               # (T, T, T) i64, binary {0,1}
     spacing: torch.Tensor              # (3,) mm/voxel of the output
     crop_geom: torch.Tensor            # (4, 3) i64: starts, crop_sizes, out_sizes, pad_lo
-    modality: str = "ct"              # "ct" | "mri" — rides for aug/analysis; encoder path ignores it
+    modality: str = "ct"               # "ct" | "mri" — rides for aug/analysis; encoder path ignores it
 
 
 class VolumeProvider(Protocol):

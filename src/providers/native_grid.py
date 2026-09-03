@@ -81,6 +81,7 @@ class NativeGridProvider:
                  mask_downsample="occupancy", mask_occupancy_thr=0.5,
                  image_antialias=True):
         self.root = Path(root)
+        self.modality = "ct"   # native-grid sources are all CT; contract for a future MultiModalProvider
         self.classes = resolve_classes_for(
             self.ALL_CLASSES, classes if classes is not None else "all", self.SOURCE)
         self.image_size = tuple(image_size)
@@ -131,7 +132,7 @@ class NativeGridProvider:
             antialias=self.image_antialias)
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
         return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom,
-                          modality=getattr(self, "modality", "ct"))
+                          modality=self.modality)
 
     # --- caches -------------------------------------------------------------
     def _load_meta(self):

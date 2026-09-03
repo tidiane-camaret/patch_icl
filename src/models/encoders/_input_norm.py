@@ -10,8 +10,6 @@ docs/superpowers/specs/2026-09-03-modality-agnostic-normalization-design.md.
 import torch
 import torch.nn as nn
 
-from src.totalseg_dataset import CtNormSpec  # noqa: F401  (type reference for callers)
-
 _INPUT_NORMS = ("passthrough", "reframe", "zscore", "instance")
 
 
@@ -25,6 +23,8 @@ class InputRenorm(nn.Module):
             raise ValueError(f"input_norm={mode!r} needs loader_spec")
         if mode == "reframe" and target_spec is None:
             raise ValueError("input_norm='reframe' needs target_spec")
+        if affine and mode != "instance":
+            raise ValueError(f"affine=True is only supported for mode='instance', not {mode!r}")
         self.mode = mode
         self._loader = loader_spec
         self._target = target_spec

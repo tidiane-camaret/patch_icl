@@ -17,6 +17,7 @@ Input normalisation (`input_norm`) — the image already arrives in the pipeline
     reframe     — invert the loader frame back to HU, then apply `target_ct_norm` (default the
                   `d297` preset). Only for weights pretrained in a different frame.
     zscore      — invert to HU, then per-volume z-score (no clip). nnInteractive "nonCT" style.
+    instance    — per-volume z-score of the tensor as received; NO frame inversion. Modality-agnostic.
 """
 import torch
 import torch.nn as nn

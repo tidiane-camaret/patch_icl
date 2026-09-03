@@ -32,7 +32,7 @@ arch:
   resenc_n_stages: 5             # M/L/XL knob (fixed width). 5 -> feats [32,64,128,256,320],
                                 #   blocks [1,3,4,6,6]. 6 adds a 320-ch stage.
   nnunet_ts_stages: [2, 3, 4]   # multi-scale concat -> out_ch = 128+256+320 = 704
-  encoder_input_norm: passthrough  # passthrough | reframe | zscore (see header)
+  encoder_input_norm: passthrough  # passthrough | reframe | zscore | instance (see header)
   encoder_precision: bf16       # autocast dtype of the encoder forward
   enc_dims: [32, 32, 32, 32]   # ignored when encoder=resenc_ts (schema parity)
   resolution: 16               # token grid R; stage 3 is native 16^3 at a 128^3 input

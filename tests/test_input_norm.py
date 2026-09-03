@@ -84,3 +84,8 @@ def test_zscore_requires_loader_spec():
 def test_reframe_requires_both_specs():
     with pytest.raises(ValueError):
         InputRenorm("reframe", loader_spec=LD)
+
+
+def test_affine_rejected_for_non_instance_modes():
+    with pytest.raises(ValueError):
+        InputRenorm("zscore", loader_spec=CT_NORM_PRESETS["fingerprint_1228"], affine=True)

@@ -17,7 +17,7 @@ current 32/64/128/256/320 @ 5 stages). `n_conv_per_stage=2` throughout (nnU-Net'
 plain-conv schedule) is the one structural difference from ResEnc's (1,3,4,6,6,...) residual
 -block schedule; kernel/stride/norm/nonlin otherwise match resenc_ts.py exactly.
 
-Input normalisation (`input_norm`) reuses resenc_ts.py's `passthrough | reframe | zscore`
+Input normalisation (`input_norm`) reuses resenc_ts.py's `passthrough | reframe | zscore | instance`
 enum, but defaults to **zscore** here (per-volume, HU-space) rather than resenc_ts's
 `passthrough` — the point of decoupling from plans.json is to also drop the fixed-dataset
 CTNormalization stats nnunet_ts.py inherits from its plans file.

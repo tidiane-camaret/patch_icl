@@ -1,6 +1,4 @@
 """The `modality` field rides LoadResult -> item dict -> batch, unused downstream."""
-import random
-
 import torch
 
 from src.incontext_dataset_v2 import LoadResult
