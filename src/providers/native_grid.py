@@ -130,7 +130,8 @@ class NativeGridProvider:
             normalize_fn=lambda a: normalize_ct(np.ascontiguousarray(a)),
             antialias=self.image_antialias)
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
-        return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom)
+        return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom,
+                          modality=getattr(self, "modality", "ct"))
 
     # --- caches -------------------------------------------------------------
     def _load_meta(self):

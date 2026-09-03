@@ -47,6 +47,7 @@ class NativeCrop:
     crop_geom: torch.Tensor       # (4,3) int64 — identical to crop_and_place's
     crop_spacing_mm: float
     decim: tuple                  # per-axis integer decimation factor (>=1)
+    modality: str = "ct"         # "ct" | "mri" — carried for the GPU realize/aug frame
 
 
 def _decim_avg_pool(arr_t, decim):
@@ -57,7 +58,7 @@ def _decim_avg_pool(arr_t, decim):
 
 
 def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
-                      crop_spacing_mm, ct_spec=None):
+                      crop_spacing_mm, ct_spec=None, modality="ct"):
     """Assemble a `NativeCrop` payload from an `organ_crop_arrays` result.
 
     `decim[a] = crop_sizes[a] // out_sizes[a]` (>=1), so the payload grid stays >=
@@ -86,7 +87,7 @@ def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
                       class_idx=int(class_idx), has_fg=has_fg,
                       out_sizes=list(out_sizes), pad_lo=list(pad_lo),
                       crop_geom=geom, crop_spacing_mm=float(crop_spacing_mm),
-                      decim=decim)
+                      decim=decim, modality=modality)
 
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
@@ -255,7 +256,8 @@ class TotalSegProvider:
                 mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
                 normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
-        return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom)
+        return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom,
+                          modality=self.modality)
 
     def load_native_crop(self, subject, cls, req: LoadRequest) -> "NativeCrop":
         """Native-pitch organ crop + geometry, integer-decimated toward out_sizes.
@@ -287,7 +289,8 @@ class TotalSegProvider:
         return build_native_crop(
             crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
             crop_spacing_mm=float(req.crop_spacing_mm),
-            ct_spec=(self.ct_spec if self.modality == "ct" else None))
+            ct_spec=(self.ct_spec if self.modality == "ct" else None),
+            modality=self.modality)
 
     # --- subjects + caches --------------------------------------------------
     def _subjects(self, split, meta_csv, max_subjects):
