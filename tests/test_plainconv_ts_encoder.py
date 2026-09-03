@@ -62,3 +62,15 @@ def test_zscore_norm_path_runs():
                              frozen=False, device="cpu", precision="fp32")
     out = enc(torch.randn(1, 1, 32, 32, 32))
     assert out.shape == (1, 64 + 128 + 256, 8, 8, 8)
+
+
+def test_instance_norm_no_hu_inversion():
+    from src.models.encoders.plainconv_ts import PlainConvTSEncoder
+    enc = PlainConvTSEncoder(resolution=8, n_stages=4, stages=(1, 2, 3),
+                             input_norm="instance", frozen=False,
+                             device="cpu", precision="fp32")
+    x = torch.randn(2, 1, 16, 16, 16) * 3.0 + 1.0
+    flat = x.float().reshape(2, -1)
+    mu = flat.mean(dim=1).reshape(-1, 1, 1, 1, 1)
+    sig = flat.std(dim=1).reshape(-1, 1, 1, 1, 1)
+    assert torch.allclose(enc._norm(x), (x.float() - mu) / (sig + 1e-8), atol=1e-6)

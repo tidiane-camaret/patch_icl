@@ -31,13 +31,12 @@ from dynamic_network_architectures.architectures.unet import PlainConvUNet
 
 from src.models.patchset3d import _down_to
 from src.models.primus_encoder import _EncodeCache, _cached_encode
-from src.totalseg_dataset import resolve_ct_norm
+from src.models.encoders._input_norm import InputRenorm, _INPUT_NORMS
+from src.totalseg_dataset import resolve_ct_norm, CtNormSpec
 
 _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
            "fp16": torch.float16, "float16": torch.float16,
            "fp32": None, "float32": None}
-
-_INPUT_NORMS = ("passthrough", "reframe", "zscore")
 
 
 def resolve_ts_weights_dir(spec) -> Path:
@@ -124,6 +123,12 @@ class NnUNetTSEncoder(nn.Module):
         fip = plans["foreground_intensity_properties_per_channel"]["0"]
         self.ct_clip = (float(fip["percentile_00_5"]), float(fip["percentile_99_5"]))
         self.ct_mean, self.ct_std = float(fip["mean"]), float(fip["std"])
+        # Shared stem. reframe target = this checkpoint's plans CTNormalization.
+        self.input_renorm = InputRenorm(
+            self.input_norm,
+            loader_spec=self._loader_spec,
+            target_spec=CtNormSpec(clip_lo=self.ct_clip[0], clip_hi=self.ct_clip[1],
+                                   mean=self.ct_mean, std=self.ct_std))
         self.train_spacing_mm = float(cfg["spacing"][0])  # isotropic pretrain pitch (297: 3 mm)
 
         net = _build_plainconv_unet(cfg, num_classes)
@@ -183,18 +188,8 @@ class NnUNetTSEncoder(nn.Module):
         self._cache = _EncodeCache(int(cache_max))
 
     def _norm(self, x):
-        """passthrough: identity. reframe (default): invert the loader frame to HU, then
-        apply this checkpoint's plans CTNormalization. zscore: invert, then per-volume."""
-        x = x.float()
-        if self.input_norm == "passthrough":
-            return x
-        hu = x * self._loader_spec.std + self._loader_spec.mean
-        if self.input_norm == "reframe":
-            return (hu.clamp(*self.ct_clip) - self.ct_mean) / self.ct_std
-        flat = hu.reshape(hu.shape[0], -1)                       # zscore
-        mu = flat.mean(dim=1).reshape(-1, 1, 1, 1, 1)
-        sig = flat.std(dim=1).reshape(-1, 1, 1, 1, 1)
-        return (hu - mu) / (sig + 1e-8)
+        """Delegates to the shared InputRenorm stem (see _input_norm.py)."""
+        return self.input_renorm(x)
 
     def _autocast_ctx(self):
         dev = next(self.encoder.parameters()).device

@@ -29,7 +29,8 @@ from dynamic_network_architectures.architectures.unet import PlainConvUNet
 from src.models.patchset3d import _down_to
 from src.models.primus_encoder import _EncodeCache, _cached_encode
 from src.models.encoders.nnunet_ts import _key
-from src.models.encoders.resenc_ts import _stage_features, _DTYPES, _INPUT_NORMS
+from src.models.encoders.resenc_ts import _stage_features, _DTYPES
+from src.models.encoders._input_norm import InputRenorm, _INPUT_NORMS
 from src.totalseg_dataset import resolve_ct_norm
 
 _N_CONV_PER_STAGE = 2   # nnU-Net's standard plain-conv schedule (vs. ResEnc's block counts)
@@ -86,12 +87,16 @@ class PlainConvTSEncoder(nn.Module):
         self.input_norm = str(input_norm)
         if self.input_norm not in _INPUT_NORMS:
             raise ValueError(f"unknown input_norm {input_norm!r} ({'|'.join(_INPUT_NORMS)})")
+        # Shared stem: passthrough/reframe/zscore = the previous inline _norm; instance =
+        # modality-agnostic per-sample renorm (no HU inversion). Frames unused for
+        # passthrough/instance but cheap to resolve.
+        self.input_renorm = InputRenorm(
+            self.input_norm,
+            loader_spec=resolve_ct_norm(loader_ct_norm),
+            target_spec=resolve_ct_norm(target_ct_norm))
         self.stages = tuple(int(s) for s in stages)
         if not all(0 <= s < self.n_stages for s in self.stages):
             raise ValueError(f"stages {self.stages} out of range [0, {self.n_stages})")
-        # Frames for the reframe/zscore paths (unused under passthrough).
-        self._loader_spec = resolve_ct_norm(loader_ct_norm)
-        self._target_spec = resolve_ct_norm(target_ct_norm)
         self.train_spacing_mm = _TRAIN_SPACING_MM
 
         net = _build_plainconv_ts_unet(self.n_stages, features)
@@ -120,18 +125,8 @@ class PlainConvTSEncoder(nn.Module):
         self._cache = _EncodeCache(int(cache_max))
 
     def _norm(self, x):
-        """passthrough: identity. reframe/zscore: invert the loader frame to HU first."""
-        x = x.float()
-        if self.input_norm == "passthrough":
-            return x
-        hu = x * self._loader_spec.std + self._loader_spec.mean
-        if self.input_norm == "reframe":
-            t = self._target_spec
-            return (hu.clamp(t.clip_lo, t.clip_hi) - t.mean) / t.std
-        flat = hu.reshape(hu.shape[0], -1)                       # zscore
-        mu = flat.mean(dim=1).reshape(-1, 1, 1, 1, 1)
-        sig = flat.std(dim=1).reshape(-1, 1, 1, 1, 1)
-        return (hu - mu) / (sig + 1e-8)
+        """Delegates to the shared InputRenorm stem (see _input_norm.py)."""
+        return self.input_renorm(x)
 
     def _autocast_ctx(self):
         dev = next(self.encoder.parameters()).device
