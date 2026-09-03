@@ -6879,3 +6879,74 @@ Tests: `tests/test_input_norm.py` (new), `tests/test_modality_seam.py` (new),
 `tests/test_gpu_augment.py`. Full suite: 391 passed / 0 skipped (plus 15 pre-existing
 failures + 4 pre-existing collection errors — identical set at the pre-seam parent
 0fce764, which had 371 passed; the +20 are the new tests above).
+
+## 2026-09-03 — PatchSet3D c-axis: separate gt/pred mask slots (`arch.mask_slots`)
+
+Today's c-axis is `[img, mask]`, where "mask" holds real GT for support rows and a
+prior/prediction for the query row — same column, different content depending on row
+group. `arch.mask_slots=2` (default 1 = unchanged) splits this into `[img, gt, pred]`:
+support rows populate `gt` (real GT) and get a zero-occupancy/presence=0 placeholder in
+`pred`; the query row is the mirror (real content only in `pred`).
+
+Compute-cost spike first (`experiments/3d/bench_mask_slots.py`, throwaway): growing the
+c-axis is linear, not quadratic — the O(c²) feature-axis (within-cell) attention term is
+3-4 orders of magnitude smaller than the O(c) sample-axis (cross-image) term at every K
+tested, so it never bites at realistic scale (c stays ≪ r). M=1→5 mask slots costs
+~2.6-2.9x latency/memory, proportional to slot count.
+
+Design constraint: continuing training from a checkpoint after changing the slot count
+must not break `strict=True` state_dict loading. So no parameter's SHAPE may depend on
+slot count:
+- `mask_embed` (`src/models/patchset3d.py`) is SHARED across every slot — one
+  `Linear(mask_patch_size³[+1 presence bit], e)` regardless of how many slots use it.
+- Slot identity is carried by `slot_pos`, an additive Fourier feature of the (fixed-
+  capacity-normalized) slot index — `FourierPositionalEncoding(e, fourier_bands,
+  n_axes=1)`, a `Linear(2·fourier_bands, e)` whose shape depends only on `fourier_bands`,
+  never on slot count. Capacity is a fixed constant (`_SLOT_CAPACITY=8`, not the live
+  `mask_slots`) so slot 0/1's encoding never shifts when a 3rd slot is added later.
+  Verified linearly separable from the existing spatial Fourier PE (independent random
+  projections: joint rank = sum of individual ranks; a single fixed linear readout
+  separates slot 0/1 with a ~16σ margin across all R³ positions) —
+  `test_slot_pos_separable_from_spatial_pos`.
+- `mask_token` (SimMIM) stays `(2,e)`, indexed by content TYPE (img / active-slot), not
+  physical slot position.
+- `mask_slots=1` takes the untouched legacy `_tokens` code path — byte-identical to
+  before, so existing checkpoints are unaffected. `mask_slots=2` uses new `_tokens_multi`.
+  Only 1|2 supported for now; more slot types (bbox/point/scribble) are a later extension
+  of the same mechanism.
+- `experiments/3d/train.py::build_model` threads `arch.mask_slots` through (Hydra config
+  key, not auto-passthrough).
+
+Tests: 5 new in `tests/test_patchset3d.py` (default-shape-unchanged, forward+backward at
+mask_slots=2, invalid-count rejection, slot/spatial-PE separability, placeholder-is-
+content-free). `tests/test_patchset3d.py tests/test_patchset3d_rope.py`: 22 passed.
+
+## 2026-09-04 — slot_layout refactor + `arch.decode_source`
+
+**Refactor**: replaced the scattered `self._SLOT_GT/_SLOT_PRED` ints with one canonical
+`self.slot_layout` tuple (`("img","gt","pred")`, or `("img","mask")` at `mask_slots=1`) +
+`self.slot_index` name→column dict, built once in `__init__` — the single source of truth
+for column order (`_tokens_multi`), slot identity (`_slot_pos_vec`), and the decode
+readout column (below). `_tokens_multi` now takes `active_slot` as a name string
+(`"gt"`/`"pred"`) and loops over `slot_layout` uniformly (img included) instead of
+special-casing img outside the loop.
+
+**`arch.decode_source`** (default `"img"`, unchanged behavior): which query-row column
+the decoder reads (`_attn`'s final `q = x[:, sep_t:, self._decode_col, :]`, resolved via
+`slot_index[decode_source]`). Prompted by inspecting why the decoder reads the img column
+at all (`patchset3d.py`, `patchset_cnn.py`, `patchset_pfn.py`, `pfn_seg_2d.py`'s
+`ImagePFN` all do, uninterrogated since the first `PatchSetPFN` design doc, 2026-06-14) —
+forcing img to double as the answer channel is indirect: sample-axis (cross-image)
+attention is column-independent (`pfn_seg_2d.py:234`, batch folds in `c`), so a column's
+OWN cross-context retrieval is only ever as good as what the SUPPORT side puts in that
+same column. Support puts real GT in `gt` (mask_slots≥2) / the shared `mask` column
+(mask_slots=1); support never populates `pred` (`context_out` is always real GT, every
+cascade level — see `cascade.py`), so `pred`'s own retrieval pathway is structurally
+vacuous — any query-side signal it carries got there by feature-axis import from `gt`.
+`gt`/`mask` is therefore the direct readout channel, not `pred` and not `img`.
+Untested empirically yet — logged as the finding + the seam; a head-to-head run is a
+follow-up.
+
+Tests: +3 in `tests/test_patchset3d.py` (slot_layout is the source of truth across
+decode_source choices, invalid decode_source rejected, decode_source actually changes the
+readout). `tests/test_patchset3d.py tests/test_patchset3d_rope.py`: 25 passed.

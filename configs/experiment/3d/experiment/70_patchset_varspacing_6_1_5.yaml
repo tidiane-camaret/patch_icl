@@ -78,6 +78,16 @@ arch:
   # Modality-agnostic input stem: per-volume z-score, no HU-frame inversion (see header).
   # ~no-op vs e4's `zscore` default on this CT-only run; ready for the CT+MRI joint run.
   encoder_input_norm: instance
+  # c-axis mask columns: 1 = today's single shared support-GT/query-prior column
+  # (PatchSet3D's default). Stated explicitly, no-op — see docs/logs.md 2026-09-03 for the
+  # gt/pred split (mask_slots=2) this is the seam for.
+  mask_slots: 1
+  # Query-row column the decoder reads. "img" = today's default (unchanged). Stated
+  # explicitly, no-op — see docs/logs.md 2026-09-04: "mask" (mask_slots=1) / "gt"
+  # (mask_slots=2) is the column support populates with real content, so its own
+  # cross-context attention does genuine retrieval — a candidate for less-indirect decode,
+  # not yet empirically validated.
+  decode_source: img
 
 train:
   # schedule keys train.yaml's _self_ shadows out of the model group -> set here
