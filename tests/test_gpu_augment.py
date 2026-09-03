@@ -350,3 +350,53 @@ def test_gin_ipa_run_on_cuda():
         assert out.shape == vols.shape
         assert out.device.type == "cuda"
         assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: de-pinnable clamp frame
+# ---------------------------------------------------------------------------
+def test_batched_intensity_clamp_default_is_ct_frame():
+    import torch
+    from src.gpu_augment import _batched_intensity, CT_NORM_MIN, CT_NORM_MAX
+
+    class _NC:  # gaussian-noise-only cfg forcing a large clamp excursion
+        class gaussian_noise:
+            p = 1.0
+            max_std = 50.0
+    g = torch.Generator().manual_seed(0)
+    vols = torch.zeros(2, 1, 8, 8, 8)
+    out = _batched_intensity(vols, _NC, g)
+    assert out.max() <= CT_NORM_MAX + 1e-4
+    assert out.min() >= CT_NORM_MIN - 1e-4
+
+
+def test_batched_intensity_clamp_override():
+    import torch
+    from src.gpu_augment import _batched_intensity
+
+    class _NC:
+        class gaussian_noise:
+            p = 1.0
+            max_std = 50.0
+    g = torch.Generator().manual_seed(0)
+    vols = torch.zeros(2, 1, 8, 8, 8)
+    out = _batched_intensity(vols, _NC, g, clamp=(-4.0, 4.0))
+    assert out.max() <= 4.0 + 1e-4
+    assert out.min() >= -4.0 - 1e-4
+
+
+def test_gpu_augmentor_clamp_frame_skips_ct_guard():
+    from src.gpu_augment import GpuAugmentor
+    # A non-default ct_norm normally raises; clamp_frame set -> allowed.
+    aug = GpuAugmentor(aug_cfg=None,
+                       ct_norm={"clip_lo": -500.0, "clip_hi": 500.0, "mean": 0.0, "std": 100.0},
+                       clamp_frame=(-3.0, 3.0))
+    assert aug._clamp == (-3.0, 3.0)
+
+
+def test_gpu_augmentor_default_still_guards():
+    import pytest
+    from src.gpu_augment import GpuAugmentor
+    with pytest.raises(NotImplementedError):
+        GpuAugmentor(aug_cfg=None,
+                     ct_norm={"clip_lo": -500.0, "clip_hi": 500.0, "mean": 0.0, "std": 100.0})

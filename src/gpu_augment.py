@@ -112,7 +112,7 @@ def _gin_once(vols, cfg, gen):
     return mixed
 
 
-def _batched_gin_ipa(vols, cfg, gen):
+def _batched_gin_ipa(vols, cfg, gen, clamp=None):
     """GIN or IPA warp: per-volume grouped conv with optional smooth field blending."""
     if getattr(cfg, "mode", "gin") != "ipa":
         out = _gin_once(vols, cfg, gen)
@@ -128,39 +128,42 @@ def _batched_gin_ipa(vols, cfg, gen):
         out = copies[0]
         for c in copies[1:]:
             out = out * (1.0 - field) + c * field
-    return out.clamp(CT_NORM_MIN, CT_NORM_MAX)
+    lo, hi = clamp if clamp is not None else (CT_NORM_MIN, CT_NORM_MAX)
+    return out.clamp(lo, hi)
 
 
-def _batched_bias_field(vols, magnitude, coarse, gen):
+def _batched_bias_field(vols, magnitude, coarse, gen, clamp=None):
     """Per-volume smooth multiplicative log-normal field (batched _simulate_bias_field)."""
     N, _, D, H, W = vols.shape
     field = torch.randn(N, 1, coarse, coarse, coarse, generator=gen,
                         device=vols.device, dtype=vols.dtype) * magnitude
     field = F.interpolate(field, size=(D, H, W), mode="trilinear", align_corners=False)
-    return (vols * field.exp()).clamp(CT_NORM_MIN, CT_NORM_MAX)
+    lo, hi = clamp if clamp is not None else (CT_NORM_MIN, CT_NORM_MAX)
+    return (vols * field.exp()).clamp(lo, hi)
 
 
-def _batched_intensity(vols, cfg, gen):
+def _batched_intensity(vols, cfg, gen, clamp=None):
     # Canonical intensity order — MUST stay identical to the CPU path
     # apply_intensity_aug (src/augmentations.py):
     #   GIN → bias → brightness/contrast → gamma → inverted-gamma → sharpness
     #        → noise → blur → low-res
     N = vols.shape[0]
     device = vols.device
-    span = CT_NORM_MAX - CT_NORM_MIN
+    lo, hi = clamp if clamp is not None else (CT_NORM_MIN, CT_NORM_MAX)
+    span = hi - lo
 
     # 1. GIN / IPA appearance warp
     gin = getattr(cfg, "gin", None)
     if gin is not None and getattr(gin, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, gin.p)
-        aug = _batched_gin_ipa(vols, gin, gen)
+        aug = _batched_gin_ipa(vols, gin, gen, clamp=clamp)
         vols = torch.where(mask, aug, vols)
 
     # 2. Bias field
     bf = getattr(cfg, "bias_field", None)
     if bf is not None and getattr(bf, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, bf.p)
-        aug = _batched_bias_field(vols, bf.magnitude, int(getattr(bf, "coarse", 4)), gen)
+        aug = _batched_bias_field(vols, bf.magnitude, int(getattr(bf, "coarse", 4)), gen, clamp=clamp)
         vols = torch.where(mask, aug, vols)
 
     # 3. Brightness / contrast
@@ -177,7 +180,7 @@ def _batched_intensity(vols, cfg, gen):
             vmax = vols.amax(dim=(1, 2, 3, 4), keepdim=True)
             aug = torch.minimum(torch.maximum(aug, vmin), vmax)
         else:
-            aug = aug.clamp(CT_NORM_MIN, CT_NORM_MAX)
+            aug = aug.clamp(lo, hi)
         vols = torch.where(mask, aug, vols)
 
     # 4. Gamma
@@ -186,13 +189,13 @@ def _batched_intensity(vols, cfg, gen):
         mask = _per_vol_mask(gen, N, device, gc.p)
         g0, g1 = gc.range
         gamma = g0 + (g1 - g0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
-        aug = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma) * span + CT_NORM_MIN
+        aug = ((vols - lo) / span).clamp(0, 1).pow(gamma) * span + lo
         if getattr(gc, "retain_stats", False):
             m_in = vols.mean(dim=(1, 2, 3, 4), keepdim=True)
             s_in = vols.std(dim=(1, 2, 3, 4), keepdim=True)
             m_out = aug.mean(dim=(1, 2, 3, 4), keepdim=True)
             s_out = aug.std(dim=(1, 2, 3, 4), keepdim=True)
-            aug = ((aug - m_out) / (s_out + 1e-8) * s_in + m_in).clamp(CT_NORM_MIN, CT_NORM_MAX)
+            aug = ((aug - m_out) / (s_out + 1e-8) * s_in + m_in).clamp(lo, hi)
         vols = torch.where(mask, aug, vols)
 
     # 5. Inverted gamma (darkening pass, gamma forced > 1)
@@ -200,7 +203,7 @@ def _batched_intensity(vols, cfg, gen):
         mask = _per_vol_mask(gen, N, device, gc.inverted_p)
         g1 = gc.range[1]
         gamma = 1.0 + (g1 - 1.0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
-        aug = ((vols - CT_NORM_MIN) / span).clamp(0, 1).pow(gamma) * span + CT_NORM_MIN
+        aug = ((vols - lo) / span).clamp(0, 1).pow(gamma) * span + lo
         vols = torch.where(mask, aug, vols)
 
     # 6. Sharpness (unsharp masking)
@@ -208,7 +211,7 @@ def _batched_intensity(vols, cfg, gen):
     if sc is not None and getattr(sc, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, sc.p)
         blur = _grouped_gaussian_blur(vols, sigma=1.0)
-        aug = (vols + sc.factor * (vols - blur)).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        aug = (vols + sc.factor * (vols - blur)).clamp(lo, hi)
         vols = torch.where(mask, aug, vols)
 
     # 7. Gaussian noise (before blur so blur correlates it)
@@ -224,7 +227,7 @@ def _batched_intensity(vols, cfg, gen):
             mean = m0 + (m1 - m0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
             std = s0 + (s1 - s0) * torch.rand(N, 1, 1, 1, 1, generator=gen, device=device)
         noise = mean + std * torch.randn(vols.shape, generator=gen, device=device, dtype=vols.dtype)
-        aug = (vols + noise).clamp(CT_NORM_MIN, CT_NORM_MAX)
+        aug = (vols + noise).clamp(lo, hi)
         vols = torch.where(mask, aug, vols)
 
     # 8. Gaussian blur
@@ -405,14 +408,15 @@ def _geometric(vols, masks, group_size, cfg, gen, *, capture=False):
 
 class GpuAugmentor:
     def __init__(self, aug_cfg, self_context_per_image: bool = False,
-                 self_context_intensity: bool = False, seed: int = 0, ct_norm=None):
-        # Intensity ops clamp to the module-level CT_NORM_MIN/MAX, which track the default
-        # CT frame. A non-default data.ct_norm would silently mis-clip, so stop loudly until
-        # the ops are parametrized (they read module globals across ~10 free functions).
-        if resolve_ct_norm(ct_norm) != DEFAULT_CT_NORM:
+                 self_context_intensity: bool = False, seed: int = 0, ct_norm=None,
+                 clamp_frame=None):
+        # Intensity ops clamp to CT_NORM_MIN/MAX (the default CT frame) unless an explicit
+        # clamp_frame (lo, hi) is given — the seam for a non-CT / multi-modality frame.
+        self._clamp = None if clamp_frame is None else (float(clamp_frame[0]), float(clamp_frame[1]))
+        if self._clamp is None and resolve_ct_norm(ct_norm) != DEFAULT_CT_NORM:
             raise NotImplementedError(
                 "GpuAugmentor is pinned to the default CT frame (fingerprint_1228); "
-                f"data.ct_norm={ct_norm!r} not yet supported by the GPU intensity ops.")
+                f"data.ct_norm={ct_norm!r} needs an explicit clamp_frame=(lo, hi).")
         self.cfg = aug_cfg
         self.self_context_per_image = bool(self_context_per_image)
         self.self_context_intensity = bool(self_context_intensity)
@@ -443,7 +447,7 @@ class GpuAugmentor:
             sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
             masks = _goal_mask_transform(masks, group_size=T, cfg=gm_cfg, gen=goal_gen,
                                          spacing_mm=sp)
-        vols = _batched_intensity(vols, cfg.intensity, int_gen)
+        vols = _batched_intensity(vols, cfg.intensity, int_gen, clamp=self._clamp)
         _unstack_task(vols, masks, B, T, batch)
         return batch, (GeoState(grid=grid, flips=flips) if capture else None)
 
@@ -476,7 +480,7 @@ class GpuAugmentor:
 
             if mode == SYNTH:
                 v, m = _geometric(v, m, group_size=1, cfg=cfg.synth, gen=gen)
-                v = _batched_intensity(v, cfg.synth, gen)
+                v = _batched_intensity(v, cfg.synth, gen, clamp=self._clamp)
             else:  # REAL or SELF_CONTEXT
                 v, m = _geometric(v, m, group_size=T, cfg=cfg.task, gen=gen)
                 gm_cfg = _cfg_get(cfg, "goal_mask")
@@ -484,7 +488,7 @@ class GpuAugmentor:
                     sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
                     m = _goal_mask_transform(m, group_size=T, cfg=gm_cfg, gen=gen, spacing_mm=sp)
                 if mode == REAL or self.self_context_intensity:
-                    v = _batched_intensity(v, cfg.intensity, gen)
+                    v = _batched_intensity(v, cfg.intensity, gen, clamp=self._clamp)
                 if mode == SELF_CONTEXT and self.self_context_per_image:
                     # extra independent geo jitter on the K context volumes only
                     G = task_sel.numel()
