@@ -1,0 +1,40 @@
+# @package _global_
+# d2_varspacing_15_6 — organ-parts TotalSegmentator, in-context dataloader v2,
+# single-forward VARIABLE-SPACING crops (the exp 37 / 69 regime). Selected as a Hydra
+# group: `dataset=d2_varspacing_15_6`. The plain-conv twin of d1: same v2 raw_ct crop
+# path, but instead of one fixed pitch the train loader draws a per-batch log-uniform
+# physical spacing in [1.5, 6] mm (SpacingBatchSampler); eval is always the single fixed
+# crop_spacing_mm.
+# No cascade — cascade_spacings / ram_cache / gpu_realize_crop are intentionally absent
+# (that is d1 + experiment=68's territory).
+data:
+  source: totalseg
+  loader_v2: true               # route build_dataset + make_eval_loader through incontext_dataset_v2
+  image_size: [128, 128, 128]
+  context_size: 1               # K contexts per task
+  # TRAIN: per-batch log-uniform crop pitch in [lo, hi] mm (SpacingBatchSampler); the
+  # dataset crops each item at that spacing, so FOV = 128*spacing spans [192, 768] mm.
+  train_spacing_range: [1.5, 6.0]
+  # EVAL pitch — train_spacing_range is TRAIN-only; make_eval_loader always crops at this
+  # one fixed spacing. 3 mm is the log-uniform midpoint of the trained range (sqrt(1.5*6)).
+  crop_spacing_mm: 3
+  # Smooth downsample target: keep the native-label area-pool FRACTION in [0,1] instead of
+  # thresholding to 0/1 (kills the staircased border on sub-cell organs). TRAIN only;
+  # make_eval_loader maps this back to "occupancy" so Dice/NSD stay hard. Pair with
+  # augmentations.{task,per_image}.mask_interp=bilinear so the GPU warp doesn't re-quantize.
+  mask_downsample: soft
+  mask_occupancy_thr: 0.5       # floors the peak cell under the area-pool
+  # NON-CASCADE query-prior injection (see experiments/3d/query_prior.py). none = the
+  # support-mean occupancy prior (unchanged default).
+  query_prior: none
+  # The ONE CT normalization frame for the whole pipeline. null = fingerprint_1228
+  # (the 1228-subject TotalSegmentator fingerprint). See src/totalseg_dataset.CtNormSpec.
+  ct_norm: null
+  class_balanced: true          # sample class uniformly, then subject (train only)
+  max_ds_len_train: 1000        # samples per train epoch (loader cap)
+  max_train_subjects: null
+  max_val_subjects: null
+  # TRAIN: the thickness/category-balanced 117-class train set (data/totalseg_classes.py).
+  train_classes: balanced
+  # VAL: every class (the balanced set + the graded-OOD complement).
+  val_classes: all

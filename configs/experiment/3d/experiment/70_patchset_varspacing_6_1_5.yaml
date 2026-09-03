@@ -1,0 +1,97 @@
+# @package _global_
+# 70_patchset_varspacing_6_1_5 — PatchSet3D on the SAME variable-spacing crop regime as
+# experiment=69_medverse_varspacing_6_1_5, but WITHOUT the coarse->fine cascade: one
+# single-forward PatchSet3D trained on the [1.5, 6] mm log-uniform crop pitch. This is the
+# PatchSet3D architecture baseline for the Medverse run (exp 69) and the no-cascade
+# counterfactual for the cascade run (exp 68).
+#
+#   python experiments/3d/train.py experiment=70_patchset_varspacing_6_1_5
+#
+# CONSTRUCTION — composed DIRECTLY from Hydra groups (no experiment-chain inheritance,
+# unlike 68/69 which chain 48 -> 57 -> 68):
+#   - dataset=d2_varspacing_15_6   exp 69's dataloader: v2 raw_ct crops, K=1, per-batch
+#                               log-uniform spacing in [1.5, 6] mm, eval fixed at 3 mm,
+#                               balanced/all class split, soft mask target. No cascade.
+#   - model=m2_patchset_decoder    exp 68's PatchSet3D head + from-scratch recipe (e=768,
+#                               conv fine-decoder, lr 7e-5, warmup 5, Muon scheduled, LAWA).
+#   - encoder=e4_plainconv_ts   from-scratch plans-free PlainConvUNet image encoder.
+#   - augmentations=calibrated  real-variability-tuned geometric magnitudes.
+#
+# The three `arch:` lines below carry exp 68's encoder width/stage choice; the aug `p`
+# trims match exp 48/57 (calibrated-minus-elastic-minus-affine-scale, bilinear mask warp);
+# the `train:` block re-states the schedule knobs train.yaml's _self_ shadows out of the
+# model group.
+#
+# SPACING SIGNAL — arch.encoder_spacing_aware=true flips PatchSet3D.spacing_aware, so the
+# train loop (train.py) and eval loop (evaluate.py) thread the per-batch physical pitch
+# into model(..., spacing=...). The PlainConv encoder ignores it (conv net, no RoPE), but
+# the set-transformer RoPE scales its token positions by spacing / rope_train_mm (3 mm for
+# plainconv_ts) — so adjacent cells sit `spacing/3` apart in physical units across the
+# range. This is a deliberate divergence from exp 69: Medverse has no positional mechanism
+# to consume spacing (genuinely blind); here PatchSet3D is TOLD the pitch.
+#
+# INPUT NORM — arch.encoder_input_norm=instance (the modality-agnostic stem, see
+# src/models/encoders/_input_norm.py + docs/superpowers/specs/2026-09-03-modality-agnostic-
+# normalization-design.md). The encoder per-volume z-scores its input directly, with NO
+# inversion back to a HU frame. For this CT-only run it is numerically ~identical to the
+# e4_plainconv_ts default `zscore` — per-volume z-score is invariant to the loader's
+# positive-affine CT frame, so `(hu-mu)/sig == (x-mu)/sig`. It is wired here so the config
+# is ready for the planned CT+MRI joint run: `instance` makes no fingerprint_1228
+# assumption, whereas `zscore` would invert MRI inputs with CT constants.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: d2_varspacing_15_6
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+# calibrated aug, trimmed (exp 48): elastic off + affine scaling neutralized; task-affine
+# fires at p=0.5 (rotation only), per-image affine at p=0.2. The soft mask target is
+# warped with bilinear so the GPU affine doesn't re-quantize the [0,1] fraction (exp 57).
+augmentations:
+  task:
+    affine:
+      p: 0.5
+      scale_min: 1
+      scale_max: 1
+    elastic:
+      p: 0
+    deform:
+      p: 0
+    mask_interp: bilinear
+  per_image:
+    affine:
+      p: 0.2
+    elastic:
+      p: 0
+    deform:
+      p: 0
+    mask_interp: bilinear
+
+arch:
+  # e4_plainconv_ts width/stage choice from experiment=68 (matched compute vs e2).
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  # Thread the per-batch physical crop pitch into the set-transformer RoPE (see header).
+  encoder_spacing_aware: true
+  # Modality-agnostic input stem: per-volume z-score, no HU-frame inversion (see header).
+  # ~no-op vs e4's `zscore` default on this CT-only run; ready for the CT+MRI joint run.
+  encoder_input_norm: instance
+
+train:
+  # schedule keys train.yaml's _self_ shadows out of the model group -> set here
+  epochs: 400
+  batch_size: 4
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+
+eval:
+  crop_jitter: 0        # centered eval crops (reproducible)
+  n_subjects: null       # full val split as the context pool
+  tasks_per_class: 10    # N targets/class; contexts still drawn from the whole pool
+
+wandb:
+  name: 70_patchset_varspacing_6_1_5

@@ -1,0 +1,73 @@
+# @package _global_
+# m2_patchset_decoder — PatchSet3D LARGE set-transformer head (progressive CONV decoder)
+# + from-scratch training recipe. Selected as a Hydra group: `model=m2_patchset_decoder`.
+# The m1 twin, with the head-geometry + optimizer deltas
+# that experiments 57 and 68 layered on m1 baked in directly, so a run can compose it
+# without inheriting the 48 -> 57 -> 68 experiment chain:
+#   * head: e=768 / h=3072 / a=12, thinking_rows=8, token-mask 0.10, feat_norm=self,
+#           fine_decode via the progressive CONV decoder (fine_stage=[0,1], proj 96)
+#   * recipe: lr 7e-5, warmup 5 ep, Muon scheduled, no wd on norm/bias, LAWA k=10
+# Encoder-forward keys are NOT here — pick an `encoder` group (e.g. encoder=e4_plainconv_ts).
+# Schedule keys train.yaml's own _self_ block also defines (epochs, batch_size, workers,
+# eval_every, grad_clip, profile_timing) are SHADOWED out of this group by composition
+# order, so they must be set in the experiment layer (see experiment/48_abdomen_ceiling).
+model: patchset3d
+
+arch:
+  # --- transformer / head geometry ---
+  l: 4                          # transformer layers
+  e: 768                        # token width
+  h: 3072                       # MLP hidden
+  a: 12                         # attention heads
+  transformer_rope: true        # RoPE positions in the set-transformer
+  rope_theta: 100.0             # small-grid base frequency (<=32 tokens/axis)
+  feat_norm: self               # encoder-feature norm: each side by its own stats (query decoupled)
+  full_attn: true               # dense all-to-all attention (not register-routed)
+  register_routed: false        # thinking rows NOT the sole cross-image bus
+  register_flex: false          # dense bool-mask SDPA (avoids flex/ptxas cold-compile hang)
+  thinking_rows: 8              # learned register rows prepended to the set
+  query_self_attn: true         # target-token self-attention
+  context_id_embed: true
+  max_context: 16
+  residual_decay: 0.95
+  fourier_bands: 8
+  mask_patch_size: 8            # mask tokenization tile (8^3 occupancy per cell)
+  mask_patch_decode_size: 8     # decode tile: 16*8 = 128^3 prediction
+  token_mask_ratio_support: 0.10  # SimMIM support-token masking (train only)
+  token_mask_ratio_query: 0.10    # query-token masking (train only)
+  # --- sub-patch decode (conv encoders only; see src/models/patchset3d.py::_decode) ---
+  fine_decode: true
+  # Encoder stage(s) tapped (0 = full res, 1 = half, ...); a list projects each at its
+  # native resolution and sums at the finest grid.
+  fine_stage: [0, 1]
+  fine_proj_dim: 96             # width the fine maps are projected to (filter rank cap)
+  # conv = progressive coarse->fine conv decoder: project tokens to decoder_dim, upsample
+  # the R^3 field, fuse each fine_stage (concat at coarse levels, per-voxel FiLM at the
+  # finest), 3x3x3 conv per level, 1x1x1 head + a token-only residual. ~6x the decode FLOPs.
+  decoder: conv
+  decoder_dim: 64               # base width of the conv decoder (halves per level, >=8)
+  compile: true                 # torch.compile the transformer + Muon Newton-Schulz
+  compile_encoder: true         # image encoder stack
+  compile_decoder: true         # decode head
+
+train:
+  # --- optim recipe (model-intrinsic) ---
+  # NOTE: keys train.yaml's own block defines (epochs, batch_size, eval_every, grad_clip,
+  # workers, seed) are applied by _self_ AFTER this group, so set them in the experiment layer.
+  optimizer: adamw              # only used when muon=false; muon path builds AdamW+Muon
+  muon: true                    # Muon on transformer 2D matrices + AdamW on the rest + LAWA
+  muon_lr_scale: 0.1            # Muon lr = muon_lr_scale * lr
+  muon_momentum: 0.96
+  muon_wd: 0.1
+  lawa_k: 10                    # LAWA checkpoint-averaging buffer
+  lr: 7.0e-5                    # 1e-4 / sqrt(2): sqrt(B) rule for B=4 vs the B=8 base
+  encoder_lr_scale: 1           # from-scratch encoder learns at the head's rate (nothing to protect)
+  no_decay_norm_bias: true      # no wd on InstanceNorm gains / biases (weight norms still moving)
+  muon_scheduled: true          # Muon gets the warmup+cosine too (non-stationary head inputs)
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 5
+  loss: bce_dice
+  dice_weight: 1.0
+  checkpoint: null              # null = fresh init | <path> = FULL resume
+  resume_weights_only: false    # true = warm-start WEIGHTS ONLY (fresh optimizer/schedule/epoch)
