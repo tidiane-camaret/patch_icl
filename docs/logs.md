@@ -6813,3 +6813,69 @@ New tests in experiments/3d/tests/test_cascade.py:
 - test_query_prior_gt_coarse_stays_aligned_under_crop_jitter — e2e run_cascade, gt_coarse
   prior IoU vs the re-cropped GT stays >0.7 at jitter 0 and 4 (misaligned would be ~0.14).
 50 passed / 1 skipped.
+
+## 2026-09-03 — experiment 70: PatchSet3D variable-spacing (no cascade), group-composed
+
+New run `experiment=70_patchset_varspacing_6_1_5`: the PatchSet3D architecture baseline for
+the Medverse variable-spacing run (exp 69) and the no-cascade counterfactual for the
+cascade run (exp 68). Same [1.5, 6] mm log-uniform crop regime as exp 69 (single forward,
+`train_spacing_range`, `SpacingBatchSampler`), same PatchSet3D head + from-scratch recipe
+as exp 68.
+
+Composed DIRECTLY from Hydra groups (no `- 68_cascade_6_3_1_5` experiment-chain
+inheritance), following the exp 48 pattern. Two new reusable groups:
+
+- `configs/experiment/3d/dataset/d2_varspacing_15_6.yaml` — d1's v2 raw_ct crop path with
+  `train_spacing_range: [1.5, 6.0]`, eval fixed at `crop_spacing_mm: 3`, `context_size: 1`,
+  `mask_downsample: soft`, `train_classes: balanced` / `val_classes: all`. No cascade keys.
+- `configs/experiment/3d/model/m2_patchset_decoder.yaml` — m1 with the exp 57 + 68 head/optim deltas baked
+  in: e=768 / h=3072 / a=12, `thinking_rows: 8`, token-mask 0.10, `feat_norm: self`,
+  `fine_decode` via the conv decoder (`fine_stage: [0,1]`, proj 96); lr 7e-5, warmup 5,
+  `muon_scheduled`, `no_decay_norm_bias`, LAWA k=10. Schedule keys train.yaml's `_self_`
+  shadows (epochs/batch_size/workers/eval_every/grad_clip/profile_timing) stay in the
+  experiment layer.
+
+The experiment body carries only: the `augmentations` p-trims (calibrated-minus-elastic-
+minus-affine-scale + bilinear mask warp, from exp 48/57), exp 68's encoder width/stage
+choice (`plainconv_ts_features_per_stage: [32,64,256,512]`, `nnunet_ts_stages: [2,3]`), the
+shadowed schedule knobs, and eval knobs.
+
+SPACING SIGNAL — `arch.encoder_spacing_aware: true` flips `PatchSet3D.spacing_aware`, so
+both the train loop and the eval loop thread the per-batch physical pitch into
+`model(..., spacing=...)`. The PlainConv encoder ignores it (conv net, no RoPE), but the
+set-transformer RoPE scales token positions by `spacing / rope_train_mm` (3 mm for
+plainconv_ts, = the log-uniform midpoint of [1.5, 6]). Deliberate divergence from exp 69:
+Medverse has no positional mechanism to consume spacing.
+
+Verified: `train.py experiment=70_patchset_varspacing_6_1_5 --cfg job --resolve` composes
+cleanly; resolved `arch` matches exp 68, resolved `data` matches exp 69.
+
+## 2026-09-03 — modality-agnostic normalization: prep seams (no-op)
+
+Landed three seams from
+docs/superpowers/specs/2026-09-03-modality-agnostic-normalization-design.md so a later
+CT+MRI joint run is config-only. Zero behavior change — exp 70 `--cfg job --resolve` diff
+empty; encoder `_norm` numerically identical for every current default.
+
+- `src/models/encoders/_input_norm.py` (new): `InputRenorm` stem, modes
+  `passthrough | reframe | zscore | instance`. The first three are the previous inline
+  `_norm` extracted verbatim; `instance` = per-sample z-score of the tensor as received,
+  NO HU inversion (modality-agnostic), optional default-off learned affine.
+- `plainconv_ts` / `resenc_ts` / `nnunet_ts`: `_norm` now delegates to a shared
+  `InputRenorm` instance; `_INPUT_NORMS` moved to `_input_norm.py`; `nnunet_ts` passes its
+  plans `CTNormalization` as `target_spec`. Per-encoder defaults unchanged
+  (zscore / passthrough / reframe). `input_norm='instance'` now accepted (unreachable
+  until a config selects it).
+- `modality: str = "ct"` on `LoadResult` + `NativeCrop`; `build_native_crop(modality=)`;
+  provider returns populate it; v2 item dict carries `"modality"`; `incontext_collate_fn`
+  emits `batch["modality"]` (list[str], nothing reads it). Cascade/realize collate not
+  threaded — later follow-up.
+- `src/gpu_augment.py`: `_batched_intensity` / `_batched_gin_ipa` / `_batched_bias_field`
+  take `clamp=(lo,hi)` (None → the CT-frame constants); `GpuAugmentor(clamp_frame=...)`
+  stores it and, when set, skips the `ct_norm != DEFAULT` guard. Default path byte-identical.
+
+Tests: `tests/test_input_norm.py` (new), `tests/test_modality_seam.py` (new),
+`instance` cases in `tests/test_{plainconv,resenc}_ts_encoder.py`, `clamp_frame` cases in
+`tests/test_gpu_augment.py`. Full suite: 391 passed / 0 skipped (plus 15 pre-existing
+failures + 4 pre-existing collection errors — identical set at the pre-seam parent
+0fce764, which had 371 passed; the +20 are the new tests above).
