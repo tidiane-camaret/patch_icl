@@ -6950,3 +6950,91 @@ follow-up.
 Tests: +3 in `tests/test_patchset3d.py` (slot_layout is the source of truth across
 decode_source choices, invalid decode_source rejected, decode_source actually changes the
 readout). `tests/test_patchset3d.py tests/test_patchset3d_rope.py`: 25 passed.
+
+## 2026-09-04 — mask_slots pivot: additive content-type tag, not a c-axis column
+
+Superseded the `_tokens_multi`/`[img,gt,pred]` design above (never trained, safe to
+revert) after spotting a gap it introduced: support only ever populates `gt` (real
+content) and query only ever populates `pred` (`context_out` is always real GT — see
+`cascade.py`), so each column's "other side" was a content-free zero/presence=0
+placeholder. On the sample-axis (cross-image attention is column-independent —
+`pfn_seg_2d.py:234`, batch folds in `c`), that means neither column ever got a bilateral,
+content-rich retrieval pass: `gt`'s query-side queries carried no prediction content to
+drive "find context whose GT resembles what I predict," and `pred`'s support-side
+keys/values carried nothing to retrieve. Legacy's single shared `mask` column had this for
+free — support's real GT and query's real pred sit in the same column/QKV space.
+
+New design keeps the c-axis fixed at `[img, mask]` forever (`self.slot_layout` no longer
+varies with `mask_slots` at all) and tags the mask column's embedding with an additive
+`slot_pos` term identifying which content type it holds — `"gt"` for the support call,
+`"pred"` for the query call, via a `content_type` kwarg on the (now single) `_tokens`
+method. `_MASK_CONTENT_TYPES = ("gt","pred")` replaces `_SLOT_LAYOUT`; `_tokens_multi` is
+deleted. This preserves everything the columnar version bought (checkpoint-stable,
+slot-count-independent `slot_pos` identity, verified separable from spatial PE) while
+fixing the retrieval gap and being strictly cheaper: `mask_embed`'s presence-bit widening
+is gone too (no longer needed — gt/pred never co-occur on the same row group, so there's
+no placeholder case to make room for), and the mechanism is now genuinely O(1) in the
+number of content types instead of O(c) — a future type (bbox/point/scribble) is one more
+`slot_pos` index and one more `mask_embed` call, no c-axis growth, no extra attention.
+
+`decode_source`'s valid values collapse back to `{"img","mask"}` (there's no separate `gt`
+column to read anymore); the config's `decode_source: img` default is unaffected.
+
+Tests: `test_slot_layout_is_the_single_source_of_truth` -> renamed
+`test_slot_layout_is_fixed_regardless_of_mask_slots` (asserts the c-axis never grows);
+`test_decode_source_invalid_raises` now also checks `"gt"`/`"pred"` are rejected;
+`test_decode_source_changes_the_readout` uses `"mask"` not `"gt"`;
+`test_tokens_multi_placeholder_is_content_free` -> replaced by
+`test_tokens_content_type_tags_the_mask_column_only` (content_type changes the mask
+column only, differs between gt/pred, and `content_type=None` reproduces plain
+`mask_embed(occ)`). `tests/test_patchset3d.py tests/test_patchset3d_rope.py`: 25 passed.
+
+## 2026-09-04 — `arch.mask_embed`: conv option for the occupancy tile
+
+Inspected the occupancy tile -> token map (`mask_embed`, `Linear(mask_patch_size³, e)` —
+`Linear(512,768)` at production settings, `mask_patch_size=8`/`e=768`). Unlike `img_embed`
+(a thin `Linear(oc,e)` sitting *after* a real conv encoder — spatial work already done
+upstream), `mask_embed` takes the flattened `p³` occupancy tile straight from
+`_mask_tiles_3d` with no spatial processing at all: one independent weight per voxel
+position, no weight sharing/translation equivariance/locality, and (at production scale)
+not actually cheap either — 393,984 params, applied to every one of `(K+1)·N` cells every
+forward.
+
+New `MaskConvEmbed` (`src/models/patchset3d.py`, mirrors `ConvEncoder3D`'s `cbr` block):
+strided `Conv3d` stack (1->16->32 ch, halving spatial size each layer while `s>2`) +
+`AdaptiveAvgPool3d(1)` + `Linear(ci,e)`. Generic in `p` — degenerates gracefully to zero
+conv layers (exactly `nn.Linear(1,e)`) at `p=1`, verified by
+`test_mask_conv_embed_p1_matches_plain_linear`. At `p=8,e=768`: **39,696 params vs
+393,984 — 9.9x fewer** (`test_mask_conv_embed_is_cheaper_than_linear_at_production_scale`);
+cheaper on FLOPs too, while adding genuine spatial inductive bias instead of a dense
+unstructured map.
+
+Exposed as `arch.mask_embed: "linear" (default, unchanged) | "conv"` — a new param shape,
+so gated as a seam like `img_embed_mlp` rather than swapped in place; `experiments/3d/
+train.py::build_model` threads it through (`a.get("mask_embed", "linear")`). Not added to
+`70_patchset_varspacing_6_1_5.yaml` (no explicit request for this one) and not yet
+empirically validated against the linear baseline.
+
+Tests: +6 in `tests/test_patchset3d.py` (MaskConvEmbed shape/backward at p=8/4/1, p=1
+degenerates to plain Linear, param-count regression guard, default-is-linear, forward
++backward with mask_embed="conv" through the full model, invalid-value rejection).
+`tests/test_patchset3d.py tests/test_patchset3d_rope.py`: 31 passed.
+
+## 2026-09-04 — wire mask_slots=2 gt/pred tagging to data.query_prior
+
+`70_patchset_varspacing_6_1_5.yaml`: `arch.mask_slots=2` (was 1 — requested as 1, but the
+gt/pred tag only exists at >=2; flagged and corrected), `arch.decode_source=mask`, plus a
+new `data:` block — `query_prior: gt` + `prior_perturb` (dataset=d1's own preset, `p`
+switched 0->1) — every TRAIN step now seeds the query mask token with a perturbed-GT proxy
+for "previous-level prediction" (this experiment has no real cascade level to draw one
+from). Eval stays prior-free (`train.py`'s `qp_on` gates injection to train only).
+
+No model-code change needed: `_attn` already tags `sup_occ` (always real GT) `"gt"` and
+`qry_occ` `"pred"` unconditionally at `mask_slots>=2` — `qry_occ` is already whatever
+`query_prior` built (`_prior_occupancy(query_prior)`) when a prior is injected, or the
+support-mean fallback otherwise, so the config change alone makes the wiring correct by
+construction. Verified with a smoke test:
+`resolve_query_prior_spec("gt")` -> `build_query_prior` (perturbed) -> `PatchSet3D(
+mask_slots=2, decode_source="mask")(..., query_prior=qp)` forward + backward, no missing
+grads. `--cfg job --resolve` confirms `data.query_prior: gt`, `data.prior_perturb.p: 1.0`,
+`arch.mask_slots: 2`, `arch.decode_source: mask` all resolve as set.

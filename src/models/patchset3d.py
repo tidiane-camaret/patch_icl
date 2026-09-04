@@ -54,6 +54,39 @@ def _mask_tiles_3d(mask: torch.Tensor, grid_res: int, p: int) -> torch.Tensor:
                 .reshape(B, grid_res ** 3, p ** 3))
 
 
+class MaskConvEmbed(nn.Module):
+    """p³ occupancy tile -> e via strided Conv3d (mirrors ConvEncoder3D's cbr block), instead
+    of a flat Linear(p³,e) over every voxel independently. Weight-shared, translation
+    -equivariant local pattern detection before collapsing to the token — cheaper AND adds
+    spatial inductive bias the mask side otherwise lacks (unlike img_embed, which sits after
+    a real conv encoder). See docs/logs.md 2026-09-04 (mask_embed conv option) for the
+    params/FLOPs comparison against the plain-Linear path (arch.mask_embed="linear").
+
+    Works for any p, including p=1: the while-loop then adds no conv layers and this reduces
+    to exactly nn.Linear(1,e) (pool/flatten on a already-1×1×1 input are no-ops)."""
+
+    def __init__(self, p: int, e: int, base_ch: int = 16, groups: int = 4):
+        super().__init__()
+        self.p = p
+        convs, ci, co, s = [], 1, base_ch, p
+        while s > 2:
+            convs.append(nn.Sequential(
+                nn.Conv3d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(min(groups, co), co),
+                nn.LeakyReLU(0.1, inplace=True),
+            ))
+            ci, co, s = co, co * 2, (s + 1) // 2
+        self.convs = nn.Sequential(*convs)
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.proj = nn.Linear(ci, e)
+
+    def forward(self, occ: torch.Tensor) -> torch.Tensor:
+        *lead, _ = occ.shape                              # (..., p³) -> (..., e)
+        x = self.convs(occ.reshape(-1, 1, self.p, self.p, self.p))
+        x = self.pool(x).flatten(1)
+        return self.proj(x).reshape(*lead, -1)
+
+
 class ConvEncoder3D(nn.Module):
     """Single-stream 3D conv encoder with multi-scale feature concat (3D ConvEncoder).
 
@@ -133,10 +166,14 @@ class _ConvNormAct(nn.Module):
 
 
 class PatchSet3D(nn.Module):
-    # Canonical physical c-axis column order for mask_slots>=2 (index 0 is always img).
-    # See __init__'s self.slot_layout for how this becomes the per-instance source of
-    # truth (mask_slots=1 uses a separate ("img","mask") layout — see there).
-    _SLOT_LAYOUT = ("img", "gt", "pred")
+    # Named mask-CONTENT identities for mask_slots>=2 — NOT c-axis columns. The c-axis
+    # stays fixed at (img, mask) always (self.slot_layout below); gt/pred instead ride as
+    # an additive slot_pos tag on the one shared mask column (see _tokens), so support's
+    # real GT and query's real pred sit in the same column/QKV space — a separate c-axis
+    # column per content type loses that (support/query never populate the SAME slot, so
+    # each column's "other side" is content-free — see docs/logs.md 2026-09-04, second
+    # entry, for the mechanism and why this superseded the earlier _tokens_multi design).
+    _MASK_CONTENT_TYPES = ("gt", "pred")
 
     def __init__(
         self,
@@ -151,6 +188,7 @@ class PatchSet3D(nn.Module):
         fourier_bands: int = 8,
         mask_patch_size: int = 1,
         mask_patch_decode_size: int = 1,
+        mask_embed: str = "linear",
         mask_slots: int = 1,
         decode_source: str = "img",
         context_id_embed: bool = False,
@@ -192,35 +230,33 @@ class PatchSet3D(nn.Module):
         self.mask_patch_size = int(mask_patch_size)
         self.mask_patch_decode_size = int(mask_patch_decode_size)
         assert self.mask_patch_size >= 1 and self.mask_patch_decode_size >= 1
-        # mask_slots: c-axis mask-content columns. 1 (default) = today's single shared
-        # column (support GT / query prior share one slot, unchanged params -> old
-        # checkpoints load as-is). 2 = separate gt/pred columns (see _tokens_multi). Only
-        # 1|2 for now; more slot types (bbox/point/scribble/...) are a later extension of
-        # the same mechanism, not a new one -- see _tokens_multi's docstring.
+        # mask_slots: mask-CONTENT identities tagged onto the single shared mask column.
+        # 1 (default) = today's untagged column (support GT / query prior share one slot,
+        # unchanged params -> old checkpoints load as-is). 2 = the column is additively
+        # tagged "gt" for support / "pred" for query (see _tokens, _MASK_CONTENT_TYPES) so
+        # the network can tell which flavor of content it's looking at — the c-axis itself
+        # never grows. Only 1|2 for now; more content types (bbox/point/scribble/...) are a
+        # later extension of the same additive-tag mechanism.
         self.mask_slots = int(mask_slots)
         assert self.mask_slots in (1, 2), (
-            f"arch.mask_slots={mask_slots} — only 1 (legacy) or 2 (gt/pred split) for now")
-        # Canonical physical c-axis column layout — the ONE source of truth for every
-        # slot-indexed thing: token-building order (_tokens_multi), slot_pos identity
-        # index, and the decode readout column (decode_source below). Adding a slot type
-        # later (bbox/point/scribble/...) is appending a name to _SLOT_LAYOUT; nothing
-        # else's indexing scheme changes. mask_slots=1 keeps its own single merged
-        # "mask" column (the untouched legacy _tokens path) rather than a name from
-        # _SLOT_LAYOUT, since it genuinely isn't split into gt/pred.
-        self.slot_layout = (self._SLOT_LAYOUT[:1 + self.mask_slots] if self.mask_slots >= 2
-                            else ("img", "mask"))
-        self.slot_index = {name: i for i, name in enumerate(self.slot_layout)}
+            f"arch.mask_slots={mask_slots} — only 1 (legacy) or 2 (gt/pred tags) for now")
+        # Canonical physical c-axis column layout — fixed regardless of mask_slots (content
+        # identity rides as a tag inside the mask column, not as a column of its own). The
+        # single source of truth for the decode readout column (decode_source below).
+        self.slot_layout = ("img", "mask")
+        self.slot_index = {"img": 0, "mask": 1}
         # Which column the decoder reads for the query row. Default "img" reproduces
-        # today's exact behavior (_decode_col=0) for every mask_slots value. See
-        # docs/logs.md 2026-09-04: support populates gt (mask_slots>=2) / mask
-        # (mask_slots=1) with REAL content, so — unlike pred, which support never
-        # populates — that column's OWN cross-context attention does genuine retrieval
-        # against real support masks; it's the more direct readout channel.
+        # today's exact behavior (_decode_col=0). See docs/logs.md 2026-09-04: support
+        # populates the mask column with REAL content (GT) — unlike a hypothetical
+        # pred-only column, which support never populates — so that column's OWN
+        # cross-context attention does genuine retrieval against real support masks; it's
+        # the more direct readout channel.
         self.decode_source = str(decode_source)
         assert self.decode_source in self.slot_layout, (
             f"arch.decode_source={decode_source!r} not in this config's slot_layout "
             f"{self.slot_layout}")
         self._decode_col = self.slot_index[self.decode_source]
+        self._mask_content_index = {name: i for i, name in enumerate(self._MASK_CONTENT_TYPES)}
         self.full_attn = full_attn
         self.query_self_attn = query_self_attn
         # register_routed: each image attends only within its own N-cell block; the thinking
@@ -321,14 +357,19 @@ class PatchSet3D(nn.Module):
         oc = self.encoder.out_ch
         self.img_embed = (nn.Sequential(nn.Linear(oc, oc), nn.GELU(), nn.Linear(oc, e))
                           if img_embed_mlp else nn.Linear(oc, e))
-        # occupancy tile p³ -> e, SHARED across every mask-content slot (gt, pred, ... all go
-        # through this one Linear — no per-slot learned weights). mask_slots>=2 widens the
-        # input by one presence scalar (1 = this slot's real content, 0 = placeholder for a
-        # slot that doesn't apply to this row group; see _tokens_multi), so the shape is a
-        # function of mask_patch_size and mask_slots-the-boolean-question ">=2", never of the
-        # slot COUNT itself.
-        mask_in = self.mask_patch_size ** 3 + (1 if self.mask_slots >= 2 else 0)
-        self.mask_embed = nn.Linear(mask_in, e)
+        # occupancy tile p³ -> e, SHARED across every mask-content type (gt, pred, ... all go
+        # through this one module — no per-type learned weights). Shape depends only on
+        # mask_patch_size, never on mask_slots: content identity (mask_slots>=2) rides as an
+        # additive slot_pos tag on the embedding output (see _tokens), not as an input
+        # widening — support and query never populate this column at once, so there's no
+        # placeholder/presence case to make room for.
+        # arch.mask_embed: "linear" (default, unchanged) = flat Linear(p³,e), one weight per
+        # voxel position, no spatial structure. "conv" = MaskConvEmbed — strided Conv3d, cheaper
+        # (~2.4x fewer FLOPs, ~10x fewer params at p=8,e=768) AND spatially structured (see
+        # docs/logs.md 2026-09-04). New param shape -> new checkpoints only, hence the seam.
+        assert mask_embed in ("linear", "conv"), f"arch.mask_embed={mask_embed!r} — 'linear' or 'conv'"
+        self.mask_embed = (MaskConvEmbed(self.mask_patch_size, e) if mask_embed == "conv"
+                           else nn.Linear(self.mask_patch_size ** 3, e))
         # Positional encoding. Default: additive Fourier features of the (i,j,k) cell (spacing
         # -blind). transformer_rope=True instead applies 3D axial RoPE on the sample axis inside
         # the transformer (mirrors the encoder's RoPE) and drops the additive term (RoPE-only).
@@ -349,21 +390,22 @@ class PatchSet3D(nn.Module):
         # docs/superpowers/specs/2026-08-11-patchset3d-token-masking-design.md.
         self.token_mask_ratio_support = float(token_mask_ratio_support)
         self.token_mask_ratio_query = float(token_mask_ratio_query)
-        # row 0 = image col, row 1 = the ROW GROUP's active content col (gt for support,
-        # pred for query when mask_slots>=2 — see _tokens_multi) — indexed by content TYPE,
-        # not physical slot position, so this shape is also independent of mask_slots.
+        # row 0 = image col, row 1 = mask col (whatever content it currently holds — gt for
+        # support, pred for query when mask_slots>=2; the SimMIM replacement drops any
+        # identity tag along with the content, see _tokens) — shape independent of mask_slots.
         self.mask_token = nn.Parameter(torch.zeros(2, e))
         nn.init.normal_(self.mask_token, std=0.02)
         self.head_dim = e // a
         self.rope_train_mm = float(getattr(self.encoder, "train_spacing_mm", 2.0))
         self.pos = None if self.transformer_rope else FourierPositionalEncoding(e, fourier_bands, n_axes=3)
-        # mask_slots>=2: additive Fourier feature of the (fixed-capacity-normalized) slot
-        # index, the ONLY thing distinguishing otherwise-identically-embedded mask columns
-        # (independent of transformer_rope — RoPE only rotates the row/sample axis, giving
-        # c-axis columns no identity of their own). Linear(2*fourier_bands, e): fixed shape
-        # regardless of mask_slots, so a checkpoint trained at mask_slots=2 loads unchanged
-        # at mask_slots=3+ later. Capacity is a fixed constant (not the live mask_slots) so
-        # slot 0/1's encoding never shifts when a slot is added — see
+        # mask_slots>=2: additive Fourier feature of the (fixed-capacity-normalized) content
+        # -type index (_MASK_CONTENT_TYPES), the ONLY thing distinguishing an otherwise
+        # identically-embedded mask column's gt vs pred content (independent of
+        # transformer_rope — RoPE only rotates the row/sample axis, giving the mask column
+        # no content identity of its own). Linear(2*fourier_bands, e): fixed shape regardless
+        # of mask_slots, so a checkpoint trained at mask_slots=2 loads unchanged if a 3rd
+        # content type is added later. Capacity is a fixed constant (not the live mask_slots)
+        # so type 0/1's encoding never shifts when a type is added — see
         # tests/test_patchset3d.py::test_slot_pos_separable_from_spatial_pos.
         self.slot_pos = FourierPositionalEncoding(e, fourier_bands, n_axes=1) if self.mask_slots >= 2 else None
         self._SLOT_CAPACITY = 8
@@ -509,9 +551,17 @@ class PatchSet3D(nn.Module):
             return _down_to(prior, self.resolution).reshape(B, self.N, 1)
         return _mask_tiles_3d(prior, self.resolution, p)      # (B, N, p³)
 
-    def _tokens(self, feat, occ, ijk, mask=None):
+    def _tokens(self, feat, occ, ijk, mask=None, content_type: str | None = None):
+        """content_type (mask_slots>=2 only): "gt" for the support call, "pred" for the
+        query call — an additive slot_pos tag on the mask column identifying which flavor
+        of content `occ` is, so support's real GT and query's real pred/prior still sit in
+        the SAME column/QKV space for cross-context attention (unlike a separate column per
+        type, which only one side would ever populate — see _MASK_CONTENT_TYPES)."""
         img = self.img_embed(feat)
         msk = self.mask_embed(occ)
+        if content_type is not None:
+            idx = self._mask_content_index[content_type]
+            msk = msk + self._slot_pos_vec(idx, occ.device, msk.dtype)
         if mask is not None:                                # SimMIM in-place [MASK] replacement
             m = mask.unsqueeze(-1)                          # (B,M,1) bool
             # Cast to the operand dtype so torch.where does not promote img/msk to fp32
@@ -530,54 +580,11 @@ class PatchSet3D(nn.Module):
         return torch.stack([img, msk], dim=2)               # (B,M,2,e)
 
     def _slot_pos_vec(self, idx: int, device, dtype):
-        """(e,) additive Fourier feature for canonical slot index `idx` (self.slot_index[...],
-        img's index 0 never calls this) — fixed-capacity normalized (self._SLOT_CAPACITY,
-        not self.mask_slots), so it never shifts when a later run adds more slots."""
+        """(e,) additive Fourier feature for canonical mask-content-type index `idx`
+        (self._mask_content_index[...]) — fixed-capacity normalized (self._SLOT_CAPACITY,
+        not self.mask_slots), so it never shifts when a later run adds more content types."""
         v = self.slot_pos(torch.tensor([[idx]], device=device), self._SLOT_CAPACITY)  # (1,e)
         return v.reshape(-1).to(dtype)
-
-    def _tokens_multi(self, feat, occ, active_slot: str, ijk, mask=None):
-        """arch.mask_slots>=2 token builder -> (B,M,len(self.slot_layout),e).
-
-        `occ` is this row group's real mask content (real GT for support, prior/pred for
-        query — same occ tensors _tokens already took); `active_slot` ("gt"/"pred") says
-        which named slot it belongs to. Every OTHER content slot gets a zero-occupancy,
-        presence=0 placeholder through the SAME shared mask_embed (widened by one presence
-        scalar in __init__) — no per-slot learned weights, so nothing here depends on
-        mask_slots except which iteration is "active". Column order and slot identity both
-        come from self.slot_layout / self.slot_index (__init__) — the single source of
-        truth; nothing in this method hardcodes an index."""
-        dtype, device = feat.dtype, feat.device
-        zeros_occ = torch.zeros_like(occ)
-        pos = self.pos(ijk, self.resolution) if self.pos is not None else None
-        active_col = self.slot_index[active_slot]
-
-        cols = []
-        for name in self.slot_layout:
-            if name == "img":
-                c = self.img_embed(feat)
-            else:
-                present = (self.slot_index[name] == active_col)
-                o = occ if present else zeros_occ
-                p = o.new_full(o.shape[:-1] + (1,), 1.0 if present else 0.0)
-                c = self.mask_embed(torch.cat([o, p], dim=-1))
-                c = c + self._slot_pos_vec(self.slot_index[name], device, dtype)
-            if pos is not None:
-                c = c + pos
-            cols.append(c)
-
-        img_col = self.slot_index["img"]
-        if mask is not None:                                # SimMIM in-place [MASK] replacement
-            m = mask.unsqueeze(-1)                          # (B,M,1) bool
-            cols[img_col] = torch.where(m, self.mask_token[0].to(dtype), cols[img_col])
-            cols[active_col] = torch.where(m, self.mask_token[1].to(dtype), cols[active_col])
-        else:
-            # Keep mask_token in the compute graph (zero contribution) so it always
-            # receives a gradient — required for optimizers that track all parameters.
-            cols[img_col] = cols[img_col] + self.mask_token[0].sum() * 0.0
-            cols[active_col] = cols[active_col] + self.mask_token[1].sum() * 0.0
-
-        return torch.stack(cols, dim=2)          # (B,M,len(self.slot_layout),e)
 
     def _tile_logits(self, out, d=None):
         """(B,N,d³) -> (B,1,Rd,Rd,Rd), inverse of _mask_tiles_3d (d=1 -> one logit per cell).
@@ -647,15 +654,14 @@ class PatchSet3D(nn.Module):
 
         sup_feat, qry_feat = self._feat_norm(sup_feat, qry_feat)
 
-        if self.mask_slots >= 2:
-            # support always carries real GT (never a prediction); query never carries real
-            # GT (only ever a prior/prediction, or the support-mean fallback) — see forward's
-            # docstring and cascade.py's context_out handling.
-            sup_tok = self._tokens_multi(sup_feat, sup_occ, "gt", sup_ijk, mask=mask_support)
-            qry_tok = self._tokens_multi(qry_feat, qry_occ, "pred", qry_ijk, mask=mask_query)
-        else:
-            sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk, mask=mask_support)   # (B,S,2,e)
-            qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk, mask=mask_query)     # (B,Q,2,e)
+        # support always carries real GT (never a prediction); query never carries real GT
+        # (only ever a prior/prediction, or the support-mean fallback) — see forward's
+        # docstring and cascade.py's context_out handling. mask_slots>=2 tags the mask
+        # column accordingly so the network knows which; mask_slots=1 tags neither (legacy).
+        ctype_sup = "gt" if self.mask_slots >= 2 else None
+        ctype_qry = "pred" if self.mask_slots >= 2 else None
+        sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk, mask=mask_support, content_type=ctype_sup)
+        qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk, mask=mask_query, content_type=ctype_qry)
 
         if self.context_id_embed:
             assert K <= self.max_context, f"context_size {K} exceeds max_context {self.max_context}"

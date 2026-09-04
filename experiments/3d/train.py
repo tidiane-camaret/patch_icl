@@ -380,6 +380,7 @@ def build_model(cfg: DictConfig):
             "fourier_bands": a.get("fourier_bands", 8),
             "mask_patch_size": a.get("mask_patch_size", 1),
             "mask_patch_decode_size": a.get("mask_patch_decode_size", 1),
+            "mask_embed": a.get("mask_embed", "linear"),
             "mask_slots": a.get("mask_slots", 1),
             "decode_source": a.get("decode_source", "img"),
             "context_id_embed": a.get("context_id_embed", False),

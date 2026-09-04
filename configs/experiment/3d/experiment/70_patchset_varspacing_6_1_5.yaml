@@ -69,6 +69,24 @@ augmentations:
       p: 0
     mask_interp: bilinear
 
+data:
+  # NON-CASCADE query-prior injection (experiments/3d/query_prior.py): every TRAIN step
+  # seeds the query mask token with the (perturbed) target GT instead of the support-mean
+  # occupancy prior — a "previous-level prediction" proxy, since this experiment has no
+  # real cascade level to draw one from. Eval always runs prior-free (train.py's qp_on
+  # gates this to train only) so val/dice stays comparable to a prior-free run.
+  query_prior: gt
+  # Degrade the injected GT so it looks like a real upstream prediction rather than a clean
+  # copy — dataset=d1's own documented preset (see there), just switched on (p: 0 -> 1).
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [0.0, 4.0]
+    erode_mm:  [0.0, 4.0]
+    erode_min_keep: 0.3
+    shift_mm:  [0.0, 6.0]
+    noise_std: [0.0, 0.3]
+
 arch:
   # e4_plainconv_ts width/stage choice from experiment=68 (matched compute vs e2).
   plainconv_ts_features_per_stage: [32, 64, 256, 512]
@@ -78,16 +96,24 @@ arch:
   # Modality-agnostic input stem: per-volume z-score, no HU-frame inversion (see header).
   # ~no-op vs e4's `zscore` default on this CT-only run; ready for the CT+MRI joint run.
   encoder_input_norm: instance
-  # c-axis mask columns: 1 = today's single shared support-GT/query-prior column
-  # (PatchSet3D's default). Stated explicitly, no-op — see docs/logs.md 2026-09-03 for the
-  # gt/pred split (mask_slots=2) this is the seam for.
-  mask_slots: 1
-  # Query-row column the decoder reads. "img" = today's default (unchanged). Stated
-  # explicitly, no-op — see docs/logs.md 2026-09-04: "mask" (mask_slots=1) / "gt"
-  # (mask_slots=2) is the column support populates with real content, so its own
-  # cross-context attention does genuine retrieval — a candidate for less-indirect decode,
-  # not yet empirically validated.
-  decode_source: img
+  # Mask-content identity tagging (see docs/logs.md 2026-09-03/04): the shared mask column
+  # gets an additive tag identifying which content it holds. Paired with data.query_prior
+  # below: context always carries real GT -> tagged "gt"; the query always carries either
+  # the injected (perturbed-GT) prior or the support-mean fallback, never real GT -> tagged
+  # "pred" either way (_attn tags qry_occ "pred" unconditionally at mask_slots>=2 — it
+  # doesn't matter what built qry_occ). The c-axis itself never grows (always img+mask).
+  mask_slots: 2
+  # Query-row column the decoder reads. "mask" (not "img", the old default) — see
+  # docs/logs.md 2026-09-04: support populates "gt"/"mask" with real content, so its own
+  # cross-context attention does genuine retrieval — the more direct readout channel.
+  # Not yet empirically validated against "img".
+  decode_source: mask
+  # Occupancy tile -> token map. "linear" = today's default (unchanged), a flat Linear over
+  # every voxel independently. Stated explicitly, no-op — see docs/logs.md 2026-09-04: "conv"
+  # (MaskConvEmbed) is ~10x fewer params / cheaper FLOPs at this config's mask_patch_size=8,
+  # e=768 AND adds spatial inductive bias the mask side otherwise lacks, not yet empirically
+  # validated.
+  mask_embed: linear
 
 train:
   # schedule keys train.yaml's _self_ shadows out of the model group -> set here
