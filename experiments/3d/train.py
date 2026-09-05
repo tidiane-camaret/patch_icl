@@ -1018,7 +1018,20 @@ def main(cfg: DictConfig) -> None:
         sd = ckpt["model"] if "model" in ckpt else ckpt
         if is_patchset:
             # Strip the `_orig_mod.` prefix torch.compile may have left on saved keys.
-            net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in sd.items()})
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            # train.checkpoint_allow_partial: opt-in escape hatch for warm-starting across a
+            # deliberate arch change (e.g. mask_embed linear->conv, docs/logs.md 2026-09-05)
+            # where one submodule's shape/name changed but the rest of the checkpoint should
+            # still transfer. Off by default: an ACCIDENTAL arch/checkpoint mismatch (wrong
+            # path, stale config) should hard-error via strict=True, not silently reinit part
+            # of the model.
+            allow_partial = bool(cfg.train.get("checkpoint_allow_partial", False))
+            result = net.load_state_dict(sd, strict=not allow_partial)
+            if allow_partial and (result.missing_keys or result.unexpected_keys):
+                print(f"Partial checkpoint load (train.checkpoint_allow_partial=true): "
+                      f"{len(result.missing_keys)} key(s) left at random init "
+                      f"{result.missing_keys}; {len(result.unexpected_keys)} unused "
+                      f"checkpoint key(s) dropped {result.unexpected_keys}.")
         else:
             model.load_finetuned(sd)
         # Weights are loaded here (before compile) so the `_orig_mod.` prefix can't block the

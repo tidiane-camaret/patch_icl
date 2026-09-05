@@ -1,0 +1,94 @@
+# @package _global_
+# 71_cascade_finetune_from_varspacing — warm-start exp68's coarse->fine cascade from
+# exp70's variable-spacing-pretrained PatchSet3D checkpoint, instead of training the
+# cascade from scratch.
+#
+#   python experiments/3d/train.py experiment=71_cascade_finetune_from_varspacing
+#
+# CONSTRUCTION: chains 68 wholesale (cascade mechanics, RAM cache + GPU-realize crop,
+# cascade_query_prior curriculum, encoder widths/stages, e/h/a/decoder — all unchanged),
+# then layers a checkpoint warm-start + the arch/aug settings needed to make that warm
+# start behaviorally continuous with exp70, plus an eased-in LR for the finetune.
+#
+# WHY THIS WORKS: exp70 pretrained PatchSet3D on a per-batch log-uniform crop pitch in
+# [1.5, 6] mm with arch.encoder_spacing_aware=true (RoPE token spacing scales with the
+# physical pitch). exp68's cascade_spacings [6, 3, 1.5] are three fixed points fully
+# INSIDE that trained range, so the warm-started encoder/attention never has to
+# extrapolate spacing — the cascade is "the same task, now with real re-crops between
+# levels instead of one shot at a random pitch."
+#
+# CHECKPOINT: fill in the actual dated exp70 run directory below (train.checkpoint).
+# resume_weights_only=true loads only the model weights — optimizer/scheduler/epoch
+# start fresh, since exp70's training state (no cascade, different query_prior) doesn't
+# mean anything for this run's schedule (docs/logs.md 2026-08-29 full-resume semantics).
+#
+# ARCH PARITY: encoder_spacing_aware/encoder_input_norm/mask_slots/decode_source don't
+# change checkpoint tensor shapes (behavior flags, not new params), but 68's defaults
+# (encoder_input_norm=zscore, mask_slots=1 default, decode_source=img default) would make
+# the loaded weights compute something different from what they were trained to. Restated
+# here to match exp70 exactly. mask_embed is the ONE deliberate exception (linear -> conv,
+# see below + train.checkpoint_allow_partial) — a genuine arch change, not parity.
+#
+# LR / AUGMENTATION: eased in rather than reusing exp68's from-scratch schedule — the
+# encoder/attention are already converged, so a from-scratch warmup peak would risk
+# undoing the pretrain; augmentation trims (elastic/deform off, affine scale neutral)
+# carried over unchanged so the cascade switch is the only new distribution shift, not
+# also a jump to the untrimmed calibrated aug exp68 inherits from exp57.
+#
+# BATCH SIZE / LR SCALING: batch_size halved (4 -> 2, exp70/68's inherited value) for
+# this run; lr scaled with it under the linear scaling rule (2.0e-5 -> 1.0e-5).
+
+defaults:
+  - 68_cascade_6_3_1_5
+  - _self_
+
+train:
+  # --- checkpoint warm start (weights only, fresh optimizer/scheduler/epoch) -------------
+  checkpoint: ${paths.results}/3d_train/TODO_FILL_IN_DATE_70_patchset_varspacing_6_1_5/best.pt
+  resume_weights_only: true
+  # exp70 was pretrained with arch.mask_embed=linear; this run switches to conv (see
+  # arch.mask_embed below), a different module/shapes for that one submodule. A strict
+  # load would hard-error, so opt into a partial load: mask_embed.* comes up at random
+  # init, everything else (encoder, transformer, decoder) warm-starts. train.py logs the
+  # skipped/dropped keys so this is never silent (experiments/3d/train.py checkpoint load).
+  checkpoint_allow_partial: true
+  # --- eased-in finetune schedule, scaled for batch_size 2 (see header) -----------------
+  batch_size: 2
+  lr: 1.0e-5
+  warmup_epochs: 1
+
+arch:
+  # exp70 parity (behavior flags only, no checkpoint shape change — see header).
+  encoder_spacing_aware: true
+  encoder_input_norm: instance
+  mask_slots: 2
+  decode_source: mask
+  # Deliberate divergence from exp70 (which trained mask_embed=linear): different
+  # module/shapes, loaded partially via train.checkpoint_allow_partial above — comes up
+  # at random init, warm-starts everything else.
+  mask_embed: conv
+
+# exp70's aug trims, carried over verbatim (elastic/deform off, affine scale neutral,
+# bilinear mask warp) — see header.
+augmentations:
+  task:
+    affine:
+      p: 0.5
+      scale_min: 1
+      scale_max: 1
+    elastic:
+      p: 0
+    deform:
+      p: 0
+    mask_interp: bilinear
+  per_image:
+    affine:
+      p: 0.2
+    elastic:
+      p: 0
+    deform:
+      p: 0
+    mask_interp: bilinear
+
+wandb:
+  name: 71_cascade_finetune_from_varspacing

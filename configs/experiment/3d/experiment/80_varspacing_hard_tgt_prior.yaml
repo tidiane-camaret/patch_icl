@@ -1,0 +1,51 @@
+# @package _global_
+# 80_varspacing_hard_tgt_prior — exp70 + arch.mask_embed=conv + a tougher prior_perturb +
+# a none-mode mix on data.query_prior, so the query mask-token prior is never a near-clean
+# copy of the target GT, and training also exercises the exact no-prior condition eval
+# always uses.
+#
+#   python experiments/3d/train.py experiment=80_varspacing_hard_tgt_prior
+#
+# WHY: exp70's `query_prior: gt` injects a prior on EVERY training step, and the inherited
+# dataset=d1 `prior_perturb` ranges all include 0 at the floor (dilate_mm/erode_mm/shift_mm/
+# noise_std), so a meaningful fraction of steps hand the query mask token something close
+# to the real answer. The model learns to copy it through `decode_source: mask` instead of
+# using image+context evidence; at eval (no prior injected, `query_prior.py`'s prior-free
+# support-mean fallback) that shortcut isn't available and val/dice collapses (~0.8 -> ~0.01,
+# observed on a real training run of exp70). Two independent fixes, combined here:
+#
+#   1. prior_perturb floors raised past the measured Dice-vs-magnitude knees for each knob
+#      (not guessed — see results/3d/query_prior_injection/perturb_gt/, viz_prior_perturb.py
+#      + fig1-3): dilate_mm/erode_mm need >=2mm to clear the cliff between 1-2mm on a small
+#      organ; shift_mm is gradual (no cliff) so its floor is pushed further to bite at all;
+#      noise_std is a near step function with its knee at ~0.10-0.12, so its floor moves to
+#      0.15 (0.1 is still pre-knee / a no-op).
+#   2. data.query_prior mixes in `none` at 20% of steps (0.8/0.2), so training also sees the
+#      exact prior-free support-mean fallback eval always runs under, not just a harder
+#      version of the always-on-prior case.
+#
+# arch.mask_embed=conv is a from-scratch choice here (exp70/80 train from scratch, no
+# checkpoint to warm-start — unlike exp71's cascade finetune, no partial-load seam needed).
+
+defaults:
+  - 70_patchset_varspacing_6_1_5
+  - _self_
+
+arch:
+  mask_embed: conv
+
+data:
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+wandb:
+  name: 80_varspacing_hard_tgt_prior
