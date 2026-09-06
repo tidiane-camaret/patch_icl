@@ -1,5 +1,9 @@
 # Change log
 
+## 2026-09-06 — multi-source dataloader
+
+- multi-source dataloader: add MultiSourceProvider (v2 cohort hook) — per-task modality regime (all-ct / all-mri / forced cross) over two modality-locked TotalSegProviders, with per-class fallback to the other modality. src/providers/multisource.py (+ unit tests).
+
 ## 2026-09-02 — exp 69: Medverse baseline for the exp 68 cascade (variable-spacing, no cascade)
 
 `configs/experiment/3d/experiment/69_medverse_varspacing_6_1_5.yaml` — the single-forward
