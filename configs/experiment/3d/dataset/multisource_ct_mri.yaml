@@ -6,17 +6,19 @@
 #   ct    (~1/3): target + all K contexts CT
 #   mri   (~1/3): target + all K contexts MRI
 #   cross (~1/3): target one modality, all K contexts the other (forced)
-# A class with no subjects in the wanted modality falls back to the other one
+# The class is drawn AFTER the regime, from that regime's no-fallback pool
+# (regime-conditional class draw), so the `cross` third is a GENUINE cross-modality
+# rate ~= regime_p[cross]. The per-slot modality fallback is now a rare safety net
 # (see src/providers/multisource.py). Eval is a stochastic-but-seeded mix of
 # `eval_epoch_length` items; regime/modality breakdown is read from the wandb
 # sample-table `detail` column (evaluate.py::_sample_detail).
 #
 #   python experiments/3d/train.py experiment=81_multisource_ct_mri
 #   python experiments/3d/plot_dataset_items.py dataset=multisource_ct_mri --split train
-paths:
-  # Repeated for cluster-independence (also in cluster/nfs.yaml).
-  totalseg:    /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg
-  totalsegmri: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalsegmri
+# paths.totalseg / paths.totalsegmri both come from the cluster config
+# (configs/cluster/{nfs,meta}.yaml). Do NOT set a paths: block here — the dataset
+# group composes AFTER cluster in train.yaml's defaults, so it would override
+# cluster=meta and wrongly resolve to the NFS roots.
 data:
   source: multisource
   loader_v2: true
@@ -24,9 +26,9 @@ data:
   context_size: 1
   train_spacing_range: [1.5, 6.0]     # per-batch log-uniform crop pitch (SpacingBatchSampler)
   crop_spacing_mm: 3                  # fixed eval pitch (train_spacing_range is train-only)
-  mask_downsample: soft              # eval maps back to "occupancy" in make_eval_loader
+  mask_downsample: soft              # eval maps "soft" back to "occupancy" in build_dataset (multisource branch)
   mask_occupancy_thr: 0.5
-  class_balanced: true               # (cohort assemble_task samples class uniformly anyway)
+  class_balanced: true               # (cohort assemble_task draws class per-regime anyway)
   max_ds_len_train: 1000             # train samples per epoch
   ct_norm: null                      # CT frame; the MRI sub-provider uses per-subject z-score
   train_classes: union               # sentinel — resolved by common.resolve_multisource_classes
@@ -35,7 +37,14 @@ data:
     sources: [totalseg, totalsegmri]
     modalities: [ct, mri]                        # parallel to `sources`
     per_source_train_classes: [balanced, train]  # spec fed to resolve_classes per source
-    per_source_val_classes:   [all, train]       # CT val on all 117; MRI on its 23 `train` classes (see ruling 1)
+    # CT val on all 117 (seen+unseen). MRI on all 50 MRI_ALL_CLASSES (23 train + 23
+    # val + 4 unknown) -> symmetric seen/unseen for a cross-modality *generalization*
+    # eval; [all, train] gave MRI no unseen-class signal. split_map still remaps the
+    # MRI subject split val->test (below).
+    per_source_val_classes:   [all, all]
     regime_p: [0.334, 0.333, 0.333]              # (all-ct, all-mri, cross)
     split_map: {totalsegmri: {val: test}}        # MRI has no `val` subject split -> eval on `test`
-    eval_epoch_length: 2000                      # ~16 tasks/class over ~120 union classes
+    # Cohort eval draws `eval_epoch_length` stochastic-but-seeded tasks; ~117 union
+    # classes at eval (~70 at train) -> ~17 tasks/class. eval.tasks_per_class
+    # (inherited via exp70) is INERT in cohort mode — assemble_task ignores it.
+    eval_epoch_length: 2000

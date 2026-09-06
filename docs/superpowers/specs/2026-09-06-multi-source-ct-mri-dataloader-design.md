@@ -100,11 +100,18 @@ __init__(sub_providers: dict[str, TotalSegProvider], *,
 
 `assemble_task(rng, crop_spacing_mm) -> dict`:
 
-1. `cls = rng.choice(self.classes)` — class-uniform (= class-balanced).
-2. `m0, m1 = list(self.subs)` (e.g. `"ct"`, `"mri"`);
+1. `m0, m1 = list(self.subs)` (e.g. `"ct"`, `"mri"`);
    `regime = rng.choices([m0, m1, "cross"], weights=self.regime_p)[0]`.
    The stored `meta["regime"]` is this value verbatim — a modality key
    (`"ct"` / `"mri"`) for the pure regimes, or `"cross"`.
+2. **Regime-conditional class draw (F7):** `cls = rng.choice(pool)` where `pool`
+   is `self._both_classes` for `cross`, else `self._classes_by_mod[regime]` (the
+   classes that regime can serve with no fallback). Empty pool (no both-modality
+   class at all, or a modality with zero classes) → `rng.choice(self.classes)`
+   and the per-slot fallback below handles it. This makes the genuine
+   cross-modality rate ≈ `regime_p[cross]` instead of ~6.7% (a class-first
+   uniform draw hit a CT-only class ~90% of the time and collapsed `cross` to
+   pure-CT). `_classes_by_mod` / `_both_classes` are precomputed in `__init__`.
 3. Resolve a modality per slot (`1 + context_size` slots):
    - pure regime (`regime in (m0, m1)`): `want = regime`; if
      `want not in _avail[cls]`, `want = _avail[cls][0]` (fallback). All slots =
@@ -132,13 +139,17 @@ __init__(sub_providers: dict[str, TotalSegProvider], *,
      "label_name": cls,
      "modality": tgt_mod,                              # target modality
      "aug_mode": torch.tensor(0, dtype=torch.long),
-     "meta": {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod},
+     "meta": {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod,
+              "fallback": bool(regime == "cross" and tgt_mod == ctx_mod)},
    }
    ```
+   `meta["fallback"]` flags a `"cross"` draw that collapsed to same-modality
+   (only the empty-pool safety net under F7). `evaluate.py::_sample_detail`
+   renders it as a trailing ` [fb]`.
 7. The engine applies `_augment_stacks` (shared geometric task-aug across the
    whole K+1, per-volume intensity aug) because `"image"` is present.
 
-Determinism: every stochastic choice (class, regime, per-modality subject
+Determinism: every stochastic choice (regime, class, per-modality subject
 shuffle, and each `load`'s crop jitter) is drawn from the single `rng` the engine
 passes. With `eval_seed` set, `rng = Random(hash((eval_seed, idx)))` → the item
 for a given `idx` is byte-identical across models, runs, workers, and DataLoader
@@ -150,9 +161,9 @@ New Hydra dataset group. Geometry inherited from the d2 varspacing regime.
 
 ```yaml
 # @package _global_
-paths:
-  totalseg: ...        # repeated for cluster-independence (also in cluster/*.yaml)
-  totalsegmri: ...
+# No paths: block — totalseg / totalsegmri roots come from the cluster config
+# (the dataset group composes after cluster, so a paths: block here would
+# override cluster=meta).
 data:
   source: multisource
   loader_v2: true
@@ -160,7 +171,7 @@ data:
   context_size: 1
   train_spacing_range: [1.5, 6.0]     # per-batch log-uniform (SpacingBatchSampler)
   crop_spacing_mm: 3                  # fixed eval pitch
-  mask_downsample: soft              # eval maps back to occupancy (make_eval_loader)
+  mask_downsample: soft              # eval maps back to occupancy (build_dataset multisource branch)
   mask_occupancy_thr: 0.5
   class_balanced: true
   max_ds_len_train: 1000
@@ -171,10 +182,10 @@ data:
     sources: [totalseg, totalsegmri]
     modalities: [ct, mri]            # parallel to `sources`; sub-provider modality flag
     per_source_train_classes: [balanced, train]   # spec fed to resolve_classes per source
-    per_source_val_classes:   [all, test]
+    per_source_val_classes:   [all, all]          # CT all 117; MRI all 50 -> symmetric seen/unseen
     regime_p: [0.334, 0.333, 0.333]  # (all-ct, all-mri, cross)
     split_map: {totalsegmri: {val: test}}         # CT keeps val; MRI val->test
-    eval_epoch_length: 1400          # ~20 tasks/class over ~70 union classes
+    eval_epoch_length: 2000          # ~17 tasks/class over ~117 union eval classes
 ```
 
 `union` for `train_classes`/`val_classes` is resolved by the wiring below;
@@ -256,7 +267,10 @@ already builds `RandomSampler(ds)` (length = `epoch_length`, capped by
 ### 5. `experiments/3d/evaluate.py::_sample_detail`
 
 Currently returns `""` for anything without an omniSynth `class_id`. Add: if
-`meta` carries `"regime"`, return `f"{meta['regime']} {meta['tgt_mod']}<-{meta['ctx_mod']}"`.
+`meta` carries `"regime"`, return
+`f"{meta['regime']} {meta['tgt_mod']}<-{meta['ctx_mod']}"`, plus a trailing
+` [fb]` when `meta["fallback"]` is set (a "cross" draw that collapsed to
+same-modality on a single-modality class).
 This lands in the sample-table `detail` column, so the wandb per-case table
 (logged every eval by `build_sample_table`) breaks Dice down by regime and
 modality pair with no schema change and no new plumbing. Aggregate + seen/unseen
@@ -318,15 +332,32 @@ repo's `_check_*` / `_plot_*` convention):
    through-plane. This is exactly what the existing `dataset=totalseg_mri` config
    already does (occupancy resample mitigates thin-structure loss); the
    multi-source path does not make it worse.
-2. **Regime fallback on CT-only classes.** ~47 of the ~70 union classes have no
-   MRI subjects, so their `mri` and `cross` regimes collapse to CT. Their
-   effective modality mix is CT-only; expected given the data, surfaced by the
-   test's fallback counter and the `detail` column.
+2. **CT-only classes are CT-only.** ~47 of the ~70 union classes have no MRI
+   subjects. With the regime-conditional class draw (F7) they are simply never
+   selected under the `mri` or `cross` regime — the class is drawn *after* the
+   regime, from that regime's no-fallback pool — so the `cross` third is a
+   genuine cross-modality rate (≈ `regime_p[cross]`), not fallback-dominated. The
+   per-slot `_draw_subjects` fallback, the `meta["fallback"]` flag and the
+   `detail` `[fb]` marker remain only as a safety net for the degenerate case
+   where a regime has no candidate classes at all.
 3. **MRI eval on `test`.** Spends the MRI test split during training-time
    validation. A dedicated MRI `val` split (carved from `train`) is deferred.
 4. **Cohort eval coverage is statistical.** No enumerated per-class task list;
    `eval_epoch_length` is sized for ~20 tasks/class on average. Reproducible, but
    per-class counts vary run-to-run only if `eval_seed` changes.
+5. **Only `train.py` / `eval.py` know `multisource`.** The eval.py siblings
+   `probe_context_drift.py`, `feature_sim/probe_transformer.py` and
+   `rawcheck_ab.py` have their own class-resolution ladders with no `multisource`
+   branch — they raise `No classes found for split 'union'` on this config. Each
+   needs the same ~4-line branch (`resolve_multisource_classes(cfg, "val")` +
+   `root = cfg.paths.totalseg`) before it can run against `experiment=81`.
+6. **Subject-id namespace collision across roots.** The CT (`totalseg`) and MRI
+   (`totalsegmri`) roots both number subjects `s0000…`, so a cross-modality task
+   whose CT and MRI ids happen to coincide is mis-flagged `self_ctx` (~0.1% of
+   cross tasks, and those are already excluded from the val aggregate), and the
+   sample-table `subject` column is ambiguous between the two roots. Left
+   unfixed — a real fix (root-qualified ids) ripples into evaluate.py's
+   figure / `ctx_cases` handling; revisit if it starts to matter.
 
 ## Out of scope
 

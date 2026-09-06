@@ -1,9 +1,11 @@
 """Multi-source in-context provider (v2 cohort hook).
 
 Composes two modality-locked TotalSegProviders into one provider that draws, per
-task, a modality REGIME (all-source-0 / all-source-1 / forced cross) and loads the
-K+1 cases accordingly. A class with no subjects in the wanted modality falls back
-to the other modality. Implements the engine's `assemble_task` hook (like
+task, a modality REGIME (all-source-0 / all-source-1 / forced cross), then draws a
+class that regime can serve WITHOUT fallback (regime-conditional class draw), and
+loads the K+1 cases accordingly. The per-slot modality fallback (a class with no
+subjects in the wanted modality) remains only as a rare safety net. Implements the
+engine's `assemble_task` hook (like
 src/providers/synth_gmm.py), so InContextDataset owns only aug + the per-item RNG.
 """
 import warnings
@@ -40,6 +42,11 @@ class MultiSourceProvider:
         self.classes = list(self._avail)
         if not self.classes:
             raise ValueError("MultiSourceProvider: no class has subjects in any sub-provider")
+        # Regime-conditional class pools: each regime draws only from classes it can
+        # serve without fallback (m -> classes with m subjects; "cross" -> both-modality).
+        self._classes_by_mod = {m: [c for c in self.classes if m in self._avail[c]]
+                                for m in self._mods}
+        self._both_classes = [c for c in self.classes if len(self._avail[c]) == 2]
 
     # --- VolumeProvider protocol stubs (engine uses assemble_task in cohort mode) ---
     def subjects_for(self, cls):
@@ -65,10 +72,17 @@ class MultiSourceProvider:
 
     # --- cohort hook ---
     def assemble_task(self, rng, crop_spacing_mm):
-        cls = rng.choice(self.classes)
-        avail = self._avail[cls]
         m0, m1 = self._mods
         regime = rng.choices([m0, m1, "cross"], weights=self.regime_p, k=1)[0]
+
+        # Draw the class from this regime's no-fallback pool, so the genuine
+        # cross-modality rate ~= regime_p[cross] (a uniform pre-regime draw
+        # collapsed ~90% of `cross` tasks to pure-CT). Empty pool (no both-modality
+        # class at all / a modality with no classes) -> uniform draw + the per-slot
+        # fallback below.
+        pool = self._both_classes if regime == "cross" else self._classes_by_mod[regime]
+        cls = rng.choice(pool) if pool else rng.choice(self.classes)
+        avail = self._avail[cls]
 
         if regime == "cross":
             tgt_mod = rng.choice(avail)
@@ -105,5 +119,8 @@ class MultiSourceProvider:
             "label_name": cls,
             "modality": tgt_mod,
             "aug_mode": torch.tensor(0, dtype=torch.long),
-            "meta": {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod},
+            # `regime` is the pre-fallback draw; `fallback` flags a "cross" draw that
+            # landed on a single-modality class and so collapsed to same-modality.
+            "meta": {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod,
+                     "fallback": bool(regime == "cross" and tgt_mod == ctx_mod)},
         }

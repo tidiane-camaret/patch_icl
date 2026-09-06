@@ -3,8 +3,9 @@
     python experiments/3d/_check_multisource.py
 
 Builds the train + eval datasets via Hydra compose, pulls items, and asserts:
-  - regime frequencies are ~1/3 each (over classes available in both modalities);
-  - every `cross` task on a both-modality class is genuinely cross-modality;
+  - regime frequencies are ~1/3 each;
+  - every `cross` task draws a both-modality class and is genuinely cross-modality
+    (F7 regime-conditional class draw -> genuine-cross rate ~= regime_p[cross]);
   - a CT-only union class never yields an MRI slot;
   - the eval dataset is deterministic (idx -> identical item across two builds);
   - both-modality classes all appear in the eval pass, overall coverage >= 90%.
@@ -22,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hydra import compose, initialize_config_dir
 
-from common import build_dataset
+from common import build_dataset, resolve_multisource_classes
 
 
 def _cfg(overrides):
@@ -44,21 +45,28 @@ def main():
 
     rng = __import__("random").Random(0)
     regimes = Counter()
-    cross_checked = 0
+    cross_genuine = 0
     for _ in range(600):
         it = prov.assemble_task(rng, 3.0)
         m = it["meta"]
         regimes[m["regime"]] += 1
-        if m["regime"] == "cross" and len(prov._avail[it["label_name"]]) == 2:
-            cross_checked += 1
-            assert m["tgt_mod"] != m["ctx_mod"], m
+        if m["regime"] == "cross":
+            # F7: `cross` draws its class from both-modality classes only, so every
+            # cross task is genuinely cross-modality with no fallback collapse.
+            assert len(prov._avail[it["label_name"]]) == 2, m
+            assert m["tgt_mod"] != m["ctx_mod"] and not m["fallback"], m
+            cross_genuine += 1
         if prov._avail[it["label_name"]] == ["ct"]:
             assert it["modality"] == "ct" and m["ctx_mod"] == "ct", m
-    print("train regime mix:", dict(regimes))
     tot = sum(regimes.values())
+    print("train regime mix:", dict(regimes),
+          f"  genuine-cross: {cross_genuine}/{regimes['cross']} "
+          f"({cross_genuine / tot:.2%} of all tasks)")
     for r in ("ct", "mri", "cross"):
         assert abs(regimes[r] / tot - 1 / 3) < 0.06, (r, regimes)
-    assert cross_checked > 20, "cross branch never hit a both-modality class"
+    # F7: genuine cross-modality rate ~= regime_p[cross] (~1/3), not the old ~6.7%.
+    assert cross_genuine == regimes["cross"], (cross_genuine, regimes)
+    assert cross_genuine / tot > 0.25, (cross_genuine, tot)
 
     # --- eval dataset: determinism + class coverage ---
     ev1 = build_dataset(cfg, "val")
@@ -72,6 +80,13 @@ def main():
         assert torch.equal(a["context_in"], b["context_in"]), idx
     seen = Counter(ev1[i]["label_name"] for i in range(len(ev1)))
     print(f"eval covers {len(seen)}/{len(ev1.provider.classes)} classes")
+
+    # Config-resolved val classes with no subjects in EITHER sub-provider: these are
+    # dropped by MultiSourceProvider (e.g. kidney_cyst_left/right are legitimately
+    # absent from CT label.npy). Informational — not asserted equal.
+    val_classes = resolve_multisource_classes(cfg, "val")
+    print("eval classes with no provider subjects:",
+          sorted(set(val_classes) - set(ev1.provider.classes)))
 
     # hard: every both-modality class must be sampled at least once
     both = [c for c in ev1.provider.classes if len(ev1.provider._avail[c]) == 2]

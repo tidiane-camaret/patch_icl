@@ -13,6 +13,15 @@ def test_regime_meta_renders():
     assert _sample_detail({"regime": "ct", "tgt_mod": "ct", "ctx_mod": "ct"}) == "ct ct<-ct"
 
 
+def test_fallback_marker():
+    # a "cross" draw that collapsed to same-modality gets a [fb] suffix
+    assert _sample_detail({"regime": "cross", "tgt_mod": "ct", "ctx_mod": "ct",
+                           "fallback": True}) == "cross ct<-ct [fb]"
+    # genuine cross (fallback False/absent) is unmarked
+    assert _sample_detail({"regime": "cross", "tgt_mod": "ct", "ctx_mod": "mri",
+                           "fallback": False}) == "cross ct<-mri"
+
+
 def test_non_regime_meta_unchanged():
     assert _sample_detail(None) == ""
     assert _sample_detail({}) == ""

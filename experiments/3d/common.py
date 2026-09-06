@@ -123,20 +123,38 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     return source, root, source == "totalsegmri"
 
 
+def _multisource_specs(cfg, which: str) -> list[tuple[str, str, object, str]]:
+    """Per-source (src, modality, class_spec, root) tuples for data.source=multisource.
+
+    `which` is "train" or "val"; the class spec comes from
+    data.source_mix.per_source_{which}_classes (parallel to .sources / .modalities).
+    Guards that source_mix is present and its three parallel lists match length, so
+    resolve_multisource_classes and build_dataset can't drift.
+    """
+    if "source_mix" not in cfg.data:
+        raise ValueError("cfg.data.source_mix is not set (needed for data.source=multisource)")
+    sm = cfg.data.source_mix
+    specs = sm[f"per_source_{which}_classes"]
+    if not (len(sm.sources) == len(sm.modalities) == len(specs)):
+        raise ValueError("source_mix.sources / modalities / per_source_*_classes "
+                         "must be the same length")
+    out = []
+    for src, mod, spec in zip(sm.sources, sm.modalities, specs):
+        root = cfg.paths.get(src)
+        if root is None:
+            raise ValueError(f"cfg.paths.{src} is not set (data.source_mix.sources)")
+        out.append((src, mod, spec, root))
+    return out
+
+
 def resolve_multisource_classes(cfg, which: str) -> list[str]:
     """Sorted union of per-source class lists for data.source=multisource.
 
     `which` is "train" or "val"; the per-source spec comes from
     data.source_mix.per_source_{which}_classes (parallel to .sources / .modalities).
     """
-    sm = cfg.data.source_mix
-    key = f"per_source_{which}_classes"
-    specs = sm[key]
     out: set[str] = set()
-    for src, mod, spec in zip(sm.sources, sm.modalities, specs):
-        root = cfg.paths.get(src)
-        if root is None:
-            raise ValueError(f"cfg.paths.{src} is not set (data.source_mix.sources)")
+    for src, mod, spec, root in _multisource_specs(cfg, which):
         out.update(resolve_classes(spec, root, is_mri=(mod == "mri")))
     return sorted(out)
 
@@ -322,14 +340,12 @@ def build_dataset(cfg, split: str):
         is_train = split == "train"
         sm = d.source_mix
         which = "train" if is_train else "val"
-        specs = sm[f"per_source_{which}_classes"]
         split_map = sm.get("split_map", {}) or {}
         subs = {}
-        for src, mod, spec in zip(sm.sources, sm.modalities, specs):
-            root = cfg.paths.get(src)
+        for src, mod, spec, root in _multisource_specs(cfg, which):
             sub_split = split_map.get(src, {}).get(split, split)
             classes = resolve_classes(spec, root, is_mri=(mod == "mri"))
-            subs[mod] = TotalSegProvider(
+            sub = TotalSegProvider(
                 root=root, classes=classes, image_size=tuple(d.image_size),
                 split=sub_split,
                 max_subjects=(d.get("max_train_subjects") if is_train
@@ -342,6 +358,15 @@ def build_dataset(cfg, split: str):
                                        else d.get("mask_downsample", "occupancy"))),
                 mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
                 modality=mod, ct_norm=d.get("ct_norm"), ram_cache=False)
+            # A broken split_map / class spec (or a wrong root) would leave a sub-provider
+            # with zero usable subjects -> the run silently degrades to one modality with
+            # bogus "cross" labels. Fail loudly instead.
+            if not any(sub.subjects_for(c) for c in sub.classes):
+                raise ValueError(
+                    f"multisource: source {src!r} (modality {mod!r}, split {sub_split!r}) "
+                    f"has no subjects for any of its {len(classes)} classes — check "
+                    f"paths.{src} / source_mix.split_map / the class spec.")
+            subs[mod] = sub
         provider = MultiSourceProvider(
             subs, context_size=d.context_size,
             regime_p=tuple(sm.get("regime_p", (1 / 3, 1 / 3, 1 / 3))),

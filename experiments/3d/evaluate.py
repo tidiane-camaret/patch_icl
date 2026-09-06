@@ -264,13 +264,15 @@ def save_cascade_figure(out_path: Path, *,
 def _sample_detail(meta: dict | None) -> str:
     """One compact per-sample string for the sample table's `detail` column, adapting
     to the data source (mirrors experiments/2d/evaluate.py:_sample_detail). multisource
-    meta -> "<regime> <tgt><-<ctx>"; omniSynth3D meta -> "mode=<m> class=<id> sub=<i>";
+    meta -> "<regime> <tgt><-<ctx>" (+ " [fb]" when a "cross" draw fell back to
+    same-modality); omniSynth3D meta -> "mode=<m> class=<id> sub=<i>";
     anything else / missing -> "". Keeps the table's columns fixed across sources
     (totalseg items carry no meta)."""
     if not meta:
         return ""
     if "regime" in meta:  # multisource (src/providers/multisource.py)
-        return f"{meta['regime']} {meta.get('tgt_mod', '?')}<-{meta.get('ctx_mod', '?')}"
+        return (f"{meta['regime']} {meta.get('tgt_mod', '?')}<-{meta.get('ctx_mod', '?')}"
+                + (" [fb]" if meta.get("fallback") else ""))
     if "class_id" in meta:  # omniSynth3D
         return (f"mode={meta.get('target_mode', '')} "
                 f"class={meta.get('class_id', '')} "

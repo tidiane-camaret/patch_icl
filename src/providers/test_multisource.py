@@ -87,11 +87,31 @@ def test_cross_is_cross_modality_when_both_available():
     seen = 0
     for _ in range(2000):
         it = prov.assemble_task(rng, 3.0)
-        if it["meta"]["regime"] == "cross" and it["label_name"] in ("b", "c"):
+        if it["meta"]["regime"] == "cross":
             seen += 1
+            # F7: `cross` draws its class from both-modality classes only.
+            assert it["label_name"] in ("b", "c")
             assert it["meta"]["tgt_mod"] != it["meta"]["ctx_mod"]
+            assert it["meta"]["fallback"] is False
             assert it["modality"] in ("ct", "mri")
-    assert seen > 50  # sanity: the branch was actually exercised
+    assert seen > 400  # ~1/3 of 2000 -- every cross draw is now genuine
+
+
+def test_regime_conditional_class_sampling():
+    prov, _, _ = _mk()
+    rng = random.Random(7)
+    ct_classes = set(prov._classes_by_mod["ct"])    # a, b, c
+    mri_classes = set(prov._classes_by_mod["mri"])   # b, c, d
+    for _ in range(3000):
+        it = prov.assemble_task(rng, 3.0)
+        r, c = it["meta"]["regime"], it["label_name"]
+        if r == "cross":
+            assert c in prov._both_classes
+            assert it["meta"]["tgt_mod"] != it["meta"]["ctx_mod"]
+        elif r == "ct":
+            assert c in ct_classes
+        elif r == "mri":
+            assert c in mri_classes
 
 
 def test_ct_only_class_never_produces_mri():
@@ -100,22 +120,29 @@ def test_ct_only_class_never_produces_mri():
     for _ in range(500):
         it = prov.assemble_task(rng, 3.0)
         if it["label_name"] == "a":
+            # F7: a CT-only class can only be picked under the `ct` regime now.
+            assert it["meta"]["regime"] == "ct"
             assert it["modality"] == "ct"
             assert it["meta"]["ctx_mod"] == "ct"
             assert all(s.startswith("ca") for s in it["context_subjects"])
             assert it["subject"].startswith("ca")
 
 
-def test_pure_regime_falls_back_for_missing_modality():
-    # regime forced to 'mri' (index 1) always; class 'a' has no MRI -> falls back to ct.
-    prov, _, _ = _mk(regime_p=(0.0, 1.0, 0.0))
+def test_empty_pool_regime_falls_back_to_uniform():
+    # No both-modality class exists -> the `cross` pool is empty -> assemble_task
+    # falls back to a uniform class draw and the per-slot modality fallback (the
+    # only path that still sets meta["fallback"]).
+    ct = _FakeSub("ct", {"a": ["ca0", "ca1"]})
+    mri = _FakeSub("mri", {"z": ["mz0", "mz1"]})
+    prov = MultiSourceProvider({"ct": ct, "mri": mri}, context_size=1,
+                               regime_p=(0.0, 0.0, 1.0), epoch_length=10)
+    assert prov._both_classes == []
     rng = random.Random(3)
     for _ in range(200):
         it = prov.assemble_task(rng, 3.0)
-        if it["label_name"] == "a":
-            assert it["meta"]["regime"] == "mri"       # regime label is unchanged
-            assert it["modality"] == "ct"              # resolved slot modality fell back
-            assert it["meta"]["ctx_mod"] == "ct"
+        assert it["meta"]["regime"] == "cross"          # regime label unchanged
+        assert it["meta"]["tgt_mod"] == it["meta"]["ctx_mod"]  # collapsed to same-modality
+        assert it["meta"]["fallback"] is True
 
 
 def test_determinism_same_seed_same_item():

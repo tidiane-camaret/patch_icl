@@ -224,6 +224,13 @@ def main(cfg: DictConfig) -> None:
         from data.totalseg_classes import resolve_more_labels_classes
         root = cfg.paths.get("totalseg_more_labels")
         classes = resolve_more_labels_classes(root, cfg.data.val_classes)
+    elif source == "multisource":
+        # `val_classes` is the `union` sentinel — resolve the per-source union
+        # (mirrors train.py::_resolve_classes_for). `root` is the CT root for the
+        # banner / node-local cache key; sub-roots come from source_mix.sources.
+        from common import resolve_multisource_classes
+        classes = resolve_multisource_classes(cfg, "val")
+        root = cfg.paths.get("totalseg")
     else:
         _, root, is_mri = _source_root(cfg)
         classes = resolve_classes(cfg.data.val_classes, root, is_mri=is_mri)
