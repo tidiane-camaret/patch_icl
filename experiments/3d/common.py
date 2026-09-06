@@ -108,6 +108,11 @@ def _source_root(cfg) -> tuple[str, str, bool]:
         if root is None:
             raise ValueError("cfg.paths.chemotox is not set (needed for source=chemotox_bc)")
         return source, root, False
+    if source == "multisource":
+        root = cfg.paths.get("totalseg")
+        if root is None:
+            raise ValueError("cfg.paths.totalseg is not set (needed for data.source=multisource)")
+        return source, root, False
     if source not in _TOTALSEG_SOURCES:
         raise ValueError(
             f"unknown data.source {source!r} (expected one of {_TOTALSEG_SOURCES})"
@@ -116,6 +121,24 @@ def _source_root(cfg) -> tuple[str, str, bool]:
     if root is None:
         raise ValueError(f"cfg.paths.{source} is not set (needed for data.source={source!r})")
     return source, root, source == "totalsegmri"
+
+
+def resolve_multisource_classes(cfg, which: str) -> list[str]:
+    """Sorted union of per-source class lists for data.source=multisource.
+
+    `which` is "train" or "val"; the per-source spec comes from
+    data.source_mix.per_source_{which}_classes (parallel to .sources / .modalities).
+    """
+    sm = cfg.data.source_mix
+    key = f"per_source_{which}_classes"
+    specs = sm[key]
+    out: set[str] = set()
+    for src, mod, spec in zip(sm.sources, sm.modalities, specs):
+        root = cfg.paths.get(src)
+        if root is None:
+            raise ValueError(f"cfg.paths.{src} is not set (data.source_mix.sources)")
+        out.update(resolve_classes(spec, root, is_mri=(mod == "mri")))
+    return sorted(out)
 
 
 def eval_cfg(cfg):
@@ -287,6 +310,45 @@ def build_dataset(cfg, split: str):
         return InContextDataset(
             provider, context_size=d.context_size,
             class_balanced=(is_train and d.get("class_balanced", False)),
+            aug_cfg=(cfg.augmentations if is_train else None),
+            defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
+            crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+            eval_seed=(None if is_train else int(cfg.get("eval", {}).get("seed", 0))))
+
+    if d.get("source") == "multisource":
+        from src.incontext_dataset_v2 import InContextDataset
+        from src.providers.totalseg import TotalSegProvider
+        from src.providers.multisource import MultiSourceProvider
+        is_train = split == "train"
+        sm = d.source_mix
+        which = "train" if is_train else "val"
+        specs = sm[f"per_source_{which}_classes"]
+        split_map = sm.get("split_map", {}) or {}
+        subs = {}
+        for src, mod, spec in zip(sm.sources, sm.modalities, specs):
+            root = cfg.paths.get(src)
+            sub_split = split_map.get(src, {}).get(split, split)
+            classes = resolve_classes(spec, root, is_mri=(mod == "mri"))
+            subs[mod] = TotalSegProvider(
+                root=root, classes=classes, image_size=tuple(d.image_size),
+                split=sub_split,
+                max_subjects=(d.get("max_train_subjects") if is_train
+                              else d.get("max_val_subjects")),
+                crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
+                crop_jitter=(d.get("crop_jitter") if is_train
+                             else cfg.get("eval", {}).get("crop_jitter", 0)),
+                mask_downsample=(d.get("mask_downsample", "occupancy") if is_train
+                                 else ("occupancy" if d.get("mask_downsample") == "soft"
+                                       else d.get("mask_downsample", "occupancy"))),
+                mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
+                modality=mod, ct_norm=d.get("ct_norm"), ram_cache=False)
+        provider = MultiSourceProvider(
+            subs, context_size=d.context_size,
+            regime_p=tuple(sm.get("regime_p", (1 / 3, 1 / 3, 1 / 3))),
+            epoch_length=((d.get("max_ds_len_train") or 1000) if is_train
+                          else int(sm.eval_epoch_length)))
+        return InContextDataset(
+            provider, context_size=d.context_size,
             aug_cfg=(cfg.augmentations if is_train else None),
             defer_aug=(is_train and bool(cfg.get("augmentations", {}).get("gpu", False))),
             crop_spacing_mm=d.get("crop_spacing_mm", 1.5),
@@ -650,7 +712,8 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     d, e = cfg.data, cfg.eval
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
-                            "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg"):
+                            "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg",
+                            "multisource"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool

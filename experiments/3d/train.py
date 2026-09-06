@@ -876,6 +876,9 @@ def _resolve_classes_for(cfg, classes_key):
     if src == "chemotox_bc":
         from src.chemotox_dataset import BC_NAMES
         return list(BC_NAMES)
+    if src == "multisource":
+        from common import resolve_multisource_classes
+        return resolve_multisource_classes(cfg, "train" if classes_key == "train_classes" else "val")
     _, root, is_mri = _source_root(cfg)
     return resolve_classes(cfg.data.get(classes_key), root, is_mri=is_mri)
 

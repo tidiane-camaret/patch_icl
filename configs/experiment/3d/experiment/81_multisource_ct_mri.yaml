@@ -1,0 +1,18 @@
+# @package _global_
+# 81_multisource_ct_mri — exp80 (hard target prior, mask_embed=conv, instance input
+# norm) trained JOINTLY on CT (totalseg) + MRI (totalsegmri) with a per-task modality
+# regime (1/3 all-ct, 1/3 all-mri, 1/3 forced cross). See
+# docs/superpowers/specs/2026-09-06-multi-source-ct-mri-dataloader-design.md and
+# configs/experiment/3d/dataset/multisource_ct_mri.yaml.
+#
+#   python experiments/3d/train.py experiment=81_multisource_ct_mri
+#
+# exp80 already ships arch.encoder_input_norm=instance ("ready for the planned CT+MRI
+# joint run") — this experiment is what consumes it.
+defaults:
+  - 80_varspacing_hard_tgt_prior
+  - override /dataset: multisource_ct_mri
+  - _self_
+
+wandb:
+  name: 81_multisource_ct_mri

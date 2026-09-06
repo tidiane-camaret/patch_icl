@@ -3,6 +3,7 @@
 ## 2026-09-06 — multi-source dataloader
 
 - multi-source dataloader: add MultiSourceProvider (v2 cohort hook) — per-task modality regime (all-ct / all-mri / forced cross) over two modality-locked TotalSegProviders, with per-class fallback to the other modality. src/providers/multisource.py (+ unit tests).
+- multi-source dataloader: dataset=multisource_ct_mri + experiment=81_multisource_ct_mri; common.py gains _source_root/build_dataset/make_eval_loader branches + resolve_multisource_classes; train.py._resolve_classes_for branch. CT eval on val, MRI eval on test (split_map). Integration check: experiments/3d/_check_multisource.py.
 
 ## 2026-09-02 — exp 69: Medverse baseline for the exp 68 cascade (variable-spacing, no cascade)
 
