@@ -5,6 +5,7 @@
 - multi-source dataloader: add MultiSourceProvider (v2 cohort hook) — per-task modality regime (all-ct / all-mri / forced cross) over two modality-locked TotalSegProviders, with per-class fallback to the other modality. src/providers/multisource.py (+ unit tests).
 - multi-source dataloader: dataset=multisource_ct_mri + experiment=81_multisource_ct_mri; common.py gains _source_root/build_dataset/make_eval_loader branches + resolve_multisource_classes; train.py._resolve_classes_for branch. CT eval on val, MRI eval on test (split_map). Integration check: experiments/3d/_check_multisource.py.
 - multi-source dataloader: evaluate.py::_sample_detail renders multisource regime meta ("<regime> <tgt><-<ctx>") into the wandb sample-table `detail` column, so eval Dice can be sliced by regime/modality post-hoc.
+- multi-source dataloader: end-to-end smoke — `experiment=81_multisource_ct_mri` runs 1 epoch on the local RTX A6000 (tiny caps: max_ds_len_train=16, batch_size=2, eval_epoch_length=24, no OOM) through the full SpacingBatchSampler -> assemble_task -> CPU aug -> collate -> train step -> val loop -> build_sample_table path. Finite val dice 0.0102 (best), no traceback. Regime mix over 300 assemble_task calls: cross 93 / ct 99 / mri 108 — all three well represented. Ready for a full run.
 
 ## 2026-09-02 — exp 69: Medverse baseline for the exp 68 cascade (variable-spacing, no cascade)
 
