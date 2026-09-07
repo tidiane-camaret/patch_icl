@@ -173,19 +173,27 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     label_names/aug_mode); crop_geom flows through untouched from each row's target crop."""
     subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
     sp = float(spacing)
+    tmods = batch.get("tgt_modality")
+    cmods = batch.get("ctx_modality")
 
     # Flat load list: per b, the target (k == -1) then its K contexts, in order.
+    # 6th field = the slot's modality ("ct"/"mri") or None for single-source providers.
     tasks = []
     for b in range(len(subs)):
-        tasks.append((b, -1, subs[b], centers[b], f"{seed}_{step}_{level}_{b}"))
+        tmod = tmods[b] if tmods is not None else None
+        cmod = cmods[b] if cmods is not None else None
+        tasks.append((b, -1, subs[b], centers[b], f"{seed}_{step}_{level}_{b}", tmod))
         for k, cs in enumerate(ctxs[b]):
-            tasks.append((b, k, cs, None, f"{seed}_{step}_{level}_{b}_{k}"))
+            tasks.append((b, k, cs, None, f"{seed}_{step}_{level}_{b}_{k}", cmod))
 
     if realize_crop:
         def _load_nc(t):
-            b, _k, subj, center, rk = t
-            return provider.load_native_crop(subj, clss[b], LoadRequest(
-                rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
+            b, _k, subj, center, rk, mod = t
+            req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
+                              center=center, jitter=jitter)
+            if mod is not None:
+                return provider.load_native_crop(subj, clss[b], req, modality=mod)
+            return provider.load_native_crop(subj, clss[b], req)
 
         flat = _run_pool(_load_nc, tasks, recrop_workers)
         # group by each task's own row index (tasks are emitted target-then-contexts
@@ -201,9 +209,12 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
         return out
 
     def _load(t):
-        b, _k, subj, center, rk = t
-        return provider.load(subj, clss[b], LoadRequest(
-            rng=random.Random(rk), crop_spacing_mm=sp, center=center, jitter=jitter))
+        b, _k, subj, center, rk, mod = t
+        req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
+                          center=center, jitter=jitter)
+        if mod is not None:
+            return provider.load(subj, clss[b], req, modality=mod)
+        return provider.load(subj, clss[b], req)
 
     results = _run_pool(_load, tasks, recrop_workers)
 
