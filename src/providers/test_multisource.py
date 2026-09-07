@@ -4,7 +4,7 @@ import random
 import pytest
 import torch
 
-from src.incontext_dataset_v2 import LoadResult
+from src.incontext_dataset_v2 import LoadRequest, LoadResult
 from src.providers.multisource import MultiSourceProvider
 
 
@@ -31,6 +31,20 @@ class _FakeSub:
         )
 
 
+class _FakeSubNC(_FakeSub):
+    """Sub-provider with load_native_crop support."""
+
+    def __init__(self, modality, class_to_subjects):
+        super().__init__(modality, class_to_subjects)
+        self.nc_loaded = []
+
+    def load_native_crop(self, subject, cls, req):
+        self.nc_loaded.append((subject, cls))
+        # a stand-in payload; the provider only forwards it
+        return {"_fake_nc": True, "modality": self.modality,
+                "subject": subject, "spacing": req.crop_spacing_mm}
+
+
 def _mk(regime_p=(1 / 3, 1 / 3, 1 / 3), context_size=1):
     ct = _FakeSub("ct", {"a": ["ca0", "ca1", "ca2"],
                           "b": ["cb0", "cb1", "cb2", "cb3"],
@@ -41,6 +55,19 @@ def _mk(regime_p=(1 / 3, 1 / 3, 1 / 3), context_size=1):
     prov = MultiSourceProvider({"ct": ct, "mri": mri},
                                context_size=context_size, regime_p=regime_p,
                                epoch_length=99)
+    return prov, ct, mri
+
+
+def _mk_nc(regime_p=(1 / 3, 1 / 3, 1 / 3), context_size=1, gpu_realize_crop=False):
+    ct = _FakeSubNC("ct", {"a": ["ca0", "ca1", "ca2"],
+                           "b": ["cb0", "cb1", "cb2", "cb3"],
+                           "c": ["cc0", "cc1", "cc2"]})
+    mri = _FakeSubNC("mri", {"b": ["mb0", "mb1", "mb2"],
+                             "c": ["mc0", "mc1", "mc2"],
+                             "d": ["md0", "md1", "md2"]})
+    prov = MultiSourceProvider({"ct": ct, "mri": mri}, context_size=context_size,
+                               regime_p=regime_p, epoch_length=99,
+                               gpu_realize_crop=gpu_realize_crop)
     return prov, ct, mri
 
 
@@ -174,3 +201,54 @@ def test_rejects_wrong_subprovider_count():
     ct = _FakeSub("ct", {"a": ["ca0"]})
     with pytest.raises(ValueError, match="exactly 2"):
         MultiSourceProvider({"ct": ct}, context_size=1, epoch_length=1)
+
+
+def test_painted_item_has_explicit_modality_keys():
+    prov, _, _ = _mk_nc()
+    it = prov.assemble_task(random.Random(0), 3.0)
+    assert it["tgt_modality"] == it["meta"]["tgt_mod"]
+    assert it["ctx_modality"] == it["meta"]["ctx_mod"]
+    assert "image" in it                       # painted path unchanged
+
+
+def test_native_emission_shape_and_no_image():
+    prov, ct, mri = _mk_nc(context_size=2, gpu_realize_crop=True)
+    it = prov.assemble_task(random.Random(0), 4.0)
+    assert "image" not in it and "native_crop" in it
+    assert len(it["native_crop"]) == 3         # target + 2 contexts
+    assert set(it) >= {"native_crop", "subject", "context_subjects", "label_name",
+                       "tgt_modality", "ctx_modality", "aug_mode", "meta"}
+    assert it["tgt_modality"] == it["meta"]["tgt_mod"]
+    assert it["ctx_modality"] == it["meta"]["ctx_mod"]
+    assert int(it["aug_mode"]) == 0
+    # every payload came from the sub-provider matching its slot's modality
+    assert it["native_crop"][0]["modality"] == it["tgt_modality"]
+    for m in it["native_crop"][1:]:
+        assert m["modality"] == it["ctx_modality"]
+
+
+def test_native_emission_cross_regime_routes_both_subproviders():
+    prov, ct, mri = _mk_nc(regime_p=(0.0, 0.0, 1.0), gpu_realize_crop=True)
+    for _ in range(50):
+        it = prov.assemble_task(random.Random(_), 3.0)
+        if it["tgt_modality"] != it["ctx_modality"]:
+            break
+    else:
+        raise AssertionError("no cross-modality task in 50 draws")
+    assert ct.nc_loaded and mri.nc_loaded       # both sub-providers were hit
+
+
+def test_load_dispatch_by_modality():
+    prov, ct, mri = _mk_nc()
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0)
+    prov.load("mb0", "b", req, modality="mri")
+    assert mri.loaded[-1] == ("mb0", "b") and not ct.loaded
+    prov.load_native_crop("cb0", "b", req, modality="ct")
+    assert ct.nc_loaded[-1] == ("cb0", "b")
+
+
+def test_load_without_modality_raises():
+    prov, _, _ = _mk_nc()
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0)
+    with pytest.raises(RuntimeError, match="modality"):
+        prov.load("mb0", "b", req)

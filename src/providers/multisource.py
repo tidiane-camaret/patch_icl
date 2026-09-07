@@ -19,7 +19,7 @@ class MultiSourceProvider:
     """Cohort-hook provider over exactly two modality-locked sub-providers."""
 
     def __init__(self, sub_providers, *, context_size, regime_p=(1 / 3, 1 / 3, 1 / 3),
-                 epoch_length=1000):
+                 epoch_length=1000, gpu_realize_crop=False):
         if len(sub_providers) != 2:
             raise ValueError(f"MultiSourceProvider expects exactly 2 sub-providers, "
                              f"got {list(sub_providers)}")
@@ -30,6 +30,7 @@ class MultiSourceProvider:
         if len(self.regime_p) != 3:
             raise ValueError(f"regime_p needs 3 entries (m0, m1, cross), got {regime_p}")
         self.epoch_length = int(epoch_length)
+        self.gpu_realize_crop = bool(gpu_realize_crop)
 
         all_classes = set()
         for p in self.subs.values():
@@ -52,8 +53,17 @@ class MultiSourceProvider:
     def subjects_for(self, cls):
         return []
 
-    def load(self, *a, **k):
-        raise RuntimeError("MultiSourceProvider is a cohort provider; use assemble_task")
+    def load(self, subject, cls, req, *, modality=None):
+        """Dispatch a single-case load to the modality-locked sub-provider.
+        Level-0 uses assemble_task; this is the cascade re-crop (level>=1) entry."""
+        if modality is None:
+            raise RuntimeError("MultiSourceProvider.load needs modality= "
+                               "(cohort provider; level-0 goes through assemble_task)")
+        return self.subs[modality].load(subject, cls, req)
+
+    def load_native_crop(self, subject, cls, req, *, modality):
+        """Native-crop re-crop for the GPU-realize cascade path (level>=1)."""
+        return self.subs[modality].load_native_crop(subject, cls, req)
 
     # --- helpers ---
     def _draw_subjects(self, rng, mod, cls, n):
@@ -100,6 +110,24 @@ class MultiSourceProvider:
             tgt_subj = self._draw_subjects(rng, tgt_mod, cls, 1)[0]
             ctx_subjs = self._draw_subjects(rng, ctx_mod, cls, k)
 
+        meta = {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod,
+                "fallback": bool(regime == "cross" and tgt_mod == ctx_mod)}
+
+        if self.gpu_realize_crop:
+            req = LoadRequest(rng=rng, crop_spacing_mm=float(crop_spacing_mm))
+            tgt_nc = self.subs[tgt_mod].load_native_crop(tgt_subj, cls, req)
+            ctx_ncs = [self.subs[ctx_mod].load_native_crop(s, cls, req) for s in ctx_subjs]
+            return {
+                "native_crop": [tgt_nc, *ctx_ncs],
+                "subject": tgt_subj,
+                "context_subjects": list(ctx_subjs),
+                "label_name": cls,
+                "tgt_modality": tgt_mod,
+                "ctx_modality": ctx_mod,
+                "aug_mode": torch.tensor(0, dtype=torch.long),
+                "meta": meta,
+            }
+
         def _load(mod, subj):
             return self.subs[mod].load(
                 subj, cls, LoadRequest(rng=rng, crop_spacing_mm=float(crop_spacing_mm)))
@@ -118,9 +146,8 @@ class MultiSourceProvider:
             "context_subjects": list(ctx_subjs),
             "label_name": cls,
             "modality": tgt_mod,
+            "tgt_modality": tgt_mod,
+            "ctx_modality": ctx_mod,
             "aug_mode": torch.tensor(0, dtype=torch.long),
-            # `regime` is the pre-fallback draw; `fallback` flags a "cross" draw that
-            # landed on a single-modality class and so collapsed to same-modality.
-            "meta": {"regime": regime, "tgt_mod": tgt_mod, "ctx_mod": ctx_mod,
-                     "fallback": bool(regime == "cross" and tgt_mod == ctx_mod)},
+            "meta": meta,
         }
