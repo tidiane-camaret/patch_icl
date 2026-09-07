@@ -360,7 +360,8 @@ def test_realize_batch_mixes_ct_and_mri_members():
     lbl = np.zeros((D, D, D), np.uint8); lbl[10:14, 10:14, 10:14] = 3
 
     ct_spec = resolve_ct_norm(None)
-    mri_spec = resolve_ct_norm({"clip_lo": 5.0, "clip_hi": 950.0, "mean": 300.0, "std": 120.0})
+    mri_stats = {"clip_lo": 5.0, "clip_hi": 950.0, "mean": 300.0, "std": 120.0}
+    mri_spec = resolve_ct_norm(mri_stats)
 
     def _mk(image_np, spec, modality):
         cc, cl, os_, pl, g = organ_crop_arrays(
@@ -374,6 +375,20 @@ def test_realize_batch_mixes_ct_and_mri_members():
                                ct_spec=ct_spec, device="cpu")
     assert out["image"].shape == (1, 1, 8, 8, 8)
     assert out["context_in"].shape == (1, 1, 1, 8, 8, 8)
-    # CT air ≈ ct_spec.norm_min (≈ -1.66); MRI context min ≈ (clip_lo-mean)/std of its spec.
-    assert abs(float(out["image"][0].min()) - ct_spec.norm_min) < 0.2
-    assert abs(float(out["context_in"][0, 0].min()) - mri_spec.norm_min) < 0.2
+    # Each member normalizes by its OWN spec: CT target vs normalize_ct(ct_spec),
+    # MRI context vs normalize_mri(per-subject stats). Compare full volumes — a
+    # realized crop's min is its content's normalized min, not the spec's clip floor.
+    ct_ref, _, _ = crop_and_place(
+        img_ct, lbl, 3, (12, 12, 12), 8, crop_spacing_mm=1.5,
+        native_spacing=(1.5, 1.5, 1.5), jitter=0, rng=random.Random(0),
+        mask_downsample="occupancy", occ_thr=0.1,
+        normalize_fn=lambda a: normalize_ct(a, ct_spec))
+    mri_ref, _, _ = crop_and_place(
+        img_mri, lbl, 3, (12, 12, 12), 8, crop_spacing_mm=1.5,
+        native_spacing=(1.5, 1.5, 1.5), jitter=0, rng=random.Random(0),
+        mask_downsample="occupancy", occ_thr=0.1,
+        normalize_fn=lambda a: normalize_mri(a, mri_stats))
+    assert (out["image"][0] - ct_ref).abs().max() < 2e-2
+    assert (out["context_in"][0, 0] - mri_ref).abs().max() < 2e-2
+    # the two specs really do map their volumes to different ranges
+    assert abs(float(out["image"][0].mean()) - float(out["context_in"][0, 0].mean())) > 0.1
