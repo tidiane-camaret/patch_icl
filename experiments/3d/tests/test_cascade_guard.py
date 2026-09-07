@@ -104,16 +104,24 @@ def test_cascade_realize_default_ok():
     _assert_cascade_supported(_cfg())
 
 
-def test_rejects_mri_source_with_gpu_realize():
-    # NativeCrop carries no modality and realize_native_crops applies the CT fingerprint
-    # unconditionally -> MRI would be silently CT-normalized. Hard error instead.
-    with pytest.raises(ValueError, match="MRI"):
-        _assert_cascade_supported(_cfg(data={"source": "totalsegmri"}))
+def test_allows_mri_source_with_gpu_realize():
+    # NativeCrop now carries a per-subject CtNormSpec, so MRI GPU-realize normalizes
+    # correctly (2026-09-07 multisource-cascade spec).
+    _assert_cascade_supported(_cfg(data={"source": "totalsegmri"}))
 
 
 def test_allows_mri_source_without_gpu_realize():
     _assert_cascade_supported(_cfg(data={"source": "totalsegmri",
                                          "gpu_realize_crop": False}))
+
+
+def test_allows_multisource_source():
+    _assert_cascade_supported(_cfg(data={"source": "multisource"}))
+
+
+def test_allows_multisource_with_gpu_realize_and_ram_cache():
+    _assert_cascade_supported(_cfg(data={"source": "multisource",
+                                         "gpu_realize_crop": True, "ram_cache": True}))
 
 
 def test_rejects_gpu_realize_without_cascade_spacings():

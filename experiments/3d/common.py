@@ -245,9 +245,10 @@ def _assert_cascade_supported(cfg) -> None:
         raise ValueError("data.cascade_spacings requires model=patchset3d.")
     if not d.get("loader_v2", False):
         raise ValueError("data.cascade_spacings requires data.loader_v2=true (v2 pipeline).")
-    if d.get("source", "totalseg") not in _TOTALSEG_SOURCES:
+    _cascade_sources = _TOTALSEG_SOURCES | {"multisource"}
+    if d.get("source", "totalseg") not in _cascade_sources:
         raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
-                         f"v2 TotalSeg source ({sorted(_TOTALSEG_SOURCES)}).")
+                         f"cascade-capable source ({sorted(_cascade_sources)}).")
     if len(spacings) < 2:
         raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
     _sp_f = [float(s) for s in spacings]
@@ -278,11 +279,6 @@ def _assert_cascade_supported(cfg) -> None:
             "data.cascade_spacings with data.gpu_realize_crop=true requires data.ram_cache=true "
             "(the RAM cache is what removes the NFS re-crop cost; realize over mmap is slower). "
             "See docs/superpowers/specs/2026-09-01-cascade-ram-cache-gpu-realize-design.md.")
-    if _gr and d.get("source", "totalseg") == "totalsegmri":
-        raise ValueError(
-            "GPU realize does not yet support per-subject MRI normalization (the NativeCrop "
-            "payload carries no modality and realize_native_crops applies the CT fingerprint "
-            "unconditionally); set data.gpu_realize_crop=false for MRI cascade runs.")
     qp = d.get("cascade_query_prior", False)
     from cascade import _resolve_prior_spec   # lazy: only when a cascade config is present
     try:
@@ -341,6 +337,12 @@ def build_dataset(cfg, split: str):
         sm = d.source_mix
         which = "train" if is_train else "val"
         split_map = sm.get("split_map", {}) or {}
+        # Cascade train runs default gpu_realize_crop ON (native-crop payload path); a
+        # non-cascade config leaves it off. ram_cache follows the RESOLVED realize flag —
+        # `load_native_crop` is its only reader — so it stays off otherwise.
+        _casc = bool(d.get("cascade_spacings"))
+        _realize = is_train and bool(d.get("gpu_realize_crop", _casc))
+        _ram = _realize and bool(d.get("ram_cache", False))
         subs = {}
         for src, mod, spec, root in _multisource_specs(cfg, which):
             sub_split = split_map.get(src, {}).get(split, split)
@@ -357,7 +359,7 @@ def build_dataset(cfg, split: str):
                                  else ("occupancy" if d.get("mask_downsample") == "soft"
                                        else d.get("mask_downsample", "occupancy"))),
                 mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
-                modality=mod, ct_norm=d.get("ct_norm"), ram_cache=False)
+                modality=mod, ct_norm=d.get("ct_norm"), ram_cache=_ram)
             # A broken split_map / class spec (or a wrong root) would leave a sub-provider
             # with zero usable subjects -> the run silently degrades to one modality with
             # bogus "cross" labels. Fail loudly instead.
@@ -371,7 +373,8 @@ def build_dataset(cfg, split: str):
             subs, context_size=d.context_size,
             regime_p=tuple(sm.get("regime_p", (1 / 3, 1 / 3, 1 / 3))),
             epoch_length=((d.get("max_ds_len_train") or 1000) if is_train
-                          else int(sm.eval_epoch_length)))
+                          else int(sm.eval_epoch_length)),
+            gpu_realize_crop=_realize)
         return InContextDataset(
             provider, context_size=d.context_size,
             aug_cfg=(cfg.augmentations if is_train else None),
