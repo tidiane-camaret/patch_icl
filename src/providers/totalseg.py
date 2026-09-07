@@ -24,7 +24,7 @@ from src.totalseg_dataloader_incontext import (
     _bbox_for_subject, _IDX_TO_CLASS,
 )
 from src.totalseg_dataset import (_ALL_CLASSES_IDX, normalize_ct, normalize_mri,
-                                  resolve_ct_norm)
+                                  resolve_ct_norm, CtNormSpec)
 
 
 @dataclass
@@ -48,6 +48,7 @@ class NativeCrop:
     crop_spacing_mm: float
     decim: tuple                  # per-axis integer decimation factor (>=1)
     modality: str = "ct"         # "ct" | "mri" — carried for the GPU realize/aug frame
+    norm: "CtNormSpec | None" = None  # per-crop normalization spec (global CT / per-subject MRI)
 
 
 def _decim_avg_pool(arr_t, decim):
@@ -58,13 +59,13 @@ def _decim_avg_pool(arr_t, decim):
 
 
 def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
-                      crop_spacing_mm, ct_spec=None, modality="ct"):
+                      crop_spacing_mm, norm=None, modality="ct"):
     """Assemble a `NativeCrop` payload from an `organ_crop_arrays` result.
 
     `decim[a] = crop_sizes[a] // out_sizes[a]` (>=1), so the payload grid stays >=
     out_sizes and the GPU realize only ever downsamples.
 
-    Image: HU-clipped to `ct_spec` FIRST (clamp does not commute with the mean, and the
+    Image: HU-clipped to `norm` FIRST (clamp does not commute with the mean, and the
     reference `crop_and_place` normalizes before it resamples), then avg-pooled by `decim`.
     Label: the target-class binary mask is built at NATIVE resolution and avg-pooled by
     `decim` into a partial-volume fraction — the composition of that pool with the GPU's
@@ -77,8 +78,8 @@ def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
                   for cs, o in zip(crop_sizes, out_sizes))
     # np.array (not ascontiguousarray) always copies -> never aliases the read-only RAM cache
     img_t = torch.from_numpy(np.array(crop_ct)).float()
-    if ct_spec is not None:
-        img_t = img_t.clamp(ct_spec.clip_lo, ct_spec.clip_hi)
+    if norm is not None:
+        img_t = img_t.clamp(norm.clip_lo, norm.clip_hi)
     binm = torch.from_numpy(np.array(crop_lbl) == class_idx)
     has_fg = bool(binm.any())
     img_t = _decim_avg_pool(img_t, decim)
@@ -87,7 +88,7 @@ def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
                       class_idx=int(class_idx), has_fg=has_fg,
                       out_sizes=list(out_sizes), pad_lo=list(pad_lo),
                       crop_geom=geom, crop_spacing_mm=float(crop_spacing_mm),
-                      decim=decim, modality=modality)
+                      decim=decim, modality=modality, norm=norm)
 
 
 def crop_and_place(image_np, label_np, class_idx, center, T, *,
@@ -283,14 +284,15 @@ class TotalSegProvider:
             image_np, label_np, center, list(native_sp),
             image_size=(self.T, self.T, self.T), crop_mm=req.crop_spacing_mm,
             jitter=jitter, rng=req.rng)
-        # build_native_crop copies the (read-only, possibly cached) slices out.
-        # ct_spec only for CT: MRI needs per-subject stats, which the GPU realize path
-        # does not carry -- common._assert_cascade_supported rejects MRI + gpu_realize_crop.
+        # Per-crop normalization spec: global CT fingerprint for CT, per-subject
+        # foreground stats for MRI (normalize_mri is the same pointwise clip+z-score
+        # form, so one CtNormSpec reproduces it). The GPU realize step reads nc.norm.
+        norm = (self.ct_spec if self.modality == "ct"
+                else resolve_ct_norm(self._ct_stats[subject]))
         return build_native_crop(
             crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
             crop_spacing_mm=float(req.crop_spacing_mm),
-            ct_spec=(self.ct_spec if self.modality == "ct" else None),
-            modality=self.modality)
+            norm=norm, modality=self.modality)
 
     # --- subjects + caches --------------------------------------------------
     def _subjects(self, split, meta_csv, max_subjects):

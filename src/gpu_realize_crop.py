@@ -34,7 +34,8 @@ def _regroup(flat, bvals, B):
 def _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device):
     """One NativeCrop -> placed (image (1,T,T,T) f32, mask (T,T,T)).
 
-    Image: CT-normalize FIRST (clip does not commute with the resample average, and the
+    Image: normalize FIRST (per-crop nc.norm — CT fingerprint or per-subject MRI stats)
+    (clip does not commute with the resample average, and the
     reference crop_and_place normalizes the crop before placing it), then area-prefilter
     to min(out, src) and trilinear resample to out_sizes; centre-pad with the
     pre-resample normalized crop min (air), matching place_image's crop_ct.min() rule.
@@ -44,7 +45,8 @@ def _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device):
     payload's `has_fg`, which was measured pre-decimation), centre-padded with 0.
     """
     size = tuple(int(s) for s in nc.out_sizes)
-    src = normalize_ct_gpu(nc.image.to(device), ct_spec)[None, None]
+    spec = nc.norm if getattr(nc, "norm", None) is not None else ct_spec
+    src = normalize_ct_gpu(nc.image.to(device), spec)[None, None]
     air = float(src.min())                       # normalized air, BEFORE any resample
     pre = tuple(min(o, s) for o, s in zip(size, src.shape[2:]))
     if pre != tuple(src.shape[2:]):

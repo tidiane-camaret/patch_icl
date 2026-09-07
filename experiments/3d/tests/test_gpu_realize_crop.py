@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 from src.incontext_dataset_v2 import LoadRequest
 from src.providers.totalseg import crop_and_place, build_native_crop, NativeCrop
 from src.totalseg_dataloader_incontext import organ_crop_arrays, _area_pool_3d
-from src.totalseg_dataset import resolve_ct_norm, normalize_ct
+from src.totalseg_dataset import resolve_ct_norm, normalize_ct, normalize_mri, CtNormSpec
 from src.gpu_realize_crop import realize_native_crops, native_crop_collate_fn, _regroup
 import torch.nn.functional as F
 
@@ -30,7 +30,7 @@ def _native_crop_from(image_np, label_np, cls_idx, center, T, spacing, spec=None
         crop_mm=spacing, jitter=0, rng=random.Random(0))
     return build_native_crop(crop_ct, crop_lbl, cls_idx, out_sizes, pad_lo, geom,
                              crop_spacing_mm=spacing,
-                             ct_spec=(spec if spec is not None else resolve_ct_norm(None)))
+                             norm=(spec if spec is not None else resolve_ct_norm(None)))
 
 
 def _fake_nc(T, class_idx=7, fg=None, spacing=3.0):
@@ -317,3 +317,63 @@ def test_hard_parity_small_label_survives_decim4():
     # FULL-RES normalized crop min, the realize path with the DECIMATED crop's min
     # (~2 HU higher once 4^3 voxels are averaged). ~4e-3 in normalized units.
     assert di.mean() < 5e-3, f"image mean|d|={di.mean():.5f}"
+
+
+def test_realize_member_uses_per_crop_norm_spec_mri():
+    """A NativeCrop carrying an MRI-style per-subject spec is normalized with THAT
+    spec, not the CT fingerprint passed to realize_native_crops."""
+    D = 24
+    # MRI-ish intensities: strictly positive, ~[0, 900]
+    img = (np.linspace(10, 890, D, dtype=np.float32)[:, None, None]
+           + np.linspace(0, 200, D, dtype=np.float32)[None, :, None]).astype(np.float16)
+    img = np.broadcast_to(img, (D, D, D)).copy()
+    lbl = np.zeros((D, D, D), np.uint8); lbl[8:16, 8:16, 8:16] = 3
+
+    mri_stats = {"clip_lo": 5.0, "clip_hi": 950.0, "mean": 300.0, "std": 120.0}
+    mri_spec = resolve_ct_norm(mri_stats)
+    ct_spec = resolve_ct_norm(None)                    # deliberately WRONG for this crop
+
+    crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+        img, lbl, (12, 12, 12), [1.5, 1.5, 1.5], image_size=(8, 8, 8),
+        crop_mm=1.5, jitter=0, rng=random.Random(0))
+    nc = build_native_crop(crop_ct, crop_lbl, 3, out_sizes, pad_lo, geom,
+                           crop_spacing_mm=1.5, norm=mri_spec, modality="mri")
+    assert nc.norm == mri_spec
+
+    out = realize_native_crops([[nc]], T=8, mask_downsample="soft", occ_thr=0.5,
+                               ct_spec=ct_spec, device="cpu")
+    # Reference: normalize_mri applied BEFORE the same crop+resample (decim=1 here).
+    ref_i, _, _ = crop_and_place(
+        img, lbl, 3, (12, 12, 12), 8, crop_spacing_mm=1.5,
+        native_spacing=(1.5, 1.5, 1.5), jitter=0, rng=random.Random(0),
+        mask_downsample="soft", occ_thr=0.5,
+        normalize_fn=lambda a: normalize_mri(a, mri_stats))
+    assert (out["image"][0] - ref_i).abs().max() < 2e-2
+
+
+def test_realize_batch_mixes_ct_and_mri_members():
+    """One batch, target CT (global spec) + context MRI (per-subject spec)."""
+    D = 24
+    img_ct = _smooth_vol(D)
+    img_mri = np.broadcast_to(
+        np.linspace(10, 890, D, dtype=np.float32)[:, None, None], (D, D, D)).astype(np.float16).copy()
+    lbl = np.zeros((D, D, D), np.uint8); lbl[10:14, 10:14, 10:14] = 3
+
+    ct_spec = resolve_ct_norm(None)
+    mri_spec = resolve_ct_norm({"clip_lo": 5.0, "clip_hi": 950.0, "mean": 300.0, "std": 120.0})
+
+    def _mk(image_np, spec, modality):
+        cc, cl, os_, pl, g = organ_crop_arrays(
+            image_np, lbl, (12, 12, 12), [1.5, 1.5, 1.5], image_size=(8, 8, 8),
+            crop_mm=1.5, jitter=0, rng=random.Random(0))
+        return build_native_crop(cc, cl, 3, os_, pl, g, crop_spacing_mm=1.5,
+                                 norm=spec, modality=modality)
+
+    members = [[_mk(img_ct, ct_spec, "ct"), _mk(img_mri, mri_spec, "mri")]]
+    out = realize_native_crops(members, T=8, mask_downsample="occupancy", occ_thr=0.1,
+                               ct_spec=ct_spec, device="cpu")
+    assert out["image"].shape == (1, 1, 8, 8, 8)
+    assert out["context_in"].shape == (1, 1, 1, 8, 8, 8)
+    # CT air ≈ ct_spec.norm_min (≈ -1.66); MRI context min ≈ (clip_lo-mean)/std of its spec.
+    assert abs(float(out["image"][0].min()) - ct_spec.norm_min) < 0.2
+    assert abs(float(out["context_in"][0, 0].min()) - mri_spec.norm_min) < 0.2
