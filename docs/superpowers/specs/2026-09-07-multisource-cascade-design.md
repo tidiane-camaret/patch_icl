@@ -86,7 +86,8 @@ default sets `train_spacing_range: [1.5, 6.0]`, which
 
 - `NativeCrop` gains `norm: CtNormSpec`.
 - `build_native_crop` takes a resolved `norm` (replacing the vestigial
-  `ct_spec=None` param) and stores it.
+  `ct_spec=None` param) and stores it. Sole caller is
+  `TotalSegProvider.load_native_crop`, so this is a safe signature change.
 - `TotalSegProvider.load_native_crop` passes:
   - **CT**: `self.ct_spec` (already a `CtNormSpec`).
   - **MRI**: `resolve_ct_norm(self._ct_stats[subject])`. `self._ct_stats` is
