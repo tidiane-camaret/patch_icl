@@ -7126,9 +7126,10 @@ Five code changes across `feat/incontext-dataloader-v2` (plus this integration c
   `{native_crop: [tgt, *ctx], tgt_modality, ctx_modality, ...}` dict instead of a painted
   `image`/`context_in` stack.
 - **`tgt_modality` / `ctx_modality` threaded through the collates** (`src/gpu_realize_crop.py`
-  `native_crop_collate_fn`, plus `cascade.realize_cascade_level0`). Both are carried as a
-  `list[str]` of length B on the batch so downstream re-crops know which modality each
-  sample is.
+  `native_crop_collate_fn` and `src/totalseg_dataloader_incontext.py` `incontext_collate_fn`
+  — the eval-path collate the cascade val loader uses — plus `cascade.realize_cascade_level0`).
+  Both are carried as a `list[str]` of length B on the batch so downstream re-crops know which
+  modality each sample is.
 - **`cascade._recrop_level` routes re-crops by modality** (`experiments/3d/cascade.py`).
   Each level ≥ 1 re-crop `load_native_crop` call passes the sample's `modality=` kwarg
   (target vs context modality per slot), so the fine-level crop is pulled from the right
@@ -7136,8 +7137,17 @@ Five code changes across `feat/incontext-dataloader-v2` (plus this integration c
 - **`common.py` guard relax + wiring** (`experiments/3d/common.py`). `_assert_cascade_supported`
   now accepts `source=multisource` (added to the cascade-capable source set) alongside the
   v2 TotalSeg sources, and permits `totalsegmri` under `gpu_realize_crop`. The multisource
-  `build_dataset` branch wires the resolved `gpu_realize_crop` flag and `ram_cache` into the
-  `MultiSourceProvider`.
+  `build_dataset` branch wires the resolved `gpu_realize_crop` flag, `ram_cache` and
+  `ram_cache_max_subjects` into the `MultiSourceProvider`.
+- **`evaluate_cascade` scores per modality root** (`experiments/3d/cascade.py`, final-review
+  fix). Cascade val now scores each case against **its own modality's dataset root**
+  (`_multisource_specs(cfg, "val")` -> `{modality: root}`) and keys every per-case structure
+  by `(modality, subject, class)`. Before this fix a multisource cascade val pass scored
+  every MRI-target case against the CT root — `totalseg` and `totalsegmri` share the `s%04d`
+  namespace, so it loaded a different patient's CT label (no error, `_write_native` clips
+  out-of-range writes) and a CT and an MRI `s0001/liver` case overwrote each other: `val/dice`
+  (the checkpoint-selection signal) was silently wrong. Single-source eval is unchanged
+  (keys become `(None, subj, cls)`, root map `{None: root}`).
 
 **Integration check** (`experiments/3d/_check_multisource.py::check_cascade_build`): builds
 the real train-split dataset under the cascade overrides, asserts the guard passes, the

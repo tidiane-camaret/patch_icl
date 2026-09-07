@@ -33,10 +33,11 @@ class NativeCrop:
 
     NO z-score, NO resample-to-out_sizes, NO centre-placement: those happen on the
     GPU downstream. `decim` is chosen per-axis so the decimated grid stays
-    >= out_sizes (the GPU step only ever downsamples). The image IS already HU-clipped
-    to the ct_spec window (clip does not commute with the decimation mean, so it has to
-    happen first — see `build_native_crop`), and the label is already reduced to the
-    target class as a partial-volume FRACTION, never a point sample.
+    >= out_sizes (the GPU step only ever downsamples). The image IS already clipped
+    to the `norm` window (global CT HU fingerprint, or per-subject MRI min/max stats)
+    (clip does not commute with the decimation mean, so it has to happen first — see
+    `build_native_crop`), and the label is already reduced to the target class as a
+    partial-volume FRACTION, never a point sample.
     """
     image: torch.Tensor           # (d,h,w) fp16, clipped HU, decimated crop
     label_frac: torch.Tensor      # (d,h,w) fp16 in [0,1], per-class partial-volume fraction

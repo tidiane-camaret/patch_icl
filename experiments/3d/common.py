@@ -359,7 +359,8 @@ def build_dataset(cfg, split: str):
                                  else ("occupancy" if d.get("mask_downsample") == "soft"
                                        else d.get("mask_downsample", "occupancy"))),
                 mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
-                modality=mod, ct_norm=d.get("ct_norm"), ram_cache=_ram)
+                modality=mod, ct_norm=d.get("ct_norm"), ram_cache=_ram,
+                ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
             # A broken split_map / class spec (or a wrong root) would leave a sub-provider
             # with zero usable subjects -> the run silently degrades to one modality with
             # bogus "cross" labels. Fail loudly instead.

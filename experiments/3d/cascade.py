@@ -173,6 +173,10 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     label_names/aug_mode); crop_geom flows through untouched from each row's target crop."""
     subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
     sp = float(spacing)
+    # tgt/ctx modality live ONLY on the original level-0 `batch` — run_cascade passes that same
+    # batch to _recrop_level at every level (it never feeds a level's output back in), so the
+    # keys survive to every level. realize_cascade_level0 re-attaches them; _recrop_level's own
+    # output dict does not, so a future refactor that chains level outputs must re-attach them.
     tmods = batch.get("tgt_modality")
     cmods = batch.get("ctx_modality")
 
@@ -591,9 +595,16 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     spacings = [float(s) for s in cfg.data.cascade_spacings]
     N = len(spacings)
     _, root, _ = _source_root(cfg)
+    # C1: source=multisource's CT and MRI sub-datasets share the s%04d subject namespace, so
+    # the native-GT stitch MUST read each case's own modality root, and per-case keys MUST be
+    # modality-qualified or a CT and an MRI `s0001/liver` case overwrite each other.
+    roots = {None: root}
+    if cfg.data.get("source") == "multisource":
+        from common import _multisource_specs
+        roots = {mod: r for _src, mod, _spec, r in _multisource_specs(cfg, "val")}
     pg_levels = [dict() for _ in range(N)]
-    order = []                                       # (subj,cls) in loader order
-    times = {}                                       # (subj,cls) -> per-sample cascade ms
+    order = []                                       # (modality,subj,cls) in loader order
+    times = {}                                       # (modality,subj,cls) -> per-sample cascade ms
     want_figs = bool(cascade_figures and fig_dir is not None)
     fig_want = set(classes) if want_figs else set()  # classes still needing a panel
     fig_cache = [dict() for _ in range(N)]           # level -> {(subj,cls): arrays} for figures
@@ -624,11 +635,13 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
             torch.cuda.synchronize()
         step += 1
         subs, clss = batch["subjects"], batch["label_names"]
+        tmods = batch.get("tgt_modality")                 # list[str] len B (multisource) or None
         dt_ms = (time.perf_counter() - t0) * 1e3
         per_sample_ms = dt_ms / max(len(subs), 1)
         t_cascade += dt_ms; n_seen += len(subs)
         for b in range(len(subs)):
-            key = (subs[b], clss[b])
+            mod = tmods[b] if tmods is not None else None
+            key = (mod, subs[b], clss[b])
             order.append(key)
             times[key] = round(per_sample_ms, 1)
             for li in range(N):
@@ -644,7 +657,9 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                     prob = lg.clamp(0, 1) if is_prob else torch.sigmoid(lg)
                     prob = F.interpolate(prob, size=(T, T, T), mode="trilinear",
                                          align_corners=False)[0, 0].cpu().numpy()
-                    fig_cache[li][key] = {
+                    # fig_cache stays (subj,cls)-keyed: one panel per class regardless of
+                    # modality, and evaluate._save_cascade_pair unpacks a 2-tuple fig key.
+                    fig_cache[li][(subs[b], clss[b])] = {
                         "img": fl["img"][b], "gt": fl["gt"][b],
                         "pred": res.hard_preds[li][b].cpu().numpy(),
                         "prob": prob, "geom": res.geoms[li][b].cpu().numpy(),
@@ -654,15 +669,27 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
 
     # Score once after the loop: each key is stitched independently of arrival order, so the
     # full cascade stitch and the per-level (per-resolution) stitches are order-invariant.
-    stitched = _stitched_native_dice_multi(pg_levels, root)
-    per_res_by_level = [_stitched_native_dice_multi([pg_levels[li]], root) for li in range(N)]
+    # C1: score each modality's cases against THAT modality's dataset root. Strip the modality
+    # prefix so _stitched_native_dice_multi's `subj, cls = key` still works, then re-add it.
+    # Single-source: mods_seen == {None}, roots == {None: root} -> byte-equivalent behaviour.
+    mods_seen = {k[0] for k in pg_levels[-1]}
+    stitched = {}
+    per_res_by_level = [dict() for _ in range(N)]
+    for m in mods_seen:
+        r = roots.get(m, root)
+        pgm = [{(k[1], k[2]): v for k, v in lvl.items() if k[0] == m} for lvl in pg_levels]
+        for (sj, cl), d in _stitched_native_dice_multi(pgm, r).items():
+            stitched[(m, sj, cl)] = d
+        for li in range(N):
+            for (sj, cl), d in _stitched_native_dice_multi([pgm[li]], r).items():
+                per_res_by_level[li][(m, sj, cl)] = d
 
     mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")
 
     cases_by_class = defaultdict(list)
     for key in order:
-        subj, cls = key
-        case = {"class": cls, "subject": subj,
+        _mod, subj, cls = key
+        case = {"class": cls, "subject": subj, "modality": _mod,
                 "dice": round(float(stitched.get(key, float("nan"))), 4),
                 "time_ms": times.get(key, float("nan"))}
         for li, s in enumerate(spacings):

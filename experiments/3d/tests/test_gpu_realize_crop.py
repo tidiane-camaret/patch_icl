@@ -421,3 +421,37 @@ def test_native_collate_omits_modality_when_absent():
               "label_name": "liver", "aug_mode": torch.tensor(0)}]
     b = native_crop_collate_fn(items)
     assert "tgt_modality" not in b and "ctx_modality" not in b
+
+
+def _incontext_item(T=4, K=1, *, tgt_modality=None, ctx_modality=None):
+    """Minimal painted item for incontext_collate_fn (the cascade-val-path collate)."""
+    item = {
+        "image":       torch.zeros(1, T, T, T),
+        "label":       torch.zeros(T, T, T),
+        "context_in":  torch.zeros(K, 1, T, T, T),
+        "context_out": torch.zeros(K, T, T, T),
+        "spacing":     torch.ones(3),
+        "subject":     "s0",
+        "label_name":  "liver",
+        "crop_geom":   torch.zeros(4, 3, dtype=torch.long),
+        "aug_mode":    torch.tensor(0),
+    }
+    if tgt_modality is not None:
+        item["tgt_modality"] = tgt_modality
+        item["ctx_modality"] = ctx_modality
+    return item
+
+
+def test_incontext_collate_passes_modality_when_present():
+    from src.totalseg_dataloader_incontext import incontext_collate_fn
+    items = [_incontext_item(tgt_modality="ct", ctx_modality="mri"),
+             _incontext_item(tgt_modality="mri", ctx_modality="mri")]
+    b = incontext_collate_fn(items)
+    assert b["tgt_modality"] == ["ct", "mri"]
+    assert b["ctx_modality"] == ["mri", "mri"]
+
+
+def test_incontext_collate_omits_modality_when_absent():
+    from src.totalseg_dataloader_incontext import incontext_collate_fn
+    b = incontext_collate_fn([_incontext_item(), _incontext_item()])
+    assert "tgt_modality" not in b and "ctx_modality" not in b

@@ -851,6 +851,67 @@ def test_evaluate_cascade_reads_cascade_recrop_workers(tmp_path, monkeypatch):
     assert len(cases) == B
 
 
+def test_evaluate_cascade_multisource_keys_and_scores_per_modality(tmp_path, monkeypatch):
+    """C1: for source=multisource, evaluate_cascade scores each case against ITS OWN
+    modality's dataset root and keys cases by (modality, subject, class). A CT `s0/liver`
+    and an MRI `s0/liver` case (same subject id in both roots) must NOT collide, and each
+    must be scored against its own root's GT. The _FakeModel emits an empty native pred, so
+    CT (GT has liver -> denom>0) scores 0.0 while MRI (GT lacks liver -> denom==0) scores
+    1.0: the two roots demonstrably drive the two cases."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, T = 2, 8
+    idx = _ALL_CLASSES_IDX["liver"]
+    ct_root, mri_root = tmp_path / "ct", tmp_path / "mri"
+    ct_lbl = np.zeros((T, T, T), dtype=np.uint8); ct_lbl[1:4, 1:4, 1:4] = idx   # has liver
+    mri_lbl = np.zeros((T, T, T), dtype=np.uint8)                              # no liver
+    (ct_root / "s0").mkdir(parents=True); np.save(ct_root / "s0" / "label.npy", ct_lbl)
+    (mri_root / "s0").mkdir(parents=True); np.save(mri_root / "s0" / "label.npy", mri_lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(ct_root), False), raising=False)
+    monkeypatch.setattr(common, "_multisource_specs",
+                        lambda cfg, which: [("ct", "ct", None, str(ct_root)),
+                                            ("mri", "mri", None, str(mri_root))],
+                        raising=False)
+
+    class _ModProvider(_FakeProvider):
+        def load(self, subject, cls, req, modality=None):   # accept + ignore the kwarg
+            return super().load(subject, cls, req)
+
+    model, prov = _FakeModel(G=4, hot=(1, 1, 1)), _ModProvider(T=T)
+
+    def _mk_batch():
+        bb = _named_batch(["liver"] * B, B=B, T=T)
+        bb["subjects"] = ["s0", "s0"]                       # SAME id in both roots
+        bb["tgt_modality"] = ["ct", "mri"]
+        bb["ctx_modality"] = ["mri", "mri"]
+        return bb
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self): return iter([_mk_batch()])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"source": "multisource",
+                                     "cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False}})
+    rows, cases = evaluate_cascade(model, cfg, ["liver"], loader=_Loader(),
+                                   seed=0, is_prob=False)
+
+    # Both modality cases survive -> the (subj,cls) collision is gone.
+    assert len(cases) == 2
+    by_mod = {c["modality"]: c for c in cases}
+    assert set(by_mod) == {"ct", "mri"}
+    assert by_mod["ct"]["subject"] == by_mod["mri"]["subject"] == "s0"
+    # Each case scored against its OWN root's GT: CT root has liver -> dice 0.0 vs the empty
+    # native pred; MRI root lacks liver -> empty-vs-empty -> dice 1.0. Distinct == no collision
+    # AND the right root per case.
+    assert by_mod["ct"]["dice"] == 0.0
+    assert by_mod["mri"]["dice"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Task 4: cascade _recrop_level GPU-realize branch (levels >= 1)
 # ---------------------------------------------------------------------------
