@@ -392,3 +392,32 @@ def test_realize_batch_mixes_ct_and_mri_members():
     assert (out["context_in"][0, 0] - mri_ref).abs().max() < 2e-2
     # the two specs really do map their volumes to different ranges
     assert abs(float(out["image"][0].mean()) - float(out["context_in"][0, 0].mean())) > 0.1
+
+
+def test_native_collate_passes_modality_when_present():
+    from src.gpu_realize_crop import native_crop_collate_fn
+    spec = resolve_ct_norm(None)
+    img = _smooth_vol(24); lbl = np.zeros((24, 24, 24), np.uint8); lbl[10:14, 10:14, 10:14] = 3
+    nc = _native_crop_from(img, lbl, 3, (12, 12, 12), 8, 1.5)
+    items = [
+        {"native_crop": [nc, nc], "subject": "s0", "context_subjects": ["c0"],
+         "label_name": "liver", "tgt_modality": "ct", "ctx_modality": "mri",
+         "aug_mode": torch.tensor(0)},
+        {"native_crop": [nc, nc], "subject": "s1", "context_subjects": ["c1"],
+         "label_name": "liver", "tgt_modality": "mri", "ctx_modality": "mri",
+         "aug_mode": torch.tensor(0)},
+    ]
+    b = native_crop_collate_fn(items)
+    assert b["tgt_modality"] == ["ct", "mri"]
+    assert b["ctx_modality"] == ["mri", "mri"]
+
+
+def test_native_collate_omits_modality_when_absent():
+    from src.gpu_realize_crop import native_crop_collate_fn
+    spec = resolve_ct_norm(None)
+    img = _smooth_vol(24); lbl = np.zeros((24, 24, 24), np.uint8); lbl[10:14, 10:14, 10:14] = 3
+    nc = _native_crop_from(img, lbl, 3, (12, 12, 12), 8, 1.5)
+    items = [{"native_crop": [nc, nc], "subject": "s0", "context_subjects": ["c0"],
+              "label_name": "liver", "aug_mode": torch.tensor(0)}]
+    b = native_crop_collate_fn(items)
+    assert "tgt_modality" not in b and "ctx_modality" not in b

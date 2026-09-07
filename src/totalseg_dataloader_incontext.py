@@ -1571,6 +1571,9 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         out["aug_mode"] = torch.stack([b["aug_mode"] for b in batch])  # (B,) int64
     if "modality" in batch[0]:
         out["modality"] = [b["modality"] for b in batch]  # (B,) list[str], unused downstream
+    if "tgt_modality" in batch[0]:
+        out["tgt_modality"] = [b["tgt_modality"] for b in batch]  # (B,) list[str], cascade re-crop routing
+        out["ctx_modality"] = [b["ctx_modality"] for b in batch]
     # Per-item NaN-pad so mixed synth+real batches still log radii/coords for their synth items
     # (an all()-gate dropped both keys whenever a single real sample shared the batch).
     if any("synth_radii_mm" in b for b in batch):

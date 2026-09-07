@@ -452,6 +452,9 @@ def realize_cascade_level0(batch, *, T, mask_downsample, occ_thr, ct_spec, devic
     out["subjects"] = list(batch["subjects"])
     out["context_subjects"] = [list(c) for c in batch["context_subjects"]]
     out["label_names"] = list(batch["label_names"])
+    if "tgt_modality" in batch:
+        out["tgt_modality"] = list(batch["tgt_modality"])
+        out["ctx_modality"] = list(batch["ctx_modality"])
     out["aug_mode"] = batch.get(
         "aug_mode", torch.zeros(len(out["subjects"]), dtype=torch.long)).to(device)
     return out

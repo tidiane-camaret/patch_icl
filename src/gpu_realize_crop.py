@@ -119,4 +119,7 @@ def native_crop_collate_fn(batch):
         "aug_mode": torch.stack([b.get("aug_mode", torch.tensor(0, dtype=torch.long))
                                  for b in batch]),
     }
+    if "tgt_modality" in batch[0]:
+        out["tgt_modality"] = [b["tgt_modality"] for b in batch]
+        out["ctx_modality"] = [b["ctx_modality"] for b in batch]
     return out
