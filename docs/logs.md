@@ -7054,3 +7054,123 @@ construction. Verified with a smoke test:
 mask_slots=2, decode_source="mask")(..., query_prior=qp)` forward + backward, no missing
 grads. `--cfg job --resolve` confirms `data.query_prior: gt`, `data.prior_perturb.p: 1.0`,
 `arch.mask_slots: 2`, `arch.decode_source: mask` all resolve as set.
+
+## 2026-09-07 — multisource CT+MRI notebook: 2-run val sample-table analysis
+
+`results/experiments/82_multisource.py` — short marimo notebook comparing two runs of
+`experiment=81_multisource_ct_mri` (multisource CT+MRI, per-task modality regime 1/3 ct /
+1/3 mri / 1/3 forced cross; 128^3, K=1, log-uniform [1.5,6] mm train pitch, eval 3 mm;
+`goal_mask.p=0.4 ops=[dilate,erode,boundary,sobel]`, `+data.ram_cache`). Reads each local
+wandb run dir directly (one `val/samples_*.table.json` per eval epoch) — no wandb API.
+Regime + modality pair parsed from the `detail` column (`"<regime> <tgt_mod><-<ctx_mod>"`).
+
+- `81 warmstart/subset` (`qjmpcm1h`) — `per_source_train_classes=[balanced,train]` (CT
+  balanced subset + 23 MRI train classes → held-out classes exist), **warm-started from the
+  exp80 CT-only checkpoint**; its `epoch` column continues exp80's counter, so evals are
+  200..300 (~110 finetune epochs).
+- `82 scratch/all-cls` (`kr49tqzo`) — `per_source_train_classes=[all,all]` (every class
+  trained → `in_train` all True), **from scratch**, evals 0..130.
+
+Cells: (0) load both + per-run header; (1) training trend, per-epoch dice by regime, one
+panel per run; (2) cross-modality decomposition — dice by modality pair + target/context
+marginals; (3) seen-vs-unseen (`in_train`) — 81 only; (4) failure breakdown — dice by
+target-size quintile (both) + worst/best classes (81).
+
+Findings (both runs still climbing — neither converged):
+- **Warm-start dominates.** 81 @ep300 overall dice 0.345 vs 82 @ep130 0.243 (+0.10 at
+  comparable finetune budget). In 81 the CT regime enters at ~0.40 at the first eval and
+  stays ~flat over 100 epochs (inherits exp80's CT ability); ALL the finetune gain is MRI
+  (0.17→0.27) + cross (0.24→0.35). 82 from scratch: all three regimes climb from ~0, cross
+  overtakes mri←mri ~ep110.
+- Regime ordering holds in both: ct > cross > mri (81: 0.411 / 0.351 / 0.270; 82: 0.272 /
+  0.243 / 0.212). Cross-modality in-context is healthy, not collapsing.
+- Score tracks the TARGET modality, nearly flat in the CONTEXT modality — in 81 `ct←mri`
+  (0.409) is identical to `ct←ct` (0.411). Matching is modality-robust; MRI-target
+  difficulty is the limiter, not the CT<->MRI transfer.
+- **Seen vs unseen (81):** generalises to held-out classes but with a penalty — overall
+  seen 0.371 / unseen 0.278; CT 0.457 / 0.325; MRI 0.299 / 0.189 (median 0.083, the
+  weakest cell). The gap WIDENS over finetuning: seen climbs steadily, unseen ~flat
+  (0.246→0.278 over 100 epochs) → specialising to the train-class set.
+- Size is the dominant failure axis in both; warm-start lifts every size quintile (81 vs
+  82: Q1 0.12/0.05 … Q5 0.57/0.47). Tiny quintile (~20% of eval) still near-failure.
+  Worst classes = thin/tubular/small (iliac & carotid vessels, portal vein, adrenals,
+  prostate, duodenum, esophagus); best = large compact organs (heart, spleen, brain,
+  liver, spinal_cord).
+- `prostate` on MRI ~0.02 in both runs. In 81 it is an UNSEEN MRI class AND tiny (~148 vox)
+  → plausibly unseen+size rather than a totalsegmri label bug (revises the earlier exp82
+  read). Still: a canonical MRI target the model can't do zero-shot.
+- Caveats: 82 `in_train` all True by design (no unseen signal); `nsd` not computed for this
+  eval path (all NaN); both runs `self_ctx` off, `spacing` 3 mm, no cross fallbacks.
+
+No code change outside the notebook. Verified by `marimo export script` → run: all cells
+execute clean (no warnings), tables + figures render.
+
+## 2026-09-07 — multi-source CT/MRI cascade support (`source=multisource` + `gpu_realize_crop`)
+
+Unblocks the cascade train loop for `experiment=81_multisource_ct_mri`. Before this,
+`+data.cascade_spacings=[6,3] +data.gpu_realize_crop=true` on a multisource run raised
+`source 'multisource' is not a v2 TotalSeg source`, and even past that the native-crop
+path assumed a single global CT HU window (wrong for the per-subject MRI normalization).
+Five code changes across `feat/incontext-dataloader-v2` (plus this integration check):
+
+- **`NativeCrop.norm` — per-crop normalization spec** (`src/providers/totalseg.py`). The
+  native-crop payload now self-describes its normalization: a `CtNormSpec` carrying the
+  global CT HU clip for CT crops, and the per-subject min/max window for MRI crops.
+  `build_native_crop(..., norm=..., modality=...)` clips the image to `norm` *before*
+  the integer `decim` avg-pool (clamp does not commute with the mean), so the GPU realize
+  step no longer has to guess a window. This is what makes MRI GPU-realize correct.
+- **`MultiSourceProvider` modality dispatch + native emission** (`src/providers/multisource.py`).
+  New `gpu_realize_crop` ctor flag. `load` / `load_native_crop` take a keyword `modality`
+  and route to the matching CT/MRI sub-`TotalSegProvider`. `assemble_task` gains a
+  native-emission branch: when `gpu_realize_crop` is on it returns an imageless
+  `{native_crop: [tgt, *ctx], tgt_modality, ctx_modality, ...}` dict instead of a painted
+  `image`/`context_in` stack.
+- **`tgt_modality` / `ctx_modality` threaded through the collates** (`src/gpu_realize_crop.py`
+  `native_crop_collate_fn`, plus `cascade.realize_cascade_level0`). Both are carried as a
+  `list[str]` of length B on the batch so downstream re-crops know which modality each
+  sample is.
+- **`cascade._recrop_level` routes re-crops by modality** (`experiments/3d/cascade.py`).
+  Each level ≥ 1 re-crop `load_native_crop` call passes the sample's `modality=` kwarg
+  (target vs context modality per slot), so the fine-level crop is pulled from the right
+  sub-provider with the right norm spec.
+- **`common.py` guard relax + wiring** (`experiments/3d/common.py`). `_assert_cascade_supported`
+  now accepts `source=multisource` (added to the cascade-capable source set) alongside the
+  v2 TotalSeg sources, and permits `totalsegmri` under `gpu_realize_crop`. The multisource
+  `build_dataset` branch wires the resolved `gpu_realize_crop` flag and `ram_cache` into the
+  `MultiSourceProvider`.
+
+**Integration check** (`experiments/3d/_check_multisource.py::check_cascade_build`): builds
+the real train-split dataset under the cascade overrides, asserts the guard passes, the
+provider is a `MultiSourceProvider` with `gpu_realize_crop is True`, and `ds[0]` is an
+imageless `native_crop` payload whose members are all `NativeCrop` with a non-None `norm`.
+Run output on NFS: `check_cascade_build OK: mri -> ct`; two RAM caches allocated —
+CT 50.5 GB (1082 subjects) + MRI 12.3 GB (456 subjects). Full unit sweep green:
+`src/providers/test_multisource.py` (15), `experiments/3d/tests/test_gpu_realize_crop.py`
+(13), `test_recrop_modality.py` (2), `test_cascade_guard.py` (21), `test_cascade.py` (51)
+= 102 passed. GPU cascade smoke SKIPPED: node GPU had only ~19 GB free (another job holding
+~29 GB), below the ~25 GB needed for a patchset3d 128³ two-level step.
+
+### Runnable command (the user's original + one required addition)
+
+```
+python experiments/3d/train.py experiment=81_multisource_ct_mri +data.ram_cache=true \
+  augmentations.goal_mask.p=0.4 augmentations.goal_mask.ops=[dilate,erode,boundary,sobel] \
+  data.source_mix.per_source_train_classes=[all,all] \
+  train.checkpoint=/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-06_82_multisource_ct_mri_train_all_classes/best.pt \
+  train.batch_size=2 train.lr=1.0e-5 train.warmup_epochs=1 \
+  data.train_spacing_range=null \
+  data.crop_spacing_mm=6 +data.cascade_spacings=[6,3] +data.cascade_crop_jitter=null \
+  +data.gpu_realize_crop=true +data.cascade_query_prior.modes=[pred,none,gt] \
+  +data.cascade_query_prior.p=[0.6,0.3,0.1] +data.cascade_query_prior.eval_mode=pred \
+  +data.cascade_query_prior_hard=false +train.cascade_loss_weights=[1,1] \
+  wandb.name=83_multisource_cascade
+```
+
+- `data.train_spacing_range=null` is the one addition needed to make the original command
+  run: `configs/experiment/3d/data/multisource_ct_mri.yaml` defaults it to `[1.5, 6.0]`,
+  and `_assert_cascade_supported` rejects `train_spacing_range` + `cascade_spacings`
+  together (both set the per-batch physical spacing — the cascade ladder owns it).
+- `+data.ram_cache=true` now allocates **two** RAM volume caches, one per sub-provider:
+  CT ≈ 50 GB + MRI ≈ 12 GB (≈ 63 GB resident). Size the node accordingly.
+- `model` resolves to `patchset3d` under this exact override set (verified via `compose`),
+  so no explicit `model=patchset3d` is needed.

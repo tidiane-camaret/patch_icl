@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hydra import compose, initialize_config_dir
 
-from common import build_dataset, resolve_multisource_classes
+from common import build_dataset, resolve_multisource_classes, _assert_cascade_supported
+from src.providers.multisource import MultiSourceProvider
+from src.providers.totalseg import NativeCrop
 
 
 def _cfg(overrides):
@@ -101,5 +103,37 @@ def main():
     print("OK")
 
 
+def check_cascade_build():
+    """Train-split multisource under the cascade overrides: provider emits native crops.
+
+    Mirrors the user's `83_multisource_cascade` command: `train_spacing_range=null`
+    (the multisource_ct_mri.yaml default [1.5,6.0] conflicts with cascade_spacings),
+    gpu_realize_crop + ram_cache on. Verifies the guard passes, the provider is a
+    MultiSourceProvider in native mode, and item[0] is an imageless native-crop
+    payload whose members are NativeCrop with a per-crop `norm` spec.
+    """
+    cfg = _cfg([
+        "experiment=81_multisource_ct_mri", "cluster=nfs",
+        "data.train_spacing_range=null", "data.crop_spacing_mm=6",
+        "+data.cascade_spacings=[6,3]", "+data.gpu_realize_crop=true",
+        "+data.ram_cache=true", "+train.cascade_loss_weights=[1,1]",
+        "+data.cascade_query_prior.modes=[pred,none,gt]",
+        "+data.cascade_query_prior.p=[0.6,0.3,0.1]",
+        "+data.cascade_query_prior.eval_mode=pred",
+    ])
+    _assert_cascade_supported(cfg)
+    ds = build_dataset(cfg, "train")
+    assert isinstance(ds.provider, MultiSourceProvider)
+    assert ds.provider.gpu_realize_crop is True
+    item = ds[0]
+    assert "image" not in item and "native_crop" in item
+    assert item["tgt_modality"] in ("ct", "mri")
+    assert item["ctx_modality"] in ("ct", "mri")
+    assert all(isinstance(x, NativeCrop) for x in item["native_crop"])
+    assert all(x.norm is not None for x in item["native_crop"])
+    print("check_cascade_build OK:", item["tgt_modality"], "->", item["ctx_modality"])
+
+
 if __name__ == "__main__":
     main()
+    check_cascade_build()
