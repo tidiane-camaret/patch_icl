@@ -67,7 +67,26 @@ eval:
   # experiment's arch.nnunet_ts_weights (e.g. exp 52's staged Dataset291 organs).
   totalseg_weights: null
   medverse_ckpt: null         # override Medverse.ckpt path; null = adapter default
+  medverse_bounded_head: null  # medverse: null = inherit the checkpoint's stored flag
+                               # (train.medverse_bounded_head); true/false to force. When on,
+                               # the adapter re-appends the sigmoid the finetune trained with.
   sw_roi_size: null           # sliding-window ROI; null = adapter default (128³)
+  sw_overlap: 0.1             # medverse autoregressive: sliding-window ROI overlap. 0.1 is
+                              # Medverse's own default (stride int(128*0.9)=115 -> 3 windows/
+                              # axis, 27 fine forwards at 256³). 0.0 -> stride 128 -> 8 fine
+                              # forwards, ~3x faster/sample. null also = adapter default (0.1).
+  # Eval-speed knobs (measured on loki @256³ autoregressive medverse, docs/logs.md 2026-09-08):
+  autocast: false            # bf16 CUDA autocast around model.predict — ~1.6x, thresholded
+                             # seg output so Dice impact is minimal (A/B on real data first).
+  compile: false             # torch.compile the medverse net — only ~1.15x on loki + a
+                             # multi-minute cold compile (recompiles if autocast toggles dtype).
+  measure_flops: true        # false skips the pre-loop FLOP count (one full predict under
+                             # FlopCounterMode; slow for 256³ AR). GFLOPs then reported as 0.
+  cascade_autocast: true     # v2 cascade eval (data.cascade_spacings): run the per-level
+                             # patchset3d forward under bf16 autocast — its trained regime
+                             # (train.py's val step already does). Measured exp-80/83: 3.0x on
+                             # the forward (which is ~79% of the cascade), macro stitched Dice
+                             # 0.6399->0.6397. realize/geo-warp stay fp32. false = old fp32.
   checkpoint: null            # trained best.pt (required for native_*/multilevel/nninteractive)
   feat_norm: null             # patchset3d only: override the checkpoint's feature-norm mode
                               # at eval (weight-free) -> sweep context|self|none on one ckpt

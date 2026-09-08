@@ -123,14 +123,32 @@ def _build_model(cfg: DictConfig):
         mk = {}
         if cfg.eval.get("sw_roi_size"):
             mk["sw_roi_size"] = tuple(cfg.eval.sw_roi_size)
+        if cfg.eval.get("sw_overlap") is not None:  # 0.0 is meaningful -> not a truthiness check
+            mk["sw_overlap"] = float(cfg.eval.sw_overlap)
         if cfg.eval.get("medverse_ckpt"):
             mk["ckpt_path"] = cfg.eval.medverse_ckpt
+        # bounded_head: append a sigmoid so predict() matches a medverse_bounded_head finetune.
+        # eval.medverse_bounded_head (null default) overrides; else read the flag the training
+        # run stored in the checkpoint. The released-weights baseline stays False.
+        ckpt = (torch.load(cfg.eval.checkpoint, map_location=DEVICE, weights_only=False)
+                if cfg.eval.get("checkpoint") else None)
+        bh = cfg.eval.get("medverse_bounded_head")
+        if bh is None and ckpt is not None:
+            bh = bool(ckpt.get("medverse_bounded_head", False))
+        if bh:
+            mk["bounded_head"] = True
         model = MedverseModel(device=DEVICE, **mk)
         # Fine-tuned checkpoint from experiments/3d/train.py (state under "model").
-        if cfg.eval.get("checkpoint"):
-            ckpt = torch.load(cfg.eval.checkpoint, map_location=DEVICE, weights_only=False)
+        if ckpt is not None:
             model.load_finetuned(ckpt["model"] if "model" in ckpt else ckpt)
-            print(f"  Loaded fine-tuned medverse weights from {cfg.eval.checkpoint}")
+            print(f"  Loaded fine-tuned medverse weights from {cfg.eval.checkpoint}"
+                  + ("  [bounded_head]" if bh else ""))
+        if cfg.eval.get("compile"):
+            # torch.compile the Medverse net (shape-stable 128³ ROI loop). Costs a multi-minute
+            # cold compile + a recompile if eval.autocast toggles the dtype; measured ~1.15x on
+            # loki so only worth it for large eval runs. Call after weight load.
+            model.compile_net()
+            print("  Compiled Medverse net (eval.compile=true)")
         return model
     if name == "patchset3d":
         # PatchSet3D is used directly as the eval model (it provides .predict, the only
@@ -246,12 +264,18 @@ def main(cfg: DictConfig) -> None:
 
     _warn_uninherited_data(cfg)
     model = _build_model(cfg)
-    print(f"  Measuring FLOPs (K={K}, size={image_size})...")
-    flops = measure_flops(model, image_size, K, DEVICE)
-    gflops = flops["total"]
-    _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer")
-                     if flops[k] is not None)
-    print(f"  GFLOPs: {gflops:.2f}{('  [' + _brk + ']') if _brk else ''}\n")
+    if cfg.eval.get("measure_flops", True):
+        print(f"  Measuring FLOPs (K={K}, size={image_size})...")
+        flops = measure_flops(model, image_size, K, DEVICE)
+        gflops = flops["total"]
+        _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer", "other")
+                         if flops.get(k) is not None)
+        print(f"  GFLOPs: {gflops:.2f}{('  [' + _brk + ']') if _brk else ''}\n")
+    else:
+        # Skip the diagnostic FLOP count (one full predict under FlopCounterMode — costly for
+        # autoregressive medverse at 256³). GFLOPs is then reported as 0 everywhere.
+        flops, gflops = {"total": 0.0, "encoder": None, "transformer": None, "other": None}, 0.0
+        print("  FLOPs measurement skipped (eval.measure_flops=false)\n")
 
     # ── wandb / output dir ───────────────────────────────────────────────────
     wb_on = bool(cfg.wandb.get("project"))
@@ -355,7 +379,8 @@ def main(cfg: DictConfig) -> None:
                                                  fig_dir=fig_dir, locator=locator,
                                                  cascade=cascade, cascade_figures=cascade_figures)
     else:
-        rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir)
+        rows, all_cases = evaluate_classes(model, cfg, classes, fig_dir=fig_dir,
+                                           autocast=bool(cfg.eval.get("autocast", False)))
     # Full per-sample detail table (mirrors experiments/2d eval.py's sample table): one row
     # per case with Dice, timing, GT/context occupancy stats, per-sample spacing + source-
     # adaptive `detail`, and an `in_train` flag. epoch stays -1 (build_sample_table's sentinel).

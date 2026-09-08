@@ -49,6 +49,12 @@ arch:
   compile: true                 # torch.compile the transformer + Muon Newton-Schulz
   compile_encoder: true         # image encoder stack
   compile_decoder: true         # decode head
+  # dynamic=True (default) shares ONE compiled graph across train/eval batch sizes;
+  # false = fixed-shape kernels (measured ~2x faster forward on loki for a
+  # cascade_spacings + train_spacing_range=null run — one static train batch size;
+  # pair with train.drop_last=true). Eval's grad-disabled mode still adds one one-time
+  # recompile per region either way.
+  compile_dynamic: true
 
 train:
   # --- optim recipe (model-intrinsic) ---

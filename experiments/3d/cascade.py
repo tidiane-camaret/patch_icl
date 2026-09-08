@@ -9,6 +9,7 @@ See docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
 """
 from __future__ import annotations
 
+import contextlib
 import random
 import threading
 import time
@@ -24,8 +25,10 @@ from src.gpu_realize_crop import realize_native_crops, _regroup
 from src.incontext_dataset_v2 import LoadRequest
 from src.totalseg_dataset import resolve_ct_norm
 from src.totalseg_dataloader_incontext import incontext_collate_fn
+from tqdm import tqdm
+
 from grid_metrics import target_like
-from evaluate import _grid_centroid, _predicted_native_center
+from evaluate import _predicted_native_center  # noqa: F401  (kept: referenced in docstrings/tests)
 
 
 def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
@@ -95,17 +98,39 @@ def _gen(seed_int, device):
     return g
 
 
+_CENTROID_COORDS: dict = {}
+
+
+def _coord_grid(T, device):
+    """Cached (3, T, T, T) float32 index grid (d, h, w) on `device`."""
+    key = (int(T), str(device))
+    g = _CENTROID_COORDS.get(key)
+    if g is None:
+        a = torch.arange(int(T), device=device, dtype=torch.float32)
+        g = torch.stack(torch.meshgrid(a, a, a, indexing="ij"))
+        _CENTROID_COORDS[key] = g
+    return g
+
+
 def _centroid_from_logit(logit_b1ghw, T, is_prob):
     """Per-b prob-weighted centroid (d,h,w) in the T^3 grid, or None when empty.
 
-    logit upsampled to T^3 so the crop-geom affine (which assumes a T^3 prob) applies.
+    Fully on-GPU (one fused weighted mean, cached coord grid); only the final (B,3)
+    result + the (B,) mass leave the device. Replaced the per-b `.cpu().numpy()` +
+    `np.indices` path, which cost ~40 ms/level at 128^3 (measured exp-80/83; the fused
+    form is ~0.2 ms, macro Dice unchanged, centroids within 0.5 vox). The logit is
+    upsampled to T^3 only if it isn't already (patchset3d: G == T, so a no-op).
     """
     prob = logit_b1ghw.float().clamp(0, 1) if is_prob else torch.sigmoid(logit_b1ghw.float())
-    up = F.interpolate(prob, size=(T, T, T), mode="trilinear", align_corners=False)
-    out = []
-    for b in range(up.shape[0]):
-        out.append(_grid_centroid(up[b, 0].detach().cpu().numpy()))   # np(d,h,w) or None
-    return out
+    if prob.shape[-1] != T:
+        prob = F.interpolate(prob, size=(T, T, T), mode="trilinear", align_corners=False)
+    p = prob[:, 0]                                                    # (B,T,T,T)
+    cg = _coord_grid(T, p.device)                                     # (3,T,T,T)
+    s = p.flatten(1).sum(-1)                                          # (B,)
+    com = (p.unsqueeze(0) * cg[:, None]).flatten(2).sum(-1) / s.clamp_min(1e-6)   # (3,B)
+    com = com.t().detach().cpu().numpy()                              # (B,3) d,h,w
+    s = s.detach().cpu()
+    return [None if float(s[b]) < 1e-6 else com[b] for b in range(p.shape[0])]
 
 
 def _to_device(batch, device):
@@ -612,13 +637,22 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     model_net = getattr(model, "model", model)
     model_net.eval()
     dev = next(model_net.parameters()).device
+    # bf16 autocast for the per-level forward (patchset3d's trained regime — train.py's val
+    # step already runs bf16). Verified on exp-80/83: 3.0x on the forward (79% -> ~35% of the
+    # cascade), macro stitched Dice unchanged (0.6399 -> 0.6397). run_cascade's realize /
+    # geo-warp keep their own `enabled=False` blocks so the data pipeline stays fp32.
+    # eval.cascade_autocast=false forces the old fp32 path.
+    _casc_ac = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if (dev.type == "cuda" and bool(cfg.eval.get("cascade_autocast", True)))
+                else contextlib.nullcontext())
     step = 0
     t_cascade = n_seen = 0.0
-    for batch in loader:
+    pbar = tqdm(loader, desc="cascade eval", leave=False)
+    for batch in pbar:
         if dev.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        with torch.no_grad():
+        with torch.no_grad(), _casc_ac:
             res = run_cascade(model, loader.dataset.provider, batch, augmentor=None,
                               spacings=spacings, device=dev,
                               training=False, step=step, seed=seed, jitter=0,
@@ -639,6 +673,7 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
         dt_ms = (time.perf_counter() - t0) * 1e3
         per_sample_ms = dt_ms / max(len(subs), 1)
         t_cascade += dt_ms; n_seen += len(subs)
+        pbar.set_postfix_str(f"{n_seen:.0f} samples, {t_cascade / n_seen:.0f} ms/sample")
         for b in range(len(subs)):
             mod = tmods[b] if tmods is not None else None
             key = (mod, subs[b], clss[b])

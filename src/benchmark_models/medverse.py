@@ -14,6 +14,7 @@ returns z-scored values, so we apply model.normalize_3d_volume() on images
 before inference.  Mask inputs ({0, 1}) are unaffected.
 """
 
+import contextlib
 import math
 import sys
 import torch
@@ -53,11 +54,23 @@ class MedverseModel(InContextModel):
         device: torch.device = None,
         forward_l_arg: int = 1,
         sw_roi_size: tuple = (128, 128, 128),
+        sw_overlap: float = 0.1,
         random_init: bool = False,
+        bounded_head: bool = False,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.forward_l_arg = forward_l_arg
         self.sw_roi_size = sw_roi_size
+        # Sliding-window ROI overlap for the autoregressive path. 0.1 is Medverse's own
+        # default; it forces a 3rd window per axis at level>=1 (int(128*0.9)=115 stride
+        # over a 256 axis -> 3^3=27 fine forwards). 0.0 -> stride 128 -> 2^3=8. See
+        # docs/logs.md (autoregressive Medverse FLOPs).
+        self.sw_overlap = float(sw_overlap)
+        # bounded_head=True: a sigmoid is appended to the net's output (see _bounded_forward),
+        # so predict() and the AR feedback loop see a [0,1] probability while train_forward
+        # returns the pre-sigmoid LOGIT. Set by train.py for medverse_bounded_head finetunes;
+        # the released-weights baseline keeps False (its head already regresses into [0,1]).
+        self.bounded_head = bool(bounded_head)
 
         if MEDVERSE_REPO not in sys.path:
             sys.path.insert(0, MEDVERSE_REPO)
@@ -74,6 +87,28 @@ class MedverseModel(InContextModel):
             self.model = LightningModel.load_from_checkpoint(
                 ckpt_path, map_location=self.device
             ).to(self.device).eval()
+
+    @contextlib.contextmanager
+    def _bounded_forward(self):
+        """Temporarily append a sigmoid to LightningModel.forward for the duration of the
+        block, so every forward the autoregressive loop runs — the final output AND the
+        prediction fed back as image_context — is a bounded [0,1] probability. No-op unless
+        bounded_head=True. The wrap is on the bound method, not a submodule, so parameter
+        names (hence checkpoint save/load) are untouched."""
+        if not self.bounded_head:
+            yield
+            return
+        had = "forward" in self.model.__dict__
+        prev = self.model.__dict__.get("forward")
+        orig = self.model.forward
+        self.model.forward = lambda *a, **k: torch.sigmoid(orig(*a, **k))
+        try:
+            yield
+        finally:
+            if had:
+                self.model.forward = prev
+            else:
+                del self.model.forward
 
     @torch.no_grad()
     def predict(self, target_img, context_imgs, context_masks):
@@ -107,30 +142,46 @@ class MedverseModel(InContextModel):
         D, H, W = target_norm.shape[2:]
         auto_level = max(1, int(math.ceil(math.log2(max(D, H, W) / 128))) + 1)
 
-        pred = self.model.autoregressive_inference(
-            target_norm,
-            context_norm,
-            context_out,
-            level=auto_level,
-            forward_l_arg=self.forward_l_arg,
-            sw_roi_size=self.sw_roi_size,
-        )
-        # pred: [B, 1, D, H, W] continuous map → threshold at 0.5
+        with self._bounded_forward():   # no-op unless bounded_head; sigmoids every AR forward
+            pred = self.model.autoregressive_inference(
+                target_norm,
+                context_norm,
+                context_out,
+                level=auto_level,
+                forward_l_arg=self.forward_l_arg,
+                sw_roi_size=self.sw_roi_size,
+                sw_overlap=self.sw_overlap,
+            )
+        # pred: [B, 1, D, H, W] continuous map → threshold at 0.5. bounded_head -> pred is
+        # already sigmoid'd so 0.5 == logit 0; the released head regresses straight into [0,1].
         return (pred.squeeze(1) > 0.5).long()
 
-    def train_forward(self, target_img, context_imgs, context_masks, l: int = None):
-        """Grad-enabled single-ROI forward for fine-tuning — returns raw logits.
+    def train_forward(self, target_img, context_imgs, context_masks, l: int = None,
+                      query_prior=None):
+        """Grad-enabled single-ROI forward for fine-tuning — returns the raw net output.
 
         Mirrors predict()'s preprocessing (per-volume min-max norm, mask channel)
         but keeps gradients and skips the sliding-window autoregressive path: the
         input is assumed to fit one ROI (image_size == sw_roi_size at train time).
+        NOT wrapped by _bounded_forward: with bounded_head=True the returned value is the
+        pre-sigmoid LOGIT and train.py's bce_dice takes the binary_cross_entropy_with_logits
+        path (it applies the sigmoid); with bounded_head=False it is Medverse's native ~[0,1]
+        regression output and train.py treats it as a probability (clamped BCE + OOB anchor).
+
+        query_prior (B,1,D,H,W) in [0,1] — a rough target mask (perturbed GT at train time).
+        Fed through Medverse's NA-ICL channel as one synthetic (image, mask) context pair:
+        image_context_in = the target image, image_context_out = the prior. This mirrors
+        autoregressive_inference's feedback = (target image, previous-level prediction), so
+        the target decoder cross-attends to the prior alongside the K real contexts. None =
+        prior-free (the released / eval regime). See experiments/3d/query_prior.py.
 
         Args:
             target_img    : (B, 1, D, H, W)
             context_imgs  : (B, K, 1, D, H, W)
             context_masks : (B, K, D, H, W)
+            query_prior   : (B, 1, D, H, W) soft mask in [0,1], or None
         Returns:
-            (B, 1, D, H, W) raw logits (no sigmoid).
+            (B, 1, D, H, W) raw net output (logit if bounded_head, else ~[0,1] probability).
         """
         target_img    = target_img.to(self.device)
         context_imgs  = context_imgs.to(self.device)
@@ -142,8 +193,15 @@ class MedverseModel(InContextModel):
         context_norm = ctx_flat.view(B, K, C, D, H, W)
         context_out = context_masks.unsqueeze(2)  # (B, K, 1, D, H, W)
 
+        ic_in = ic_out = None
+        if query_prior is not None:
+            qp = query_prior.to(target_norm.device).float().clamp(0.0, 1.0)  # (B,1,D,H,W)
+            ic_in  = target_norm.unsqueeze(1)                                # (B,1,1,D,H,W)
+            ic_out = qp.unsqueeze(1)                                         # (B,1,1,D,H,W)
+
         return self.model.forward(
             target_norm, context_in=context_norm, context_out=context_out,
+            image_context_in=ic_in, image_context_out=ic_out,
             l=(l if l is not None else self.forward_l_arg),
         )
 

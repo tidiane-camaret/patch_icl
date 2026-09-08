@@ -338,11 +338,23 @@ def _occupancy_stats(label_i: torch.Tensor, ctx_masks_i: torch.Tensor) -> dict:
 def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> dict:
     """GFLOPs for one predict() call with a single-sample dummy input.
 
-    Returns {"total", "encoder", "transformer"} in GFLOPs. FlopCounterMode keys its
-    per-module breakdown by class name (each top-level key aggregates its subtree), so
-    the encoder / transformer shares come from the submodule class names; the small
-    img/mask embeds + decoder fall outside both. encoder/transformer are None for models
-    lacking those submodules (e.g. medverse). All-zero total on failure.
+    Returns {"total", "encoder", "transformer", "other"} in GFLOPs.
+
+    `total` = FlopCounterMode's global tally — EVERY countable op in predict()
+    regardless of module: encoder convs, transformer SDPA/matmuls, AND the decoder
+    (conv-decoder `_ConvNormAct` blocks / fine-filter heads are Conv3d + Linear, all
+    counted), plus the img/mask embeds. Verified on exp-80 patchset3d: encoder 22.6%
+    + transformer 70.4% + decoder ~6.5% + embeds ~0.6% = 100% of `total`. Not counted
+    (all O(elements), no contraction, <0.1% combined): trilinear F.interpolate,
+    InstanceNorm/LayerNorm, activations, RoPE, Fourier PE.
+
+    `encoder`/`transformer` are the named-subtree shares (None for models without them,
+    e.g. medverse); `other` = total - encoder - transformer makes the decoder + embeds
+    visible so the printed breakdown accounts for the whole `total`. All-zero on failure.
+
+    NOTE for cascade eval: this measures ONE forward at `image_size`. A v2 cascade sample
+    (data.cascade_spacings) runs one forward per level + the query-prior warp, so its true
+    per-sample cost is ~len(cascade_spacings)x this figure.
     """
     D, H, W = image_size
     dummy_target  = torch.zeros(1, 1, D, H, W, device=device)
@@ -358,19 +370,26 @@ def measure_flops(model, image_size: tuple, K: int, device: torch.device) -> dic
         with FlopCounterMode(display=False) as fc:
             model.predict(dummy_target, dummy_ctx_img, dummy_ctx_msk)
         counts = fc.get_flop_counts()
+        total = fc.get_total_flops() / 1e9
+
+        # predict() calls model.forward() directly (not __call__), so FlopCounterMode keys
+        # submodule subtrees by class name; if that ever routes through __call__ the keys
+        # become "<Root>.<attr>" — try both.
+        root = type(model).__name__
 
         def _share(attr):
             sub = getattr(model, attr, None)
             if sub is None:
                 return None
-            c = counts.get(type(sub).__name__)
+            c = counts.get(type(sub).__name__) or counts.get(f"{root}.{attr}")
             return sum(c.values()) / 1e9 if c else None
 
-        return {"total": fc.get_total_flops() / 1e9,
-                "encoder": _share("encoder"), "transformer": _share("transformer")}
+        enc, tr = _share("encoder"), _share("transformer")
+        other = (total - (enc or 0.0) - (tr or 0.0)) if (enc is not None or tr is not None) else None
+        return {"total": total, "encoder": enc, "transformer": tr, "other": other}
     except Exception as exc:  # noqa: BLE001
         print(f"    [FLOPs] Could not count: {exc}")
-        return {"total": 0.0, "encoder": None, "transformer": None}
+        return {"total": 0.0, "encoder": None, "transformer": None, "other": None}
     finally:
         _pfn._FLEX_ENABLED = _flex_prev
 

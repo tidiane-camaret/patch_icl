@@ -710,12 +710,17 @@ def train_loader(cfg) -> DataLoader:
     common = dict(num_workers=nw, collate_fn=collate,
                   pin_memory=DEVICE.type == "cuda", persistent_workers=nw > 0,
                   prefetch_factor=2 if nw > 0 else None)
+    # train.drop_last: drop a short final batch so a fixed-shape torch.compile graph
+    # (arch.compile_dynamic=false) never sees an odd batch size mid-epoch. Default false
+    # (no-op unless max_ds_len_train / len(ds) is not a multiple of batch_size).
+    _drop_last = bool(cfg.train.get("drop_last", False))
     train_spacing_range = cfg.data.get("train_spacing_range", None)
     if train_spacing_range is not None:
         batch_sampler = SpacingBatchSampler(base, bs, train_spacing_range,
+                                            drop_last=_drop_last,
                                             seed=int(cfg.train.get("seed", 0)))
         return DataLoader(ds, batch_sampler=batch_sampler, **common)
-    return DataLoader(ds, batch_size=bs, sampler=base, **common)
+    return DataLoader(ds, batch_size=bs, sampler=base, drop_last=_drop_last, **common)
 
 
 def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = None) -> DataLoader:

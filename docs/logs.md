@@ -1,5 +1,224 @@
 # Change log
 
+## 2026-09-08 — query prior for medverse (NA-ICL image_context channel)
+
+To compare medverse to a patchset run that injects a perturbed-GT query prior
+(`data.query_prior={modes:[gt,none], p:[...]}`, e.g. exp80), medverse needs the same
+training signal. Patchset seeds its query mask-token; medverse has no such token, but its
+**NA-ICL `image_context_in/out`** channel already carries one synthetic (image, mask)
+context pair — in `autoregressive_inference` it's `(target image, previous-level
+prediction)`. Same shape as a query prior.
+
+- `MedverseModel.train_forward(..., query_prior=None)`: when a prior `(B,1,D,H,W)` is passed,
+  send `image_context_in = normalize(target)` and `image_context_out = prior.clamp(0,1)`,
+  both `(B,1,1,D,H,W)`, into `Medverse.forward`. The target decoder then cross-attends to the
+  prior alongside the K real contexts. `None` → prior-free (eval / released regime). Not
+  wrapped by `_bounded_forward`; `image_context_code` / `image_context_embedding` are
+  unconditional params in the released ckpt so the channel is already trained.
+- `train.py::train_epoch`: the query-prior draw (`draw_query_prior_mode` + `build_query_prior`
+  with `data.prior_perturb`, seeded `f"{seed}_{epoch}_{step}"`) is hoisted out of the
+  `is_patchset` block and shared; `qp_on` gate broadened from `is_patchset` to
+  `is_patchset or model=="medverse"` (still non-cascade + `qp_spec.active` only, so every
+  `query_prior=none` run is untouched — byte-identical). medverse branch calls
+  `train_forward(..., query_prior=qp)`. `query_prior_frac/{gt,none}` now logs for medverse too.
+- Eval stays prior-free: only `train_epoch` passes `query_prior=`; `evaluate_classes`'
+  `logits_fn=model.train_forward` and `predict()` never synthesize the pair (matches
+  patchset's prior-free eval).
+
+Caveats: coarser integration than patchset's mask-token tag (whole mean-pooled context pair,
+fused per U-Net stage, not a pre-transformer token add); no `decode_source=mask` analog, so
+whether medverse shows exp80's "copy the prior → collapse at prior-free eval" failure is an
+open question the `none`-mix (70%) guards against either way; prior built from the
+goal_mask-transformed `lbl` (consistent with patchset); GT is `.detach()`-ed in
+`build_query_prior` so no leak-gradient.
+
+Tests: `experiments/3d/tests/test_medverse_query_prior.py` (3), still-green
+`test_medverse_bounded_head.py` (3). Run: the exp80 medverse override from the previous
+entry picks it up automatically via `data.query_prior` (no extra flag).
+
+## 2026-09-08 — medverse bounded head (`train.medverse_bounded_head`)
+
+Learning-curve autopsy of exp69 (medverse) vs exp70 (patchset3d) on the same [1.5,6] mm
+var-spacing regime: exp69 `train/loss` **explodes 0.96 → 20–77** (oscillating, `val/loss` to
+200) while `val/dice` crawls 0.13 → 0.21 over 275 ep; exp70 loss is monotone 1.10 → 0.86 and
+passes exp69's best by ~e18. Root cause of the divergence half: Medverse's head has **no
+output activation** (regresses into ≈[0,1], unbounded). `build_loss`'s `is_prob` path
+compensates with clamped BCE + soft-Dice + a **`oob_w=10·mean((out−clamp(out,0,1))²)`**
+anchor. The clamped BCE (≲2) and Dice (≤1) terms are tiny next to that anchor, so a loss of
+20–77 is almost entirely "pull the head back into [0,1]" — and `grad_clip=1.0` then throttles
+the (small) segmentation gradient. `smooth_l1` is the only other option and it background-
+collapses under class imbalance (`project_medverse_output_is_prob`).
+
+Fix: **`train.medverse_bounded_head=true`** appends a sigmoid to the head, in the adapter:
+
+- `MedverseModel(bounded_head=True)` + `MedverseModel._bounded_forward()` — a ctx manager that
+  wraps `LightningModel.forward` with `sigmoid` for the duration of `predict()`, so the final
+  output **and** the AR feedback (`image_context_in/out`) are bounded [0,1]. Wrap is on the
+  bound method, not a submodule → parameter names / checkpoints unchanged. No-op when the flag
+  is off (released-weights baseline keeps its native ≈[0,1] head).
+- `train_forward` is **not** wrapped: it returns the pre-sigmoid **logit**.
+- `model_output_is_prob(cfg)` → **False** when the flag is set → `build_loss` takes the
+  standard `binary_cross_entropy_with_logits + soft_dice(sigmoid)` path. OOB anchor, `_st_clamp`
+  and the fp32-BCE guard all go unused. Verified: `loss(logit=+12, tgt=0)` = 13.0 bounded vs
+  1224.8 on the is_prob path.
+- Checkpoint stores `medverse_bounded_head`; `eval.py` reads it back (or
+  `eval.medverse_bounded_head` forces it). Threshold stays 0.5 (== logit 0) both paths.
+
+Expected: loss becomes monotone/bounded, grad-clip stops eating the seg signal (higher
+effective LR at the same `train.lr`), probabilities calibrate (`dice_soft` → `dice`), and the
+"don't resume from collapse-edge best.pt" caveat goes away. Does **not** touch the matcher-
+capacity ceiling (64-token / 66-d context attention) — if medverse still plateaus far below
+patchset3d after this, that's the honest architecture gap.
+
+Run: `python experiments/3d/train.py experiment=69_medverse_varspacing_6_1_5 +train.medverse_bounded_head=true`
+(optionally `train.lr=7.0e-5` — exp69's 3e-5 was a deliberate stability hedge that the bounded
+head removes). Test: `experiments/3d/tests/test_medverse_bounded_head.py` (3 pass).
+
+## 2026-09-08 — v2 cascade eval: bf16 autocast on the per-level forward (patchset3d)
+
+Phase-profiled `evaluate_cascade` / `run_cascade` on the exp-80/83 cascade ckpt (128³, B=2,
+3 levels [6,3,1.5] mm, `query_prior=pred`, RAM cache + gpu_realize_crop). `run_cascade` was
+**1599 ms/batch**:
+
+| phase | ms/batch | share |
+|---|---:|---:|
+| model forward × 3 levels | 1267 | **79%** |
+| re-crop × 2 (`realize_native_crops`) | 255 (L1 **244** / L2 13) | 16% |
+| centroid + geo-invert × 2 | 74 | 4.6% |
+| prior-warp / hard-pred / to-device | ~6 | 0.4% |
+
+The forward dominated **and ran fp32** — `evaluate_cascade`→`run_cascade`→`_forward_level`→
+`model(...)` had no autocast (~18 TFLOP/s effective at 3887 GFLOPs/forward on an RTX 6000 Ada
+= no tensor cores). `train.py`'s val step already runs patchset3d val under bf16; standalone
+`eval.py` cascade was the anomaly and the reason patchset `mean_time_ms` > medverse despite
+fewer FLOPs.
+
+Fix: **`eval.cascade_autocast` (default true)** — `evaluate_cascade` wraps the `run_cascade`
+call in `torch.autocast(bf16)`. `run_cascade`'s realize / geo-warp keep their own
+`enabled=False` blocks so the data pipeline stays fp32. A/B on exp-80/83 (6 classes, stitched
+native Dice): **forward 1268 → 418 ms/batch (3.0x)**, macro Dice **0.6399 → 0.6397** (per-class
+within ±0.002). `run_cascade` ~1599 → ~845 ms/batch (**1.9x** overall); the mix becomes forward
+~35% / recrop ~30% / centroid ~9%.
+
+Two secondary levers inspected (bf16-forward baseline, `run_cascade` 744 ms/batch):
+
+- **`_centroid_from_logit` fused on-GPU** (done). The old path did `up[b,0].cpu().numpy()` +
+  `np.indices((128,128,128))` (a 50 MB alloc) per b — **40.7 ms/level**. Fused weighted mean
+  with a cached coord grid, only (B,3)+(B,) leave the device: **0.2 ms/level** (−85 ms/batch,
+  −11%). Centroids within 0.5 vox of the numpy path; all 52 `test_cascade.py` pass.
+- **`recrop_workers`**: swept 1/4/8 — higher is *worse* (recrop[L1] 234 → 351 / 372 ms),
+  `ThreadPoolExecutor` + GIL contention on `build_native_crop`'s numpy work. `=1` stays
+  optimal (confirms the earlier profile note). **Not changed.**
+- **recrop L1 still 226 ms** and is CPU-bound `build_native_crop` assembly, not GPU realize
+  (~35 ms): for the 6→3 mm level the native crop is ~256³ (384 mm FOV / ~1.5 mm native),
+  and each of the B·(K+1) members does `np.array` copy + `.float()` + `.clamp()` + two CPU
+  `avg_pool3d` 256³→128³, serially. Real fixes are structural (reuse level-0 context crops
+  via centre-crop instead of re-slicing native; or torch-tensor RAM cache + GPU decimation —
+  the latter was a past pessimization via H2D of the raw crop). Left for a follow-up.
+
+Net with both applied: `run_cascade` ~1599 (fp32) → ~659 ms/batch (bf16 + fused centroid),
+**2.4x**; mix is now forward ~63% / recrop-L1 ~34% / everything else ~3%.
+
+## 2026-09-08 — patchset3d eval FLOP audit + `other` breakdown line
+
+Audited `evaluate.measure_flops` for patchset3d (exp-80/83 cascade ckpt: plainconv_ts
+encoder + conv `fine_decode` decoder + 4-layer 768-d transformer, 128³, K=1). FlopCounterMode's
+`total` (`get_total_flops`, the `Global` tally) **already includes every module** — it sums
+every countable op regardless of hierarchy:
+
+| part | GFLOPs | % of total |
+|---|---|---|
+| transformer (SDPA + mlp/qkv matmuls) | 2736.3 | 70.4 |
+| encoder (plainconv convs) | 877.0 | 22.6 |
+| decoder (`_ConvNormAct` blocks + dec_head/film/skip/token_residual — all Conv3d) | ~254 | 6.5 |
+| img_embed MLP + mask_embed conv + pos enc | ~22 | 0.6 |
+| **total** | **3887.3** | 100 |
+
+Only the printed *breakdown* was incomplete: it named `encoder` + `transformer` and the
+decoder's 6.5% was silent (still in `total`). Not counted anywhere (all O(elements), no
+contraction, <0.1% combined): trilinear `F.interpolate` (×4 in the conv decoder), InstanceNorm,
+activations, RoPE, Fourier PE.
+
+Changes:
+- `measure_flops` now also returns **`other` = total − encoder − transformer** (decoder +
+  embeds + heads) so the printed `[encoder=… transformer=… other=…]` sums to `total`.
+  `_share` also falls back to the `"<Root>.<attr>"` FQN key (robust if `predict()` ever
+  routes through `__call__` instead of `forward()`). `eval.py` / `train.py` print `other`.
+- Docstring documents the coverage + the **cascade caveat**: `measure_flops` measures ONE
+  forward at `image_size`; a v2 `cascade_spacings` sample runs one forward per level, so its
+  true per-sample cost is ~`len(cascade_spacings)`× the reported figure.
+
+## 2026-09-08 — speed up autoregressive Medverse 3D eval
+
+Benchmarked `MedverseModel.predict()` @256³ B=1 K=1 on loki (RTX 6000 Ada), best-of-3,
+one ckpt load reused (`scratchpad` bench2.py):
+
+| config | ms/sample | vs baseline |
+|---|---|---|
+| eager, `sw_overlap=0.1` (28 fwd) — baseline | 5229 | 1.0× |
+| eager + bf16 autocast | 3269 | 1.6× |
+| eager, `sw_overlap=0.0` (9 fwd) | 1723 | 3.0× |
+| eager, `sw_overlap=0.0` + bf16 | **1035** | **5.1×** |
+| `torch.compile`, `sw_overlap=0.1`, fp32 | 4563 | 1.14× |
+| `sw_batch_size_val` 4 / 8 (any row) | +3–9% | **slower** |
+
+Findings / decisions:
+- `sw_overlap=0.0` (28→9 forwards) and bf16 autocast are the two real levers; they stack
+  to ~5×, both zero compile cost. `eval.sw_overlap` already exposed (prev entry); added
+  **`eval.autocast`** (bool → `evaluate_classes(autocast=)`, reuses `_eval_autocast`'s bf16
+  path — medverse has no `logits_fn` so it only wraps `model.predict`).
+- **Accuracy A/B (47 totalseg benchmark classes, `tasks_per_class=1`, `crop_jitter=0`, same
+  seed → identical tasks):** defaults (`sw_overlap=0.1`, no autocast) → Mean Dice **0.1095**
+  @ 5624 ms/sample; fast (`sw_overlap=0.0` + `autocast=true`) → Mean Dice **0.1090** @ 1053
+  ms/sample. **5.3× faster, Δdice −0.0005**; only 2/47 classes move >0.02 (IVC, trachea:
+  −0.023 each — thin structures, seam-blend noise at n=1). Fast settings are accuracy-safe.
+- `torch.compile`: only ~1.14× and a multi-minute cold compile; a bf16 dtype toggle forces a
+  full Triton recompile that did not finish in 10 min. Exposed as **`eval.compile`** (bool,
+  default off) but not recommended for eval-sized runs.
+- `sw_batch_size` batching of sliding-window ROIs is consistently ~3–9% slower (the 128³ conv
+  net already saturates the GPU per window) — not exposed.
+- Added **`eval.measure_flops`** (default true): false skips the pre-loop FLOP count (one full
+  256³ AR predict under FlopCounterMode, ~5–10 s fixed) and reports GFLOPs as 0.
+- **Data is not the bottleneck.** v2 `TotalSegProvider.load()` uncached @1.5mm/256³ is
+  ~110–220 ms/volume (~2 loads/task); fully hidden behind GPU compute at `eval.workers=20`.
+  A `ct_raw_1.5mm.npy` cache (`convert_to_npy.py --target-spacing 1.5`) would only matter at
+  workers≤2 or once the model step drops below ~400 ms/sample. Not built.
+- **`data.ram_cache=true` is a no-op here** — `load()` never reads `_ram` (only the cascade
+  `load_native_crop()` path does); setting it just triggers an unused multi-minute NFS read.
+
+## 2026-09-08 — expose medverse sliding-window overlap in 3D eval
+
+- `eval.sw_overlap` (config default `0.1` = Medverse's own default) plumbs
+  `configs/experiment/3d/eval.yaml` -> `eval.py::_build_model` -> `MedverseModel(sw_overlap=)`
+  -> `predict()` -> `autoregressive_inference(sw_overlap=)`. `_build_model` uses an
+  `is not None` check (not the truthiness check `sw_roi_size` uses) so `eval.sw_overlap=0.0`
+  is honoured.
+- Why: at `data.image_size=[256,256,256]` the adapter's `auto_level` formula gives level=2,
+  so `predict()` runs 1 coarse (128³, K contexts) + N fine (128³, K contexts + 1
+  image-context pair) forwards. With the old hard-wired overlap 0.1, MONAI stride =
+  `int(128*0.9)=115` needs 3 windows/axis -> **27** fine forwards -> measured 95217
+  GFLOPs/sample (≈40× a single 128³ forward, ~1.44× per fine window from the extra
+  image-context stream). `eval.sw_overlap=0.0` -> stride 128 -> 2³ = **8** fine forwards
+  (1+8 total), ~30k GFLOPs. Verified via net.forward tap on loki: overlap 0.1 -> 28
+  forwards (1+27), 0.0 -> 9 (1+8). FLOP count itself is faithful (FlopCounterMode over the
+  whole predict); it just omits the cheap `F.interpolate` / Gaussian-blend ops.
+- `train.py` medverse path unaffected (single-ROI `train_forward`, no sliding window).
+- **1.5 mm image cache built** for all 1228 totalseg subjects (`convert_to_npy.py
+  --target-spacing 1.5`; `ct_raw_1.5mm.npy`, ~5.7 min) so v2 `load()` takes the
+  `crop_and_place_cached` fast path at `crop_spacing_mm=1.5`. `spacings.json` refreshed.
+- **Reference run** (wandb `patchset_eval/pey7i39w`, `medverse`, totalseg test, 256³ @1.5 mm,
+  `sw_overlap=0.0` + `autocast=true`, 47 classes × 10 tasks = 470 samples, NSD@3 mm):
+  Mean Dice **0.1465**, Mean NSD **0.1361**, **1041.5 ms/sample**, 11:17 wall (+~2 min cold
+  start), GFLOPs 29874.94. 13/47 classes near-zero (thin/small: gallbladder, esophagus,
+  ribs, thyroid, adrenal, great-vessel branches). Top: liver 0.73, kidney_r 0.61,
+  bladder 0.49, femur 0.44, brain 0.41, spleen 0.40.
+- **Full run** (wandb `patchset_eval/cwaiusdi`, `medverse_ts256_1p5mm_all`): same config but
+  `data.val_classes=all` (117 classes) + no `tasks_per_class` cap = every test (subject,class)
+  = **6217 samples**, 1:59:35 wall, 1039 ms/sample. Macro Dice **0.1025**, macro NSD **0.0977**,
+  50/117 near-zero. By group: muscle 0.26, lung lobes 0.22, other-bone 0.19, organs/misc 0.16,
+  vertebrae 0.044, vessels 0.026, **ribs 0.010 (0/24 above 0.05)**. Top: liver 0.68, femur 0.63,
+  brain 0.59, kidney_r 0.58.
+
 ## 2026-09-06 — multi-source dataloader
 
 - multi-source dataloader: add MultiSourceProvider (v2 cohort hook) — per-task modality regime (all-ct / all-mri / forced cross) over two modality-locked TotalSegProviders, with per-class fallback to the other modality. src/providers/multisource.py (+ unit tests).

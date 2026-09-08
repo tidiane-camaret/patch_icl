@@ -116,8 +116,15 @@ def model_output_is_prob(cfg) -> bool:
     released checkpoint has loss_seg='smoothl3_l1' and no output activation (verified: raw
     output ranges ~[0,1], and its own predict() thresholds the raw output at 0.5). patchset3d
     emits real logits, which do need a sigmoid. Sigmoiding Medverse's [0,1] output pins every
-    voxel to foreground (sigmoid(x)>=0.5 for x>=0), collapsing dice to ~0.1."""
-    return cfg.get("model", "medverse") == "medverse"
+    voxel to foreground (sigmoid(x)>=0.5 for x>=0), collapsing dice to ~0.1.
+
+    Exception: train.medverse_bounded_head appends a sigmoid to Medverse's head (in the
+    adapter), so train_forward returns a real LOGIT and we take the standard
+    binary_cross_entropy_with_logits path — no [0,1] clamp, no out-of-bounds anchor.
+    See docs/logs.md 2026-09-08."""
+    if cfg.get("model", "medverse") != "medverse":
+        return False
+    return not bool(cfg.train.get("medverse_bounded_head", False))
 
 
 def _to_prob(logits, is_prob: bool):
@@ -369,6 +376,10 @@ def build_model(cfg: DictConfig):
         #   overridden by load_finetuned in main()).
         if cfg.train.get("checkpoint") == "random":
             mk["random_init"] = True  # train from scratch (ignores pretrained weights)
+        if cfg.train.get("medverse_bounded_head"):
+            # append a sigmoid to the head -> train_forward returns a logit, predict()/the AR
+            # loop see a [0,1] prob. Pairs with model_output_is_prob()==False (with_logits loss).
+            mk["bounded_head"] = True
         return MedverseModel(device=DEVICE, **mk), name
     if name == "patchset3d":
         from src.models.patchset3d import PatchSet3D
@@ -489,11 +500,14 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # end-of-epoch merge below is skipped, so the single-forward path is unaffected.
     _c_loss_acc, _c_dice_acc, _c_empty_acc = {}, {}, [0.0]
     _c_prior_acc = {}                      # query_prior mode -> #levels drawn (cascade mixture)
-    # Non-cascade query-prior injection (data.query_prior): a fraction of steps seed the query
-    # mask token with the target GT instead of the support-mean prior. Train-only; eval always
-    # runs prior-free. Inert (qp_on False) on the pure-`none` default and the cascade path.
+    # Non-cascade query-prior injection (data.query_prior): a fraction of steps hand the model a
+    # rough target mask (perturbed GT) instead of the prior-free default. Train-only; eval always
+    # runs prior-free. patchset3d seeds its query mask token; medverse feeds it through the
+    # NA-ICL image_context channel (adapter.train_forward). Inert (qp_on False) on the pure-`none`
+    # default and the cascade path.
     qp_spec = resolve_query_prior_spec(cfg.data.get("query_prior", None))
-    qp_on = is_patchset and qp_spec.active and not cfg.data.get("cascade_spacings")
+    qp_on = (qp_spec.active and not cfg.data.get("cascade_spacings")
+             and (is_patchset or cfg.get("model") == "medverse"))
     qp_perturb = cfg.data.get("prior_perturb", None)   # shared with the cascade prior path
     _qp_acc = {}                           # query_prior mode -> #steps drawn (non-cascade)
     # Optional per-phase timing: data-wait (perf_counter between steps) + image-encode and
@@ -635,6 +649,18 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             lbl = batch["label"].to(DEVICE, non_blocking=True).float()     # (B,D,H,W)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
+        # Query-prior draw (shared by both model paths; no-op unless qp_on). Seeded on
+        # f"{seed}_{epoch}_{step}" so it is reproducible and RNG-independent — byte-identical
+        # to the previous patchset-only placement.
+        qp = None
+        if qp_on:
+            qp_mode = draw_query_prior_mode(qp_spec, f"{cfg.train.seed}_{epoch}_{n}")
+            _qp_acc[qp_mode] = _qp_acc.get(qp_mode, 0) + 1
+            _qp_gen = torch.Generator(device=DEVICE)
+            _qp_gen.manual_seed(int(cfg.train.seed) + epoch * 100_003 + n)
+            _qp_sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
+            qp = build_query_prior(qp_mode, lbl, perturb_cfg=qp_perturb,
+                                   spacing_mm=_qp_sp, gen=_qp_gen)      # (B,1,D,H,W) or None
         with _autocast():
             if is_patchset:
                 # Per-batch physical spacing (the batch sampler makes it constant across the
@@ -645,15 +671,6 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 img_in = batch["image"] if gpu_aug is not None else batch["image"].to(DEVICE, non_blocking=True)
                 cin = batch["context_in"] if gpu_aug is not None else batch["context_in"].to(DEVICE, non_blocking=True)
                 cout = batch["context_out"] if gpu_aug is not None else batch["context_out"].to(DEVICE, non_blocking=True)
-                qp = None
-                if qp_on:
-                    qp_mode = draw_query_prior_mode(qp_spec, f"{cfg.train.seed}_{epoch}_{n}")
-                    _qp_acc[qp_mode] = _qp_acc.get(qp_mode, 0) + 1
-                    _qp_gen = torch.Generator(device=DEVICE)
-                    _qp_gen.manual_seed(int(cfg.train.seed) + epoch * 100_003 + n)
-                    _qp_sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
-                    qp = build_query_prior(qp_mode, lbl, perturb_cfg=qp_perturb,
-                                           spacing_mm=_qp_sp, gen=_qp_gen)
                 # Pass the kwarg only when a prior is actually built (mirrors
                 # cascade._forward_level) so torch.compile keeps one graph for the no-prior case.
                 qp_kw = {"query_prior": qp} if qp is not None else {}
@@ -662,8 +679,9 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 logits = out["final_logit"].float()                    # (B,1,Rd,Rd,Rd)
                 target = target_like(lbl.unsqueeze(1), logits)         # GT pooled to grid
             else:
+                # medverse: qp (perturbed GT) rides the NA-ICL image_context channel; None -> off
                 logits = model.train_forward(batch["image"], batch["context_in"],
-                                             batch["context_out"])      # (B,1,D,H,W)
+                                             batch["context_out"], query_prior=qp)  # (B,1,D,H,W)
                 target = lbl.unsqueeze(1)
             # Fail fast + legibly on a non-finite forward: a NaN here otherwise passes through
             # clamp() into F.binary_cross_entropy, tripping an async CUDA device-side assert
@@ -894,9 +912,11 @@ def _compile_encoder(net, cfg) -> str:
     wrapper around it: the CT renormalization, the _down_to resamples and the encode cache have
     data-dependent shapes/branches that would graph-break, and train_epoch's profile_timing
     hooks are registered on net.encoder itself (a compiled wrapper still fires them, but the
-    eager wrapper keeps the timing comparable across runs). dynamic=True so train/eval batch
-    -size differences don't retrigger compilation.
+    eager wrapper keeps the timing comparable across runs). The trainable conv stacks use
+    dynamic = arch.compile_dynamic (default true so train/eval batch-size differences don't
+    retrigger compilation); the frozen primus/tap encoders keep their own settled choice.
     """
+    _dyn = bool(cfg.arch.get("compile_dynamic", True))
     want = cfg.arch.get("compile_encoder", None)
     if want is False:
         return "; encoder runs eager (arch.compile_encoder=false)"
@@ -919,7 +939,7 @@ def _compile_encoder(net, cfg) -> str:
     if which == "nnunet_ts" and hasattr(enc, "encoder"):
         # Inner PlainConvUNet encoder stack (conv / InstanceNorm / LeakyReLU): inductor fuses
         # the norm+activation tails around cuDNN's convs.
-        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        enc.encoder = torch.compile(enc.encoder, dynamic=_dyn)
         return " + frozen nnU-Net encoder stack"
     if which == "resenc_ts" and hasattr(enc, "encoder"):
         # From-scratch ResidualEncoderUNet.encoder (conv / InstanceNorm / LeakyReLU residual
@@ -927,17 +947,17 @@ def _compile_encoder(net, cfg) -> str:
         # covers fwd+bwd. Only the raw residual stack is compiled — the passthrough _norm and
         # the _down_to/cat to R^3 stay eager (data-dependent trilinear window), mirroring the
         # nnunet_ts branch. dynamic=True so train/eval batch-size differences don't recompile.
-        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        enc.encoder = torch.compile(enc.encoder, dynamic=_dyn)
         return " + from-scratch ResEnc encoder stack"
     if which == "plainconv_ts" and hasattr(enc, "encoder"):
         # From-scratch PlainConvUNet.encoder (conv / InstanceNorm / LeakyReLU, no residual
         # blocks): the plainconv_ts twin of the resenc_ts branch above.
-        enc.encoder = torch.compile(enc.encoder, dynamic=True)
+        enc.encoder = torch.compile(enc.encoder, dynamic=_dyn)
         return " + from-scratch PlainConv encoder stack"
     if which == "conv" and hasattr(enc, "_stage_feats"):
         # ConvEncoder3D: compile the stem+stages only — forward's _resample/concat to R^3 stays
         # eager (data-dependent avg_pool3d window).
-        enc._stage_feats = torch.compile(enc._stage_feats, dynamic=True)
+        enc._stage_feats = torch.compile(enc._stage_feats, dynamic=_dyn)
         return " + conv encoder stages"
     return "; encoder runs eager (no compile target)"
 
@@ -1005,8 +1025,8 @@ def main(cfg: DictConfig) -> None:
     n_total = sum(p.numel() for p in net.parameters())
     flops = measure_flops(model, image_size, cfg.data.context_size, DEVICE)
     gflops = flops["total"]
-    _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer")
-                     if flops[k] is not None)
+    _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer", "other")
+                     if flops.get(k) is not None)
     print(f"Params: {n_trainable/1e6:.1f}M trainable / {n_total/1e6:.1f}M total "
           f"({100 * n_trainable / max(n_total, 1):.0f}%) | predict GFLOPs: {gflops:.2f}"
           f"{('  [' + _brk + ']') if _brk else ''} (K={cfg.data.context_size}, size={image_size})")
@@ -1066,17 +1086,23 @@ def main(cfg: DictConfig) -> None:
     # Compiled AFTER the checkpoint load so warm-starting a raw state_dict isn't blocked by the
     # `_orig_mod.` prefix; the prefix is stripped again when this run saves (see below).
     if is_patchset and cfg.arch.get("compile", False) and hasattr(net, "transformer"):
-        net.transformer = torch.compile(net.transformer, dynamic=True)
+        # arch.compile_dynamic (default true): dynamic=True shares ONE compiled graph across
+        # train/eval batch sizes at the cost of guard-heavier kernels. Set false for a fixed
+        # geometry run (cascade_spacings + train_spacing_range=null, one static batch size ->
+        # pair with train.drop_last=true) to get tighter kernels; eval's differing batch size
+        # then triggers one extra one-time compile.
+        _cdyn = bool(cfg.arch.get("compile_dynamic", True))
+        net.transformer = torch.compile(net.transformer, dynamic=_cdyn)
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
-        msg = "Compiled net.transformer + Newton–Schulz (dynamic=True)"
+        msg = f"Compiled net.transformer + Newton–Schulz (dynamic={_cdyn})"
         msg += _compile_encoder(net, cfg)
         if cfg.arch.get("compile_decoder", False):
             # _decode is a method, so this shadows it with a compiled callable on the instance —
             # no state_dict keys change. Covers both heads: the plain per-token tile MLP and the
             # fine_decode path, whose z-score / 1x1x1 projection / per-cell einsum are
             # memory-bound elementwise work that inductor fuses.
-            net._decode = torch.compile(net._decode, dynamic=True)
+            net._decode = torch.compile(net._decode, dynamic=_cdyn)
             msg += " + decode head"
         print(msg)
 
@@ -1352,6 +1378,9 @@ def main(cfg: DictConfig) -> None:
                     "model": sd, "model_name": model_name,
                     "image_size": list(image_size), "context_size": cfg.data.context_size,
                     "best_val_dice": best, "epoch": epoch,
+                    # medverse only: True -> the adapter must re-append the sigmoid at eval
+                    # (train_forward output is a logit). Read back by eval.py's _build_model.
+                    "medverse_bounded_head": bool(cfg.train.get("medverse_bounded_head", False)),
                     # Training state for a full resume (train.checkpoint=<path>): optimizer
                     # moments, the LR-scheduler step count and RNG, so a resumed run CONTINUES
                     # its schedule instead of replaying warmup from the peak (docs/logs.md
