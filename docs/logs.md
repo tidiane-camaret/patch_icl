@@ -7537,3 +7537,32 @@ python experiments/3d/eval.py experiment=80_varspacing_hard_tgt_prior eval.model
 ```
 `data.train_spacing_range=null` + `crop_spacing_mm == cascade_spacings[0]` are required by
 `_assert_cascade_supported` (unchanged guards).
+
+**GFLOPs logging (v2 cascade).** `measure_flops` counts ONE forward at `data.image_size`
+(=128³, the per-level ROI). eval.py now scales that by `len(cascade_spacings)` for any
+`data.cascade_spacings` run (patchset3d and medverse alike) so the logged / wandb / CSV
+`gflops` is the per-sample cascade cost, not a single level. Close lower bound (~N×): the
+query-prior `grid_sample` warp isn't counted, and levels ≥1 carry one extra image_context
+pair. `measure_flops` at 128³ is a single cheap forward (medverse `predict` → auto_level=1),
+so keep `eval.measure_flops=true` for cascade runs (the earlier "set it false" advice was for
+256³ autoregressive medverse, which the cascade path never hits). Verified: medverse cascade
+`[6,3,1.5]` → 2362.56 → ×3 = 7087.69 GFLOPs/sample.
+
+## 2026-09-09 — parallel scan-cache build
+
+`.scan_cache_<hash>.pkl` was built with a serial loop over every subject's
+`label.npy` (`np.unique` per volume) in both loader engines — several minutes on
+first init over 1228 TotalSeg subjects, painful on a fresh cloud VM. Now
+parallelised with `ProcessPoolExecutor(max_workers=min(16, os.cpu_count()))`,
+mirroring the adjacent bbox/adj cache builders:
+
+- `src/totalseg_dataloader_incontext.py`: new module-level `_scan_for_subject`
+  (picklable worker); `_load_or_build_cache` fans out over it. Cache key / file
+  name unchanged (still hashed from the full dir list), so existing pickles load
+  as-is.
+- `src/providers/totalseg.py` (v2 `TotalSegProvider._load_or_build_scan`): imports
+  `_scan_for_subject`, same fan-out; also gained a progress print.
+
+Runs inside `build_dataset` (train_loader), before any `.to(DEVICE)`, so the fork
+pool is clear of the CUDA-init-then-fork crash. No worker override knob — always
+`min(16, cpu_count)`.

@@ -21,7 +21,7 @@ from src.incontext_dataset_v2 import LoadRequest, LoadResult
 from src.providers.volume_cache import get_cache
 from src.totalseg_dataloader_incontext import (
     organ_crop_arrays, place_image, place_label, resample_binary,
-    _bbox_for_subject, _IDX_TO_CLASS,
+    _bbox_for_subject, _scan_for_subject, _IDX_TO_CLASS,
 )
 from src.totalseg_dataset import (_ALL_CLASSES_IDX, normalize_ct, normalize_mri,
                                   resolve_ct_norm, CtNormSpec)
@@ -330,16 +330,18 @@ class TotalSegProvider:
         if path.exists():
             with open(path, "rb") as f:
                 return pickle.load(f)
+        subs = [p.name for p in self.root.iterdir()
+                if p.is_dir() and (p / "label.npy").exists()]
+        n_workers = min(16, os.cpu_count() or 1)
+        print(f"Building scan cache for {len(subs)} subjects "
+              f"(saved to {path.name}, {n_workers} workers)...", flush=True)
         cache = {}
-        for s in (p.name for p in self.root.iterdir() if p.is_dir()):
-            lp = self.root / s / "label.npy"
-            if not lp.exists():
-                continue
-            try:
-                idxs = set(np.unique(np.load(lp, mmap_mode="r")))
-            except (EOFError, ValueError, OSError):
-                continue
-            cache[s] = frozenset(_IDX_TO_CLASS[i] for i in idxs if i in _IDX_TO_CLASS)
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futs = {ex.submit(_scan_for_subject, self.root, s): s for s in subs}
+            for fut in as_completed(futs):
+                s, classes = fut.result()
+                if classes is not None:
+                    cache[s] = classes
         with open(path, "wb") as f:
             pickle.dump(cache, f)
         return cache

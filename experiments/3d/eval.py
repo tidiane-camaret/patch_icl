@@ -271,6 +271,19 @@ def main(cfg: DictConfig) -> None:
         _brk = "  ".join(f"{k}={flops[k]:.2f}" for k in ("encoder", "transformer", "other")
                          if flops.get(k) is not None)
         print(f"  GFLOPs: {gflops:.2f}{('  [' + _brk + ']') if _brk else ''}\n")
+        # v2 cascade (data.cascade_spacings) runs one forward per level at image_size — both
+        # patchset3d (model(...)) and medverse (MedverseModel.__call__ -> train_forward). Scale
+        # the single-forward count so the reported per-sample GFLOPs covers the whole cascade.
+        # The query-prior warp (grid_sample, no contraction) is not counted here or by
+        # FlopCounterMode; levels >=1 also carry one extra image_context pair, so this is a
+        # close lower bound (~N x), not exact. measure_flops at 128^3 is a single cheap forward
+        # (auto_level=1 for medverse), so keep eval.measure_flops=true for cascade runs.
+        _casc_sp = cfg.data.get("cascade_spacings")
+        if _casc_sp and gflops:
+            _n = len(_casc_sp)
+            gflops = round(gflops * _n, 2)
+            flops["total"] = gflops
+            print(f"  GFLOPs (v2 cascade, x{_n} levels): {gflops:.2f}/sample\n")
     else:
         # Skip the diagnostic FLOP count (one full predict under FlopCounterMode — costly for
         # autoregressive medverse at 256³). GFLOPs is then reported as 0 everywhere.

@@ -208,6 +208,16 @@ def _bbox_for_subject(root: Path, subj: str) -> tuple[str, dict | None]:
         return subj, None
 
 
+def _scan_for_subject(root: Path, subj: str) -> tuple[str, "frozenset[str] | None"]:
+    """Class names present in one subject's label.npy (module-level for pickling).
+    Returns (subj, None) for a missing/corrupt file so the caller can skip it."""
+    try:
+        idxs = np.unique(np.load(root / subj / "label.npy", mmap_mode="r"))
+    except (EOFError, ValueError, OSError):
+        return subj, None
+    return subj, frozenset(_IDX_TO_CLASS[int(i)] for i in idxs if int(i) in _IDX_TO_CLASS)
+
+
 def organ_crop_arrays(ct_mm, label_mm, center, sp, *, image_size, crop_mm, jitter, rng):
     """Pure array-level organ crop. Returns (crop_ct, crop_lbl, out_sizes, pad_lo, crop_geom).
 
@@ -600,22 +610,26 @@ class TotalSegInContextDataset(Dataset):
                   flush=True)
             return cache
 
-        print(f"Building scan cache for {len(all_subjects)} subjects "
-              f"(saved to {cache_path.name})...", flush=True)
+        subjects_with_labels = [s for s in all_subjects
+                                if (self.root / s / "label.npy").exists()]
+        n_workers = min(16, os.cpu_count() or 1)
+        print(f"Building scan cache for {len(subjects_with_labels)} subjects "
+              f"(saved to {cache_path.name}, {n_workers} workers)...", flush=True)
         cache: dict[str, frozenset[str]] = {}
-        for subj in all_subjects:
-            label_npy = self.root / subj / "label.npy"
-            if not label_npy.exists():
-                continue
-            try:
-                arr = np.load(label_npy, mmap_mode="r")
-                present_indices = set(np.unique(arr))
-            except (EOFError, ValueError, OSError):
-                print(f"  Skipping corrupt file: {label_npy}", flush=True)
-                continue
-            cache[subj] = frozenset(
-                _IDX_TO_CLASS[i] for i in present_indices if i in _IDX_TO_CLASS
-            )
+        done = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futs = {ex.submit(_scan_for_subject, self.root, s): s
+                    for s in subjects_with_labels}
+            for fut in as_completed(futs):
+                subj, classes = fut.result()
+                if classes is None:
+                    print(f"  Skipping corrupt file: {self.root / subj / 'label.npy'}",
+                          flush=True)
+                    continue
+                cache[subj] = classes
+                done += 1
+                if done % 200 == 0:
+                    print(f"  scan cache: {done}/{len(subjects_with_labels)}", flush=True)
 
         with open(cache_path, "wb") as f:
             pickle.dump(cache, f)
