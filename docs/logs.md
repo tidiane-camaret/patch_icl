@@ -7548,6 +7548,26 @@ so keep `eval.measure_flops=true` for cascade runs (the earlier "set it false" a
 256³ autoregressive medverse, which the cascade path never hits). Verified: medverse cascade
 `[6,3,1.5]` → 2362.56 → ×3 = 7087.69 GFLOPs/sample.
 
+**bf16 for medverse (train + eval).** Medverse's *training* forward was already bf16 —
+`train.py::_autocast()` is an unconditional `torch.autocast(bfloat16)` on CUDA wrapping the
+forward for both models (the loss's `F.binary_cross_entropy` stays fp32: autocast-unsafe, a
+hard requirement not a knob; no GradScaler — bf16 needs none). So the exp-80/85 checkpoint is
+already a bf16-trained model; nothing to change for training.
+- **In-training val step**: `fast_eval` gated both `autocast` and `reuse_logits` and was
+  hardcoded `== "patchset3d"`, so medverse's val ran fp32. Split out `train.eval_autocast`
+  (default = `fast_eval`, i.e. unchanged): `+train.eval_autocast=true` runs the medverse val
+  forward under bf16 too. `reuse_logits` stays `fast_eval` (medverse predict is still a
+  separate pass).
+- **Standalone eval.py, non-cascade**: `eval.autocast=true` (pre-existing knob) →
+  `model.predict` + the soft pass under bf16.
+- **Standalone eval.py, v2 cascade**: reverted the medverse fp32-force in `evaluate_cascade`;
+  it now follows `eval.cascade_autocast` (default **True** → bf16) for both models, matching
+  the bf16 training forward. `eval.cascade_autocast=false` forces fp32 (e.g. vs the released
+  Medverse fp32 benchmark). `run_cascade`'s realize / geo-warp keep their own `enabled=False`
+  blocks; `_forward_level` upcasts the logit with `.float()` so COM / hard-pred / prior math
+  stay fp32.
+Expect a small threshold-crossing Dice drift from bf16 — A/B on a few classes first.
+
 ## 2026-09-09 — parallel scan-cache build
 
 `.scan_cache_<hash>.pkl` was built with a serial loop over every subject's

@@ -637,19 +637,15 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     model_net = getattr(model, "model", model)
     model_net.eval()
     dev = next(model_net.parameters()).device
-    # bf16 autocast for the per-level forward (patchset3d's trained regime — train.py's val
-    # step already runs bf16). Verified on exp-80/83: 3.0x on the forward (79% -> ~35% of the
-    # cascade), macro stitched Dice unchanged (0.6399 -> 0.6397). run_cascade's realize /
-    # geo-warp keep their own `enabled=False` blocks so the data pipeline stays fp32.
-    # eval.cascade_autocast=false forces the old fp32 path.
-    # Medverse (MedverseModel.__call__ -> train_forward per level) is validated in fp32 —
-    # train.py keeps its val byte-identical — so it always runs fp32 here regardless of
-    # eval.cascade_autocast; a bf16 cascade forward would drift it off its own baseline.
-    from src.benchmark_models.medverse import MedverseModel  # safe: no cascade import cycle
-    _is_medverse = isinstance(model, MedverseModel)
+    # bf16 autocast for the per-level forward follows eval.cascade_autocast (default True) for
+    # BOTH models: it matches the bf16 training forward (train.py's _autocast() is unconditional
+    # bf16 on CUDA — medverse's train_forward included, reached here via MedverseModel.__call__).
+    # Verified on exp-80/83 (patchset3d): 3.0x on the forward (79% -> ~35% of the cascade), macro
+    # stitched Dice unchanged (0.6399 -> 0.6397). run_cascade's realize / geo-warp keep their own
+    # `enabled=False` blocks so the data pipeline stays fp32. eval.cascade_autocast=false forces
+    # fp32 (e.g. to score medverse against the released fp32 benchmark).
     _casc_ac = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if (dev.type == "cuda" and not _is_medverse
-                    and bool(cfg.eval.get("cascade_autocast", True)))
+                if (dev.type == "cuda" and bool(cfg.eval.get("cascade_autocast", True)))
                 else contextlib.nullcontext())
     step = 0
     t_cascade = n_seen = 0.0

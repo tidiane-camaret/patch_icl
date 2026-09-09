@@ -53,7 +53,7 @@ sudo apt-get update
 sudo apt-get install -y git unzip wget tmux
 lsblk
 # Confirm the data disk (usually /dev/sdb) before running mkfs. This erases it.
-sudo mkfs.ext4 -F /dev/sdb
+#sudo mkfs.ext4 -F /dev/sdb
 sudo mkdir -p /mnt/data
 sudo mount /dev/sdb /mnt/data
 sudo chown "$USER:$USER" /mnt/data

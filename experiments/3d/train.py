@@ -874,6 +874,12 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # separate predict pass) and run eval under bf16 (matches training, avoids recompiling the
     # compiled encoder/transformer between dtypes). Off for medverse to keep its val byte-identical.
     fast_eval = cfg.get("model", "medverse") == "patchset3d"
+    # eval_autocast: bf16 autocast around the val forward(s). Defaults to fast_eval — on for
+    # patchset3d (its val also reuses the bf16 train_forward logits), off for medverse so its
+    # val/dice stays fp32-stable across epochs and vs the released benchmark. Set
+    # train.eval_autocast=true for an end-to-end bf16 medverse run (matches the bf16 training
+    # forward from _autocast(); expect small threshold-crossing Dice drift, so A/B first).
+    eval_ac = bool(cfg.train.get("eval_autocast", fast_eval))
     # Cross-subject-only aggregation when eval self-context is off: p.eval=0 still lets the
     # context sampler fall back to self-cloning for candidate-less classes (leakage-inflated),
     # so drop those self_ctx rows from the reported means. p.eval>0 = intentional probe, keep.
@@ -884,7 +890,7 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
                                    logits_fn=model.train_forward, loss_fn=loss_fn,
                                    grid_res=getattr(model, "grid_size", None),
                                    output_is_prob=model_output_is_prob(cfg),
-                                   autocast=fast_eval, reuse_logits=fast_eval,
+                                   autocast=eval_ac, reuse_logits=fast_eval,
                                    drop_self_ctx=drop_self_ctx)
     valid = [r for r in rows if "mean_dice" in r]
     mean_dice = sum(r["mean_dice"] for r in valid) / len(valid) if valid else float("nan")
