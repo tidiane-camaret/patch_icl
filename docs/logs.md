@@ -1,5 +1,29 @@
 # Change log
 
+## 2026-09-09 — RAM cache now feeds the non-cascade v2 `load()` path
+
+`data.ram_cache=true` on a non-cascade `loader_v2` run (e.g. `experiment=80_varspacing_hard_tgt_prior`)
+built `TotalSegProvider._ram` (paying the ~35 GB / multi-minute preload) but nothing read
+it: `__getitem__` takes the `provider.load()` branch and `load()` always did
+`np.load(..., mmap_mode="r")` from NFS. Only `load_native_crop()` (the cascade /
+`gpu_realize_crop` path) consulted `_ram`.
+
+- `TotalSegProvider.load()`: on a `_ram` hit, use the resident native `ct_raw` + `label`
+  arrays instead of mmap, and skip the on-disk `ct_raw_{pitch:g}mm.npy` fast path (a
+  varspacing run's pitch is continuous so that file never exists anyway; the resident
+  native array already removes the NFS read it optimizes). Output is byte-identical to the
+  mmap path — same `crop_and_place`, read-only arrays copied out as before.
+- Train loaders `fork` → workers share `_ram` copy-on-write. Eval loaders
+  (`spawn`/`forkserver`) get `_ram=None` via `__getstate__` and fall back to mmap
+  unchanged. So this only accelerates the train loop, which is the point.
+- `common.py`: no logic change — `ram_cache=bool(d.get("ram_cache", _realize))` already
+  lets an explicit `+data.ram_cache=true` through; stale comment updated. RAM budget: cap
+  with `+data.ram_cache_max_subjects=N` if the node is tight.
+
+Tests: `tests/test_incontext_v2_provider.py` +2 (`test_ram_cache_matches_mmap_and_skips_disk`,
+`test_getstate_strips_ram_cache`), full file + volume_cache + cascade_provider + gpu_realize
+green (32).
+
 ## 2026-09-08 — query prior for medverse (NA-ICL image_context channel)
 
 To compare medverse to a patchset run that injects a perturbed-GT query prior

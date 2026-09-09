@@ -392,8 +392,9 @@ def build_dataset(cfg, split: str):
         classes = resolve_classes(class_spec, root, is_mri=is_mri)
         # Cascade train runs default gpu_realize_crop ON (the level-0 native-crop payload
         # path); a non-cascade config leaves it off -> byte-identical v2 path. ram_cache
-        # follows the RESOLVED gpu_realize_crop: `load_native_crop` is its only reader, so
-        # anything else would pay a multi-minute 35 GB NFS preload nothing touches.
+        # defaults to the RESOLVED gpu_realize_crop, but an explicit data.ram_cache=true
+        # now also feeds the non-cascade `load()` path (resident native ct_raw+label ->
+        # no NFS mmap per item) on fork train workers. Costs a multi-minute ~35 GB preload.
         _casc = bool(d.get("cascade_spacings"))
         _realize = (split == "train") and bool(d.get("gpu_realize_crop", _casc))
         provider = TotalSegProvider(

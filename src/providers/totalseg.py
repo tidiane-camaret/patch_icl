@@ -211,10 +211,10 @@ class TotalSegProvider:
         DataLoader workers started with `spawn`/`forkserver` (the eval loaders, so they
         don't inherit the parent CUDA context) pickle the dataset -> the provider. The
         cache is a process-lifetime singleton holding every subject loaded so far (tens of
-        GB); pickling it would blow up every worker. Workers only ever call `load()`, which
-        reads npy via mmap and never consults `_ram`; `load_native_crop` (the only reader)
-        runs in the main process, which keeps its `_ram`. `fork` workers are unaffected
-        (no pickling, copy-on-write pages)."""
+        GB); pickling it would blow up every worker. `load()` and `load_native_crop()` both
+        read `_ram` when it is present, but a spawn/forkserver worker gets `_ram=None` here
+        and cleanly falls back to mmap. `fork` workers (the train loaders) are unaffected —
+        no pickling, copy-on-write pages — so they keep the shared cache."""
         return {**self.__dict__, "_ram": None}
 
     # --- public API ---------------------------------------------------------
@@ -223,7 +223,14 @@ class TotalSegProvider:
 
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         subj_dir = self.root / subject
-        label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
+        # RAM cache (data.ram_cache): resident native ct_raw+label, preloaded in the main
+        # process so fork workers share it copy-on-write. Present only on fork loaders (the
+        # train path) — __getstate__ strips it for spawn/forkserver workers, which fall
+        # back to mmap. Arrays are read-only; every consumer copies its crop out.
+        ram = getattr(self, "_ram", None)
+        ram_hit = ram is not None and subject in ram
+        label_np = (ram[subject]["label"] if ram_hit
+                    else np.load(subj_dir / "label.npy", mmap_mode="r"))
         center = req.center
         if center is None:
             D, H, W = label_np.shape
@@ -236,8 +243,11 @@ class TotalSegProvider:
         # native CT downsampled to the crop pitch once, offline). Used only when its pitch
         # equals the requested crop_spacing (so the image is never upsampled); the mask still
         # comes from the full-res native label so occupancy is unchanged. See docs/logs.md.
+        # Skipped on a RAM-cache hit: the resident native ct_raw already removes the NFS read
+        # this exists to avoid, and a varspacing run's pitch is continuous so the per-pitch
+        # file essentially never exists anyway.
         cache_p = subj_dir / f"ct_raw_{req.crop_spacing_mm:g}mm.npy"
-        if cache_p.exists():
+        if not ram_hit and cache_p.exists():
             img_cache_np = np.load(cache_p, mmap_mode="r")
             image_t, label_t, geom = crop_and_place_cached(
                 img_cache_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
@@ -247,10 +257,13 @@ class TotalSegProvider:
                 mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
                 normalize_fn=lambda a: norm(np.ascontiguousarray(a)))
         else:
-            raw = subj_dir / "ct_raw.npy"
-            if not raw.exists():
-                raise FileNotFoundError(f"{raw} missing (v2 requires ct_raw.npy)")
-            image_np = np.load(raw, mmap_mode="r")
+            if ram_hit:
+                image_np = ram[subject]["ct_raw"]
+            else:
+                raw = subj_dir / "ct_raw.npy"
+                if not raw.exists():
+                    raise FileNotFoundError(f"{raw} missing (v2 requires ct_raw.npy)")
+                image_np = np.load(raw, mmap_mode="r")
             image_t, label_t, geom = crop_and_place(
                 image_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
                 crop_spacing_mm=req.crop_spacing_mm, native_spacing=native_sp,

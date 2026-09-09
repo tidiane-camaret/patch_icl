@@ -52,6 +52,43 @@ def test_provider_hard_fails_without_ct_raw(tmp_path):
         prov.load("s0000", _CLS, req)
 
 
+def test_ram_cache_matches_mmap_and_skips_disk(tmp_path, monkeypatch):
+    """data.ram_cache: load() reads the resident native arrays, byte-identical to the
+    mmap path, and does not np.load the subject's npy files."""
+    from src.providers import volume_cache
+    volume_cache.clear_cache()
+    root = tmp_path / "ts"; _make_tree(root)
+
+    ref = TotalSegProvider(root=root, classes=[_CLS], image_size=(32, 32, 32),
+                           crop_spacing_mm=1.5, crop_jitter=0).load(
+        "s0000", _CLS, LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5))
+
+    prov = TotalSegProvider(root=root, classes=[_CLS], image_size=(32, 32, 32),
+                            crop_spacing_mm=1.5, crop_jitter=0, ram_cache=True)
+    assert "s0000" in prov._ram
+
+    real_load = np.load
+    def _guard(path, *a, **k):
+        assert "s0000" not in str(path), f"ram hit still hit disk: {path}"
+        return real_load(path, *a, **k)
+    monkeypatch.setattr(np, "load", _guard)
+
+    res = prov.load("s0000", _CLS, LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5))
+    assert torch.equal(res.image, ref.image)
+    assert torch.equal(res.label, ref.label)
+    assert torch.equal(res.crop_geom, ref.crop_geom)
+
+
+def test_getstate_strips_ram_cache(tmp_path):
+    from src.providers import volume_cache
+    volume_cache.clear_cache()
+    root = tmp_path / "ts"; _make_tree(root)
+    prov = TotalSegProvider(root=root, classes=[_CLS], image_size=(32, 32, 32),
+                            ram_cache=True)
+    assert prov._ram is not None
+    assert prov.__getstate__()["_ram"] is None      # spawn/forkserver workers -> mmap
+
+
 def test_provider_request_center_overrides_centroid(tmp_path):
     root = tmp_path / "ts"; _make_tree(root)
     prov = TotalSegProvider(root=root, classes=[_CLS], image_size=(32, 32, 32),
