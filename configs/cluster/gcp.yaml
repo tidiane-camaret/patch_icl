@@ -1,0 +1,30 @@
+# @package _global_
+# Google Cloud Platform VM (single GPU). Select with `cluster=gcp`.
+#
+# Assumes the TotalSegmentator dataset produced by scripts/convert_to_npy.py
+# (per-subject ct.npy + label.npy + meta.csv at the root) lives on a persistent
+# disk. Replace /mnt/data below with your actual mount point (see docs/GCP2.md).
+#
+#   experiments/3d/train.py -> reads only paths.totalseg + paths.results for the
+#                              default dataset=totalseg / model=medverse.
+#   scripts/train.py        -> also honours the train: block below.
+
+paths:
+  totalseg:    /mnt/data/totalseg
+  results:     /mnt/data/results/patch_icl        # run dirs + checkpoints land here
+  checkpoints: ${paths.results}/checkpoints
+
+  # --- optional: only read if you change data.source / model / arch ---
+  # totalsegmri:     /mnt/data/totalsegmri
+  # nnunet:          /mnt/data/results/nnunet
+  # gmm_bank:        /mnt/data/gmm_bank
+  # totalseg_nnunet: /mnt/data/checkpoints/totalseg_nnunet
+  # colipri:         /mnt/data/checkpoints/colipri
+  # omniglot:        /mnt/data/omniglot/python
+
+# Consumed by scripts/train.py only. experiments/3d/train.py hard-sets batch_size/
+# workers in configs/experiment/3d/train.yaml, so pass train.batch_size=/train.workers=
+# on the CLI there.
+train:
+  batch_size: 4
+  workers: 8

@@ -205,6 +205,27 @@ class MedverseModel(InContextModel):
             l=(l if l is not None else self.forward_l_arg),
         )
 
+    def __call__(self, target_img, context_in=None, context_out=None,
+                 mode="train", spacing=None, query_prior=None, l: int = None):
+        """PatchSet3D-style call adapter so MedverseModel can run through the shared v2
+        cascade loop (experiments/3d/cascade.run_cascade / _forward_level), which calls
+        ``model(image, context_in=, context_out=, mode=, spacing=, query_prior=)`` and reads
+        ``out["final_logit"]`` (B,1,D,H,W).
+
+        Delegates to train_forward: ONE single-ROI forward per level — no sliding window, no
+        autoregressive downsampling. The cascade loop owns the coarse->fine re-crop, so each
+        level is already a single ROI at that level's spacing. `mode` / `spacing` / `l` are
+        accepted for signature parity only (Medverse has no positional or spacing mechanism).
+
+        With bounded_head=True the returned map is a pre-sigmoid LOGIT (callers pass
+        is_prob=False); otherwise it is Medverse's native ~[0,1] regression output
+        (is_prob=True). `query_prior` (B,1,D,H,W soft mask in [0,1]) rides Medverse's NA-ICL
+        image_context channel, exactly as at fine-tune time (see train_forward).
+        """
+        out = self.train_forward(target_img, context_in, context_out, l=l,
+                                 query_prior=query_prior)
+        return {"final_logit": out}
+
     def enable_gradient_checkpointing(self) -> int:
         """Gradient-checkpoint every conv block of the three U-Nets (context_unet /
         target_encoder / target_decoder) — the ModuleLists holding the full-res

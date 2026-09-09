@@ -32,9 +32,13 @@ def test_off_is_noop():
     _assert_cascade_supported(_cfg(data={"cascade_spacings": None}))
 
 
-def test_rejects_non_patchset():
-    with pytest.raises(ValueError, match="patchset3d"):
-        _assert_cascade_supported(_cfg(model="medverse"))
+def test_accepts_medverse():
+    _assert_cascade_supported(_cfg(model="medverse"))          # v2 cascade eval via train_forward
+
+
+def test_rejects_other_model():
+    with pytest.raises(ValueError, match="patchset3d or model=medverse"):
+        _assert_cascade_supported(_cfg(model="native_resenc"))
 
 
 def test_rejects_loader_v1():
@@ -130,3 +134,57 @@ def test_rejects_gpu_realize_without_cascade_spacings():
     with pytest.raises(ValueError, match="cascade_spacings"):
         _assert_cascade_supported(_cfg(data={"cascade_spacings": None,
                                              "gpu_realize_crop": True}))
+
+
+# --- data.cascade_train: random per-batch N-level training ladder ---------------
+
+def test_allows_cascade_train_within_eval_range():
+    _assert_cascade_supported(_cfg(data={"cascade_train":
+                                         {"levels": 2, "spacing_range": [1.5, 3]}}))
+
+
+def test_cascade_train_warns_out_of_eval_range():
+    with pytest.warns(UserWarning, match="cascade_train"):
+        _assert_cascade_supported(_cfg(data={"cascade_train":
+                                             {"levels": 2, "spacing_range": [1.5, 6]}}))
+
+
+def test_cascade_train_weight_accepts_train_levels_len():
+    # base cascade_spacings has len 2; cascade_train.levels=3 -> weights of len 3 accepted.
+    _assert_cascade_supported(_cfg(data={"cascade_train":
+                                         {"levels": 3, "spacing_range": [1.5, 3]}},
+                                   train={"cascade_loss_weights": [1.0, 1.0, 1.0]}))
+
+
+def test_cascade_train_weight_accepts_eval_ladder_len():
+    # levels=2 but weights match the 3-entry eval ladder -> accepted (train loop slices
+    # to the coarsest 2). This is the exp-80 command shape ([1,1,1] + levels=2).
+    _assert_cascade_supported(_cfg(
+        data={"cascade_spacings": [6, 3, 1.5], "crop_spacing_mm": 6,
+              "cascade_train": {"levels": 2, "spacing_range": [1.5, 6]}},
+        train={"cascade_loss_weights": [1.0, 1.0, 1.0]}))
+
+
+def test_cascade_train_weight_rejects_other_len():
+    with pytest.raises(ValueError, match="cascade_loss_weights"):
+        _assert_cascade_supported(_cfg(
+            data={"cascade_train": {"levels": 2, "spacing_range": [1.5, 3]}},
+            train={"cascade_loss_weights": [1.0]}))
+
+
+def test_cascade_train_rejects_bad_range_order():
+    with pytest.raises(ValueError, match="lo < hi"):
+        _assert_cascade_supported(_cfg(data={"cascade_train":
+                                             {"levels": 2, "spacing_range": [3, 1.5]}}))
+
+
+def test_cascade_train_rejects_bad_range_len():
+    with pytest.raises(ValueError, match="spacing_range"):
+        _assert_cascade_supported(_cfg(data={"cascade_train":
+                                             {"levels": 2, "spacing_range": [1.5]}}))
+
+
+def test_cascade_train_rejects_levels_lt_2():
+    with pytest.raises(ValueError, match="levels"):
+        _assert_cascade_supported(_cfg(data={"cascade_train":
+                                             {"levels": 1, "spacing_range": [1.5, 3]}}))

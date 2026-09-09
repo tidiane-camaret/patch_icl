@@ -348,9 +348,9 @@ def main(cfg: DictConfig) -> None:
         # which is intentionally left untouched.
         from cascade import evaluate_cascade
         from train import model_output_is_prob
-        if model_name != "patchset3d":
+        if model_name not in ("patchset3d", "medverse"):
             raise ValueError(f"data.cascade_spacings eval requires eval.model=patchset3d "
-                             f"(got {model_name!r}).")
+                             f"or medverse (got {model_name!r}).")
         if sweep or locator or cascade:
             raise ValueError("data.cascade_spacings (v2 cascade eval) is mutually exclusive "
                              "with eval.spacing_sweep / spacing_locator / spacing_cascade.")
@@ -361,12 +361,20 @@ def main(cfg: DictConfig) -> None:
         qp = _pspec.eval_mode if len(_pspec.modes) == 1 else (
             f"{list(_pspec.modes)}~{list(_pspec.weights)} -> eval_mode={_pspec.eval_mode}")
         qp_hard = " (hard)" if cfg.data.get("cascade_query_prior_hard") else ""
-        print(f"  v2 cascade eval: {spacings} mm  query_prior={qp}{qp_hard}  "
+        print(f"  v2 cascade eval ({model_name}): {spacings} mm  query_prior={qp}{qp_hard}  "
               f"split={cfg.eval.split}  recrop_workers={cfg.data.get('cascade_recrop_workers', 16)}\n")
+        # is_prob tells run_cascade whether the per-level forward returns a [0,1] prob (clamp)
+        # or a logit (sigmoid). model_output_is_prob(cfg) is unreliable at eval for medverse:
+        # cfg.train.medverse_bounded_head is not in the eval config and cfg.model may be an
+        # inert composed value. Read the adapter's bounded_head instead (set from the
+        # checkpoint in _build_model): bounded head -> train_forward returns a LOGIT ->
+        # is_prob=False; released weights -> native ~[0,1] output -> is_prob=True.
+        casc_is_prob = (not bool(getattr(model, "bounded_head", False))
+                        if model_name == "medverse" else bool(model_output_is_prob(cfg)))
         loader = make_eval_loader(cfg, classes, split=cfg.eval.split)
         rows, all_cases = evaluate_cascade(
             model, cfg, classes, loader=loader, seed=cfg.eval.seed,
-            is_prob=bool(model_output_is_prob(cfg)), fig_dir=fig_dir,
+            is_prob=casc_is_prob, fig_dir=fig_dir,
             cascade_figures=bool(cfg.eval.get("cascade_figures", False)))
     elif sweep:
         _assert_sweep_supported(cfg)

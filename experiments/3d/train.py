@@ -70,7 +70,8 @@ sys.path.append(str(ROOT / "experiments" / "2d"))         # reuse Muon/LAWA from
 
 from data.totalseg_classes import resolve_classes
 from common import (DEVICE, _source_root, train_loader, make_eval_loader, _self_context,
-                    eval_cfg, _assert_cascade_supported)
+                    eval_cfg, _assert_cascade_supported, resolve_cascade_train,
+                    draw_cascade_ladder)
 from evaluate import evaluate_classes, build_sample_table, measure_flops
 from grid_metrics import target_like, soft_sum, hard_sum, cos_sum
 from cascade import run_cascade, _cascade_loss
@@ -500,6 +501,11 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # end-of-epoch merge below is skipped, so the single-forward path is unaffected.
     _c_loss_acc, _c_dice_acc, _c_empty_acc = {}, {}, [0.0]
     _c_prior_acc = {}                      # query_prior mode -> #levels drawn (cascade mixture)
+    _c_sp_acc = {}                         # random-cascade only: level idx -> Σ drawn spacing
+    # data.cascade_train: random per-batch N-level ladder for training (eval keeps the fixed
+    # data.cascade_spacings). None -> the static-ladder path. Per-level metrics are keyed by
+    # level index (not spacing value) on this path since every step draws a fresh ladder.
+    _cascade_train_spec = resolve_cascade_train(cfg.data)
     # Non-cascade query-prior injection (data.query_prior): a fraction of steps hand the model a
     # rough target mask (perturbed GT) instead of the prior-free default. Train-only; eval always
     # runs prior-free. patchset3d seeds its query mask token; medverse feeds it through the
@@ -552,6 +558,16 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                     torch.cuda.synchronize()
                     tsum.setdefault("realize0", 0.0)
                     tsum["realize0"] += (time.perf_counter() - _t_r0) * 1000
+            if _cascade_train_spec is not None:
+                # Random ladder: s0 = the coarse spacing CascadeSpacingBatchSampler cropped
+                # level 0 at (read back from the realized batch), then draw levels-1 finer
+                # spacings in [lo, s0) with a per-step RNG. run_cascade re-crops levels >= 1.
+                _lv, _lo, _hi = _cascade_train_spec
+                _s0 = (float(batch["spacing"][0, 0]) if "spacing" in batch
+                       else float(cascade_spacings[0]))
+                spacings = draw_cascade_ladder(
+                    _s0, _lv, _lo,
+                    random.Random(f"{cfg.train.seed}_{epoch}_{n}_cascade_sp"))
             gstep = epoch * len(loader) + n
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
@@ -582,8 +598,12 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                         raise RuntimeError(
                             f"non-finite cascade forward @ epoch {epoch} step {n} level {_li} "
                             f"(spacing {spacings[_li]:g})")
-                loss, per_level = _cascade_loss(
-                    res, loss_fn, cfg.train.get("cascade_loss_weights"))
+                # Random cascade with fewer train levels than the eval ladder: take the
+                # coarsest len(spacings) weights (a full-length list stays exact).
+                _clw = cfg.train.get("cascade_loss_weights")
+                if _clw is not None and len(_clw) > len(spacings):
+                    _clw = list(_clw)[:len(spacings)]
+                loss, per_level = _cascade_loss(res, loss_fn, _clw)
             if prof:
                 torch.cuda.synchronize()
                 tsum.setdefault("cascade", 0.0)
@@ -609,11 +629,16 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             s, sc = soft_sum(prob, fine_tgt); gs += s; gsc += sc
             c, cc = cos_sum(prob, fine_tgt);  gc += c; gcc += cc
             for si, sp in enumerate(spacings):
-                _c_loss_acc.setdefault(f"loss_r{sp:g}", 0.0)
-                _c_loss_acc[f"loss_r{sp:g}"] += per_level[si]
-                _c_dice_acc.setdefault(f"dice_r{sp:g}", 0.0)
-                _c_dice_acc[f"dice_r{sp:g}"] += _hard_dice(
+                # Random ladder -> key by level index (spacing varies every step); fixed
+                # ladder -> key by spacing value (stable, back-compat with existing dashboards).
+                _sk = f"L{si}" if _cascade_train_spec is not None else f"r{sp:g}"
+                _c_loss_acc.setdefault(f"loss_{_sk}", 0.0)
+                _c_loss_acc[f"loss_{_sk}"] += per_level[si]
+                _c_dice_acc.setdefault(f"dice_{_sk}", 0.0)
+                _c_dice_acc[f"dice_{_sk}"] += _hard_dice(
                     res.logits[si].float(), res.targets[si], is_prob)
+                if _cascade_train_spec is not None:
+                    _c_sp_acc[f"spacing_L{si}"] = _c_sp_acc.get(f"spacing_L{si}", 0.0) + float(sp)
             _c_empty_acc[0] += res.empty_frac
             for _m in (res.prior_modes_used or [])[1:]:     # level 0 has no prior
                 _c_prior_acc[_m] = _c_prior_acc.get(_m, 0) + 1
@@ -735,6 +760,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         for k, v in _c_loss_acc.items():
             grid[k] = v / n
         for k, v in _c_dice_acc.items():
+            grid[k] = v / n
+        for k, v in _c_sp_acc.items():           # random cascade: mean drawn spacing per level
             grid[k] = v / n
         grid["cascade_empty_frac"] = _c_empty_acc[0] / n
         _pt = sum(_c_prior_acc.values())

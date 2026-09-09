@@ -241,8 +241,8 @@ def _assert_cascade_supported(cfg) -> None:
                 "payload is only consumed by the cascade train loop; without it the loader "
                 "would ship NativeCrop dataclasses into the default stacking collate).")
         return
-    if cfg.get("model") != "patchset3d":
-        raise ValueError("data.cascade_spacings requires model=patchset3d.")
+    if cfg.get("model") not in ("patchset3d", "medverse"):
+        raise ValueError("data.cascade_spacings requires model=patchset3d or model=medverse.")
     if not d.get("loader_v2", False):
         raise ValueError("data.cascade_spacings requires data.loader_v2=true (v2 pipeline).")
     _cascade_sources = _TOTALSEG_SOURCES | {"multisource"}
@@ -269,10 +269,28 @@ def _assert_cascade_supported(cfg) -> None:
     if d.get("train_spacing_range") is not None:
         raise ValueError("data.cascade_spacings and data.train_spacing_range are mutually "
                          "exclusive (both set the per-batch physical spacing).")
+    # data.cascade_train: random per-batch N-level ladder for TRAINING (eval keeps the
+    # fixed data.cascade_spacings ladder). resolve_cascade_train validates the spec shape.
+    ct = resolve_cascade_train(d)
+    if ct is not None:
+        _, _lo, _hi = ct
+        if _hi > _sp_f[0] or _lo < _sp_f[-1]:
+            warnings.warn(
+                f"data.cascade_train.spacing_range=[{_lo:g},{_hi:g}] extends past the eval "
+                f"ladder [{_sp_f[-1]:g},{_sp_f[0]:g}] (data.cascade_spacings) -- training "
+                f"spacings will fall outside the eval distribution.")
     w = cfg.get("train", {}).get("cascade_loss_weights")
-    if w is not None and len(w) != len(spacings):
-        raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match "
-                         f"data.cascade_spacings (len {len(spacings)}).")
+    if w is not None:
+        # Fixed ladder: exactly len(cascade_spacings). Random training ladder: either
+        # cascade_train.levels (train-length) or len(cascade_spacings) (train loop takes
+        # the coarsest `levels` of it).
+        _ok = ({len(spacings)} if ct is None
+               else {ct[0], len(spacings)})
+        if len(w) not in _ok:
+            _src = (f"data.cascade_train.levels (={ct[0]}) or data.cascade_spacings "
+                    f"(={len(spacings)})" if ct is not None
+                    else f"data.cascade_spacings (={len(spacings)})")
+            raise ValueError(f"train.cascade_loss_weights (len {len(w)}) must match {_src}.")
     _gr = bool(d.get("gpu_realize_crop", True))   # under cascade the default is ON
     if _gr and d.get("ram_cache") is not None and not d.get("ram_cache"):
         raise ValueError(
@@ -646,6 +664,47 @@ def build_dataset(cfg, split: str):
     )
 
 
+def resolve_cascade_train(d):
+    """data.cascade_train -> (levels, lo, hi) or None.
+
+    Random per-batch N-level cascade ladder for TRAINING only; eval / the val pass
+    keep the fixed data.cascade_spacings ladder. `levels` sets N; per step the ladder
+    is s0 (the coarsest, drawn by CascadeSpacingBatchSampler in the coarse band of
+    [lo, hi] and used for the level-0 crop) plus levels-1 finer spacings drawn in
+    [lo, s0) by draw_cascade_ladder. Raises on a malformed spec."""
+    ct = d.get("cascade_train") if hasattr(d, "get") else None
+    if not ct:
+        return None
+    levels = int(ct.get("levels", 2))
+    rng = ct.get("spacing_range", None)
+    if rng is None or len(rng) != 2:
+        raise ValueError("data.cascade_train.spacing_range must be [lo, hi] mm.")
+    lo, hi = float(rng[0]), float(rng[1])
+    if not (0 < lo < hi):
+        raise ValueError(f"data.cascade_train.spacing_range={[lo, hi]} must be 0 < lo < hi.")
+    if levels < 2:
+        raise ValueError(f"data.cascade_train.levels={levels} must be >= 2.")
+    return levels, lo, hi
+
+
+def draw_cascade_ladder(s0, n_levels, lo, rng, min_ratio=1.15):
+    """One training cascade ladder: s0 (coarsest, already cropped by the batch sampler)
+    followed by n_levels-1 finer spacings drawn log-uniformly in [lo, s0), returned
+    strictly descending with every adjacent pair >= min_ratio apart. Falls back to a
+    fixed geometric split if 20 draws can't satisfy the min-ratio constraint."""
+    s0 = float(s0)
+    if n_levels <= 1:
+        return [s0]
+    lo = float(min(lo, s0 / min_ratio ** (n_levels - 1)))
+    for _ in range(20):
+        finer = sorted((math.exp(rng.uniform(math.log(lo), math.log(s0)))
+                        for _ in range(n_levels - 1)), reverse=True)
+        ladder = [s0, *finer]
+        if all(a / b >= min_ratio for a, b in zip(ladder, ladder[1:])):
+            return ladder
+    return [s0 * (lo / s0) ** (i / (n_levels - 1)) for i in range(n_levels)]
+
+
 class SpacingBatchSampler:
     """Wrap a base sampler into fixed-size batches of (idx, spacing), one spacing per
     batch drawn log-uniformly in [lo, hi] mm. One spacing per batch lets the spacing-aware
@@ -678,6 +737,27 @@ class SpacingBatchSampler:
     def __len__(self):
         n = len(self.sampler)
         return n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
+
+
+class CascadeSpacingBatchSampler(SpacingBatchSampler):
+    """SpacingBatchSampler for the random N-level training cascade (data.cascade_train).
+
+    Each batch's (idx, s0) tuple carries only the COARSEST spacing s0 -- what the v2
+    loader crops level 0 at. s0 is drawn log-uniformly in the coarse band
+    [s0_lo, hi], with s0_lo placed (n_levels-1)/n_levels of the way up the log-range
+    so there is always room for the levels-1 finer spacings the train loop draws in
+    [lo, s0) (draw_cascade_ladder). The finer spacings are not needed at crop time
+    (run_cascade re-crops levels >= 1 itself), so they are not sampled here."""
+
+    def __init__(self, sampler, batch_size, spacing_range, n_levels,
+                 drop_last=False, seed=0):
+        super().__init__(sampler, batch_size, spacing_range, drop_last=drop_last, seed=seed)
+        self.n_levels = int(n_levels)
+        frac = (self.n_levels - 1) / self.n_levels
+        self._s0_lo = math.exp(math.log(self.lo) + frac * (math.log(self.hi) - math.log(self.lo)))
+
+    def _sample(self) -> float:
+        return math.exp(self._rng.uniform(math.log(self._s0_lo), math.log(self.hi)))
 
 
 def train_loader(cfg) -> DataLoader:
@@ -715,6 +795,15 @@ def train_loader(cfg) -> DataLoader:
     # (arch.compile_dynamic=false) never sees an odd batch size mid-epoch. Default false
     # (no-op unless max_ds_len_train / len(ds) is not a multiple of batch_size).
     _drop_last = bool(cfg.train.get("drop_last", False))
+    _ct = resolve_cascade_train(cfg.data)
+    if _ct is not None:
+        # Random N-level training cascade: the batch sampler crops level 0 at a random
+        # coarse spacing; run_cascade's finer levels are drawn per step in the train loop.
+        _lv, _lo, _hi = _ct
+        batch_sampler = CascadeSpacingBatchSampler(base, bs, [_lo, _hi], _lv,
+                                                   drop_last=_drop_last,
+                                                   seed=int(cfg.train.get("seed", 0)))
+        return DataLoader(ds, batch_sampler=batch_sampler, **common)
     train_spacing_range = cfg.data.get("train_spacing_range", None)
     if train_spacing_range is not None:
         batch_sampler = SpacingBatchSampler(base, bs, train_spacing_range,

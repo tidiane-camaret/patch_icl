@@ -642,8 +642,14 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     # cascade), macro stitched Dice unchanged (0.6399 -> 0.6397). run_cascade's realize /
     # geo-warp keep their own `enabled=False` blocks so the data pipeline stays fp32.
     # eval.cascade_autocast=false forces the old fp32 path.
+    # Medverse (MedverseModel.__call__ -> train_forward per level) is validated in fp32 —
+    # train.py keeps its val byte-identical — so it always runs fp32 here regardless of
+    # eval.cascade_autocast; a bf16 cascade forward would drift it off its own baseline.
+    from src.benchmark_models.medverse import MedverseModel  # safe: no cascade import cycle
+    _is_medverse = isinstance(model, MedverseModel)
     _casc_ac = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if (dev.type == "cuda" and bool(cfg.eval.get("cascade_autocast", True)))
+                if (dev.type == "cuda" and not _is_medverse
+                    and bool(cfg.eval.get("cascade_autocast", True)))
                 else contextlib.nullcontext())
     step = 0
     t_cascade = n_seen = 0.0

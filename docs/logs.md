@@ -7427,3 +7427,113 @@ python experiments/3d/train.py experiment=81_multisource_ct_mri +data.ram_cache=
   CT ≈ 50 GB + MRI ≈ 12 GB (≈ 63 GB resident). Size the node accordingly.
 - `model` resolves to `patchset3d` under this exact override set (verified via `compose`),
   so no explicit `model=patchset3d` is needed.
+
+## 2026-09-09 — `data.cascade_train`: random per-batch N-level cascade ladder (training only)
+
+Mirror of `data.train_spacing_range` for the cascade: training draws a fresh coarse→fine
+spacing ladder every batch; eval / the val pass keep the fixed `data.cascade_spacings`
+ladder (still `eval_mode=pred` at every level). Motivation: train a 2-level cascade for
+speed while the 3 mm grid is exercised as both a coarse and a fine level across steps, and
+level 1 still sees a real upstream `pred` prior at the configured mixture rate (0.6) — same
+per-level signal a 3-level cascade's level 2 gets.
+
+**Config**
+```yaml
+data:
+  cascade_spacings: [6, 3, 1.5]        # eval ladder (unchanged path) + fallback
+  cascade_train:
+    levels: 2                          # N during training (>= 2)
+    spacing_range: [1.5, 6.0]          # [lo, hi] mm
+```
+Per step: `CascadeSpacingBatchSampler` draws `s0` log-uniform in the coarse band
+`[lo·(hi/lo)^((N-1)/N), hi]` and crops level 0 at it (via the existing v2 `(idx, spacing)`
+tuple path); `draw_cascade_ladder` then draws `N-1` finer spacings in `[lo, s0)`, strictly
+descending, each adjacent pair ≥ 1.15× apart (geometric-split fallback after 20 tries). The
+train loop reads the realized `s0` back from `batch["spacing"]` (no formula duplication) and
+draws the rest with `Random(f"{seed}_{epoch}_{step}_cascade_sp")`. `run_cascade` /
+`_recrop_level` / `evaluate_cascade` are unchanged — `run_cascade` already takes `spacings`
+per call.
+
+**Plumbing**
+- `common.resolve_cascade_train` / `draw_cascade_ladder` / `CascadeSpacingBatchSampler` (new);
+  `train_loader` picks the cascade sampler when `data.cascade_train` is set.
+- `_assert_cascade_supported`: allows `cascade_train` alongside `cascade_spacings`; validates
+  spec shape; `train.cascade_loss_weights` may be `cascade_train.levels` **or**
+  `len(cascade_spacings)` long (train loop takes the coarsest `levels` of a full list);
+  warns when `spacing_range` extends past the eval ladder.
+- `train_epoch`: random path keys per-level metrics by **level index** (`train/loss_L{i}`,
+  `train/dice_L{i}`) since spacing varies every step, and logs `train/spacing_L{i}` (epoch
+  mean). Fixed-ladder path keeps the `_r{spacing}` keys (dashboard back-compat). Val keeps
+  `val/dice_r{spacing}` over the fixed ladder.
+- Guard: `train_spacing_range` + `cascade_spacings` still mutually exclusive — `cascade_train`
+  is the cascade-native replacement.
+
+**Runnable** (the exp-80 command + the two new keys; `cascade_loss_weights` can stay `[1,1,1]`):
+```
+python experiments/3d/train.py experiment=80_varspacing_hard_tgt_prior \
+  data.train_spacing_range=null data.crop_spacing_mm=6 \
+  +data.cascade_spacings=[6,3,1.5] +train.cascade_loss_weights=[1,1,1] \
+  +data.cascade_crop_jitter=null +data.ram_cache=true +data.gpu_realize_crop=true \
+  +data.cascade_query_prior.modes=[pred,none,gt] +data.cascade_query_prior.p=[0.6,0.3,0.1] \
+  +data.cascade_query_prior.eval_mode=pred +data.cascade_query_prior_hard=false \
+  +data.cascade_train.levels=2 +data.cascade_train.spacing_range=[1.5,6]
+```
+
+**Tests**: `tests/test_cascade_train_ladder.py` (new) — ladder monotonicity/anchoring/
+reproducibility, sampler batching + coarse band; `tests/test_cascade_guard.py` (+8) —
+`cascade_train` accept/reject/warn + weight-length rules. Full cascade/spacing/loader
+selection green (from repo root — the exp59 config tests need CWD=repo root, pre-existing).
+
+---
+
+## 2026-09-09 — Medverse in the v2 cascade eval (`data.cascade_spacings`)
+
+**Goal.** Evaluate a fine-tuned Medverse checkpoint (exp-80/85 `85_medverse_varspacing_hard_tgt_prior`,
+`medverse_bounded_head=true`) through the same N-level coarse→fine eval as patchset3d
+(`cascade.evaluate_cascade` / `run_cascade`), so both models get the *same per-level inputs*
+(dataloader-driven re-crop on the previous level's predicted COM) and differ only internally.
+
+**Approach = "harness owns the ladder".** Medverse runs ONE single-ROI forward per level via
+`train_forward` — no internal `autoregressive_inference`, no sliding window (each level is
+already a single 128³ ROI at that level's spacing). The warped previous-level prior rides
+Medverse's NA-ICL `image_context_in` channel, exactly as at fine-tune time. Scoring is the
+unchanged `_stitched_native_dice_multi` (per-level hard preds composited coarse→fine into
+`label.npy`), plus per-level `dice_r{s}`.
+
+**Changes**
+- `src/benchmark_models/medverse.py`: `MedverseModel.__call__(image, context_in=, context_out=,
+  mode=, spacing=, query_prior=) -> {"final_logit": train_forward(...)}` — PatchSet3D-style
+  call adapter so `_forward_level` works unchanged. `mode`/`spacing`/`l` accepted for parity
+  only. Bounded head → returns a LOGIT; released weights → native ~[0,1] output.
+- `experiments/3d/common.py::_assert_cascade_supported`: `model` guard now accepts
+  `patchset3d` **or** `medverse`.
+- `experiments/3d/eval.py` v2-cascade branch: guard accepts `eval.model=medverse`; `is_prob`
+  for medverse is derived from `model.bounded_head` (set from the checkpoint in
+  `_build_model`), NOT `model_output_is_prob(cfg)` — the eval config has no
+  `train.medverse_bounded_head` and `cfg.model` is an inert composed value, so
+  `model_output_is_prob` would mislabel a bounded-head logit as a probability (→ `clamp`
+  instead of `sigmoid` → wrong COM / prior / masks). bounded head → `is_prob=False`;
+  released weights → `is_prob=True`.
+- `experiments/3d/cascade.py::evaluate_cascade`: Medverse forces fp32 (bypasses
+  `eval.cascade_autocast`) — it is validated in fp32 (train.py keeps its val byte-identical),
+  a bf16 cascade forward would drift it off its own baseline. patchset3d keeps the bf16 path.
+
+**Not changed / inherited from the patchset3d path**
+- Level 0 = finished-tensor eval batch; levels ≥1 = `_recrop_level` (realize path default-on,
+  same as patchset3d). Recommend `data.gpu_realize_crop=false` for medverse eval (no RAM-cache
+  warm-up set up) → CPU re-crop, byte-equivalent batch dict.
+- `cascade_query_prior` feeds `image_context_in`. The exp-80 checkpoint trained that channel
+  on *perturbed GT* (`data.query_prior: {gt 0.3, none 0.7}`), never on real coarse preds, so
+  `pred` is a mild train/eval shift; `gt_coarse` ≈ training (unperturbed oracle), `none`
+  matches the 70% no-prior fraction. `cascade_query_prior_hard=false` (training used soft).
+
+**Runnable** (exp-80 checkpoint, val split; add `eval.checkpoint=<best.pt>`):
+```
+python experiments/3d/eval.py experiment=80_varspacing_hard_tgt_prior eval.model=medverse \
+  eval.checkpoint=.../2026-09-09_85_medverse_varspacing_hard_tgt_prior/best.pt \
+  data.train_spacing_range=null data.crop_spacing_mm=6 \
+  +data.cascade_spacings=[6,3,1.5] +data.cascade_query_prior=pred +data.gpu_realize_crop=false \
+  eval.split=val eval.cascade_autocast=false eval.measure_flops=false wandb.name=medverse_85_cascade
+```
+`data.train_spacing_range=null` + `crop_spacing_mm == cascade_spacings[0]` are required by
+`_assert_cascade_supported` (unchanged guards).

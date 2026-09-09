@@ -27,7 +27,7 @@ gcloud compute instances create "$CPU_VM" \
     --project="$PROJECT" \
     --zone="$ZONE" \
     --machine-type=n2d-standard-32 \
-    --provisioning-model=SPOT \
+    #--provisioning-model=SPOT \
     --boot-disk-size=50GB \
     --boot-disk-type=pd-balanced \
     --image-family=ubuntu-2404-lts-amd64 \
@@ -151,7 +151,7 @@ Upload only after checking that the conversion ended with `err=0`. This saves th
 gcloud storage buckets create "gs://$BUCKET" \
     --project="$PROJECT" --location=us-central1  # once
 gcloud storage rsync --recursive --exclude='.*\.nii\.gz$' \
-    /mnt/data/totalseg "gs://$BUCKET/totalseg"
+    /mnt/data/totalseg "gs://$BUCKET/data/totalseg"
 gcloud storage du --summarize "gs://$BUCKET/totalseg"
 ```
 
