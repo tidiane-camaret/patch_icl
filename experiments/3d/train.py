@@ -1352,6 +1352,25 @@ def main(cfg: DictConfig) -> None:
                     if vals:
                         log[f"val/dice_r{s:g}"] = sum(vals) / len(vals)
                 log["val/dice_stitched"] = val_dice     # == macro stitched (checkpoint metric)
+                # multisource cohort: per-regime (ct / mri / cross) and per-target-modality
+                # (ct / mri) micro Dice, from the per-case `regime` / `modality` tags
+                # evaluate_cascade attaches. Reporting only — val/dice above is unchanged.
+                if cfg.data.get("source") == "multisource":
+                    from collections import defaultdict as _dd
+                    _reg, _tgt = _dd(list), _dd(list)
+                    for _c in cases:
+                        _d = _c.get("dice", float("nan"))
+                        if math.isnan(_d):
+                            continue
+                        if _c.get("regime"):
+                            _reg[_c["regime"]].append(_d)
+                        if _c.get("modality"):
+                            _tgt[_c["modality"]].append(_d)
+                    for _k, _v in _reg.items():
+                        log[f"val/dice_{_k}"] = sum(_v) / len(_v)
+                        log[f"val/n_{_k}"] = len(_v)
+                    for _k, _v in _tgt.items():
+                        log[f"val/dice_tgt_{_k}"] = sum(_v) / len(_v)
             # Seen/unseen macro split. data.val_classes may deliberately hold classes the model
             # never trained on, as a generalization control (exp57: 8 trained + 8 held-out, each
             # size-matched to a trained class). REPORTING ONLY — val/dice above stays the plain

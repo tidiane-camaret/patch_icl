@@ -628,7 +628,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
         from common import _multisource_specs
         roots = {mod: r for _src, mod, _spec, r in _multisource_specs(cfg, "val")}
     pg_levels = [dict() for _ in range(N)]
-    order = []                                       # (modality,subj,cls) in loader order
+    order = []                                       # per-occurrence (key, ctx_mod, ctx_subjs)
+                                                     # key = (modality, subj, cls), loader order
     times = {}                                       # (modality,subj,cls) -> per-sample cascade ms
     want_figs = bool(cascade_figures and fig_dir is not None)
     fig_want = set(classes) if want_figs else set()  # classes still needing a panel
@@ -672,14 +673,22 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
         step += 1
         subs, clss = batch["subjects"], batch["label_names"]
         tmods = batch.get("tgt_modality")                 # list[str] len B (multisource) or None
+        cmods = batch.get("ctx_modality")                 # list[str] len B (multisource) or None
+        ccases = batch.get("context_subjects")            # list[list[str]] len B or None
         dt_ms = (time.perf_counter() - t0) * 1e3
         per_sample_ms = dt_ms / max(len(subs), 1)
         t_cascade += dt_ms; n_seen += len(subs)
         pbar.set_postfix_str(f"{n_seen:.0f} samples, {t_cascade / n_seen:.0f} ms/sample")
         for b in range(len(subs)):
             mod = tmods[b] if tmods is not None else None
+            cmod = cmods[b] if cmods is not None else None
+            cc = list(ccases[b]) if ccases is not None else None
             key = (mod, subs[b], clss[b])
-            order.append(key)
+            # ctx_mod / ctx_subjs ride the per-occurrence `order` entry, not a key-dict:
+            # the cohort eval can draw the same (mod,subj,cls) under >1 regime, so a
+            # key-keyed side dict would mislabel earlier occurrences (dice/time still
+            # collapse per key, a pre-existing dup-key limitation).
+            order.append((key, cmod, cc))
             times[key] = round(per_sample_ms, 1)
             for li in range(N):
                 hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
@@ -724,11 +733,20 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")
 
     cases_by_class = defaultdict(list)
-    for key in order:
+    for key, _cmod, _cc in order:
         _mod, subj, cls = key
+        # regime tag for the multisource cohort: ct / mri / cross (None for single-source).
+        # `detail` mirrors evaluate._sample_detail's "<regime> <tgt><-<ctx>" so the wandb
+        # sample-table slices the same way as the non-cascade val pass.
+        _regime = None if _mod is None else (_mod if _mod == _cmod else "cross")
         case = {"class": cls, "subject": subj, "modality": _mod,
+                "regime": _regime,
+                "detail": "" if _regime is None else f"{_regime} {_mod}<-{_cmod}",
                 "dice": round(float(stitched.get(key, float("nan"))), 4),
                 "time_ms": times.get(key, float("nan"))}
+        if _cc is not None:
+            case["ctx_cases"] = ";".join(map(str, _cc))
+            case["self_ctx"] = subj in _cc
         for li, s in enumerate(spacings):
             case[f"dice_r{s:g}"] = round(float(per_res_by_level[li].get(key, float("nan"))), 4)
         cases_by_class[cls].append(case)

@@ -1,5 +1,31 @@
 # Change log
 
+## 2026-09-10 — cascade val sample-table: regime/modality columns + `val/dice_<regime>`
+
+The v2 cascade val pass (`cascade.evaluate_cascade`) emitted per-case dicts with only
+`class / subject / modality / dice / time_ms / dice_r{s}`, so the wandb `val/samples`
+table left `detail`, `ctx_cases`, `self_ctx` empty — no way to slice a multisource
+CT+MRI run by regime (the 2026-09-07 multisource-cascade spec listed this as a non-goal).
+
+- `evaluate_cascade` now also reads `batch["ctx_modality"]` / `batch["context_subjects"]`
+  (both already threaded by the collates + `realize_cascade_level0`) and carries them
+  per-occurrence on `order` (not a key-dict: the cohort eval can draw the same
+  `(mod,subj,cls)` under >1 regime). Each case gains:
+  - `regime`  — `ct` / `mri` / `cross` (`None` for single-source; `cross` = tgt≠ctx modality)
+  - `detail`  — `"<regime> <tgt><-<ctx>"`, matching `evaluate._sample_detail`'s multisource
+                format so the table slices the same as the non-cascade val pass
+  - `ctx_cases` / `self_ctx` — from `context_subjects`
+  Single-source cascade is unchanged (regime `None` → `detail` `""`).
+- `train.py` val logging: for `data.source=multisource`, log per-regime micro Dice
+  `val/dice_{ct,mri,cross}` (+ counts `val/n_*`) and per-target-modality
+  `val/dice_tgt_{ct,mri}`, from the new `regime` / `modality` case tags. Reporting only —
+  `val/dice` (macro stitched, the checkpoint metric) is unchanged.
+- Still nan in the cascade table (separate changes): `nsd` (needs a stitched-native NSD),
+  `soft_dice` / `loss` (per-case, cascade scores hard preds only), `tgt_size`/`tgt_occ`/
+  `ctx_size`/`ctx_occ`.
+
+Applied mid-run to `89_multisource_cascade`; restarted full-resume from its `best.pt`.
+
 ## 2026-09-09 — RAM cache now feeds the non-cascade v2 `load()` path
 
 `data.ram_cache=true` on a non-cascade `loader_v2` run (e.g. `experiment=80_varspacing_hard_tgt_prior`)
