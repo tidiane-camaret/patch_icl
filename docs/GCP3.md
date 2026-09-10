@@ -1,6 +1,7 @@
 export PROJECT=atomic-acrobat-308517
 export ZONE=us-central1-b
 export CPU_VM=patch-icl-prep
+export GPU_VM=patch-icl-h100
 export DATA_DISK=patch-icl-prep-data
 export BUCKET=atomic-acrobat-totalseg
 
@@ -50,7 +51,6 @@ gcloud compute instances delete "$CPU_VM" --project="$PROJECT" --zone="$ZONE"
 
 #### TRAINING ####
 
-export GPU_VM=patch-icl-h100
 
 # NVIDIA T4
 gcloud compute instances create "$GPU_VM" \
@@ -95,21 +95,34 @@ sudo mount /dev/sdb /mnt/data #
 # if disk has another name, search it : 
 # lsblk
 # ls -l /dev/disk/by-id/google-*
-# then : 
+# if non formated (WILL ERASE DATA) sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-persistent-disk-1
 # sudo mount -o discard,defaults /dev/disk/by-id/google-persistent-disk-1 /mnt/data
+# auto-mount on VM restart : echo '/dev/disk/by-id/google-persistent-disk-1 /mnt/data ext4 discard,defaults,nofail 0 2' | sudo tee -a /etc/fstab
+
 
 sudo chown -R $USER:$USER /mnt/data/
 df -h /mnt/data
+
+
+# rsync bucket data -> disk
+cd /mnt/data
+gcloud storage rsync gs://atomic-acrobat-totalseg/results results --recursive
+gcloud storage rsync gs://atomic-acrobat-totalseg/data/totalseg totalseg --recursive
 
 curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
 git clone https://github.com/tidiane-camaret/patch_icl && cd patch_icl && git checkout feat/incontext-dataloader-v2
 uv sync --extra cu124        # or --extra cu128
 
+
+# run training 
 tmux
+export NUMEXPR_MAX_THREADS=26 #h100 has 26 cores
+
 uv run python experiments/3d/train.py cluster=gcp experiment=80_varspacing_hard_tgt_prior train.batch_size=2 train.epochs=5 data.max_train_subjects=50
 
+# rsync disk -> bucket data
 
+gcloud storage rsync results gs://atomic-acrobat-totalseg/results --recursive
 
-#delete instance 
+# delete instance 
 gcloud compute instances delete "$GPU_VM" --project="$PROJECT" --zone="$ZONE"
-gcloud compute instances delete "$CPU_VM" --project="$PROJECT" --zone="$ZONE"

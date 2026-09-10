@@ -1,0 +1,146 @@
+# @package _global_
+# 88_cascade — clean-arch v2 coarse->fine cascade finetune.
+#
+#   python experiments/3d/train.py experiment=88_cascade \
+#     train.checkpoint=<.../2026-09-01_67_cascade_qprior_pred_crop_gpu/best.pt>
+#
+# This is the recipe validated in run 87 (wandb `87_recover_spacingaware_cascadetrain_b2`,
+# val ~0.58 and still rising on val_classes=all), MINUS the arch bundle a Sept-2026
+# investigation pinned as the cause of the 0.61 -> 0.44 macro-Dice regression on the
+# [6, 3, 1.5] mm TotalSeg cascade (rfb8pc9x / the exp80 line):
+#
+#     arch.decode_source = mask   -> the decoder reads the query's MASK column (support-mean
+#                                    fallback at eval), not the img column
+#     arch.mask_slots    = 2      -> gt/pred additive content tags on that column
+#     arch.mask_embed    = conv   -> MaskConvEmbed instead of the flat Linear
+#
+# Ablation summary (vs the cwbghuv6 0.6136 checkpoint; val_classes=all, tasks_per_class=10,
+# [6,3,1.5] cascade, `pred` prior):
+#   * reverting the three keys above      recovers ~0.13 of the ~0.165 gap   (dominant term)
+#   * encoder_spacing_aware=true          costs ~0.03 when the resumed weights were trained
+#                                         spacing-UNAWARE (the 67/68 line) -- see NOTE below
+#   * cascade_train random ladder         ~neutral
+#   * encoder_input_norm instance|zscore  verified numerical no-op on CT (param-free)
+#   * eval/dataloader code, environment   no effect (cwbghuv6 ckpt reproduces 0.6136 on HEAD)
+#
+# CONSTRUCTION: composes straight from the hydra groups. `model=m2_patchset_decoder` already
+# bakes in the 48 -> 57 -> 68 head geometry (e768/h3072/a12, thinking_rows 8, token-mask 0.10,
+# fine_decode conv fine_stage [0,1] proj 96) + from-scratch recipe (Muon scheduled, LAWA,
+# no-wd norm/bias), so there is no experiment-chain inheritance.
+#
+# CHECKPOINT: pass `train.checkpoint=<best.pt>` on the CLI. `resume_weights_only=true` loads
+# only the model weights -- optimizer/scheduler/epoch start fresh (the source run's training
+# state doesn't map onto this schedule). A same-arch cascade checkpoint from the 67/68 line
+# (e.g. 2026-09-01_67_cascade_qprior_pred_crop_gpu/best.pt) loads strict.
+#
+# BATCH SIZE / LR: batch_size=2 + lr=1e-5 as run 87 (loki 48 GB). On a larger GPU use
+# `train.batch_size=4 train.lr=1.4e-5 train.epochs=200` -- sqrt(B) lr scaling, step-matched
+# so the cosine covers the same ~50k updates.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: d1
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  # plainconv_ts encoder width/stages (e4's base32/x2/cap320 formula is wider than this)
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: zscore        # e4 default; restated for parity. `instance` is a no-op on CT.
+  # Set-transformer RoPE scales token positions by spacing / rope_train_mm across the cascade
+  # levels. NOTE: this is a param-free BEHAVIOR flag -- for a resume from weights trained
+  # spacing-UNAWARE (the 67/68 cascade line, encoder_spacing_aware=false) set this to `false`
+  # for arch parity; run 87 measured ~-0.03 Dice from leaving it on in that case.
+  encoder_spacing_aware: true
+  compile_dynamic: false            # fixed-shape kernels: ~2x faster fwd on a single-batch cascade run
+
+  # --- REMOVED failure hypothesis (investigation 2026-09) -- pinned to the safe defaults so a
+  #     later `model=` swap or a default change cannot silently reintroduce them, and so the
+  #     67/68-line checkpoint's weights compute what they were trained to. ---
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+
+data:
+  context_size: 1
+  train_classes: balanced
+  val_classes: all
+  crop_spacing_mm: 6                 # == cascade_spacings[0] (required by _assert_cascade_supported)
+  train_spacing_range: null          # fixed-pitch crops; cascade guard requires this null
+  mask_downsample: soft              # smooth downsample target (train); eval maps back to occupancy
+
+  cascade_spacings: [6, 3, 1.5]      # coarse -> fine
+  cascade_crop_jitter: null          # level>0 re-crop jitter: null -> T//4; 0 -> exact predicted COM
+  cascade_recrop_workers: 1          # serial re-crop loads (~ -175 ms/step on loki vs 16)
+  ram_cache: true                    # fork-shared RAM cache of ct_raw.npy + label.npy (>= 96 GB node)
+  gpu_realize_crop: true             # GPU resample / normalize / place for every cascade crop
+
+  # per-level>0 query mask-token prior. Train draws one mode per level per step from this
+  # categorical; eval runs `eval_mode` deterministically (== the real cascade). cascade.py.
+  cascade_query_prior:
+    modes: [pred, none, gt]
+    p:     [0.8, 0.1, 0.1]
+    eval_mode: pred
+  cascade_query_prior_hard: false
+
+  # random per-batch N-level ladder for TRAINING only (eval keeps the fixed cascade_spacings)
+  cascade_train:
+    levels: 2
+    spacing_range: [1.5, 6]
+
+  # degrade the built prior at levels>0, TRAIN only, so a gt/oracle prior looks like a real
+  # upstream seg. Ranges pushed past the measured Dice-vs-magnitude knees (vs d1's defaults).
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  # calibrated, trimmed to exp48/57/70: elastic + deform off, affine scale neutralized
+  # (rotation-only), soft-mask warp with bilinear.
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  # goal_mask: rewrite target + every context mask with one shared op (train only, replayed
+  # identically across cascade levels). Sub-op radii come from the calibrated preset.
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  # schedule keys -- train.yaml's own _self_ shadows the model group for these, so set here
+  epochs: 100
+  batch_size: 2                      # loki 48 GB; larger GPU -> 4 + lr 1.4e-5 + epochs 200
+  eval_every: 5
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true                    # no odd final batch for the fixed-shape compile graph
+
+  # gentle resume-finetune deltas vs the m2 recipe (m2: lr 7e-5 / encoder_lr_scale 1)
+  lr: 1.0e-5
+  encoder_lr_scale: 0.3              # protect the already-trained plainconv encoder
+  cascade_loss_weights: [1, 1, 1]
+  resume_weights_only: true          # warm-start WEIGHTS ONLY; pass train.checkpoint=<best.pt>
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0                     # centered eval crops (reproducible)
+
+wandb:
+  name: 88_cascade
