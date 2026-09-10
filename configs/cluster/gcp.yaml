@@ -14,8 +14,9 @@ paths:
   results:     /mnt/data/results/patch_icl        # run dirs + checkpoints land here
   checkpoints: ${paths.results}/checkpoints
 
+  totalsegmri:   /mnt/data/totalsegmri              # CT+MRI multisource runs (dataset=multisource_ct_mri / totalseg_mri)
+
   # --- optional: only read if you change data.source / model / arch ---
-  # totalsegmri:     /mnt/data/totalsegmri
   # nnunet:          /mnt/data/results/nnunet
   # gmm_bank:        /mnt/data/gmm_bank
   # totalseg_nnunet: /mnt/data/checkpoints/totalseg_nnunet
