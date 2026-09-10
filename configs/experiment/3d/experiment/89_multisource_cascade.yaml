@@ -50,6 +50,7 @@ data:
   train_classes: union            # cohort sentinel (88 left these balanced/all -- inert for
   val_classes: union              # source=multisource, but reset to match the dataset group)
   source_mix:
+    regime_p: [0.4, 0.4, 0.2]
     # TRAIN on the balanced anatomy set for BOTH modalities (group default was
     # [balanced, train] -- an oddly limb/lung-skewed 23-class MRI set that dropped
     # liver/kidney/colon/brain/... and left only a 14-class cross pool).

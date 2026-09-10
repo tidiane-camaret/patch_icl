@@ -1264,11 +1264,19 @@ def main(cfg: DictConfig) -> None:
     _cascade_on = bool(cfg.data.get("cascade_spacings"))
     if cfg.augmentations.get("gpu", False) or _cascade_on:
         _, _sc_int, _sc_pi, _ = _self_context(cfg.data, "train")
+        # MRI-bearing runs z-score each volume per subject, so no single scalar clamp
+        # frame is valid across a batch (CT members + MRI members, MRI norm_max ranges
+        # ~2 to ~28). "per_volume" clips each volume's intensity-aug output to its own
+        # [min, max]. Pure-CT / synth sources keep the fixed CT frame (byte-identical).
+        _clamp_frame = ("per_volume"
+                        if cfg.data.get("source") in ("multisource", "totalsegmri")
+                        else None)
         gpu_aug = GpuAugmentor(cfg.augmentations,
                                self_context_per_image=bool(_sc_pi),
                                self_context_intensity=bool(_sc_int),
                                seed=int(cfg.get("seed", 0)),
-                               ct_norm=cfg.data.get("ct_norm"))
+                               ct_norm=cfg.data.get("ct_norm"),
+                               clamp_frame=_clamp_frame)
     else:
         gpu_aug = None
 

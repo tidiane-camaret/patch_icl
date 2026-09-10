@@ -278,11 +278,20 @@ def apply_intensity_aug(
         image = image.clamp_(CT_NORM_MIN, CT_NORM_MAX)
 
     # Canonical intensity order (kept identical to the GPU path _batched_intensity):
-    #   GIN → bias → brightness/contrast → gamma → inverted-gamma → sharpness
+    #   GIN → invert → bias → brightness/contrast → gamma → inverted-gamma → sharpness
     #        → noise → blur → low-res
     # Physical image-formation chain: appearance warp, multiplicative field, global
     # window transforms, edge/resolution effects, then acquisition noise (before blur
     # so blur correlates it, matching reconstructed-CT noise texture).
+
+    # --- Contrast inversion --------------------------------------------------
+    # Reflect the volume about its own [min, max] midpoint (min<->max). Range-
+    # preserving, frame-agnostic; models MRI sequence polarity flips (T1 fat-bright
+    # <-> T2 fluid-bright). Independent per volume (this fn runs per volume).
+    invcfg = getattr(cfg, "invert", None)
+    if invcfg is not None and random.random() < invcfg.p:
+        vmin, vmax = image.min(), image.max()
+        image = (vmin + vmax) - image
 
     # --- Bias field (smooth multiplicative log-normal field) -------------
     # Right after the appearance warp so the window transforms and degradations
@@ -348,13 +357,20 @@ def apply_intensity_aug(
 
     # --- Simulate low resolution -----------------------------------------
     # nnUNet SimulateLowResolutionTransform: downsample then upsample trilinear.
+    # anisotropic=True -> downsample ONE random axis only (thick-slice MRI: high
+    # in-plane resolution, coarse through-plane).
     lrcfg = getattr(cfg, "simulate_low_resolution", None)
     if lrcfg is not None and random.random() < lrcfg.p:
-        D, H, W = image.shape[1:]
+        dims = list(image.shape[1:])
         scale = random.uniform(lrcfg.scale_min, lrcfg.scale_max)
-        small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
+        if getattr(lrcfg, "anisotropic", False):
+            ax = random.randrange(3)
+            small = tuple(max(1, int(d * scale)) if i == ax else d
+                          for i, d in enumerate(dims))
+        else:
+            small = tuple(max(1, int(d * scale)) for d in dims)
         x = F.interpolate(image.unsqueeze(0), size=small, mode="trilinear", align_corners=False)
-        image = F.interpolate(x, size=(D, H, W), mode="trilinear", align_corners=False).squeeze(0)
+        image = F.interpolate(x, size=tuple(dims), mode="trilinear", align_corners=False).squeeze(0)
 
     return image
 

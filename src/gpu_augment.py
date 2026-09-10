@@ -145,25 +145,49 @@ def _batched_bias_field(vols, magnitude, coarse, gen, clamp=None):
 def _batched_intensity(vols, cfg, gen, clamp=None):
     # Canonical intensity order — MUST stay identical to the CPU path
     # apply_intensity_aug (src/augmentations.py):
-    #   GIN → bias → brightness/contrast → gamma → inverted-gamma → sharpness
+    #   GIN → invert → bias → brightness/contrast → gamma → inverted-gamma → sharpness
     #        → noise → blur → low-res
     N = vols.shape[0]
     device = vols.device
-    lo, hi = clamp if clamp is not None else (CT_NORM_MIN, CT_NORM_MAX)
-    span = hi - lo
+    # Resolve the clamp frame every intensity op clips its output to. A fixed (lo, hi) —
+    # the CT z-score frame by default, or an explicit clamp_frame — OR, when
+    # clamp="per_volume", each volume's own [min, max] as (N,1,1,1,1) tensors. A CT+MRI
+    # batch has no single valid z-score range (MRI per-subject z-score puts ~2/3 of
+    # volumes past CT_NORM_MAX, some to ~+28), so a scalar frame would crush the MRI
+    # bright tail in GIN/IPA, gamma, noise, blur; the per-volume range is each volume's
+    # true valid frame and works for CT and MRI members of the same batch.
+    if isinstance(clamp, str) and clamp == "per_volume":
+        lo = vols.amin(dim=(1, 2, 3, 4), keepdim=True)
+        hi = vols.amax(dim=(1, 2, 3, 4), keepdim=True)
+        span = (hi - lo).clamp_min(1e-3)
+    else:
+        lo, hi = clamp if clamp is not None else (CT_NORM_MIN, CT_NORM_MAX)
+        span = hi - lo
+    _clamp = (lo, hi)
 
     # 1. GIN / IPA appearance warp
     gin = getattr(cfg, "gin", None)
     if gin is not None and getattr(gin, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, gin.p)
-        aug = _batched_gin_ipa(vols, gin, gen, clamp=clamp)
+        aug = _batched_gin_ipa(vols, gin, gen, clamp=_clamp)
         vols = torch.where(mask, aug, vols)
+
+    # 1b. Contrast inversion — reflect each volume about its own [min, max] midpoint
+    # (min<->max). Range-preserving and frame-agnostic; geometry / masks untouched.
+    # Models MRI sequence polarity flips (T1 fat-bright <-> T2 fluid-bright); per volume
+    # so target and context can differ, forcing polarity-invariant matching.
+    inv = getattr(cfg, "invert", None)
+    if inv is not None and getattr(inv, "p", 0) > 0:
+        mask = _per_vol_mask(gen, N, device, inv.p)
+        vmin = vols.amin(dim=(1, 2, 3, 4), keepdim=True)
+        vmax = vols.amax(dim=(1, 2, 3, 4), keepdim=True)
+        vols = torch.where(mask, (vmin + vmax) - vols, vols)
 
     # 2. Bias field
     bf = getattr(cfg, "bias_field", None)
     if bf is not None and getattr(bf, "p", 0) > 0:
         mask = _per_vol_mask(gen, N, device, bf.p)
-        aug = _batched_bias_field(vols, bf.magnitude, int(getattr(bf, "coarse", 4)), gen, clamp=clamp)
+        aug = _batched_bias_field(vols, bf.magnitude, int(getattr(bf, "coarse", 4)), gen, clamp=_clamp)
         vols = torch.where(mask, aug, vols)
 
     # 3. Brightness / contrast
@@ -245,11 +269,19 @@ def _batched_intensity(vols, cfg, gen, clamp=None):
     lr = getattr(cfg, "simulate_low_resolution", None)
     if lr is not None and lr.p > 0:
         mask = _per_vol_mask(gen, N, device, lr.p)
-        # NOTE: low-res scale is shared per call (per-volume scale isn't batchable —
-        # differing output shapes) — intentional batching simplification.
+        # NOTE: scale + (anisotropic) axis are one draw per batched call (per-volume
+        # scale isn't batchable — differing output shapes) — intentional simplification.
         D, H, W = vols.shape[-3:]
         scale = _uniform(gen, device, lr.scale_min, lr.scale_max)
-        small = (max(1, int(D * scale)), max(1, int(H * scale)), max(1, int(W * scale)))
+        dims = [D, H, W]
+        if getattr(lr, "anisotropic", False):
+            # downsample ONE random axis (thick-slice MRI: high in-plane res, coarse
+            # through-plane); the other two axes keep full resolution.
+            ax = int(torch.randint(3, (1,), generator=gen, device=device).item())
+            small = tuple(max(1, int(d * scale)) if i == ax else d
+                          for i, d in enumerate(dims))
+        else:
+            small = tuple(max(1, int(d * scale)) for d in dims)
         down = F.interpolate(vols, size=small, mode="trilinear", align_corners=False)
         aug = F.interpolate(down, size=(D, H, W), mode="trilinear", align_corners=False)
         vols = torch.where(mask, aug, vols)
@@ -410,9 +442,16 @@ class GpuAugmentor:
     def __init__(self, aug_cfg, self_context_per_image: bool = False,
                  self_context_intensity: bool = False, seed: int = 0, ct_norm=None,
                  clamp_frame=None):
-        # Intensity ops clamp to CT_NORM_MIN/MAX (the default CT frame) unless an explicit
-        # clamp_frame (lo, hi) is given — the seam for a non-CT / multi-modality frame.
-        self._clamp = None if clamp_frame is None else (float(clamp_frame[0]), float(clamp_frame[1]))
+        # Intensity ops clamp to CT_NORM_MIN/MAX (the default CT frame) unless clamp_frame
+        # is given — the seam for a non-CT / multi-modality frame. Either an explicit
+        # (lo, hi) tuple, or the string "per_volume" (clip each volume to its own
+        # [min, max]) for a CT+MRI batch where no single z-score range is valid.
+        if clamp_frame is None:
+            self._clamp = None
+        elif isinstance(clamp_frame, str) and clamp_frame == "per_volume":
+            self._clamp = "per_volume"
+        else:
+            self._clamp = (float(clamp_frame[0]), float(clamp_frame[1]))
         if self._clamp is None and resolve_ct_norm(ct_norm) != DEFAULT_CT_NORM:
             raise NotImplementedError(
                 "GpuAugmentor is pinned to the default CT frame (fingerprint_1228); "

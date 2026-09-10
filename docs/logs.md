@@ -1,5 +1,45 @@
 # Change log
 
+## 2026-09-10 — two MRI-oriented intensity augs: `invert` + anisotropic low-res
+
+Added to the canonical intensity chain in BOTH paths (`src/gpu_augment.py:_batched_intensity`,
+`src/augmentations.py:apply_intensity_aug`); order comments updated to
+`GIN → invert → bias → brightness/contrast → gamma → …`.
+
+- **`invert`** (new op, after GIN): reflect each volume about its own `[min, max]`
+  midpoint (`min<->max`). Range-preserving, frame-agnostic, geometry/masks untouched.
+  Models MRI sequence polarity flips (T1 fat-bright <-> T2 fluid-bright); per volume so
+  target and context can differ → polarity-invariant matching. Config: `intensity.invert.p`.
+- **`simulate_low_resolution.anisotropic`** (new flag): downsample ONE random axis only
+  (GPU: one axis per batched call, keeping the existing shared-shape simplification;
+  CPU: per-volume axis). Mimics thick-slice MRI (high in-plane res, coarse through-plane).
+- Both default OFF (key/flag absent → no-op); existing runs byte-identical. Enable per
+  the `89_multisource_cascade` proposal via `+augmentations.intensity.invert.p=…` /
+  `+augmentations.intensity.simulate_low_resolution.anisotropic=true`.
+- Tests: `tests/test_gpu_augment.py::test_batched_intensity_invert_reflects_and_preserves_range`,
+  `::test_batched_intensity_low_res_anisotropic_hits_one_axis`.
+- NOTE: the CPU GIN block still hard-clamps to `CT_NORM_MIN/MAX` (`augmentations.py`);
+  latent since MRI runs use GPU aug, but the CPU path has no `clamp_frame` seam yet.
+
+## 2026-09-10 — GPU intensity-aug clamp frame: `per_volume` mode for CT+MRI runs
+
+`GpuAugmentor`'s intensity ops (`_batched_intensity` / `_batched_gin_ipa` / `_batched_bias_field`)
+clamped every op's output to the fixed CT z-score frame `(CT_NORM_MIN, CT_NORM_MAX)` ≈
+`(-1.661, 3.441)` unless an explicit `clamp_frame=(lo, hi)` was passed. For a CT+MRI run
+this crushes the MRI bright tail: MRI is per-subject-z-scored, and ~68% of `totalsegmri`
+subjects have `norm_max > 3.441` (median ~3.9, p99 ~7.7, max ~28), so GIN/IPA (`.clamp` to
+frame), gamma, noise, blur all flatten hyperintense MRI structure to a constant on the
+volumes that get augmented.
+
+- `clamp` / `clamp_frame` now also accept the string `"per_volume"`: each volume's
+  intensity-aug output is clipped to its own pre-aug `[min, max]` `(N,1,1,1,1)` tensors.
+  Works for CT and MRI members of the same batch; no magic numbers.
+- `train.py` passes `clamp_frame="per_volume"` when `data.source in {multisource,
+  totalsegmri}`. Pure-CT / synth sources keep the fixed CT frame → byte-identical.
+- Existing fixed-tuple `clamp_frame` and the default CT-guard `NotImplementedError` are
+  unchanged. Tests: `tests/test_gpu_augment.py::test_batched_intensity_clamp_per_volume`,
+  `::test_gpu_augmentor_clamp_frame_per_volume_skips_ct_guard`.
+
 ## 2026-09-10 — cascade val sample-table: regime/modality columns + `val/dice_<regime>`
 
 The v2 cascade val pass (`cascade.evaluate_cascade`) emitted per-case dicts with only

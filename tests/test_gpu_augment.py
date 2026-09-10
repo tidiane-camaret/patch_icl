@@ -353,6 +353,45 @@ def test_gin_ipa_run_on_cuda():
 
 
 # ---------------------------------------------------------------------------
+# invert / anisotropic low-res (MRI intensity aug)
+# ---------------------------------------------------------------------------
+def test_batched_intensity_invert_reflects_and_preserves_range():
+    import torch
+    from src.gpu_augment import _batched_intensity
+
+    class _C:
+        class invert:
+            p = 1.0
+    g = torch.Generator().manual_seed(0)
+    vols = torch.rand(3, 1, 6, 6, 6) * 4 - 1
+    out = _batched_intensity(vols.clone(), _C, g, clamp="per_volume")
+    for b in range(3):
+        vmin, vmax = vols[b].min(), vols[b].max()
+        assert torch.allclose(out[b], (vmin + vmax) - vols[b], atol=1e-5)
+        assert torch.allclose(out[b].min(), vmin, atol=1e-5)
+        assert torch.allclose(out[b].max(), vmax, atol=1e-5)
+
+
+def test_batched_intensity_low_res_anisotropic_hits_one_axis():
+    import torch
+    from src.gpu_augment import _batched_intensity
+
+    class _C:
+        class simulate_low_resolution:
+            p = 1.0
+            scale_min = 0.25
+            scale_max = 0.25
+            anisotropic = True
+    torch.manual_seed(0)
+    vols = torch.randn(4, 1, 16, 16, 16)
+    out = _batched_intensity(vols.clone(), _C, torch.Generator().manual_seed(3),
+                             clamp="per_volume")
+    axvar = sorted(float(out.diff(dim=d).abs().mean()) for d in (2, 3, 4))
+    # one axis is markedly smoother than the other two (only it was downsampled)
+    assert axvar[0] < 0.5 * axvar[1]
+
+
+# ---------------------------------------------------------------------------
 # Task 4: de-pinnable clamp frame
 # ---------------------------------------------------------------------------
 def test_batched_intensity_clamp_default_is_ct_frame():
@@ -383,6 +422,33 @@ def test_batched_intensity_clamp_override():
     out = _batched_intensity(vols, _NC, g, clamp=(-4.0, 4.0))
     assert out.max() <= 4.0 + 1e-4
     assert out.min() >= -4.0 - 1e-4
+
+
+def test_batched_intensity_clamp_per_volume():
+    import torch
+    from src.gpu_augment import _batched_intensity
+
+    class _NC:
+        class gaussian_noise:
+            p = 1.0
+            max_std = 50.0
+    g = torch.Generator().manual_seed(0)
+    # two volumes in very different frames (a "CT" one and an "MRI" one that runs to +20)
+    v0 = torch.full((1, 1, 8, 8, 8), -1.0); v0[..., 0, 0, 0] = 3.0
+    v1 = torch.full((1, 1, 8, 8, 8), 0.0);  v1[..., 0, 0, 0] = 20.0
+    vols = torch.cat([v0, v1], dim=0)
+    out = _batched_intensity(vols.clone(), _NC, g, clamp="per_volume")
+    # each volume clipped to its OWN pre-aug [min, max], not a shared scalar frame
+    assert out[0].max() <= 3.0 + 1e-4 and out[0].min() >= -1.0 - 1e-4
+    assert out[1].max() <= 20.0 + 1e-4 and out[1].min() >= 0.0 - 1e-4
+
+
+def test_gpu_augmentor_clamp_frame_per_volume_skips_ct_guard():
+    from src.gpu_augment import GpuAugmentor
+    aug = GpuAugmentor(aug_cfg=None,
+                       ct_norm={"clip_lo": -500.0, "clip_hi": 500.0, "mean": 0.0, "std": 100.0},
+                       clamp_frame="per_volume")
+    assert aug._clamp == "per_volume"
 
 
 def test_gpu_augmentor_clamp_frame_skips_ct_guard():
