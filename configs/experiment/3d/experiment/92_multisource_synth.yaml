@@ -1,0 +1,50 @@
+# @package _global_
+# 92_multisource_synth — 89_multisource_cascade + synth_gmm as 3rd source (p=0.3)
+# + full intensity aug set (GIN/IPA, bias field, gamma, low-res, invert)
+#
+#   python experiments/3d/train.py experiment=92_multisource_synth
+
+defaults:
+  - 89_multisource_cascade
+  - _self_
+
+data:
+  p_synth: 0.3
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+  cohort:
+    w_span: 0
+    w_fov: 0
+    w_spacing: 0
+    w_by_class_size: 1
+    randomness: 1
+    min_masks_per_class: null
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+
+augmentations:
+  intensity:
+    gin:
+      p: 0.6
+    bias_field:
+      p: 0.4
+      magnitude: 0.3
+      coarse: 4
+    gamma:
+      range: [0.6, 1.7]
+    gaussian_noise:
+      p: 0.15
+    simulate_low_resolution:
+      p: 0.35
+      scale_min: 0.25
+      anisotropic: true
+    invert:
+      p: 0.15
+
+wandb:
+  name: 92_multisource_synth

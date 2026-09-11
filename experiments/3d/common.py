@@ -388,12 +388,64 @@ def build_dataset(cfg, split: str):
                     f"has no subjects for any of its {len(classes)} classes — check "
                     f"paths.{src} / source_mix.split_map / the class spec.")
             subs[mod] = sub
+        _epoch_len = (d.get("max_ds_len_train") or 1000) if is_train else int(sm.eval_epoch_length)
         provider = MultiSourceProvider(
             subs, context_size=d.context_size,
             regime_p=tuple(sm.get("regime_p", (1 / 3, 1 / 3, 1 / 3))),
-            epoch_length=((d.get("max_ds_len_train") or 1000) if is_train
-                          else int(sm.eval_epoch_length)),
+            epoch_length=_epoch_len,
             gpu_realize_crop=_realize)
+        # data.p_synth > 0: wrap with TriSourceProvider to add synth_gmm as a 3rd regime.
+        # Synth is train-only (val stays real via data.val or the multisource eval branch).
+        p_synth = float(d.get("p_synth", 0.0))
+        if p_synth > 0 and is_train:
+            from omegaconf import OmegaConf
+            from src.providers.synth_gmm import SynthGmmProvider
+            from src.providers.tri_source import TriSourceProvider
+            from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
+            from src.gpu_gmm_intensity import (CT_GROUP_MAISI_IDS, CT_GROUP_RHO,
+                                               MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)
+            _MU_PRESETS = {"ct": (CT_GROUP_MAISI_IDS, CT_GROUP_RHO),
+                           "merged": (MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)}
+            bank = cfg.paths.get("gmm_bank")
+            if bank is None:
+                raise ValueError("data.p_synth > 0 requires cfg.paths.gmm_bank")
+            g = d.get("gmm", {}) or {}
+            _mu_cfg = (OmegaConf.to_container(g, resolve=True) if OmegaConf.is_config(g)
+                       else dict(g)).get("mu_group_ids")
+            _mu_ids, _mu_rho = _MU_PRESETS.get(_mu_cfg, (None, None))
+            cohort_cfg = d.get("cohort", {}) or {}
+            synth_ds = SynthGmmMaisiDataset(
+                bank_dir=bank,
+                image_size=tuple(d.image_size),
+                context_size=int(d.context_size),
+                crop_spacing_mm=float(d.get("crop_spacing_mm", 1.5)),
+                classes=None,   # None = all bank classes
+                length=_epoch_len,
+                var_max=float((g.get("var_max") if OmegaConf.is_config(g) else g.get("var_max")) or 5.0),
+                background_mode=(g.get("background_mode") if OmegaConf.is_config(g)
+                                 else g.get("background_mode")) or "zero",
+                mask_downsample=("occupancy" if d.get("mask_downsample") == "soft"
+                                 else d.get("mask_downsample", "occupancy")),
+                mask_occupancy_thr=float(d.get("mask_occupancy_thr", 0.1)),
+                class_balanced=True,
+                cohort=(OmegaConf.to_container(cohort_cfg, resolve=True)
+                        if OmegaConf.is_config(cohort_cfg) else dict(cohort_cfg)),
+                gpu_realize=False,   # cascade path builds NativeCrop directly
+                eval_seed=None,
+                paint_mask_aligned=bool((g.get("paint_mask_aligned")
+                                         if OmegaConf.is_config(g)
+                                         else g.get("paint_mask_aligned")) or False),
+                mu_group_ids=(_mu_ids if _mu_ids is not None else _mu_cfg),
+                mu_group_rho=(_mu_rho if _mu_rho is not None
+                              else (g.get("mu_group_rho") if OmegaConf.is_config(g)
+                                    else g.get("mu_group_rho"))),
+                sd_between_ratio=(g.get("sd_between_ratio") if OmegaConf.is_config(g)
+                                  else g.get("sd_between_ratio")),
+            )
+            synth_prov = SynthGmmProvider(synth_ds, cascade=True)
+            provider = TriSourceProvider(
+                provider, synth_prov, p_synth=p_synth,
+                epoch_length=_epoch_len, gpu_realize_crop=_realize)
         return InContextDataset(
             provider, context_size=d.context_size,
             aug_cfg=(cfg.augmentations if is_train else None),
