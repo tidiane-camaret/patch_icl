@@ -25,6 +25,13 @@ class LoadRequest:
     jitter: Optional[int] = None       # per-load crop-jitter override (native voxels);
                                        # None -> provider default self.crop_jitter.
                                        # Cascade re-crops pass 0 so the predicted COM is exact.
+    center_mode: str = "com"           # how a provider fills in `center` when it is None:
+                                       # "com" (default) -> the provider's precomputed centroid
+                                       # (today's behavior, byte-identical); "random_fg" -> a
+                                       # uniformly random native voxel inside the class mask
+                                       # (data.cascade_center_mode; see providers/totalseg.py
+                                       # _resolve_center). Only ever consulted when center is
+                                       # None -- an explicit center always wins.
 
 
 @dataclass

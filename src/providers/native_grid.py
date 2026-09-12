@@ -25,8 +25,10 @@ import numpy as np
 import torch
 
 from src.incontext_dataset_v2 import LoadRequest, LoadResult
-from src.providers.totalseg import crop_and_place
-from src.totalseg_dataset import normalize_ct
+from src.providers.totalseg import (NativeCrop, _resolve_center, _resolve_jitter,
+                                    build_native_crop, crop_and_place)
+from src.totalseg_dataloader_incontext import organ_crop_arrays
+from src.totalseg_dataset import normalize_ct, resolve_ct_norm
 
 
 def resolve_classes_for(all_classes: list[str], value, source: str) -> list[str]:
@@ -121,18 +123,44 @@ class NativeGridProvider:
         center = req.center
         if center is None:
             D, H, W = label_np.shape
-            center = self._centroids.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            fallback = self._centroids.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            center = _resolve_center(req, label_np, self.CLASS_IDX.get(cls, -1), fallback)
         image_t, label_t, geom = crop_and_place(
             image_np, label_np, self.CLASS_IDX[cls], center, self.T,
             crop_spacing_mm=req.crop_spacing_mm,
             native_spacing=self._meta[subject]["spacing"],
-            jitter=self.crop_jitter, rng=req.rng,
+            jitter=_resolve_jitter(req, self.crop_jitter), rng=req.rng,
             mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
             normalize_fn=lambda a: normalize_ct(np.ascontiguousarray(a)),
             antialias=self.image_antialias)
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
         return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom,
                           modality=self.modality)
+
+    def load_native_crop(self, subject, cls, req: LoadRequest) -> NativeCrop:
+        """Native-pitch organ crop + geometry for the GPU-realize cascade path
+        (data.gpu_realize_crop) — no normalize / no resample / no placement, the GPU
+        realize step (src/gpu_realize_crop.py) does those. Mirrors
+        TotalSegProvider.load_native_crop (same organ_crop_arrays/build_native_crop pure
+        helpers `.load` already uses via crop_and_place); this provider has no per-subject
+        ct_norm, so it uses the same implicit DEFAULT_CT_NORM `.load` gets from
+        normalize_ct(a, spec=None)."""
+        subj_dir = self.root / subject
+        image_np = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
+        label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
+        center = req.center
+        if center is None:
+            D, H, W = label_np.shape
+            fallback = self._centroids.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            center = _resolve_center(req, label_np, self.CLASS_IDX.get(cls, -1), fallback)
+        crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+            image_np, label_np, center, list(self._meta[subject]["spacing"]),
+            image_size=(self.T, self.T, self.T), crop_mm=req.crop_spacing_mm,
+            jitter=_resolve_jitter(req, self.crop_jitter), rng=req.rng)
+        return build_native_crop(
+            crop_ct, crop_lbl, self.CLASS_IDX.get(cls, -1), out_sizes, pad_lo, geom,
+            crop_spacing_mm=float(req.crop_spacing_mm),
+            norm=resolve_ct_norm(None), modality=self.modality)
 
     # --- caches -------------------------------------------------------------
     def _load_meta(self):

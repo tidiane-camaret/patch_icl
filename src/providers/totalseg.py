@@ -165,6 +165,26 @@ def _resolve_jitter(req: LoadRequest, default: int) -> int:
     return int(req.jitter) if req.jitter is not None else int(default)
 
 
+def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback):
+    """Fill in a crop center when `req.center` is None, per `req.center_mode`.
+
+    "com" (default): `fallback` — the provider's precomputed centroid, byte-identical to
+    pre-random_fg behavior. "random_fg": a uniformly random native voxel where
+    `label_np == class_idx`, drawn via `req.rng` (so it's reproducible the same way jitter
+    is); falls back to `fallback` if the class has no voxels for this subject/label array
+    (e.g. a synth/goal-mask edit emptied it) or `class_idx < 0` (unknown class).
+
+    Cost note: "random_fg" scans the full (already-loaded-for-the-crop) label array —
+    unavoidable without a precomputed per-class voxel cache. Only paid when requested."""
+    if req.center is not None:
+        return req.center
+    if req.center_mode == "random_fg" and class_idx >= 0:
+        coords = np.argwhere(label_np == class_idx)
+        if coords.shape[0] > 0:
+            return tuple(int(v) for v in coords[req.rng.randrange(coords.shape[0])])
+    return fallback
+
+
 class TotalSegProvider:
     """Source-specific I/O for the totalseg family: scan + bbox caches and a single
     raw_ct organ-crop `load`. Missing ct_raw.npy is a hard error."""
@@ -234,7 +254,8 @@ class TotalSegProvider:
         center = req.center
         if center is None:
             D, H, W = label_np.shape
-            center = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            fallback = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            center = _resolve_center(req, label_np, _ALL_CLASSES_IDX.get(cls, -1), fallback)
         jitter = _resolve_jitter(req, self.crop_jitter)
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
         norm = ((lambda a: normalize_ct(a, self.ct_spec)) if self.modality == "ct"
@@ -291,7 +312,8 @@ class TotalSegProvider:
         center = req.center
         if center is None:
             D, H, W = label_np.shape
-            center = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            fallback = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+            center = _resolve_center(req, label_np, _ALL_CLASSES_IDX.get(cls, -1), fallback)
         jitter = _resolve_jitter(req, self.crop_jitter)
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
         crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(

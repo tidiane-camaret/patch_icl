@@ -245,12 +245,23 @@ def _assert_cascade_supported(cfg) -> None:
         raise ValueError("data.cascade_spacings requires model=patchset3d or model=medverse.")
     if not d.get("loader_v2", False):
         raise ValueError("data.cascade_spacings requires data.loader_v2=true (v2 pipeline).")
-    _cascade_sources = _TOTALSEG_SOURCES | {"multisource"}
+    # nasalseg/flare22 (NativeGridProvider) are duck-type compatible with the cascade re-crop
+    # path (_recrop_level calls provider.load / .load_native_crop generically) -- see
+    # src/providers/native_grid.py::NativeGridProvider.load_native_crop.
+    _cascade_sources = _TOTALSEG_SOURCES | {"multisource", "nasalseg", "flare22"}
     if d.get("source", "totalseg") not in _cascade_sources:
         raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
                          f"cascade-capable source ({sorted(_cascade_sources)}).")
     if len(spacings) < 2:
         raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
+    _cm = d.get("cascade_center_mode", "com")
+    from cascade import _resolve_center_mode   # lazy: only when a cascade config is present
+    try:
+        _resolve_center_mode(_cm)
+    except (ValueError, TypeError, KeyError) as e:
+        raise ValueError(
+            f"data.cascade_center_mode={_cm!r} invalid: {e}. Expected a mode string "
+            f"(com|random_fg) or a mapping {{mode: ..., eval_mode: ...}}.") from e
     _sp_f = [float(s) for s in spacings]
     if not all(a > b for a, b in zip(_sp_f, _sp_f[1:])):
         # Spec: warn, don't error -- an equal/fine->coarse ladder is a valid ablation

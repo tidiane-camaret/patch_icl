@@ -144,3 +144,70 @@ def test_provider_is_not_pickled_with_its_ram_cache(tmp_path):
     assert len(blob) < 100_000, f"pickled provider is {len(blob)} bytes (cache leaked in?)"
     assert pickle.loads(blob)._ram is None
     assert prov._ram is not None                             # the live provider keeps it
+
+
+# --- data.cascade_center_mode="random_fg" -------------------------------------
+from src.providers.totalseg import _resolve_center
+
+
+def test_resolve_center_prefers_explicit_center():
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5,
+                      center=(1, 2, 3), center_mode="random_fg")
+    lbl = np.ones((4, 4, 4), dtype=np.uint8)
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(9, 9, 9)) == (1, 2, 3)
+
+
+def test_resolve_center_com_mode_uses_fallback():
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="com")
+    lbl = np.ones((4, 4, 4), dtype=np.uint8)
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(9, 9, 9)) == (9, 9, 9)
+
+
+def test_resolve_center_random_fg_lands_on_a_class_voxel():
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    lbl[2, 3, 4] = 1                                  # single voxel of class 1
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0)) == (2, 3, 4)
+
+
+def test_resolve_center_random_fg_falls_back_when_class_absent():
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)          # no voxel == class 1
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(3, 3, 3)) == (3, 3, 3)
+    # unknown class (-1, e.g. _ALL_CLASSES_IDX miss) also falls back rather than scanning
+    assert _resolve_center(req, lbl, class_idx=-1, fallback=(3, 3, 3)) == (3, 3, 3)
+
+
+def test_resolve_center_random_fg_is_seeded_by_req_rng():
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    lbl[1, 1, 1] = 1; lbl[4, 4, 4] = 1
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    a = _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0))
+    req2 = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    b = _resolve_center(req2, lbl, class_idx=1, fallback=(0, 0, 0))
+    assert a == b and a in {(1, 1, 1), (4, 4, 4)}
+
+
+def test_load_native_crop_random_fg_center_lands_inside_the_liver_block(tmp_path):
+    """End-to-end through TotalSegProvider.load_native_crop: center=None + center_mode=
+    'random_fg' must pick a voxel actually inside the liver block (8:12 on every axis in
+    the 20^3 fixture), unlike the fixed bbox-COM default which always returns its centroid."""
+    from src.totalseg_dataset import _ALL_CLASSES_IDX
+
+    prov = _tiny_provider(tmp_path, spacing=1.5, T=8)
+    req = LoadRequest(rng=random.Random(1), crop_spacing_mm=1.5, jitter=0,
+                      center_mode="random_fg")
+    nc = prov.load_native_crop("s0", "liver", req)
+    # starts (crop_geom row 0) recovers the resolved centre for a jitter=0, T==crop_sizes
+    # request: ideal = center - crop_sizes//2 == starts, so center == starts + crop_sizes//2.
+    starts, crop_sizes = nc.crop_geom[0].tolist(), nc.crop_geom[1].tolist()
+    center = tuple(s + cs // 2 for s, cs in zip(starts, crop_sizes))
+    assert all(8 <= c < 12 for c in center), \
+        f"random_fg center {center} is outside the planted liver block [8,12)"
+
+    # the "com" default keeps returning the bbox centroid (9,9,9) for the same request shape
+    req_com = LoadRequest(rng=random.Random(1), crop_spacing_mm=1.5, jitter=0, center_mode="com")
+    nc_com = prov.load_native_crop("s0", "liver", req_com)
+    starts_c, crop_c = nc_com.crop_geom[0].tolist(), nc_com.crop_geom[1].tolist()
+    center_com = tuple(s + cs // 2 for s, cs in zip(starts_c, crop_c))
+    assert center_com == (9, 9, 9)

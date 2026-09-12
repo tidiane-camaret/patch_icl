@@ -589,7 +589,9 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                     mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
                     occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
                     ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
-                    prior_perturb=cfg.data.get("prior_perturb", None))
+                    prior_perturb=cfg.data.get("prior_perturb", None),
+                    center_mode=cfg.data.get("cascade_center_mode", "com"),
+                    center_fg_thr=float(cfg.data.get("cascade_center_fg_thr", 0.5)))
                 # Fail fast on a non-finite forward at ANY level, BEFORE the loss: a NaN
                 # reaching F.binary_cross_entropy trips an async device assert with a useless
                 # later stack (cf. the non-cascade guard).

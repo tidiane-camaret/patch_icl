@@ -125,6 +125,13 @@ class SynthGmmProvider:
         """Cascade re-crop: re-derive same GMM + member paint nrng from subject string."""
         if not self.cascade:
             raise RuntimeError("SynthGmmProvider.load_native_crop requires cascade=True")
+        if req.center is None and getattr(req, "center_mode", "com") == "random_fg":
+            # data.cascade_center_mode=random_fg needs a per-voxel GT scan (see
+            # providers/totalseg.py::_resolve_center); not wired up for the synth MAISI mask
+            # bank -- fail loudly instead of silently falling back to the GT centroid.
+            raise NotImplementedError(
+                "SynthGmmProvider: cascade_center_mode='random_fg' is not implemented "
+                "(TotalSegProvider/NativeGridProvider only).")
         filename, gmm_seed_str, member_idx_str = subject.rsplit("|", 2)
         gmm_seed = int(gmm_seed_str)
         member_idx = int(member_idx_str)

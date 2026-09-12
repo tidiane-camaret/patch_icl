@@ -123,6 +123,22 @@ def test_allows_multisource_source():
     _assert_cascade_supported(_cfg(data={"source": "multisource"}))
 
 
+def test_allows_nasalseg_source():
+    # NativeGridProvider now implements load_native_crop (2026-09-12) -- cascade eval works
+    # on the NativeGridProvider-backed sources too.
+    _assert_cascade_supported(_cfg(data={"source": "nasalseg"}))
+
+
+def test_allows_flare22_source():
+    _assert_cascade_supported(_cfg(data={"source": "flare22"}))
+
+
+def test_allows_nasalseg_source_without_gpu_realize():
+    # The recommended eval mode: NativeGridProvider has no RAM cache, so the plain CPU
+    # provider.load() recrop path (gpu_realize_crop=false) is the practical default here.
+    _assert_cascade_supported(_cfg(data={"source": "nasalseg", "gpu_realize_crop": False}))
+
+
 def test_allows_multisource_with_gpu_realize_and_ram_cache():
     _assert_cascade_supported(_cfg(data={"source": "multisource",
                                          "gpu_realize_crop": True, "ram_cache": True}))
@@ -188,3 +204,34 @@ def test_cascade_train_rejects_levels_lt_2():
     with pytest.raises(ValueError, match="levels"):
         _assert_cascade_supported(_cfg(data={"cascade_train":
                                              {"levels": 1, "spacing_range": [1.5, 3]}}))
+
+
+# --- data.cascade_center_mode ---------------------------------------------------
+
+def test_allows_center_mode_com_default():
+    _assert_cascade_supported(_cfg())                       # unset -> "com", no raise
+
+
+def test_allows_center_mode_random_fg():
+    _assert_cascade_supported(_cfg(data={"cascade_center_mode": "random_fg"}))
+
+
+def test_rejects_bad_center_mode():
+    with pytest.raises(ValueError, match="cascade_center_mode"):
+        _assert_cascade_supported(_cfg(data={"cascade_center_mode": "bogus"}))
+
+
+def test_allows_center_mode_mapping_with_eval_override():
+    _assert_cascade_supported(_cfg(data={"cascade_center_mode":
+                                         {"mode": "random_fg", "eval_mode": "com"}}))
+
+
+def test_rejects_center_mode_mapping_missing_mode_key():
+    with pytest.raises(ValueError, match="cascade_center_mode"):
+        _assert_cascade_supported(_cfg(data={"cascade_center_mode": {"eval_mode": "com"}}))
+
+
+def test_rejects_center_mode_mapping_bad_eval_mode():
+    with pytest.raises(ValueError, match="cascade_center_mode"):
+        _assert_cascade_supported(_cfg(data={"cascade_center_mode":
+                                             {"mode": "com", "eval_mode": "bogus"}}))

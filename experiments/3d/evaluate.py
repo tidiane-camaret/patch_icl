@@ -12,6 +12,7 @@ scripts/eval.py stays as the legacy CLI benchmark.
 """
 
 import contextlib
+import json
 import time
 from pathlib import Path
 
@@ -902,19 +903,43 @@ def _unpack_pred(entry):
     return np.unpackbits(packed)[:int(np.prod(shape))].reshape(shape).astype(bool), geom
 
 
-def _stitched_native_dice_multi(pg_levels, root):
-    """Dice on the full native volume: GT vs the composite of pg_levels applied
-    coarse->fine (list order), each level's per-(subj,cls) region overwriting the
-    previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
-    Returns {(subj,cls): dice} over the keys of the LAST level that also appear in
-    every earlier level. Generalises _stitched_native_dice."""
-    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+def _load_native_spacings(root) -> dict:
+    """Per-subject native voxel spacing (mm/vox), read from `root/spacings.json` — the same
+    file src.providers.totalseg.TotalSegProvider loads. Independent of any provider instance
+    so it works for both the plain totalseg root and a multisource sub-root. Missing file /
+    missing subject -> caller falls back to (1,1,1)."""
+    path = Path(root) / "spacings.json"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    return {s: tuple(float(x) for x in m["spacing"]) for s, m in raw.items()}
+
+
+def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None, class_idx=None):
+    """Dice (+ NSD when `tol_mm` is given) on the full native volume: GT vs the composite of
+    pg_levels applied coarse->fine (list order), each level's per-(subj,cls) region
+    overwriting the previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
+    Returns {(subj,cls): (dice, nsd_or_None)} over the keys of the LAST level that also appear
+    in every earlier level. Both metrics share the one native GT load + composite per case, so
+    computing them together avoids re-reading/re-stitching label.npy twice.
+
+    `class_idx`: name -> label.npy index map. None (default) -> the merged-label
+    `_ALL_CLASSES_IDX` (totalseg / totalsegmri / multisource, whose label.npy is
+    TotalSeg-indexed). A source with its OWN label index space (NativeGridProvider:
+    FLARE22/NasalSeg) must pass its provider's `CLASS_IDX` -- else every key silently
+    misses (`idx is None` for a name outside the TotalSeg vocabulary) and every case
+    scores NaN (docs/logs.md 2026-09-12)."""
+    if class_idx is None:
+        from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+        class_idx = _ALL_CLASSES_IDX
     if not pg_levels:
         return {}
+    spacings = _load_native_spacings(root) if tol_mm is not None else {}
     out = {}
     for key in pg_levels[-1]:
         subj, cls = key
-        idx = _ALL_CLASSES_IDX.get(cls)
+        idx = class_idx.get(cls)
         if idx is None or any(key not in lvl for lvl in pg_levels):
             continue
         gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
@@ -924,8 +949,26 @@ def _stitched_native_dice_multi(pg_levels, root):
             _write_native(native, p, geom)
         inter = 2.0 * np.logical_and(native, gt).sum()
         denom = int(native.sum()) + int(gt.sum())
-        out[key] = inter / denom if denom > 0 else 1.0
+        dice = inter / denom if denom > 0 else 1.0
+        nsd = None
+        if tol_mm is not None:
+            sp = spacings.get(subj, (1.0, 1.0, 1.0))
+            nsd_t = nsd_batch(torch.from_numpy(native)[None], torch.from_numpy(gt)[None],
+                              sp, tol_mm)
+            nsd = float(nsd_t[0])
+        out[key] = (dice, nsd)
     return out
+
+
+def _stitched_native_dice_multi(pg_levels, root, class_idx=None):
+    """Dice on the full native volume: GT vs the composite of pg_levels applied
+    coarse->fine (list order), each level's per-(subj,cls) region overwriting the
+    previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
+    Returns {(subj,cls): dice} over the keys of the LAST level that also appear in
+    every earlier level. Thin wrapper over _stitched_native_metrics_multi (dice only);
+    see its docstring for `class_idx`."""
+    return {k: d for k, (d, _) in
+            _stitched_native_metrics_multi(pg_levels, root, class_idx=class_idx).items()}
 
 
 def _stitched_native_dice(base_pg, over_pg, root):

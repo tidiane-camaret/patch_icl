@@ -1,9 +1,10 @@
 """N-level coarse->fine cascade for PatchSet3D (v2 pipeline).
 
 run_cascade executes one N-level forward (level 0 = GT-centred, level i>0 = target
-re-cropped on level i-1's predicted centre-of-mass); shared by the train loop
-(experiments/3d/train.py train_epoch) and the v2 cascade val pass (evaluate_cascade).
-PatchSet3D.forward stays single-level.
+re-cropped on level i-1's prediction -- its prob-weighted centroid by default, or a
+uniformly random voxel from the mask under data.cascade_center_mode='random_fg'); shared
+by the train loop (experiments/3d/train.py train_epoch) and the v2 cascade val pass
+(evaluate_cascade). PatchSet3D.forward stays single-level.
 
 See docs/superpowers/specs/2026-08-30-cascade-training-patchset3d-design.md.
 """
@@ -133,6 +134,62 @@ def _centroid_from_logit(logit_b1ghw, T, is_prob):
     return [None if float(s[b]) < 1e-6 else com[b] for b in range(p.shape[0])]
 
 
+def _random_fg_point(logit_b1ghw, T, is_prob, thr, *, seed, step, level):
+    """Per-b uniformly-random voxel (d,h,w) among the `>= thr` binarized mask, or None when
+    empty. Companion to `_centroid_from_logit` for data.cascade_center_mode='random_fg':
+    same signature/output contract (list of (3,) np array | None, one per b), so it feeds
+    `invert_geo_center` unchanged -- large/non-convex ROIs get a point actually inside the
+    mask instead of a centroid that can land off it (e.g. a donut-shaped organ).
+
+    Operates on the already-in-memory (small, T^3) prediction grid -- no provider/disk
+    involvement, essentially free. Seeded per (seed, step, level, b) like the rest of the
+    file's re-crop seeding, so the draw is reproducible."""
+    prob = logit_b1ghw.float().clamp(0, 1) if is_prob else torch.sigmoid(logit_b1ghw.float())
+    if prob.shape[-1] != T:
+        prob = F.interpolate(prob, size=(T, T, T), mode="trilinear", align_corners=False)
+    mask = prob[:, 0] >= thr                                          # (B,T,T,T)
+    out = []
+    for b in range(mask.shape[0]):
+        idx = torch.nonzero(mask[b], as_tuple=False)                  # (n,3) d,h,w
+        if idx.shape[0] == 0:
+            out.append(None)
+            continue
+        pick = random.Random(f"{seed}_{step}_{level}_{b}_ctr").randrange(idx.shape[0])
+        out.append(idx[pick].detach().float().cpu().numpy())
+    return out
+
+
+_CENTER_MODES = ("com", "random_fg")
+
+
+def _resolve_center_mode(value):
+    """Normalize data.cascade_center_mode into (train_mode, eval_mode).
+
+    Accepts the plain scalar ("com" default | "random_fg") -- the SAME mode runs at train
+    and eval, today's behavior -- and a mapping form ``{mode: ..., eval_mode: ...}`` so
+    training can run 'random_fg' while eval stays on the deterministic 'com' path (mirrors
+    cascade_query_prior's train/eval split -- though unlike query_prior there is no
+    per-step train-time MIXTURE here, just one train mode + one optional eval override).
+    `eval_mode` defaults to 'com' (not `mode`): eval should stay on the stable, canonical
+    centering unless explicitly told to also run stochastically."""
+    if value is None or isinstance(value, str):
+        m = value or "com"
+        if m not in _CENTER_MODES:
+            raise ValueError(f"cascade_center_mode={value!r} must be one of {_CENTER_MODES}")
+        return m, m
+    if not hasattr(value, "get") or "mode" not in value:
+        raise ValueError(
+            f"cascade_center_mode={value!r}: expected a mode string {_CENTER_MODES} or a "
+            f"mapping with a 'mode' key (optionally 'eval_mode').")
+    m = str(value["mode"])
+    if m not in _CENTER_MODES:
+        raise ValueError(f"cascade_center_mode.mode={m!r} must be one of {_CENTER_MODES}")
+    em = str(value.get("eval_mode", "com"))
+    if em not in _CENTER_MODES:
+        raise ValueError(f"cascade_center_mode.eval_mode={em!r} must be one of {_CENTER_MODES}")
+    return m, em
+
+
 def _to_device(batch, device):
     for k in ("image", "label", "context_in", "context_out"):
         batch[k] = batch[k].to(device, non_blocking=True)
@@ -182,7 +239,7 @@ def _run_pool(fn, tasks, workers):
 
 def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitter,
                   recrop_workers=1, realize_crop=False, mask_downsample="occupancy",
-                  occ_thr=0.1, ct_spec=None, device=None):
+                  occ_thr=0.1, ct_spec=None, device=None, center_mode="com"):
     """Build one level-i v2 batch: target re-cropped on `centers[b]`, K contexts GT-centred,
     same subjects/classes as level 0.
 
@@ -195,7 +252,13 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     resample them on `device` via realize_native_crops, instead of the provider.load +
     incontext_collate_fn CPU path. Both branches return the same batch-dict keys
     (image/label/context_in/context_out/spacing/crop_geom + subjects/context_subjects/
-    label_names/aug_mode); crop_geom flows through untouched from each row's target crop."""
+    label_names/aug_mode); crop_geom flows through untouched from each row's target crop.
+
+    center_mode: data.cascade_center_mode ("com" | "random_fg"), forwarded to every
+    LoadRequest. Only matters when a task's `center` is None -- context tasks always pass
+    None (GT-centred every level), and the target does too when run_cascade's centroid/
+    random-fg extraction found an empty mask (fallback). "random_fg" makes the provider
+    sample a random voxel from that task's own GT mask instead of its precomputed centroid."""
     subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
     sp = float(spacing)
     # tgt/ctx modality live ONLY on the original level-0 `batch` — run_cascade passes that same
@@ -219,7 +282,7 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
         def _load_nc(t):
             b, _k, subj, center, rk, mod = t
             req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
-                              center=center, jitter=jitter)
+                              center=center, jitter=jitter, center_mode=center_mode)
             if mod is not None:
                 return provider.load_native_crop(subj, clss[b], req, modality=mod)
             return provider.load_native_crop(subj, clss[b], req)
@@ -240,7 +303,7 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     def _load(t):
         b, _k, subj, center, rk, mod = t
         req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
-                          center=center, jitter=jitter)
+                          center=center, jitter=jitter, center_mode=center_mode)
         if mod is not None:
             return provider.load(subj, clss[b], req, modality=mod)
         return provider.load(subj, clss[b], req)
@@ -505,8 +568,24 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                 recrop_workers=1, query_prior=False, query_prior_hard=False,
                 want_figure_arrays=False, realize_crop=False,
                 mask_downsample="occupancy", occ_thr=0.1, ct_spec=None,
-                prior_perturb=None):
+                prior_perturb=None, center_mode="com", center_fg_thr=0.5):
+    """center_mode (data.cascade_center_mode): "com" (default, byte-identical to pre-
+    random_fg behavior) picks each level>0's re-crop centre as the prob-weighted centroid
+    of the previous level's prediction (_centroid_from_logit); "random_fg" instead draws a
+    uniformly random voxel from the `>= center_fg_thr` binarized prediction
+    (_random_fg_point) -- lands the crop inside the mask even when it's large/non-convex,
+    where a centroid can sit off-object (e.g. a donut shape) or a fixed-radius jitter can't
+    reach the far end. Also accepts a mapping ``{mode: ..., eval_mode: ...}`` so training
+    can run 'random_fg' while eval stays on 'com' (_resolve_center_mode; mirrors
+    cascade_query_prior's train/eval split -- no per-step mixture here, though, just one
+    train mode + one eval override, `training` picks between them). The resolved mode is
+    forwarded to every re-crop's LoadRequest, so context tasks (always GT-centred) and the
+    target's own empty-mask fallback pick their default center the same way: "com" -> the
+    provider's precomputed centroid (today's default); "random_fg" -> a random voxel from
+    that task's own GT mask (providers/totalseg.py _resolve_center)."""
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
+    _train_mode, _eval_mode = _resolve_center_mode(center_mode)
+    center_mode = _train_mode if training else _eval_mode
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
     N = len(spacings)
     T = batch["image"].shape[-1]
@@ -529,7 +608,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                                 step=step, seed=seed, level=i, jitter=jitter,
                                 recrop_workers=recrop_workers, realize_crop=realize_crop,
                                 mask_downsample=mask_downsample, occ_thr=occ_thr,
-                                ct_spec=ct_spec, device=device)
+                                ct_spec=ct_spec, device=device, center_mode=center_mode)
             cur = _to_device(cur, device)   # no-op for realize output (already on device)
         capture = augmentor is not None and i < N - 1
         if augmentor is not None:
@@ -578,7 +657,10 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             })
 
         if i < N - 1:
-            cens = _centroid_from_logit(logit, T, is_prob)
+            cens = (_random_fg_point(logit, T, is_prob, center_fg_thr,
+                                     seed=seed, step=step, level=i)
+                    if center_mode == "random_fg" else
+                    _centroid_from_logit(logit, T, is_prob))
             row = []
             for b in range(B):
                 empty_total += 1
@@ -615,7 +697,14 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     from collections import defaultdict
     import numpy as np
     from common import _source_root                     # NOTE: _source_root lives in common.py
-    from evaluate import _stitched_native_dice_multi, _save_cascade_pair
+    from evaluate import _stitched_native_dice_multi, _stitched_native_metrics_multi, _save_cascade_pair
+
+    # NSD tolerance (mm), same convention as evaluate.evaluate_classes: absent eval config (e.g.
+    # train.py's cascade val step, whose cfg may have no `eval.nsd_tolerance_mm`) -> skipped.
+    # Only the FULL stitched (finest) prediction is scored, not the intermediate per-level
+    # dice_r{s} passes -- one dice+nsd pair per case, same granularity as the non-cascade path.
+    _ev = cfg.get("eval")
+    nsd_tol = _ev.get("nsd_tolerance_mm") if _ev is not None else None
 
     spacings = [float(s) for s in cfg.data.cascade_spacings]
     N = len(spacings)
@@ -667,6 +756,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                               mask_downsample=cfg.data.get("mask_downsample", "occupancy"),
                               occ_thr=float(cfg.data.get("mask_occupancy_thr", 0.1)),
                               ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
+                              center_mode=cfg.data.get("cascade_center_mode", "com"),
+                              center_fg_thr=float(cfg.data.get("cascade_center_fg_thr", 0.5)),
                               want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()
@@ -718,16 +809,27 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     # C1: score each modality's cases against THAT modality's dataset root. Strip the modality
     # prefix so _stitched_native_dice_multi's `subj, cls = key` still works, then re-add it.
     # Single-source: mods_seen == {None}, roots == {None: root} -> byte-equivalent behaviour.
+    #
+    # class_idx: label.npy uses the provider's OWN index space, not necessarily the merged-label
+    # _ALL_CLASSES_IDX the stitch helpers default to. TotalSegProvider / MultiSourceProvider IS
+    # that vocabulary (no override needed -> None keeps the default); a source with its own index
+    # space (NativeGridProvider: FLARE22/NasalSeg) sets `.CLASS_IDX` and must pass it explicitly,
+    # else every key silently misses and every case scores NaN (docs/logs.md 2026-09-12).
+    cls_idx = getattr(loader.dataset.provider, "CLASS_IDX", None)
     mods_seen = {k[0] for k in pg_levels[-1]}
     stitched = {}
+    nsd_scores = {}
     per_res_by_level = [dict() for _ in range(N)]
     for m in mods_seen:
         r = roots.get(m, root)
         pgm = [{(k[1], k[2]): v for k, v in lvl.items() if k[0] == m} for lvl in pg_levels]
-        for (sj, cl), d in _stitched_native_dice_multi(pgm, r).items():
+        for (sj, cl), (d, nsd) in _stitched_native_metrics_multi(
+                pgm, r, tol_mm=nsd_tol, class_idx=cls_idx).items():
             stitched[(m, sj, cl)] = d
+            if nsd is not None:
+                nsd_scores[(m, sj, cl)] = nsd
         for li in range(N):
-            for (sj, cl), d in _stitched_native_dice_multi([pgm[li]], r).items():
+            for (sj, cl), d in _stitched_native_dice_multi([pgm[li]], r, class_idx=cls_idx).items():
                 per_res_by_level[li][(m, sj, cl)] = d
 
     mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")
@@ -744,6 +846,8 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                 "detail": "" if _regime is None else f"{_regime} {_mod}<-{_cmod}",
                 "dice": round(float(stitched.get(key, float("nan"))), 4),
                 "time_ms": times.get(key, float("nan"))}
+        if key in nsd_scores:
+            case["nsd"] = round(nsd_scores[key], 4)
         if _cc is not None:
             case["ctx_cases"] = ";".join(map(str, _cc))
             case["self_ctx"] = subj in _cc
@@ -765,6 +869,10 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                "std_dice": round(float(np.std(dvals)), 4),
                "mean_time_ms": mean_ms,
                "n_samples": len(cs)}
+        nvals = [c["nsd"] for c in cs if "nsd" in c]
+        if nvals:
+            row["mean_nsd"] = round(sum(nvals) / len(nvals), 4)
+            row["std_nsd"] = round(float(np.std(nvals)), 4)
         for s in spacings:
             vals = [c[f"dice_r{s:g}"] for c in cs if not np.isnan(c[f"dice_r{s:g}"])]
             if vals:

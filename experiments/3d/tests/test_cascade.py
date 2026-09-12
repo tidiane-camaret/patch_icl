@@ -771,6 +771,83 @@ def test_evaluate_cascade_shapes_and_nan_safe_macro(tmp_path, monkeypatch):
     assert by_cls["not_a_real_class"]["error"] == "no valid samples"
 
 
+def test_evaluate_cascade_uses_provider_class_idx_for_non_totalseg_source(tmp_path, monkeypatch):
+    """Regression: a source with its OWN label-index space (NativeGridProvider: FLARE22/
+    NasalSeg -- `.CLASS_IDX` on the provider) must NOT be scored through the merged-label
+    `_ALL_CLASSES_IDX`. Before the fix, every case for such a class silently missed
+    (`idx is None` for a name outside the TotalSeg vocabulary) and every row came back
+    "no valid samples" (docs/logs.md 2026-09-12 -- found evaluating NasalSeg)."""
+    import common
+
+    B, T = 2, 8
+    cls, idx = "custom_air_cavity", 3           # not a real TotalSeg class / index at all
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = idx
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    model = _FakeModel(G=4, hot=(1, 1, 1))
+    prov = _FakeProvider(T=T)
+    prov.CLASS_IDX = {cls: idx}                 # the provider's own (non-TotalSeg) index map
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self):
+            return iter([_named_batch([cls] * B, B=B, T=T)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False}})
+    rows, cases = evaluate_cascade(model, cfg, [cls], loader=_Loader(), seed=0, is_prob=False)
+
+    by_cls = {r["class"]: r for r in rows}
+    assert "error" not in by_cls[cls], by_cls[cls]
+    assert np.isfinite(by_cls[cls]["mean_dice"])
+    assert all(np.isfinite(c["dice"]) for c in cases)
+
+
+def test_evaluate_cascade_computes_nsd_when_configured(tmp_path, monkeypatch):
+    """cfg.eval.nsd_tolerance_mm set -> every valid case carries a finite `nsd` in [0,1] and the
+    class row aggregates mean_nsd/std_nsd (mirrors evaluate.evaluate_classes). Absent (as in
+    test_evaluate_cascade_shapes_and_nan_safe_macro, no `eval` key at all) -> NSD stays off."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, T = 2, 8
+    idx = _ALL_CLASSES_IDX["liver"]
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = idx
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    model, prov = _FakeModel(G=4, hot=(1, 1, 1)), _FakeProvider(T=T)
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self):
+            return iter([_named_batch(["liver"] * B, B=B, T=T)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False},
+                            "eval": {"nsd_tolerance_mm": 3.0}})
+    rows, cases = evaluate_cascade(model, cfg, ["liver"],
+                                   loader=_Loader(), seed=0, is_prob=False)
+
+    assert all("nsd" in c and np.isfinite(c["nsd"]) and 0.0 <= c["nsd"] <= 1.0 for c in cases)
+    row = {r["class"]: r for r in rows}["liver"]
+    assert "mean_nsd" in row and "std_nsd" in row
+    assert 0.0 <= row["mean_nsd"] <= 1.0
+
+
 def test_run_cascade_figure_arrays_opt_in():
     """want_figure_arrays=True -> figure_levels is a per-level list of {img,gt,ctx_img,ctx_gt}
     (B,T,T,T) post-aug arrays; default keeps it None."""
@@ -980,3 +1057,138 @@ def test_realize_cascade_level0_shape_contract():
     assert out["label"].shape == (B, T, T, T)
     assert out["crop_geom"].shape == (B, 4, 3)
     assert out["subjects"] == ["s0", "s1"]
+
+
+# ---------------------------------------------------------------------------
+# data.cascade_center_mode="random_fg" — sample the re-crop centre from the mask
+# instead of its (possibly off-mask) centroid.
+# ---------------------------------------------------------------------------
+from cascade import _random_fg_point
+
+
+def test_random_fg_point_lands_on_the_single_fg_voxel():
+    T = 6
+    logit = torch.full((2, 1, T, T, T), -10.0)
+    logit[0, 0, 2, 3, 4] = 10.0
+    logit[1, 0, 0, 5, 1] = 10.0
+    out = _random_fg_point(logit, T, is_prob=False, thr=0.5, seed=0, step=0, level=0)
+    assert tuple(int(v) for v in out[0]) == (2, 3, 4)
+    assert tuple(int(v) for v in out[1]) == (0, 5, 1)
+
+
+def test_random_fg_point_picks_one_of_several_fg_voxels():
+    T = 6
+    logit = torch.full((1, 1, T, T, T), -10.0)
+    logit[0, 0, 1, 1, 1] = 10.0
+    logit[0, 0, 4, 4, 4] = 10.0                      # 2 disjoint voxels: COM (2.5,2.5,2.5) is off-mask
+    out = _random_fg_point(logit, T, is_prob=False, thr=0.5, seed=0, step=0, level=0)
+    assert tuple(int(v) for v in out[0]) in {(1, 1, 1), (4, 4, 4)}
+
+
+def test_random_fg_point_empty_mask_returns_none():
+    T = 6
+    logit = torch.full((1, 1, T, T, T), -10.0)       # sigmoid(-10) << thr everywhere
+    assert _random_fg_point(logit, T, is_prob=False, thr=0.5, seed=0, step=0, level=0) == [None]
+
+
+def test_random_fg_point_is_seeded_reproducibly():
+    T = 6
+    logit = torch.full((1, 1, T, T, T), -10.0)
+    logit[0, 0, 1, 1, 1] = 10.0
+    logit[0, 0, 4, 4, 4] = 10.0
+    a = _random_fg_point(logit, T, is_prob=False, thr=0.5, seed=7, step=3, level=1)
+    b = _random_fg_point(logit, T, is_prob=False, thr=0.5, seed=7, step=3, level=1)
+    assert tuple(a[0].tolist()) == tuple(b[0].tolist())
+
+
+class _TwoBlobModel(torch.nn.Module):
+    """Two disjoint one-hot cells at logit resolution == T (no upsample blur): a
+    'non-convex' mask whose COM (their midpoint) is NOT itself a foreground voxel."""
+    spacing_aware = False
+
+    def __init__(self, T, blobs):
+        super().__init__()
+        self.T, self.blobs = T, blobs
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None):
+        B = image.shape[0]
+        lg = torch.full((B, 1, self.T, self.T, self.T), -10.0, device=image.device)
+        for c in self.blobs:
+            lg[:, :, c[0], c[1], c[2]] = 10.0
+        return {"final_logit": lg + self.p.to(image.device)}
+
+
+def test_run_cascade_center_mode_random_fg_lands_on_a_masked_voxel():
+    """center_mode='random_fg' must re-crop the target on one of the two blob voxels, never
+    on their midpoint (which is what center_mode='com', the default, would pick)."""
+    B, T = 2, 8
+    blobs = ((1, 1, 1), (6, 6, 1))
+    model, prov = _TwoBlobModel(T, blobs), _FakeProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=0, seed=0, jitter=0,
+                      center_mode="random_fg")
+    assert isinstance(res, CascadeResult)
+    for b in range(B):
+        nc = res.centers[1][b]
+        assert nc is not None
+        assert nc in blobs, f"b={b}: {nc} is not one of the planted voxels {blobs}"
+    # every level>0 LoadRequest (target AND context) carried center_mode through
+    tgt_calls = [c for c in prov.calls if c["center"] is not None]
+    assert len(tgt_calls) == B
+
+
+def test_run_cascade_center_mode_invalid_raises():
+    with pytest.raises(ValueError, match="cascade_center_mode"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=True, step=0, seed=0, center_mode="bogus")
+
+
+# --- cascade_center_mode mapping form: train mode + eval_mode override ----------
+from cascade import _resolve_center_mode
+
+
+def test_resolve_center_mode_scalar_is_train_and_eval():
+    assert _resolve_center_mode(None) == ("com", "com")
+    assert _resolve_center_mode("com") == ("com", "com")
+    assert _resolve_center_mode("random_fg") == ("random_fg", "random_fg")
+
+
+def test_resolve_center_mode_mapping_defaults_eval_to_com():
+    assert _resolve_center_mode({"mode": "random_fg"}) == ("random_fg", "com")
+
+
+def test_resolve_center_mode_mapping_explicit_eval_mode():
+    assert _resolve_center_mode({"mode": "random_fg", "eval_mode": "random_fg"}) == \
+        ("random_fg", "random_fg")
+
+
+@pytest.mark.parametrize("bad", ["bogus", {"mode": "bogus"}, {"mode": "com", "eval_mode": "x"},
+                                 {"eval_mode": "com"}])
+def test_resolve_center_mode_rejects_bad(bad):
+    with pytest.raises(ValueError):
+        _resolve_center_mode(bad)
+
+
+def test_run_cascade_center_mode_mapping_uses_eval_mode_at_eval():
+    """mode='random_fg' + eval_mode='com' (the default eval_mode): training=True re-crops
+    the target on a blob voxel; training=False re-crops it at the COM (their midpoint),
+    which is NOT itself a blob voxel -- proving eval genuinely ran the 'com' path."""
+    B, T = 2, 8
+    blobs = ((1, 1, 1), (6, 6, 1))
+    model = _TwoBlobModel(T, blobs)
+    spec = {"mode": "random_fg", "eval_mode": "com"}
+
+    res_train = run_cascade(model, _FakeProvider(T=T), _v2_batch(B=B, T=T), augmentor=None,
+                            spacings=[3.0, 1.5], device=torch.device("cpu"),
+                            training=True, step=0, seed=0, jitter=0, center_mode=spec)
+    for b in range(B):
+        assert res_train.centers[1][b] in blobs
+
+    res_eval = run_cascade(model, _FakeProvider(T=T), _v2_batch(B=B, T=T), augmentor=None,
+                           spacings=[3.0, 1.5], device=torch.device("cpu"),
+                           training=False, step=0, seed=0, jitter=0, center_mode=spec)
+    for b in range(B):
+        assert res_eval.centers[1][b] not in blobs

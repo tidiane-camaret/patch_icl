@@ -1,5 +1,56 @@
 # Change log
 
+## 2026-09-12 — cascade re-crop: `data.cascade_center_mode="random_fg"` (crop over the mask)
+
+COM (+jitter) re-crop centering is suboptimal for large/non-convex ROIs: the probability-
+weighted centroid can land off the mask entirely (e.g. a donut/annulus, or two disjoint
+blobs), and a fixed-radius jitter can't reach the far end of an elongated organ. New opt-in
+mode samples the re-crop centre from *inside* the mask instead: `prev_pred` for the target
+(level i>0), the class's own GT for context (always GT-centred, every level). Byte-identical
+when unset (`data.cascade_center_mode` defaults to `"com"`).
+
+- **Target** (`cascade.py`): new `_random_fg_point` — same signature/output contract as
+  `_centroid_from_logit` (per-b `(3,) np array | None`), so it feeds `invert_geo_center`
+  unchanged. Binarizes the (already in-memory, small T³) prediction at
+  `data.cascade_center_fg_thr` (default 0.5) and uniformly samples one `True` voxel per b,
+  seeded off `f"{seed}_{step}_{level}_{b}_ctr"`. No provider/disk involvement — essentially free.
+- **Context + target's empty-mask fallback** (`LoadRequest.center_mode`, new field,
+  default `"com"`): `src/providers/totalseg.py::_resolve_center` — when a task's `center`
+  is `None`, `"random_fg"` does `np.argwhere(label_np == class_idx)` on the already-loaded
+  native label array and RNG-picks one voxel (`req.rng`, same reproducibility convention as
+  jitter); falls back to the provider's precomputed centroid if the class has no voxels.
+  Wired into both `TotalSegProvider` and `NativeGridProvider` (nasalseg/flare22) — the only
+  two provider families `_assert_cascade_supported` allows for `cascade_spacings`.
+  `MultiSourceProvider` needs no change (forwards `req` verbatim to its sub-providers).
+  `SynthGmmProvider` (exp92's synth cascade source) raises `NotImplementedError` rather than
+  silently ignoring the flag — GT there is a synthetic MAISI mask, not wired up.
+- `run_cascade`/`_recrop_level` gain `center_mode`/`center_fg_thr` kwargs, threaded from
+  both call sites (`train.py`'s cascade branch, `cascade.evaluate_cascade`) via
+  `data.cascade_center_mode` / `data.cascade_center_fg_thr`. `_assert_cascade_supported`
+  validates the mode.
+- `data.cascade_center_mode` also accepts a mapping `{mode: ..., eval_mode: ...}`
+  (`cascade._resolve_center_mode`, mirroring `cascade_query_prior`'s train/eval split —
+  no per-step train-time mixture here though, just one train mode + one eval override).
+  `eval_mode` defaults to `"com"`: training can run `random_fg` while eval stays on the
+  deterministic COM path for stable, comparable Dice across epochs/checkpoints. Plain
+  string form (today's behavior — same mode train+eval) still works unchanged.
+- EVAL NOTE (raised, and deliberately left as-is per discussion): under `random_fg`, the
+  *context* re-crop draws a fresh random voxel independently at EVERY cascade level (the
+  provider-side seed bakes in `level`), so unlike `"com"` (same physical point at every
+  level, just a finer spacing) the support view does not track the same region across
+  levels. Still fully reproducible for a fixed eval seed. Left unchanged intentionally —
+  not revisited if it turns out to matter.
+- Tests: `experiments/3d/tests/test_cascade.py` (`_random_fg_point` + `_resolve_center_mode`
+  unit tests + a two-disjoint-blob `run_cascade` smoke test proving the centre lands on a
+  blob, never their off-mask midpoint, incl. the mapping form's train-vs-eval split),
+  `test_cascade_provider.py` / `test_native_grid_provider.py` (`_resolve_center` unit tests
+  + an end-to-end `load_native_crop` check against a planted mask block), `test_cascade_guard.py`
+  (mode + mapping validation).
+- NEXT (separate, not yet implemented): making the crop *differentiable* so a finer level's
+  loss can refine the coarser level's prediction (gradient currently cut by the disk-backed
+  re-crop + `int(round(...))`, and deliberately by `_build_query_prior`'s `.detach()`) — see
+  the 2026-09-12 brainstorm on Gumbel-softmax soft-argmax + a GPU-resident per-target buffer.
+
 ## 2026-09-10 — two MRI-oriented intensity augs: `invert` + anisotropic low-res
 
 Added to the canonical intensity chain in BOTH paths (`src/gpu_augment.py:_batched_intensity`,
@@ -7652,3 +7703,96 @@ mirroring the adjacent bbox/adj cache builders:
 Runs inside `build_dataset` (train_loader), before any `.to(DEVICE)`, so the fork
 pool is clear of the CUDA-init-then-fork crash. No worker override knob — always
 `min(16, cpu_count)`.
+
+## 2026-09-12 — NSD wired into the v2 cascade eval path
+
+`eval.py`'s `data.cascade_spacings` branch (`cascade.evaluate_cascade`) never
+computed NSD — `mean_nsd` silently never appeared in a cascade run's rows/wandb
+log even with `eval.nsd_tolerance_mm` set, because only the non-cascade
+`evaluate.evaluate_classes` path called `nsd_batch`. Found evaluating exp92
+(`92_multisource_synth`) on plain totalseg.
+
+- `experiments/3d/evaluate.py`: `_stitched_native_dice_multi` split into a new
+  `_stitched_native_metrics_multi(pg_levels, root, tol_mm=None)` that composites the
+  native prediction once and returns `(dice, nsd_or_None)` per case — `nsd` needs the
+  same native GT/pred arrays Dice already builds, so computing both together avoids a
+  second `label.npy` load + re-stitch. NSD needs real per-subject voxel spacing (the
+  cascade's crop-pitch spacing isn't the native grid); added `_load_native_spacings(root)`
+  reading `root/spacings.json` (same file `TotalSegProvider` loads), independent of any
+  provider instance so it also works for a multisource sub-root. `_stitched_native_dice_multi`
+  is now a thin dice-only wrapper — unchanged return type/behavior (existing
+  `test_cascade_stitch.py` still passes byte-for-byte).
+- `experiments/3d/cascade.py::evaluate_cascade`: reads `cfg.eval.nsd_tolerance_mm` the
+  same way `evaluate_classes` does (absent `eval` config, e.g. train.py's cascade val step,
+  → `None` → skipped); the FULL stitched (finest) prediction is scored, not the
+  intermediate per-level `dice_r{s}` passes — one dice+nsd pair per case, matching the
+  non-cascade path's granularity. Cases gain an `nsd` key when configured; class rows
+  gain `mean_nsd`/`std_nsd` (`eval.py`'s printing/wandb/CSV logic already handled these
+  keys generically, no changes needed there).
+- New test `test_evaluate_cascade_computes_nsd_when_configured` (`experiments/3d/tests/
+  test_cascade.py`) alongside the existing nsd-absent case.
+
+## 2026-09-12 (cont.) — cascade eval generalized to NativeGridProvider sources (nasalseg, flare22)
+
+Investigating a cascade eval of exp92 on NasalSeg surfaced two gaps, both now fixed. Traced
+first (no code change assumed until confirmed): `cascade._recrop_level` / `gpu_realize_crop.py`
+turned out to be fully provider-agnostic already (pure `NativeCrop`-dataclass consumption, no
+TotalSeg-specific branching) — the only missing piece was `NativeGridProvider` never
+implementing `load_native_crop`.
+
+- `src/providers/native_grid.py`: `NativeGridProvider.load_native_crop` — a mechanical port of
+  `TotalSegProvider.load_native_crop` onto this provider's own `self._centroids`/`self._meta`
+  (vs. TotalSeg's bbox/spacings caches) and the implicit `DEFAULT_CT_NORM` (`resolve_ct_norm(None)`,
+  matching what `.load()` already gets from `normalize_ct(a, spec=None)` — this provider has no
+  per-subject `ct_norm` config). Reuses the same pure helpers `.load()` already calls
+  (`organ_crop_arrays`, `build_native_crop`) — zero changes needed in `gpu_realize_crop.py`,
+  `cascade.py`, or `_recrop_level`. Unlocks `data.gpu_realize_crop=true` for FLARE22/NasalSeg.
+- Same file, `.load()`: fixed a latent bug found while tracing this — it hardcoded
+  `jitter=self.crop_jitter` instead of honoring a per-call `req.jitter` override via
+  `_resolve_jitter` (like `TotalSegProvider` does), so `LoadRequest.jitter` was silently a
+  no-op for this provider family. Harmless for the nasalseg eval specifically
+  (`evaluate_cascade` hardcodes `jitter=0` for every level, matching the ignored default), but
+  would have silently broken a future cascade *training* run with `cascade_crop_jitter` set.
+  Fixed in both `.load()` and the new `.load_native_crop()`.
+- `experiments/3d/common.py::_assert_cascade_supported`: added `"nasalseg"`/`"flare22"` to the
+  cascade-source allowlist (`_cascade_sources`) — previously hardcoded to
+  `_TOTALSEG_SOURCES | {"multisource"}`, which blocked `data.cascade_spacings` on these sources
+  even though nothing downstream actually required it.
+- New `experiments/3d/tests/test_native_grid_provider.py` (geometry parity with
+  `organ_crop_arrays`, the jitter fix on both `.load`/`.load_native_crop`, and CPU/GPU-realize
+  path agreement) + `test_cascade_guard.py` gains `test_allows_nasalseg_source` /
+  `test_allows_flare22_source` / `test_allows_nasalseg_source_without_gpu_realize`.
+- Not needed for the immediate nasalseg eval task: NasalSeg volumes are tiny (~1.4M voxels vs.
+  TotalSeg's tens of millions), so the CPU `.load()` recrop path is plenty fast —
+  `data.gpu_realize_crop=false` remains the practical default there. This generalization is
+  about parity/future larger native-grid sources, not a perf fix for NasalSeg itself.
+
+## 2026-09-12 (cont.) — cascade eval scored every NasalSeg case as NaN: hardcoded TotalSeg class index
+
+First real cascade run on NasalSeg (exp92, `[1.5, 1]` mm ladder) came back `ERROR: no valid
+samples` for all 5 classes, despite the cascade forward clearly running (cascade-fig panels
+showed sane 0.71–0.89 GT-refit Dice). Cause: `evaluate._stitched_native_metrics_multi` (the
+native-GT stitcher both `_stitched_native_dice_multi` and NSD sit on top of) hardcoded
+`_ALL_CLASSES_IDX` — the **merged-label TotalSeg vocabulary** — to look up each class's index
+in `label.npy`. NasalSeg's `label.npy` uses its own 1..5 index space (`NASALSEG_IDX`, see
+`src/providers/nasalseg.py`), which shares no indices with TotalSeg's ~117-class map. Every
+NasalSeg class name is absent from `_ALL_CLASSES_IDX`, so `idx = _ALL_CLASSES_IDX.get(cls)` was
+`None` for every single case, the stitcher's `continue` guard silently dropped every key, every
+case's dice/nsd fell back to the "no matching key" NaN default, and "no valid samples" fired for
+every class. FLARE22 (also `CLASS_IDX`-based, also NativeGridProvider) has the same latent bug —
+just never previously run through a cascade eval to surface it.
+
+- `experiments/3d/evaluate.py`: `_stitched_native_metrics_multi` and `_stitched_native_dice_multi`
+  gain an optional `class_idx=None` param — `None` keeps the exact old behavior (falls back to
+  `_ALL_CLASSES_IDX`, correct for totalseg/totalsegmri/multisource, whose `label.npy` IS that
+  vocabulary); a source with its own index space must pass its provider's `.CLASS_IDX` map.
+- `experiments/3d/cascade.py::evaluate_cascade`: resolves
+  `cls_idx = getattr(loader.dataset.provider, "CLASS_IDX", None)` once and threads it through
+  both the full-stitch (`_stitched_native_metrics_multi`) and per-level
+  (`_stitched_native_dice_multi`) calls. `TotalSegProvider`/`MultiSourceProvider` never define
+  `.CLASS_IDX` (`getattr` -> `None` -> unchanged default); only `NativeGridProvider` subclasses
+  (FLARE22, NasalSeg) do, via `src/providers/native_grid.py`.
+- New regression test `test_evaluate_cascade_uses_provider_class_idx_for_non_totalseg_source`
+  (`experiments/3d/tests/test_cascade.py`) — a fake provider with a `.CLASS_IDX` entry outside
+  `_ALL_CLASSES_IDX`; reproduces the exact `{'error': 'no valid samples'}` on the pre-fix code
+  (verified by stashing the fix and re-running), passes after.
