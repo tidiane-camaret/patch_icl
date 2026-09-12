@@ -1,0 +1,34 @@
+# @package _global_
+# MSD Task04_Hippocampus -- 260 T1 MRI hippocampus anterior/posterior cases, 2 classes, MRI.
+# Eval-only: no synth, no aug.
+#
+#   python scripts/convert_msd_hippocampus.py --workers 16   # once, .nii.gz -> native .npy
+#   python experiments/3d/eval.py dataset=msd_hippocampus eval.model=patchset3d
+#
+# Zero overlap with TotalSegmentator (or this project's own data/totalseg_classes.py): only
+# undifferentiated "brain" exists there, no hippocampus/substructure of any kind. Non-CT
+# modality too -- a native-grid MRI source (src/providers/native_grid.py's MODALITY="mri"
+# branch, same per-subject mri_stats mechanism ISLES22/Shifts-MS use). 260 x 2 = 520
+# (subject, class) tasks.
+#
+# crop_spacing_mm=0.5 is the harness's first sub-mm pitch: native volumes here are ALREADY
+# ROI-cropped to a tiny box around the hippocampus (median ~35x50x36 vox at 1mm -- a ~35-50mm
+# physical FOV, vs. whole organs/heads/torsos everywhere else). A round-trip grid-occupancy
+# sweep (T=128, all 260 training shapes) found 0.5mm is the largest pitch with ZERO subjects
+# clipped on any axis (0.45mm already clips 1/260 on one axis); mean grid fill at 0.5mm is
+# 55-78% (docs/datasets/msd_hippocampus.md).
+paths:
+  msd_hippocampus: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/msd_hippocampus/npy
+data:
+  source: msd_hippocampus
+  loader_v2: true               # msd_hippocampus is v2-only (MsdHippocampusProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  crop_spacing_mm: 0.5
+  val_classes: all               # both classes, or an explicit subset
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

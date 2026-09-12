@@ -103,6 +103,16 @@ def _source_root(cfg) -> tuple[str, str, bool]:
             raise ValueError(f"cfg.paths.{source} is not set "
                              f"(needed for data.source={source})")
         return source, root, False
+    if source in ("isles22", "shifts_ms", "msd_hippocampus", "msd_prostate"):
+        root = cfg.paths.get(source)
+        if root is None:
+            raise ValueError(f"cfg.paths.{source} is not set "
+                             f"(needed for data.source={source})")
+        return source, root, True   # native-grid MRI sources -- is_mri unused by their own
+                                    # class resolution (resolve_isles22_classes /
+                                    # resolve_shifts_ms_classes / resolve_msd_hippocampus_classes),
+                                    # same as flare22/nasalseg's is_mri=False; kept accurate
+                                    # regardless.
     if source == "chemotox_bc":
         root = cfg.paths.get("chemotox")
         if root is None:
@@ -248,7 +258,8 @@ def _assert_cascade_supported(cfg) -> None:
     # nasalseg/flare22 (NativeGridProvider) are duck-type compatible with the cascade re-crop
     # path (_recrop_level calls provider.load / .load_native_crop generically) -- see
     # src/providers/native_grid.py::NativeGridProvider.load_native_crop.
-    _cascade_sources = _TOTALSEG_SOURCES | {"multisource", "nasalseg", "flare22"}
+    _cascade_sources = _TOTALSEG_SOURCES | {"multisource", "nasalseg", "flare22", "isles22",
+                                            "shifts_ms", "msd_hippocampus", "msd_prostate"}
     if d.get("source", "totalseg") not in _cascade_sources:
         raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
                          f"cascade-capable source ({sorted(_cascade_sources)}).")
@@ -328,15 +339,24 @@ def build_dataset(cfg, split: str):
     n_synth_merge_*) is forwarded, so the dataset is identical to training.
     """
     d = cfg.data
-    if d.get("source") in ("flare22", "nasalseg"):
+    if d.get("source") in ("flare22", "nasalseg", "isles22", "shifts_ms", "msd_hippocampus",
+                           "msd_prostate"):
         # Sources stored on their native anisotropic grid; the provider crops + resamples
         # to the isotropic model grid per item (src/providers/native_grid.py). v2 only.
         from src.incontext_dataset_v2 import InContextDataset
         _, root, _ = _source_root(cfg)
         if d.get("source") == "flare22":
             from src.providers.flare22 import Flare22Provider as _Provider
-        else:
+        elif d.get("source") == "nasalseg":
             from src.providers.nasalseg import NasalSegProvider as _Provider
+        elif d.get("source") == "isles22":
+            from src.providers.isles22 import Isles22Provider as _Provider
+        elif d.get("source") == "shifts_ms":
+            from src.providers.shifts_ms import ShiftsMsProvider as _Provider
+        elif d.get("source") == "msd_hippocampus":
+            from src.providers.msd_hippocampus import MsdHippocampusProvider as _Provider
+        else:
+            from src.providers.msd_prostate import MsdProstateProvider as _Provider
         is_train = split == "train"
         provider = _Provider(
             root=root,
@@ -900,6 +920,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     _sc_p, _sc_int, _sc_pi, _sc_synth = _self_context(d, split)
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
                             "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg",
+                            "isles22", "shifts_ms", "msd_hippocampus", "msd_prostate",
                             "multisource"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the

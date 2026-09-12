@@ -1,0 +1,33 @@
+# @package _global_
+# ISLES22 — 250 MRI stroke-lesion cases (DWI only), 1 class, MRI. Eval-only: no synth, no aug.
+#
+#   python scripts/convert_isles22.py --workers 16          # once, BIDS .nii.gz -> native .npy
+#   python experiments/3d/eval.py dataset=isles22 eval.model=patchset3d
+#
+# Zero overlap with TotalSegmentator (or this project's own data/totalseg_classes.py): no
+# lesion class of any kind exists there. Non-CT modality too — the first native-grid MRI
+# source (src/providers/native_grid.py's MODALITY="mri" branch, per-subject mri_stats
+# normalization, not the fixed CT HU frame). 250 x 1 = 250 (subject, class) tasks; 3/250
+# subjects have an entirely empty lesion mask (real, not a conversion artifact — see
+# docs/datasets/isles22.md) and are naturally excluded from subjects_for("stroke_lesion")
+# by the centroid cache, same mechanism as any other absent class.
+paths:
+  isles22: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/isles22/npy
+data:
+  source: isles22
+  loader_v2: true               # isles22 is v2-only (Isles22Provider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 1.5mm: FOV=192mm covers the median brain (224x224x144mm native) at 100% in-plane / 75% z
+  # fill (round-trip grid-occupancy sweep, docs/datasets/isles22.md). Lesion volume spans
+  # 40mm3-482mL, so the crop must comfortably contain a whole hemisphere-sized lesion, not
+  # just the median case -- 1.5mm keeps the largest observed FOV subject (256x256x144mm) at
+  # 100%/100%/75% too.
+  crop_spacing_mm: 1.5
+  val_classes: all              # the sole class, or explicit ["stroke_lesion"]
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5       # matches FLARE22/NasalSeg's calibrated default (v2 default 0.1 dilates thin lesions)
+  image_antialias: true
+  class_balanced: false

@@ -7796,3 +7796,350 @@ just never previously run through a cascade eval to surface it.
   (`experiments/3d/tests/test_cascade.py`) — a fake provider with a `.CLASS_IDX` entry outside
   `_ALL_CLASSES_IDX`; reproduces the exact `{'error': 'no valid samples'}` on the pre-fix code
   (verified by stashing the fix and re-running), passes after.
+
+## 2026-09-12 (cont.) — eval dataset expansion: access triage + 3 new datasets pulled/inspected
+
+Followed up `docs/datasets/eval_strategy_report.md` with real access checks (Zenodo/S3/
+Figshare/TCIA/Grand-Challenge APIs, not just the report's literature summary) and pulled the
+zero-friction candidates. Full triage in `docs/datasets/eval_expansion_status.md`.
+
+- **Downloaded + characterized** (raw data on NFS, NOT yet converted/wired — provider/
+  converter/config is future work, same pre-integration state NasalSeg/FLARE22 were once in):
+  - `docs/datasets/msd_hippocampus.md` — MSD Task04, 260/130 train/test, T1 MRI, RAS, isotropic
+    1mm, but volumes are ALREADY hippocampus-cropped ROIs (median 35×50×36 vox) — a
+    fundamentally smaller scale than anything else in the harness, needs a sub-mm
+    `crop_spacing_mm` to make sense of. The report's flagship "genuinely unseen class" pick.
+  - `docs/datasets/isles22.md` — 250 subjects, BIDS, DWI+ADC+FLAIR, **LAS** orientation (not
+    RAS — needs a flip step no existing converter has), 3/250 have an empty lesion mask (new
+    finding, not in the report), lesion volume spans 4 orders of magnitude (40mm³–482mL).
+  - `docs/datasets/msd_prostate.md` — MSD Task05, 32/16 train/test, genuinely **4D input**
+    (T2+ADC stacked, "tensorImageSize": "4D" in `dataset.json`) — every existing provider is
+    single-channel, so this needs a real design decision, not a mechanical port.
+- **AMOS22** download kicked off in background (Zenodo, open, 24.23GB) — not yet unpacked at
+  session end.
+- **Rosenhain mouse µCT** (Medverse's "unseen species" set): CC0-licensed, genuinely
+  open — but Figshare's `ndownloader` endpoint sits behind an AWS WAF JS challenge that returns
+  HTTP 202 + `x-amzn-waf-action: challenge` to every curl/wget attempt regardless of
+  User-Agent. Not a real access wall (license has zero restriction), but not headless-
+  scriptable either — needs a real browser.
+- Verified real, current access status (not the report's approximate figures) for the rest of
+  the report's list: MSD Pancreas-Tumor (12.3GB, open) and CTPelvic1K (17.0GB, open) are ready
+  to pull; ULS23 is fully open but ~238GB across 6 split-zip Zenodo records (recommend Part 1
+  only, 15.9GB, if pursued); PPMI/ADNI-PET/ACDC/FeTA/crossMoDA/M&Ms are genuinely
+  registration/DUA-gated (crossMoDA's data page 403'd outright); AutoPET is open via TCIA but
+  needs the NBIA Data Retriever/REST API rather than a plain URL.
+
+## 2026-09-12 (cont.) — refocused on non-CT modalities + OOD classes; 4th dataset pulled
+
+Direction: prioritize non-CT modality + classes outside TotalSegmentator's vocabulary. Checked
+all four MRI pulls (ISLES22, MSD Hippocampus, MSD Prostate, + new Shifts-MS below) against
+`data/totalseg_classes.py` directly (our OWN training class registry, not just the public
+TotalSegmentator tool) — confirmed none share a single class with it; the MR list only has
+undifferentiated `brain`/`prostate`, no substructures/zones/lesions anywhere.
+
+- **New: Shifts-MS Part 2** (`docs/datasets/shifts_ms.md`) — 46 cases, MS lesion, MRI
+  (t1/t2/flair/pd/t1ce + fg_mask + multi-rater masks), two cohorts with a BUILT-IN
+  in/out-of-distribution split (`best` train/dev_in/eval_in vs. `ljubljana` dev_out) — a second
+  domain-shift axis for free. Zenodo `7051692`, open, 941MB (Part 1 / MSSEG-1 needs an OFSEP
+  DUA, stayed gated). The two cohorts disagree on NIfTI orientation (`best`=LAS,
+  `ljubljana`=LPS) — a converter needs a per-cohort flip, not one dataset-wide flip like every
+  other source so far.
+- Checked and confirmed gated (no open path exists): **ATLAS v2.0** — verified BOTH mirrors
+  (ICPSR restricted-DUA AND the NITRC/INDI "preprocessed" copy) require a reviewed application;
+  the NITRC copy is NOT a lighter-weight alternative as might be assumed. **BraTS** — Synapse
+  registration. Re-confirmed **crossMoDA**/**FeTA** still gated from before.
+- Rewrote `docs/datasets/eval_expansion_status.md` around this filter: the 4 MRI/OOD pulls are
+  now the explicit priority queue (ISLES22 → Shifts-MS → Hippocampus → Prostate, by pool size
+  and integration cost); FLARE22/NasalSeg (CT), AMOS22 (in-vocabulary classes), Rosenhain mouse
+  (µCT = CT-family, species-shift not class-OOD) are explicitly deprioritized for this specific
+  angle (not abandoned — still useful for the other axes the original report covers).
+- AMOS22 background download still running (~7.9/24.2 GB), now explicitly a lower-priority
+  control rather than a headline pull given the new filter.
+
+## 2026-09-12 (cont.) — ISLES22 wired in: first native-grid MRI source
+
+Full integration, same shape as FLARE22/NasalSeg, converted and eval-ready.
+
+- `src/providers/native_grid.py`: `NativeGridProvider` gained a `MODALITY` class attribute
+  (default `"ct"`, FLARE22/NasalSeg unchanged) and a `MODALITY="mri"` branch — per-subject
+  `mri_stats`/`normalize_mri` (same convention `TotalSegProvider`'s totalsegmri branch uses)
+  instead of the fixed global CT HU frame, since MRI intensity has no fixed clip/z-score
+  window. New `_load_ct_stats()` (reads `root/ct_stats.json`, raises clearly if missing on an
+  MRI source) + `_normalize_fn`/`_norm_spec` helpers shared by `.load()`/`.load_native_crop()`.
+- `scripts/convert_isles22.py`: BIDS `.nii.gz` → native RAS `.npy`, DWI sequence only (the
+  acute-stroke-sensitive one of the three shipped). LAS→RAS via `nib.as_closest_canonical` —
+  simpler than NasalSeg's NRRD case (a real affine to derive from, no hand-rolled axis math);
+  verified post-conversion (`aff2axcodes` = RAS for every subject). Also writes per-subject
+  `mri_stats` to `ct_stats.json`. **250/250 converted, 0 failures**, 3 with an all-zero lesion
+  mask (matches the raw release exactly, kept not dropped — the centroid cache already
+  excludes empty classes from `subjects_for`).
+- `src/providers/isles22.py`: `Isles22Provider(NativeGridProvider)`, single class
+  `stroke_lesion`, `MODALITY="mri"`.
+- `configs/experiment/3d/dataset/isles22.yaml`: `crop_spacing_mm=1.5` (round-trip
+  grid-occupancy sweep: 100% in-plane / 75% z fill at both median and largest-FOV subjects).
+- Dispatch wired everywhere FLARE22/NasalSeg were (`common.py`'s `_source_root`,
+  `build_dataset`, `make_eval_loader`'s routed-sources list, the cascade-source allowlist;
+  `eval.py`'s class-resolution branch).
+- New tests in `test_native_grid_provider.py` for the MRI-modality branch (missing
+  `ct_stats.json` raises, `.load()`/`.load_native_crop()` both use the RIGHT subject's stats —
+  caught with deliberately mismatched per-subject stats dicts). Full 3D suite: 209 passed (up
+  from 187), same 8 pre-existing unrelated `test_infer_nifti.py` failures.
+- Visual sanity check `results/3d/isles22_items.png`: DWI windowing and lesion/hyperintensity
+  alignment both look correct.
+- `docs/datasets/isles22.md` updated with the "Integration (implemented)" section.
+
+## 2026-09-12 (cont.) — eval'd exp92 on ISLES22; found + fixed a general qualitative-figure bug
+
+Ran `experiments/3d/eval.py dataset=isles22 eval.model=patchset3d
+eval.checkpoint=2026-09-11_92_multisource_synth/best.pt` on a real GPU (torch.cuda WAS usable
+despite `nvidia-smi` failing its NVML query on `loki` this session — worth remembering:
+NVML failure ≠ no usable GPU, check `torch.cuda.is_available()` + a real tensor alloc before
+concluding a node is GPU-less). Single-level (non-cascade) eval, `crop_spacing_mm=1.5` vs the
+checkpoint's trained `6` (cascade level 0) — `_warn_uninherited_data` correctly flagged this
+drift, expected for a first read on a brand-new source.
+
+**Result: mean Dice 0.0544 ± 0.108, NSD 0.0738, n=247** (`wandb: stellar-cosmos-73`,
+`.../3d_eval/2026-09-12_stellar-cosmos-73/`). Near-collapse — plausible given the stacked
+confounds (genuinely unseen lesion class, DWI brain MRI vs. the model's mostly-CT/whole-body-
+MRI training mix, AND a single-level forward on a checkpoint whose whole architecture/training
+was built around the coarse→fine cascade). Not yet isolated which confound dominates; a
+matched cascade eval (mirroring the FLARE22/NasalSeg cascade follow-ups) is the natural next
+diagnostic before reading much into this number.
+
+**Found + fixed while sanity-checking the ONE qualitative figure the run saved**: the "target"
+panel rendered solid black while "GT"/"pred" (same underlying image) looked like a normal
+brain. Root cause: `evaluate.save_eval_figure`'s mask overlays used a bare
+`imshow(mask, cmap="Reds", alpha=0.45)` — a sequential colormap has NO transparency, so
+mask==0 pixels get colored too (near-white for "Reds" at 0) and alpha-blended over the WHOLE
+frame, not just the lesion. On CT this was invisible (the background is already fairly
+bright); on ISLES22's DWI, a handful of very bright outlier voxels crush the rest of the
+min-max-normalized slice toward black, and the un-tinted "target" panel showed that true dark
+image while GT/pred's whole-frame near-white tint brightened them into looking normal. Fixed
+by routing `save_eval_figure` through the ALREADY-correct `_overlay` helper (proper
+alpha-masked RGBA, used by the cascade figures) instead of the bare colormap call — a latent
+bug in shared, dataset-agnostic code that ISLES22's intensity histogram happened to expose,
+not an ISLES22-specific issue. Verified with a diagnostic repro before touching the fix, and
+confirmed the fix visually (`/tmp/repro_fig_fixed.png`, all 4 panels now consistent).
+New `experiments/3d/tests/test_save_eval_figure.py` (2 tests — alpha-mask correctness +
+cross-panel background consistency decoded from the real saved PNG) — verified BOTH fail on
+the pre-fix code (stashed and re-ran) and pass after. Does not affect the reported Dice/NSD
+numbers above (scoring is a fully separate code path from the figure).
+
+## 2026-09-12 (cont.) — ISLES22 cascade eval `[3,1.5]`: cascading hurts, not helps
+
+Ran the recommended cascade ladder (`experiment=92_multisource_synth` + `data.source=isles22
+data.crop_spacing_mm=3 data.cascade_spacings=[3,1.5]`). Needed `data.mask_downsample=occupancy`
+as an explicit override — composing the experiment chain drags in the training-time
+`mask_downsample: soft`, and unlike the totalseg-specific v2 loader branch, the FLARE22/
+NasalSeg/ISLES22 branch of `build_dataset` has no soft→occupancy eval remap; left alone this
+would have silently scored against a soft partial-volume target.
+
+**Result: coarse 0.0444, fine/stitched 0.0460, NSD 0.0622, n=247 — WORSE than the single-level
+baseline (0.0544 Dice, 0.0738 NSD)**, not better. The cascade figure explains why: the coarse
+(3mm) pass roughly flags the right region, but the fine (1.5mm) re-crop — fed the coarse
+level's own imprecise prediction as a query prior (`eval_mode=pred`) — produces an even MORE
+diffuse over-segmented blob, missing ISLES22's true multi-focal scattered pattern just as
+badly. Confirms the structural concern flagged before running: the cascade's centroid-of-mass
+re-crop + prior-feedback mechanism assumes a single confined target (its FLARE22/NasalSeg
+regime); a multi-focal lesion has no meaningful single COM, and feeding the coarse level's
+already-wrong prediction forward compounds rather than corrects the error.
+
+**Conclusion for this checkpoint: single-level (§7) is the one to report for ISLES22, not
+cascade.** Untested follow-ups if revisited: `[2,1.5]` (better coarse occupancy) or
+`cascade_query_prior=none` (drop the prior-feedback, keep only the re-crop).
+`docs/datasets/isles22.md` §8 has the full writeup.
+
+## 2026-09-12 (cont.) — Shifts-MS integrated + eval'd (second native-grid MRI source)
+
+Second MRI source; `native_grid.py`'s `MODALITY="mri"` support (built for ISLES22) needed zero
+changes — reused as-is.
+
+- `scripts/convert_shifts_ms.py`: FLAIR only, LAS/LPS→RAS via `nib.as_closest_canonical`
+  (handles BOTH cohorts' different source orientations automatically, verified per-file via
+  `aff2axcodes`). Two things this converter needed that ISLES22 didn't: (1) subject IDs are
+  **not unique across splits** (`best/train/25` and `best/eval_in/25` are different patients —
+  verified, different shape/content) → namespaced `{cohort}_{split}_{id}`; (2) `ljubljana`'s
+  flair/gt affines disagree by up to ~0.45mm across all 25 cases (sub-voxel origin-rounding,
+  `best` has ~1e-8mm agreement) → the affine-check tolerance is 1mm here, not ISLES22's
+  tighter one. **46/46 converted, 0 failures**, 0 empty masks.
+- `src/providers/shifts_ms.py` (`ShiftsMsProvider`), `configs/experiment/3d/dataset/
+  shifts_ms.yaml` (`crop_spacing_mm=1.5`, same occupancy-sweep reasoning as ISLES22), dispatch
+  wired identically. No new tests needed — the MRI branch is shared code already covered.
+- Visual sanity (`results/3d/shifts_ms_items.png`): periventricular lesion clustering visible
+  — the classic MS distribution — good sign the mask/orientation pipeline is right.
+- First eval (exp92, single-level @1.5mm): **Dice 0.0632±0.056, NSD 0.1649, n=46.** Same
+  ballpark as ISLES22 but a DIFFERENT failure signature: much tighter std (uniformly poor, not
+  a mix of near-misses/failures), and a much higher NSD relative to Dice than ISLES22 despite
+  the lower Dice — consistent with near-EMPTY/collapsed predictions (small/sparse, scores some
+  boundary proximity but ~zero volumetric overlap) rather than ISLES22's over-segmented-blob
+  failure mode. Confirmed qualitatively: the one saved figure's "pred" panel is visibly
+  near-empty. Cascade eval not yet run (expect the COM-recrop mismatch to be at least as bad —
+  MS lesions are typically even more numerous/scattered per subject than ISLES22's).
+
+## 2026-09-12 (cont.) — MSD Hippocampus integrated + eval'd (third native-grid MRI source;
+## first sub-mm crop pitch; found + fixed a latent organ_crop_arrays crash)
+
+Third MRI source; `native_grid.py`'s `MODALITY="mri"` support needed zero changes again.
+
+- **Grid-occupancy sweep** (T=128, all 260 training shapes; native volumes are ALREADY
+  ROI-cropped to a tiny box around the hippocampus — median ~35x50x36 vox, max ~43x59x47, all
+  at exactly 1mm isotropic) picked `crop_spacing_mm=0.5`: the largest pitch with **zero**
+  subjects clipped on any axis (0.45mm already clips 1/260 on one axis), 55-78% mean grid fill.
+  Every other harness source uses `crop_spacing_mm >= 0.6` — this is the first sub-mm pitch.
+- `scripts/convert_msd_hippocampus.py`: already RAS + isotropic 1mm (verified), so
+  `nib.as_closest_canonical` is a no-op safety net rather than a real fix here; per-subject
+  `mri_stats` for raw (unnormalized) T1 intensity, same as ISLES22/Shifts-MS. **260/260
+  converted, 0 failures**, shapes match the source exactly.
+- `src/providers/msd_hippocampus.py` (`MsdHippocampusProvider`, 2 classes: anterior/
+  posterior), `configs/experiment/3d/dataset/msd_hippocampus.yaml`, dispatch wired identically
+  to ISLES22/Shifts-MS in `experiments/3d/common.py` + `eval.py`.
+- **Found + fixed a general (not hippocampus-specific) latent bug in
+  `organ_crop_arrays`** (`src/totalseg_dataloader_incontext.py`): when `crop_size == dim` on an
+  axis (`smax=0` — the target crop box is at least as large as the whole native volume, which
+  is *always* true here at 0.5mm since target~64vox > every native dim), `lo == hi == 0` and
+  the code called `rng.randint(lo, hi)`. `np.random.RandomState.randint` requires `high >
+  low` and raises `ValueError: high <= 0` on `randint(0, 0)` — unlike Python's `random.Random`,
+  whose `.randint` is inclusive and silently tolerates `lo==hi`. The existing
+  `test_organ_crop_thin_axis_padded` test covers exactly this crop-size-clamped case but uses
+  `random.Random`, so it never caught the numpy-RNG-specific crash that production code
+  (`LoadRequest.rng`) actually hits. Fixed by skipping the `randint` call when `lo >= hi` (there
+  is only one valid start position anyway). Regression test added:
+  `test_organ_crop_smax_zero_with_numpy_rng_does_not_crash`
+  (`experiments/3d/tests/test_crop_helpers.py`). Full 3D suite re-run clean (211→212 passed,
+  same 8 pre-existing unrelated `test_infer_nifti.py` failures).
+- Visual sanity (`results/3d/msd_hippocampus_items.png`): clear elongated hippocampus mask,
+  well-aligned target/context pairs; a couple of rotated-crop rows show background corners
+  entering the frame (expected — task-level rotation aug on an already-tiny native volume).
+- **First eval (exp92, single-level @0.5mm): Mean Dice 0.4809, NSD 0.7193, n=260.** By far the
+  best OOD-MRI result this session (ISLES22 0.054, Shifts-MS 0.063) — per-class: anterior
+  0.527±0.116 (nsd 0.720), posterior 0.435±0.142 (nsd 0.719). Qualitative figure
+  (`hippocampus_anterior_hippocampus_001.png`, dice=0.523) shows a genuinely accurate,
+  well-localized prediction, closely matched to GT in shape and position — a real
+  segmentation, not a collapse/near-miss like the two lesion datasets. Makes sense: unlike
+  ISLES22/Shifts-MS's scattered/variable-count lesions, hippocampus is a single well-defined
+  compact structure per volume — closer to the model's trained regime (localize one structure,
+  segment it) despite the unseen class/modality/scale. Cascade eval not yet attempted.
+
+## 2026-09-12 (cont.) — MSD Prostate integrated + eval'd (fourth native-grid MRI source;
+## channel-split design, closes out the non-CT+OOD dataset queue)
+
+Fourth and final MRI source in this session's non-CT+OOD focus. Resolved the outstanding 4D
+(T2+ADC) design question by **splitting channels into separate tasks** rather than adding
+multi-channel input support: the converter treats each case's T2 and ADC channel as an
+independent single-channel "subject" sharing the same PZ/TZ label (`prostate_00_t2`,
+`prostate_00_adc`) — no new architecture/dataloader work, just another `NativeGridProvider`
+subclass. Verified before committing: both channels share one affine (co-registered on one
+grid, confirmed by round-tripping each channel through its own 3D NIfTI wrapper +
+`nib.as_closest_canonical`), so the split is a pure converter-time reshape with no
+registration risk. **32 cases → 64 converted channel-subjects, 0 failures.**
+
+- `crop_spacing_mm=0.75` used a DIFFERENT sweep methodology than ISLES22/Shifts-MS/
+  Hippocampus: the prostate is small relative to the native in-plane FOV (median 200x200mm vs.
+  ~53x45x56mm median label extent), a find-in-scene geometry like FLARE22/NasalSeg — so the
+  sweep checked clip-avoidance against each (case, class) label's own centroid-relative extent
+  (62 instances), not the whole native volume. 0.75mm is the smallest pitch with zero clipped.
+- **Verified geometric caveat, flagged not fixed**: 6/32 cases (19%) have a real affine shear
+  (up to ~42% of axis norm on Y/Z, gantry-tilted acquisition) that this harness's axis-aligned
+  crop/resample pipeline can't represent — a genuine, modest, dataset-specific limitation
+  documented for anyone reading eval numbers off this source.
+- `src/providers/msd_prostate.py` (`MsdProstateProvider`), `configs/experiment/3d/dataset/
+  msd_prostate.yaml`, dispatch wired identically to the other 3 MRI sources. Per-class subject
+  counts confirm the known TZ-absent-in-2-cases gap propagated correctly through the split
+  (PZ 64/64, TZ 60/64). Full 3D suite clean (212 passed, same 8 pre-existing unrelated
+  failures).
+- Visual sanity (`results/3d/msd_prostate_items.png`): correct T2/ADC contrast per
+  channel-subject, well-localized zonal masks.
+- **First eval (exp92, single-level @0.75mm): Mean Dice 0.2946, NSD 0.3208, n=124** —
+  second-best OOD-MRI result this session (Hippocampus 0.481 > this 0.295 > Shifts-MS 0.063 >
+  ISLES22 0.054). Clean class split: TZ (larger, bulkier) 0.404±0.176 vs. PZ (thin/crescent)
+  0.185±0.120 — qualitatively confirmed as a size/shape-driven gap (TZ predictions are
+  roughly-correct compact blobs; PZ predictions are small disconnected fragments of the true
+  thin crescent), the same small/thin-structure instability pattern the eval-strategy report
+  flags generally.
+
+**This closes out the full non-CT+OOD dataset-expansion queue**: ISLES22, Shifts-MS, MSD
+Hippocampus, MSD Prostate are all integrated, converted, wired, and eval'd against exp92.
+Summary ranking by Dice: Hippocampus 0.481 (single well-defined compact structure, closest to
+the model's trained regime) > Prostate 0.295 (mixed by zone size/shape) > Shifts-MS 0.063 ≈
+ISLES22 0.054 (both scattered/variable-count lesion targets, both showing distinct
+near-empty-collapse vs. over-segmented-blob failure modes respectively).
+
+## 2026-09-12 (cont.) — AMOS22 characterized (deliberate in-distribution CONTROL, not wired)
+
+Unpacked and inspected the previously-downloaded AMOS22 zip (24.2GB, was sitting unopened).
+Not part of the non-CT+OOD queue by design — all 15 organs are already in `data/
+totalseg_classes.py`, this is the eval-strategy report's "in-distribution reference" pick.
+
+- Verified (not just trusted the readme) the id<500=CT / id>=500=MRI split by parsing every
+  filename: 240 train (200 CT+40 MRI), 120 val (100 CT+20 MRI), 240 test (199 CT+41 MRI, GT
+  withheld — challenge-server only). `dataset.json`'s own `"modality":{"0":"CT"}` field is
+  stale/misleading — the actual release is CT-majority, not CT-only.
+- Full label census (all 360 train+val volumes, parallelized): orientation splits CLEANLY by
+  modality (every CT case LAS, every MRI case RAS — no per-file surprises found, though still
+  worth verifying per-file rather than hardcoding if this gets converted). Genuinely
+  heterogeneous multi-center/multi-vendor geometry: CT z-spacing spans 1.25-5mm (4x), MRI
+  shapes span 192-576vox in-plane and 64-512 through-slice (5-8x) — a harder "one converter,
+  one crop-pitch" problem than any single-protocol source integrated so far.
+- Label presence: 7 organs 100%, most others 94-99%, bladder 82% and prostate/uterus 81% (the
+  latter genuinely sex-dependent — merged single label, not two) — no annotation-quality red
+  flags, ordinary multi-center/multi-disease variability.
+- Intensity verified standard for both modalities: CT real HU (e.g. [-1024, 1373]), MRI
+  arbitrary positive units (e.g. [0, 1093]) — same normalize_ct / per-subject mri_stats split
+  every other source in the harness already uses.
+
+Wrote `docs/datasets/amos22.md`. **Deliberately left unconverted/unwired** — its role is a
+control (does the model do reasonably on in-vocabulary organs, corroborating that the OOD
+sources' low Dice is about novelty not a broken harness), not a new eval headline. If ever
+integrated, the real cost is doing separate CT/MRI grid-occupancy sweeps for `crop_spacing_mm`
+(mirrors `TotalSegProvider`'s existing CT/totalsegmri split), not a novel design decision like
+Hippocampus's sub-mm pitch or Prostate's channel split.
+
+## 2026-09-12 (cont.) — second wave of downloadable datasets (ACDC, AutoPET-III, crossMoDA
+## correction, BraTS/ATLAS via HF token)
+
+Continued dataset-expansion research after the primary non-CT+OOD queue closed. Found and
+verified access for several more candidates from `eval_strategy_report.md`.
+
+- **ACDC** (cardiac cine-MRI, RV/myocardium/LV — genuinely OOD, verified our own
+  `data/totalseg_classes.py` has only undifferentiated `heart` + vessels, no chambers).
+  Official challenge page says "closed" but a Girder data portal
+  (`humanheart-project.creatis.insa-lyon.fr`) hosts the full 150-patient release + GT publicly,
+  no login (verified `public: true` via the portal's own REST API). 150 patients, perfectly
+  balanced 30/pathology-group × 5 groups, 300 GT volumes (ED+ES). Grid-occupancy sweep (same
+  clip-avoidance methodology as MSD Prostate, since the heart is small vs. its in-plane FOV):
+  `crop_spacing_mm=1.2`. Characterized in `docs/datasets/acdc.md`. Not yet integrated.
+- **AutoPET III** (whole-body PET/CT tumor lesion). Official TCIA source confirmed genuinely
+  open (`FDG-PET-CT-Lesions`/`PSMA-PET-CT-Lesions` collections, public, no DUA — verified via
+  the TCIA REST API) but raw access means per-series DICOM + DICOM-SEG decoding, real friction.
+  Used a NIfTI "Lite" HF mirror instead (`YongchengYAO/autoPET-III-Lite`, not gated,
+  repackages the same open TCIA data) — 1038 cases (501 FDG + 537 PSMA), all non-empty lesion
+  masks, whole-body volumes up to 963 slices (largest in the harness by far). PET is a
+  genuinely new modality axis; would need a new `MODALITY="pet"` branch in `native_grid.py`
+  (SUV-style normalization, not `mri_stats`) before wiring — real new code, not just a
+  converter port. Characterized in `docs/datasets/autopet_iii.md`. Not yet integrated.
+- **crossMoDA — corrected a prior finding.** Earlier this session, crossMoDA was marked gated
+  based on `crossmoda.grand-challenge.org/Data/` returning HTTP 403. A HuggingFace search
+  (prompted by wanting to check for NIfTI mirrors of harder datasets) surfaced
+  `YongchengYAO/CrossMoDA-Lite`, whose README pointed to the REAL official archival source:
+  **Zenodo record 4662239, `access_right: open`, CC-BY-4.0, no login** — verified directly via
+  the Zenodo API. Downloaded from Zenodo directly (105 train + val cases, ceT1 MRI,
+  vestibular schwannoma + cochlea labels — genuinely unseen classes). Lesson logged: one
+  portal 403'ing is not the same as "genuinely gated" — always check for a separate archival
+  DOI before concluding a dataset needs credentials.
+- **User provided their own HF read token** to unlock searching/downloading gated-looking
+  candidates. Used only as an in-session env var (never written to any file). This searching
+  turned up unofficial full re-uploads of **BraTS 2024** (~97GB, `Spirit-26/
+  BraTS-2024-Complete`) and **ATLAS v2.0** (`jayzzzzz0134/atlas-stroke`) on HuggingFace — both
+  source datasets remain genuinely DUA-gated at their OFFICIAL hosts (Synapse registration;
+  ICPSR/NITRC reviewed application), unlike crossMoDA's rediscovered open source, so these HF
+  copies are very likely unauthorized redistributions of consent-controlled patient data.
+  Flagged this distinction explicitly to the user before downloading (AskUserQuestion) rather
+  than silently proceeding or silently skipping; user chose "download both anyway." Both
+  downloading now via `huggingface_hub.snapshot_download` (slow due to per-file HF resolve
+  overhead — many thousands of small files, expect hours for BraTS's ~97GB).
+
+All of ACDC/AutoPET-III/crossMoDA/BraTS/ATLAS are pulled or in-progress but **none are wired
+into the harness yet** — this session's second wave was acquire+characterize only, matching
+the pre-integration pattern MSD Hippocampus/Prostate went through before their own
+"integrate X" instructions. Updated `docs/datasets/eval_expansion_status.md` and the
+`project_eval_dataset_expansion` memory file with the full second-wave status.

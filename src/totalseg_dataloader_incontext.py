@@ -236,7 +236,12 @@ def organ_crop_arrays(ct_mm, label_mm, center, sp, *, image_size, crop_mm, jitte
         ideal = c - cs // 2
         lo = min(max(0, ideal - jitter), smax)
         hi = min(max(0, ideal + jitter), smax)
-        starts.append(rng.randint(lo, hi))
+        # lo==hi whenever there's only one valid start (no jitter, or smax==0 because
+        # crop_size==dim on this axis -- the whole-native-volume case, e.g. MSD Hippocampus'
+        # sub-mm crop_spacing_mm where the target box exceeds the already-ROI-cropped native
+        # volume on most axes). np.random.randint requires high > low, so skip the call rather
+        # than crash on the single-valid-value case.
+        starts.append(lo if lo >= hi else rng.randint(lo, hi))
     d0, h0, w0 = starts
     crop_ct = ct_mm[d0:d0 + crop_sizes[0], h0:h0 + crop_sizes[1], w0:w0 + crop_sizes[2]]
     crop_lbl = label_mm[d0:d0 + crop_sizes[0], h0:h0 + crop_sizes[1], w0:w0 + crop_sizes[2]]

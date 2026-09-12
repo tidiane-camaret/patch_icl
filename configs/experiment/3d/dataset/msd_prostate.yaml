@@ -1,0 +1,36 @@
+# @package _global_
+# MSD Task05_Prostate -- 32 multi-parametric-MRI cases (T2+ADC), 2 classes (PZ/TZ), MRI.
+# The source is genuinely 4D (T2+ADC stacked); the converter splits each case's two channels
+# into two independent single-channel "subjects" sharing the same label (prostate_00_t2,
+# prostate_00_adc) instead of adding multi-channel input support -- 32 cases -> 64
+# channel-subjects. See src/providers/msd_prostate.py. Eval-only: no synth, no aug.
+#
+#   python scripts/convert_msd_prostate.py --workers 16      # once, .nii.gz -> native .npy
+#   python experiments/3d/eval.py dataset=msd_prostate eval.model=patchset3d
+#
+# Zero overlap with TotalSegmentator (or this project's own data/totalseg_classes.py): only
+# undifferentiated "prostate" exists there, no PZ/TZ zonal anatomy. Non-CT modality too -- a
+# native-grid MRI source (src/providers/native_grid.py's MODALITY="mri" branch, same
+# per-subject/per-channel mri_stats mechanism as ISLES22/Shifts-MS/Hippocampus).
+#
+# crop_spacing_mm=0.75: the prostate is small relative to the native in-plane FOV (median
+# 200x200mm vs. ~53x45x56mm median label extent) -- a find-in-scene geometry closer to
+# FLARE22/NasalSeg than to the whole-native-volume MRI sources. Picked via a per-class
+# label-extent clip-avoidance sweep (not a whole-volume sweep): 0.75mm is the smallest pitch
+# with zero of 62 (case, class) label instances clipped from their own centroid
+# (docs/datasets/msd_prostate.md).
+paths:
+  msd_prostate: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/msd_prostate/npy
+data:
+  source: msd_prostate
+  loader_v2: true               # msd_prostate is v2-only (MsdProstateProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  crop_spacing_mm: 0.75
+  val_classes: all               # both zones, or an explicit subset
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

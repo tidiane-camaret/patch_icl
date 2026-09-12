@@ -1,10 +1,17 @@
 """Shared base for volume providers whose source is stored on its NATIVE grid.
 
-FLARE22 and NasalSeg are both converted to `{subj}/ct_raw.npy` + `{subj}/label.npy` at
+FLARE22, NasalSeg and ISLES22 are all converted to `{subj}/ct_raw.npy` + `{subj}/label.npy` at
 native (anisotropic) spacing with a root `spacings.json`; the organ crop + resample to the
 isotropic T^3 model grid happens here, at load time, so `crop_spacing_mm` stays a config
 knob rather than a property of the conversion. Sources differ only in their class list,
 label index map, and defaults — everything else lives in `NativeGridProvider`.
+
+`MODALITY` (class attr, default "ct"): a native MRI source (e.g. `Isles22Provider`) sets this
+to "mri" — mirrors `TotalSegProvider`'s ct/mri split, just per-subclass instead of a
+constructor arg, since every source here is single-modality. MRI normalization needs
+per-subject stats (arbitrary scanner units, no fixed HU-style frame): `ct_stats.json` at the
+root, `{clip_lo, clip_hi, mean, std}` per subject (`src.totalseg_dataset.mri_stats`), the same
+file/format `TotalSegProvider`'s totalsegmri branch reads.
 
 Two defaults differ from `TotalSegProvider`, both because these grids are finer and
 anisotropic (on 1.5mm-isotropic totalseg the resample was an identity, which masked both):
@@ -28,7 +35,7 @@ from src.incontext_dataset_v2 import LoadRequest, LoadResult
 from src.providers.totalseg import (NativeCrop, _resolve_center, _resolve_jitter,
                                     build_native_crop, crop_and_place)
 from src.totalseg_dataloader_incontext import organ_crop_arrays
-from src.totalseg_dataset import normalize_ct, resolve_ct_norm
+from src.totalseg_dataset import normalize_ct, normalize_mri, resolve_ct_norm
 
 
 def resolve_classes_for(all_classes: list[str], value, source: str) -> list[str]:
@@ -77,13 +84,14 @@ class NativeGridProvider:
     SOURCE: str = "native"
     ALL_CLASSES: list[str] = []
     CLASS_IDX: dict[str, int] = {}
+    MODALITY: str = "ct"   # subclasses set "mri" for a native MRI source (e.g. Isles22Provider)
 
     def __init__(self, root, classes=None, image_size=(128, 128, 128),
                  max_subjects=None, crop_spacing_mm=1.5, crop_jitter=0,
                  mask_downsample="occupancy", mask_occupancy_thr=0.5,
                  image_antialias=True):
         self.root = Path(root)
-        self.modality = "ct"   # native-grid sources are all CT; contract for a future MultiModalProvider
+        self.modality = self.MODALITY
         self.classes = resolve_classes_for(
             self.ALL_CLASSES, classes if classes is not None else "all", self.SOURCE)
         self.image_size = tuple(image_size)
@@ -95,6 +103,7 @@ class NativeGridProvider:
         self.image_antialias = bool(image_antialias)
 
         self._meta = self._load_meta()
+        self._ct_stats = self._load_ct_stats() if self.modality == "mri" else {}
         subjects = sorted(p.name for p in self.root.iterdir()
                           if p.is_dir() and (p / "ct_raw.npy").exists())
         if not subjects:
@@ -131,7 +140,7 @@ class NativeGridProvider:
             native_spacing=self._meta[subject]["spacing"],
             jitter=_resolve_jitter(req, self.crop_jitter), rng=req.rng,
             mask_downsample=self.mask_downsample, occ_thr=self.mask_occupancy_thr,
-            normalize_fn=lambda a: normalize_ct(np.ascontiguousarray(a)),
+            normalize_fn=self._normalize_fn(subject),
             antialias=self.image_antialias)
         spacing = torch.full((3,), float(req.crop_spacing_mm), dtype=torch.float32)
         return LoadResult(image=image_t, label=label_t, spacing=spacing, crop_geom=geom,
@@ -160,7 +169,21 @@ class NativeGridProvider:
         return build_native_crop(
             crop_ct, crop_lbl, self.CLASS_IDX.get(cls, -1), out_sizes, pad_lo, geom,
             crop_spacing_mm=float(req.crop_spacing_mm),
-            norm=resolve_ct_norm(None), modality=self.modality)
+            norm=self._norm_spec(subject), modality=self.modality)
+
+    # --- modality-specific normalization ------------------------------------
+    def _normalize_fn(self, subject):
+        """`normalize_fn` for `crop_and_place` (`.load`): global CT fingerprint, or this
+        subject's whole-volume MRI stats (`mri_stats`, from `ct_stats.json`)."""
+        if self.modality == "ct":
+            return lambda a: normalize_ct(np.ascontiguousarray(a))
+        stats = self._ct_stats[subject]
+        return lambda a: normalize_mri(np.ascontiguousarray(a), stats)
+
+    def _norm_spec(self, subject):
+        """`CtNormSpec` for `build_native_crop` (`.load_native_crop`) — same frame as
+        `_normalize_fn`, in the shape the GPU realize step (`resolve_ct_norm`) expects."""
+        return resolve_ct_norm(None if self.modality == "ct" else self._ct_stats[subject])
 
     # --- caches -------------------------------------------------------------
     def _load_meta(self):
@@ -175,6 +198,19 @@ class NativeGridProvider:
                     "shape": tuple(int(x) for x in m["shape"]),
                     "affine": np.asarray(m["affine"], dtype=np.float64)}
                 for s, m in raw.items()}
+
+    def _load_ct_stats(self):
+        """Per-subject MRI normalization stats (`mri_stats`), written by the converter to
+        `ct_stats.json` — same file/format `TotalSegProvider`'s totalsegmri branch reads.
+        Only loaded for `self.modality == "mri"`."""
+        path = self.root / "ct_stats.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} missing — a native MRI source (modality='mri') needs per-subject "
+                f"stats from the {self.SOURCE} converter (mri_stats has no fixed global frame "
+                "to fall back to, unlike normalize_ct's DEFAULT_CT_NORM).")
+        with open(path) as f:
+            return json.load(f)
 
     def _load_or_build_centroids(self, subjects):
         path = self.root / ".centroid_cache.pkl"

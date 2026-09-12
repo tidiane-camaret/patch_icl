@@ -238,6 +238,22 @@ def main(cfg: DictConfig) -> None:
         from src.providers.nasalseg import resolve_nasalseg_classes
         root = cfg.paths.get("nasalseg")
         classes = resolve_nasalseg_classes(cfg.data.val_classes)
+    elif source == "isles22":
+        from src.providers.isles22 import resolve_isles22_classes
+        root = cfg.paths.get("isles22")
+        classes = resolve_isles22_classes(cfg.data.val_classes)
+    elif source == "shifts_ms":
+        from src.providers.shifts_ms import resolve_shifts_ms_classes
+        root = cfg.paths.get("shifts_ms")
+        classes = resolve_shifts_ms_classes(cfg.data.val_classes)
+    elif source == "msd_hippocampus":
+        from src.providers.msd_hippocampus import resolve_msd_hippocampus_classes
+        root = cfg.paths.get("msd_hippocampus")
+        classes = resolve_msd_hippocampus_classes(cfg.data.val_classes)
+    elif source == "msd_prostate":
+        from src.providers.msd_prostate import resolve_msd_prostate_classes
+        root = cfg.paths.get("msd_prostate")
+        classes = resolve_msd_prostate_classes(cfg.data.val_classes)
     elif source == "totalseg_more_labels":
         from data.totalseg_classes import resolve_more_labels_classes
         root = cfg.paths.get("totalseg_more_labels")

@@ -136,26 +136,28 @@ def _best_slice(mask: np.ndarray) -> int:
 
 
 def save_eval_figure(target_img, gt, pred, ctx_img, ctx_gt, out_path: Path, title: str = "") -> None:
-    """Save a 4-panel figure: context | target | GT overlay | pred overlay."""
-    def _norm(sl):
-        mn, mx = sl.min(), sl.max()
-        return (sl - mn) / (mx - mn + 1e-6)
+    """Save a 4-panel figure: context | target | GT overlay | pred overlay.
 
+    Overlays go through `_overlay` (alpha-masked RGBA: only mask>0.5 pixels are tinted) rather
+    than a bare `imshow(mask, cmap="Reds", alpha=...)`. The naive form colors EVERY pixel
+    through the colormap (0 -> a near-white "Reds" color, not transparent) and alpha-blends
+    that over the whole frame -- on CT this was hard to notice (the background is already
+    fairly bright), but on MRI whose min-max-normalized dynamic range can be crushed dark by a
+    few bright outlier voxels, the un-tinted "target" panel (no overlay at all) rendered
+    visibly black next to the falsely-brightened GT/pred panels (same background, but with the
+    old bug's near-white tint layered on). Caught evaluating ISLES22 DWI, docs/logs.md
+    2026-09-12; fixes every source, not just MRI."""
     z, z_ctx = _best_slice(gt), _best_slice(ctx_gt)
     fig, axes = plt.subplots(1, 4, figsize=(16, 4), gridspec_kw={"wspace": 0.04})
-    axes[0].imshow(_norm(ctx_img[z_ctx]), cmap="gray")
-    axes[0].imshow(ctx_gt[z_ctx].astype(float), cmap="Reds", alpha=0.45, vmin=0, vmax=1)
+    _overlay(axes[0], ctx_img[z_ctx], [(ctx_gt[z_ctx], "red", 0.45)])
     axes[0].set_title("context", fontsize=8)
-    axes[1].imshow(_norm(target_img[z]), cmap="gray")
+    axes[1].imshow(_norm2d(target_img[z]), cmap="gray")
+    axes[1].axis("off")
     axes[1].set_title("target", fontsize=8)
-    axes[2].imshow(_norm(target_img[z]), cmap="gray")
-    axes[2].imshow(gt[z].astype(float), cmap="Reds", alpha=0.45, vmin=0, vmax=1)
+    _overlay(axes[2], target_img[z], [(gt[z], "red", 0.45)])
     axes[2].set_title("GT", fontsize=8)
-    axes[3].imshow(_norm(target_img[z]), cmap="gray")
-    axes[3].imshow(pred[z].astype(float), cmap="Blues", alpha=0.45, vmin=0, vmax=1)
+    _overlay(axes[3], target_img[z], [(pred[z], "blue", 0.45)])
     axes[3].set_title("pred", fontsize=8)
-    for ax in axes:
-        ax.axis("off")
     fig.suptitle(title, fontsize=9)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=100, bbox_inches="tight")

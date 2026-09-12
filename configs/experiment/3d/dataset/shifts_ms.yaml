@@ -1,0 +1,31 @@
+# @package _global_
+# Shifts-MS Part 2 — 46 MRI multiple-sclerosis lesion cases (FLAIR only), 1 class, MRI.
+# Two cohorts with a BUILT-IN domain-shift split: best_{train,dev_in,eval_in} (ISBI 2015,
+# 21 cases) vs. ljubljana_dev_out (PubMRI, deliberately out-of-distribution, 25 cases).
+# Eval-only: no synth, no aug.
+#
+#   python scripts/convert_shifts_ms.py --workers 16       # once, .nii.gz -> native .npy
+#   python experiments/3d/eval.py dataset=shifts_ms eval.model=patchset3d
+#
+# Zero overlap with TotalSegmentator (or this project's own data/totalseg_classes.py): no
+# lesion class of any kind exists there. Non-CT modality too — a native-grid MRI source
+# (src/providers/native_grid.py's MODALITY="mri" branch, per-subject mri_stats normalization,
+# not the fixed CT HU frame; same mechanism ISLES22 uses). 46 x 1 = 46 (subject, class) tasks.
+paths:
+  shifts_ms: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/shifts_ms/npy
+data:
+  source: shifts_ms
+  loader_v2: true               # shifts_ms is v2-only (ShiftsMsProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 1.5mm: FOV=192mm covers the median/largest brain (154-173 x 241 x 241mm native) at 100%
+  # in-plane / 80-90% on the shortest axis (round-trip grid-occupancy sweep,
+  # docs/datasets/shifts_ms.md) -- same reasoning and same value as ISLES22.
+  crop_spacing_mm: 1.5
+  val_classes: all              # the sole class, or explicit ["ms_lesion"]
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

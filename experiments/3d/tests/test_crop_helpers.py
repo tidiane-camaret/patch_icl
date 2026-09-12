@@ -43,6 +43,23 @@ def test_organ_crop_thin_axis_padded():
     assert out_sizes[0] == 4 and pad_lo[0] == 2  # 4 maps to 4/8, centred -> pad 2
 
 
+def test_organ_crop_smax_zero_with_numpy_rng_does_not_crash():
+    # Regression: when crop_size==dim on an axis (smax=0, e.g. crop_spacing_mm picked so the
+    # target box exceeds an already-tiny native volume -- MSD Hippocampus's sub-mm pitch),
+    # lo==hi==0 and np.random.RandomState.randint(0, 0) raises ValueError("high <= 0") --
+    # unlike Python's random.Random.randint, which is inclusive and tolerates low==high. The
+    # thin-axis test above never caught this because it uses random.Random, not the numpy RNG
+    # production code actually gets via LoadRequest.rng.
+    ct = np.zeros((4, 4, 4), dtype=np.float32)
+    lbl = np.zeros((4, 4, 4), dtype=np.uint8)
+    rng = np.random.RandomState(0)
+    _, _, out_sizes, pad_lo, geom = organ_crop_arrays(
+        ct, lbl, center=(2, 2, 2), sp=[1.0, 1.0, 1.0],
+        image_size=(8, 8, 8), crop_mm=1.0, jitter=0, rng=rng)
+    assert geom[0].tolist() == [0, 0, 0]       # only valid start when smax==0
+    assert geom[1].tolist() == [4, 4, 4]       # crop_size clamped to native 4 on every axis
+
+
 def test_place_image_pads_with_air():
     crop = np.full((4, 8, 8), -3.0, dtype=np.float32)
     img = place_image(crop, out_sizes=[4, 8, 8], pad_lo=[2, 0, 0], T=8)
