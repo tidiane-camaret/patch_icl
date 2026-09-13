@@ -189,3 +189,42 @@ patch-row-major to align with `sup_feat` and `ij_base`. Head = `Conv3×3 → GEL
 Idea 2's read-out naturally emits `(mask, sampling)` at `R_hi`; running it a second time with
 `q_tok = s_tok` (support-as-query) reuses `v_hi` to produce per-**context** hi-res sampling
 maps — i.e. Idea 1's context outputs at high resolution, for one extra `A @ V`.
+
+---
+
+## Cascade: keep query_prior gradients attached across levels (ablation, not yet built)
+
+Companion to `arch.cascade_registers` (implemented 2026-09-13, `src/models/patchset3d.py` /
+`experiments/3d/cascade.py`; see `project_cascade_register_carry` memory) — that feature
+carries level i-1's thinking-row state into level i **with gradient attached** (a deliberate
+choice, verified to be a genuine departure from the rest of the cascade: `query_prior` and
+the re-crop center are both explicitly severed from gradient today). The natural next ablation
+is the mirror-image question: what if `query_prior` itself also carried gradient?
+
+**Current state**: `experiments/3d/cascade.py::_build_query_prior`, `pred` mode —
+`src = prev_logit.detach().float()`, then geometrically warped (`_warp_prior_m2` /
+`_warp_prior_cropgeom`, `grid_sample`-based, forced fp32 via `torch.autocast(enabled=False)`)
+onto level i's crop and fed into level i's query mask token. Removing the `.detach()` would
+let level i's loss backprop through the warp, into level i-1's decode head and transformer,
+teaching level i-1 to predict masks that make a *better prior for level i*, not just a good
+mask on its own.
+
+**Estimated cost (analytical, not yet benchmarked — see 2026-09-13 conversation)**: materially
+larger than `cascade_registers`, for three concrete reasons, using exp92's real dims
+(`resolution=16, e=768, thinking_rows=8, mask_patch_decode_size=8` → decode grid
+`T=128`, `B=2`):
+1. **Tensor size crossing the new backward edge**: `prev_logit` at `T=128` is
+   `(B,1,128,128,128)` ≈ 4.2M elements vs `cascade_regs`' `(B,8,768)` ≈ 12K elements —
+   **~340× more data**.
+2. **A genuinely new op sits on the path**: the geometric warp isn't needed by level i-1's
+   own loss at all (unlike the decode-head activations `cascade_registers` piggybacks on,
+   which are already retained regardless). `grid_sample`'s backward saves its input volume
+   *and* sampling grid, both full-res fp32 — a `(B,128,128,128,3)` grid alone is ~50MB.
+3. **Bigger fan-out at the next level**: the warped prior feeds `mask_embed` for every one
+   of the `N=16³=4096` query tokens (via `qry_occ`), not a fixed 8 register rows.
+
+Rough estimate: tens of MB extra per level-transition (not negligible, unlike
+`cascade_registers`) — worth an actual `torch.cuda.max_memory_allocated()` + timing
+measurement before committing to it, not just this reasoning. Only the `pred` mode is
+affected (`gt_coarse`/`gt_fine` modes use dataloader GT tensors, already non-differentiable,
+so detaching them is a no-op either way).
