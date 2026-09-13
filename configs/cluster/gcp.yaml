@@ -18,7 +18,7 @@ paths:
 
   # --- optional: only read if you change data.source / model / arch ---
   # nnunet:          /mnt/data/results/nnunet
-  # gmm_bank:        /mnt/data/gmm_bank
+  gmm_bank:        /mnt/data/gmm_bank              # MAISI mask bank, needed for data.p_synth>0 / data.source=synth_gmm_maisi (see docs/GCP3.md)
   # totalseg_nnunet: /mnt/data/checkpoints/totalseg_nnunet
   # colipri:         /mnt/data/checkpoints/colipri
   # omniglot:        /mnt/data/omniglot/python

@@ -12,11 +12,14 @@ as "<filename>|<gmm_seed>|<member_idx>". load_native_crop re-derives the same co
 shared mu/sd from the seed, and the per-member paint nrng from (gmm_seed, member_idx),
 giving an identical color palette at every cascade level for the same member.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
 from data.maisi_classes import MAISI_CLASS_TO_IDX, MAISI_IDX_TO_CLASS
 from src.gpu_gmm_intensity import sample_grouped_uniform
+from src.providers.totalseg import _resolve_center
 from src.totalseg_dataloader_incontext import organ_crop_arrays
 
 
@@ -61,7 +64,7 @@ class SynthGmmProvider:
         return mu, sd
 
     def _build_nc(self, e, cls_id, rng, crop_mm, mu, sd, gmm_seed, member_idx, *,
-                  center=None, jitter=None):
+                  center=None, jitter=None, center_mode="com"):
         """Crop + paint one MAISI bank entry → NativeCrop. cascade=True required."""
         # per-member nrng keyed to (gmm_seed, member_idx): reproducible at L1 recrops
         member_nrng = np.random.default_rng([int(gmm_seed), int(member_idx)])
@@ -70,9 +73,12 @@ class SynthGmmProvider:
                 if self.ds.between_ratio is not None else mu)
 
         arr = np.squeeze(np.load(self.ds.cs.dir / "masks" / e["file"], mmap_mode="r"))
-        if center is None:
-            cents = e["cents"].get(cls_id)
-            center = tuple(cents[:3]) if cents is not None else None
+        # centroid fallback loaded before center resolution -- random_fg needs `arr` to draw
+        # a voxel from (mirrors providers/totalseg.py::_resolve_center; same helper, reused).
+        cents = e["cents"].get(cls_id)
+        fallback = tuple(cents[:3]) if cents is not None else None
+        center = _resolve_center(SimpleNamespace(center=center, center_mode=center_mode, rng=rng),
+                                  arr, cls_id, fallback)
         if jitter is None:
             jitter = self.ds.jitter
         _, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
@@ -125,13 +131,6 @@ class SynthGmmProvider:
         """Cascade re-crop: re-derive same GMM + member paint nrng from subject string."""
         if not self.cascade:
             raise RuntimeError("SynthGmmProvider.load_native_crop requires cascade=True")
-        if req.center is None and getattr(req, "center_mode", "com") == "random_fg":
-            # data.cascade_center_mode=random_fg needs a per-voxel GT scan (see
-            # providers/totalseg.py::_resolve_center); not wired up for the synth MAISI mask
-            # bank -- fail loudly instead of silently falling back to the GT centroid.
-            raise NotImplementedError(
-                "SynthGmmProvider: cascade_center_mode='random_fg' is not implemented "
-                "(TotalSegProvider/NativeGridProvider only).")
         filename, gmm_seed_str, member_idx_str = subject.rsplit("|", 2)
         gmm_seed = int(gmm_seed_str)
         member_idx = int(member_idx_str)
@@ -146,4 +145,5 @@ class SynthGmmProvider:
         # no jitter for cascade recrops (center is predicted, not default centroid)
         jitter = 0 if req.center is not None else self.ds.jitter
         return self._build_nc(e, cls_id, req.rng, req.crop_spacing_mm, mu, sd,
-                               gmm_seed, member_idx, center=req.center, jitter=jitter)
+                               gmm_seed, member_idx, center=req.center, jitter=jitter,
+                               center_mode=getattr(req, "center_mode", "com"))

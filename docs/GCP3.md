@@ -6,6 +6,16 @@ export DATA_DISK=patch-icl-tokyo-data  # permanent 200GB disk in asia-northeast1
 export BUCKET=atomic-acrobat-totalseg
 
 
+#### ONE-TIME: seed gmm_bank into the bucket (only if using data.p_synth>0 / synth_gmm_maisi) ####
+
+# gmm_bank is not yet in gs://atomic-acrobat-totalseg — run once from a machine with the NFS
+# mount (e.g. the NFS dev box), then every GCP VM just rsyncs from the bucket like the rest
+# of the data. ~50GB (index.pkl + masks/).
+gcloud storage rsync \
+  /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gmm_bank \
+  gs://atomic-acrobat-totalseg/data/gmm_bank --recursive
+
+
 #### DATA PREPARATION ####
 
 # create CPU instance with 32 cores
@@ -113,10 +123,12 @@ df -h /mnt/data
 
 # rsync bucket data -> disk (first run or after re-creating disk in a new zone)
 cd /mnt/data
-mkdir -p results totalseg totalsegmri
+mkdir -p results totalseg totalsegmri gmm_bank
 gcloud storage rsync gs://atomic-acrobat-totalseg/results results --recursive
 gcloud storage rsync gs://atomic-acrobat-totalseg/data/totalseg totalseg --recursive
 gcloud storage rsync gs://atomic-acrobat-totalseg/data/totalsegmri totalsegmri --recursive
+# only needed for data.p_synth>0 / data.source=synth_gmm_maisi (e.g. experiment=92_multisource_synth) — 50GB
+gcloud storage rsync gs://atomic-acrobat-totalseg/data/gmm_bank gmm_bank --recursive
 
 curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
 git clone https://github.com/tidiane-camaret/patch_icl && cd patch_icl && git checkout feat/incontext-dataloader-v2
