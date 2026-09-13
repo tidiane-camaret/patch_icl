@@ -8296,3 +8296,39 @@ memory file.
   `gmm_bank` needed) covering `com` (uses stored centroid), `random_fg` (samples an actual
   fg voxel, matches `_resolve_center`'s draw exactly, replayed independently), and explicit-
   center-always-wins. 142/142 existing cascade/provider tests still pass.
+
+## 2026-09-13 (cont.) — arch.cascade_registers: carry cascade level i-1's thinking-row
+## state into level i
+
+- Investigated feasibility first (see `project_cascade_register_carry` memory): two
+  precedents already exist in-repo for "carry register/thinking-row state across a
+  coarse->fine cascade" — `experiments/2d/multilevel/pipeline.py` +
+  `src/models/patchset_pfn.py`'s `stage1_think` (learned projection + type-embedding,
+  prepended to the support block) and `PatchICLAttention.cascade_registers`
+  (`experiments/feature_attention/model.py`, zero-param raw concat, own fresh registers
+  alongside carried ones). Chose the `stage1_think` style — user's explicit pick.
+- `src/models/patchset3d.py`: `PatchSet3D` gains `cascade_registers=False`; when `True`,
+  `cascade_proj` (Linear e→e) + a learned `cascade_type` vector project+tag the previous
+  level's `registers` output (`(B, thinking_rows, e)`, mean-pooled over columns — the same
+  extraction the 2D `return_thinking` already does) and prepend it as extra rows *before*
+  `self.thinking(x, sep)` runs, so the model's own fresh thinking rows still end up as the
+  outermost prefix (this level's own `registers` extraction, `x[:, :self.thinking.n]`, is
+  unchanged regardless). `_rope`'s zero-position prefix count grows by the memory-row
+  count too — needed because `transformer_rope=True` (`m2_patchset_decoder`, the live
+  cascade model config) assigns row positions assuming a fixed `[thinking, support,
+  query]` layout; without the fix, positions misalign once memory rows are inserted.
+  Asserted incompatible with `register_routed=True` at construction (its block-mask
+  partitioning assumes no extra prefix rows — fail loudly rather than silently mis-mask).
+- `experiments/3d/cascade.py::_forward_level` now returns `(logit, out.get("registers"))`
+  — `None` for every model predating this feature, so `run_cascade`'s new `prev_regs`
+  threading (parallel to the existing `prev_logit` threading) is fully inert without any
+  `getattr`/`isinstance` branching. Gradient flows the same way `prev_logit` already does
+  (one summed backward across the whole cascade).
+- `arch.cascade_registers` threaded into `experiments/3d/train.py`'s `PatchSet3D` kwarg
+  dict, default `False` (existing checkpoints stay loadable unchanged; resuming *into* a
+  flag-on model needs `train.checkpoint_allow_partial=true` since `cascade_proj`/
+  `cascade_type` are new params).
+- 8 new tests (6 `tests/test_patchset3d.py`, 2 `experiments/3d/tests/test_cascade.py`
+  via a spy model). Verified end-to-end against the real `92_multisource_synth` config
+  (`+arch.cascade_registers=true`): builds, forwards, backward reaches the new params.
+  268/268 existing tests still pass. Not yet enabled on the live GCP run.
