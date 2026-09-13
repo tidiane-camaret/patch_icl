@@ -609,7 +609,17 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     figs = [] if want_figure_arrays else None
     empty_hits = empty_total = 0
     prev_logit = prev_geo = prev_label = None                 # for the query_prior warp
-    prev_regs = None                                          # for arch.cascade_registers
+    # prev_regs (arch.cascade_registers) is deliberately NOT detached, unlike query_prior
+    # (_build_query_prior detaches prev_logit -- "each level keeps its own loss") and the
+    # re-crop center (non-differentiable indexing regardless). This is the one cross-level
+    # channel that carries real gradient: level i's loss can backprop through cascade_proj/
+    # cascade_type AND through level i-1's own attention that produced the register, so
+    # level i-1 gets a direct signal to extract what actually helps level i (not just an
+    # incidental byproduct of its own loss). Retains level i-1's forward graph in memory
+    # until the cascade's one backward -- a real memory/stability tradeoff, chosen
+    # deliberately (verified 2026-09-13: NOT "consistent with existing practice", the
+    # opposite -- query_prior/center are both severed on purpose).
+    prev_regs = None
 
     cur = _to_device(dict(batch), device)
     for i in range(N):
