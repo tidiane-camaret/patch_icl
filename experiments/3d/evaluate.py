@@ -918,7 +918,8 @@ def _load_native_spacings(root) -> dict:
     return {s: tuple(float(x) for x in m["spacing"]) for s, m in raw.items()}
 
 
-def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None, class_idx=None):
+def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None, class_idx=None,
+                                   gt_loader=None):
     """Dice (+ NSD when `tol_mm` is given) on the full native volume: GT vs the composite of
     pg_levels applied coarse->fine (list order), each level's per-(subj,cls) region
     overwriting the previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
@@ -931,8 +932,19 @@ def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None,
     TotalSeg-indexed). A source with its OWN label index space (NativeGridProvider:
     FLARE22/NasalSeg) must pass its provider's `CLASS_IDX` -- else every key silently
     misses (`idx is None` for a name outside the TotalSeg vocabulary) and every case
-    scores NaN (docs/logs.md 2026-09-12)."""
-    if class_idx is None:
+    scores NaN (docs/logs.md 2026-09-12).
+
+    `gt_loader(subj, cls) -> bool ndarray | None`, when given, TAKES PRIORITY over `class_idx`
+    and supplies the native GT mask directly instead of the default `label.npy == idx` shared-
+    array read. Needed for a provider whose classes don't partition the native volume into one
+    shared array -- e.g. GNC_705's kidney lesions, where a `mask_X.cyst` class is a genuine
+    subset of its `X` superset on many subjects, so painting both into one shared array would
+    silently shrink the superset every time both are present (verified at conversion time,
+    `src/providers/gnc_kidney.py`). `NativeGridProvider.native_gt` is the matching provider-
+    side hook (default implementation reproduces the shared-array behavior exactly, so a
+    subclass only needs to override it, not this function). Return None from the loader to
+    skip a (subj,cls) key, same as a missing `class_idx` entry."""
+    if gt_loader is None and class_idx is None:
         from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
         class_idx = _ALL_CLASSES_IDX
     if not pg_levels:
@@ -941,10 +953,18 @@ def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None,
     out = {}
     for key in pg_levels[-1]:
         subj, cls = key
-        idx = class_idx.get(cls)
-        if idx is None or any(key not in lvl for lvl in pg_levels):
+        if any(key not in lvl for lvl in pg_levels):
             continue
-        gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
+        if gt_loader is not None:
+            gt = gt_loader(subj, cls)
+            if gt is None:
+                continue
+            gt = np.asarray(gt)
+        else:
+            idx = class_idx.get(cls)
+            if idx is None:
+                continue
+            gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
         native = np.zeros(gt.shape, dtype=bool)
         for lvl in pg_levels:                                  # coarse -> fine, each overwrites
             p, geom = _unpack_pred(lvl[key])
@@ -962,15 +982,16 @@ def _stitched_native_metrics_multi(pg_levels, root, tol_mm: float | None = None,
     return out
 
 
-def _stitched_native_dice_multi(pg_levels, root, class_idx=None):
+def _stitched_native_dice_multi(pg_levels, root, class_idx=None, gt_loader=None):
     """Dice on the full native volume: GT vs the composite of pg_levels applied
     coarse->fine (list order), each level's per-(subj,cls) region overwriting the
     previous. pg_levels[i]: {(subj,cls): (packbits, shape_tuple, geom_ndarray)}.
     Returns {(subj,cls): dice} over the keys of the LAST level that also appear in
     every earlier level. Thin wrapper over _stitched_native_metrics_multi (dice only);
-    see its docstring for `class_idx`."""
+    see its docstring for `class_idx`/`gt_loader`."""
     return {k: d for k, (d, _) in
-            _stitched_native_metrics_multi(pg_levels, root, class_idx=class_idx).items()}
+            _stitched_native_metrics_multi(pg_levels, root, class_idx=class_idx,
+                                           gt_loader=gt_loader).items()}
 
 
 def _stitched_native_dice(base_pg, over_pg, root):

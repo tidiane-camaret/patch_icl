@@ -1,5 +1,43 @@
 # Change log
 
+## 2026-09-14 — GNC_705 kidney lesions: converter + provider + eval (single-level and cascade)
+
+Built and ran the full pipeline for GNC_705 (`scripts/convert_gnc_kidney.py`,
+`src/providers/gnc_kidney.py`, `configs/experiment/3d/dataset/gnc_kidney.yaml`). Two corrections
+vs. the earlier design doc: `crop_spacing_mm` recomputed from each label's actual nonzero
+content extent (1.2mm, not the shape-based 1.4mm guess — 4 files have an oversized, un-cropped
+canvas around a tiny lesion, not "corrupt whole-volume masks" as first assumed), and one binary
+plane per class instead of a shared `label.npy` (classes genuinely overlap). Verified the
+composed image's channel order (opp/in/fat/water) by correlation against the single-contrast
+station files rather than trusting the filename. 610/610 cases converted, 8/1,499 individual
+label-plane rejections (6mm-Z-spacing subjects + post-clip-empty edge cases).
+
+Results (exp92 checkpoint): single-level (1.2mm) Mean Dice 0.0585, NSD 0.0784, n=1490. Cascade
+`[6,3,1.2]` Mean Dice 0.0189, NSD 0.0293 (native-space, stricter metric + a real localization
+failure mode — see `docs/datasets/gnc_kidney_lesions.md` §9, same "cascading doesn't help"
+conclusion ISLES22 reached). Also hit and fixed a latent `eval.workers=20` centroid-cache race
+(any brand-new native-grid source's first-ever eval run spawns 20×16 nested
+`ProcessPoolExecutor`s and hangs before its `.centroid_cache*.pkl` exists) — worked around by
+pre-building the cache in the main process; worth fixing upstream.
+
+## 2026-09-14 — cascade eval: `NativeGridProvider.native_gt` hook (fixes overlapping-label sources)
+
+`evaluate._stitched_native_metrics_multi` (native-space cascade scoring) hardcoded reading a
+shared `label.npy == class_idx` array, bypassing the provider entirely. Broke on GNC_705's
+kidney-lesion provider, which deliberately stores one binary plane per class instead (its
+classes genuinely overlap — a `mask_X.cyst` sits inside its `X` superset on many subjects, so a
+shared array would silently corrupt one of them). Fixed generally, not with a GNC-only patch:
+
+- New `NativeGridProvider.native_gt(subject, cls) -> bool ndarray | None` hook
+  (`src/providers/native_grid.py`) — default reproduces the old shared-array read exactly
+  (verified byte-identical against ATLAS v2.0); `GncKidneyProvider` overrides it.
+- `evaluate._stitched_native_metrics_multi`/`_stitched_native_dice_multi` gained an optional
+  `gt_loader(subj, cls)` param, priority over `class_idx` when given.
+  `cascade.py` passes `getattr(loader.dataset.provider, "native_gt", None)` — `None` for
+  TotalSegProvider/MultiSourceProvider (unchanged), the provider's own hook otherwise.
+- Any future overlapping-label source only needs to override `native_gt` — no cascade.py/
+  evaluate.py changes required per-source. See `docs/datasets/gnc_kidney_lesions.md` §9a.
+
 ## 2026-09-13 — GNC_705 kidney-lesion cohort: census + balanced subset selection
 
 Inspected the local GNC_705 restricted-access National Cohort MRI release (30,385 subjects,

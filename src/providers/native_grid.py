@@ -125,6 +125,21 @@ class NativeGridProvider:
         a native-space metric needs in order to invert `crop_geom`."""
         return self._meta[subject]
 
+    def native_gt(self, subject, cls):
+        """Native-space boolean GT mask for (subject, cls) — the hook cascade eval's
+        `evaluate._stitched_native_metrics_multi` uses to score a stitched prediction, instead
+        of that function hardcoding a `label.npy == CLASS_IDX[cls]` read itself. Default here
+        reproduces that exact read (every source but GNC partitions its classes into one
+        shared array); a subclass whose classes don't partition the volume (see
+        `GncKidneyProvider`'s per-class-plane docstring) overrides this instead of the shared
+        cascade scorer. Returns None if the class has no voxels for this subject (skips the
+        key, same as a missing class_idx entry)."""
+        idx = self.CLASS_IDX.get(cls)
+        if idx is None:
+            return None
+        arr = np.load(self.root / subject / "label.npy", mmap_mode="r")
+        return np.asarray(arr) == idx
+
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         subj_dir = self.root / subject
         image_np = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")

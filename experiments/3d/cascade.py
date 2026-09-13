@@ -836,7 +836,16 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     # that vocabulary (no override needed -> None keeps the default); a source with its own index
     # space (NativeGridProvider: FLARE22/NasalSeg) sets `.CLASS_IDX` and must pass it explicitly,
     # else every key silently misses and every case scores NaN (docs/logs.md 2026-09-12).
+    #
+    # gt_loader: takes priority over class_idx when the provider defines `.native_gt` (every
+    # NativeGridProvider subclass does, base impl == the class_idx path above byte-for-byte) --
+    # lets a subclass whose classes don't partition into one shared label.npy (GncKidneyProvider:
+    # a mask_X.cyst class is a genuine subset of its X superset on many subjects, so a shared
+    # array would silently corrupt one of them) supply native GT its own way, without the
+    # stitch scorer needing to know the storage format. TotalSegProvider/MultiSourceProvider
+    # don't define it -> None -> unchanged class_idx path.
     cls_idx = getattr(loader.dataset.provider, "CLASS_IDX", None)
+    gt_loader = getattr(loader.dataset.provider, "native_gt", None)
     mods_seen = {k[0] for k in pg_levels[-1]}
     stitched = {}
     nsd_scores = {}
@@ -845,12 +854,13 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
         r = roots.get(m, root)
         pgm = [{(k[1], k[2]): v for k, v in lvl.items() if k[0] == m} for lvl in pg_levels]
         for (sj, cl), (d, nsd) in _stitched_native_metrics_multi(
-                pgm, r, tol_mm=nsd_tol, class_idx=cls_idx).items():
+                pgm, r, tol_mm=nsd_tol, class_idx=cls_idx, gt_loader=gt_loader).items():
             stitched[(m, sj, cl)] = d
             if nsd is not None:
                 nsd_scores[(m, sj, cl)] = nsd
         for li in range(N):
-            for (sj, cl), d in _stitched_native_dice_multi([pgm[li]], r, class_idx=cls_idx).items():
+            for (sj, cl), d in _stitched_native_dice_multi(
+                    [pgm[li]], r, class_idx=cls_idx, gt_loader=gt_loader).items():
                 per_res_by_level[li][(m, sj, cl)] = d
 
     mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")

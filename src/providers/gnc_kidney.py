@@ -115,6 +115,16 @@ class GncKidneyProvider(NativeGridProvider):
             pickle.dump(cache, f)
         return cache
 
+    def native_gt(self, subject, cls):
+        """Override: read this class's own plane rather than a shared `label.npy` (see module
+        docstring / `evaluate._stitched_native_metrics_multi`'s `gt_loader` hook) — cascade
+        eval's native-space stitching needs this to score correctly against the per-class-plane
+        storage `scripts/convert_gnc_kidney.py` writes."""
+        p = self.root / subject / f"label_{cls}.npy"
+        if not p.exists():
+            return None
+        return np.asarray(np.load(p, mmap_mode="r")) != 0
+
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         subj_dir = self.root / subject
         image_np = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
