@@ -25,7 +25,7 @@ class CohortSampler:
 
     def __init__(self, bank_dir, k, w_span=1.0, w_fov=0.02, w_spacing=0.3, w_by_class_size=3.0,
                  randomness=0.0, min_masks_per_class=None, by_class_size_common_frac=0.75,
-                 by_class_size_mode="fraction", class_balanced=True):
+                 by_class_size_mode="fraction", class_balanced=True, exclude_src=None):
         """k = context_size (cohort draws k+1 masks). Distance weights fuse region-span
         (idx units), FOV (mm), spacing (mm), and by-class organ-size L1.
 
@@ -46,7 +46,15 @@ class CohortSampler:
                         SCALE-INVARIANT: same proportions -> same vector regardless of body size).
           'volume'   — organ physical volume in LITRES (counts × prod(spacing)); scale-AWARE
                         (separates large vs thin patients), big-organ-weighted. Needs a smaller
-                        w_by_class_size (~0.5) as its L1 is ~5 L vs ~0.5 for fraction."""
+                        w_by_class_size (~0.5) as its L1 is ~5 L vs ~0.5 for fraction.
+
+        exclude_src drops every mask whose provenance tag (index.pkl entry["src"], set by
+        build_gmm_mask_bank.py from the MAISI candidate-mask list, e.g. "TotalSegmentatorV2",
+        "HNSCC", ...) is in the given iterable. Use this when a REAL dataset also serves as a
+        cascade source alongside synth_gmm (data.source=multisource) -- otherwise a synth mask
+        built from that dataset's own label map lets the model recognize identical anatomy
+        layouts under a repainted appearance, deflating the diversity synth is meant to add.
+        None (default) = keep everything, unchanged behavior."""
         self.dir = Path(bank_dir)
         with open(self.dir / "index.pkl", "rb") as f:
             idx = pickle.load(f)
@@ -68,8 +76,20 @@ class CohortSampler:
         if not good.all():
             print(f"CohortSampler: dropping {int((~good).sum())} masks with bad spacing "
                   f"({[entries[i]['file'] for i in np.where(~good)[0]]})", flush=True)
-        self.entries = [e for e, g in zip(entries, good) if g]
+        entries = [e for e, g in zip(entries, good) if g]
         size_mat = size_mat[good]
+
+        if exclude_src:
+            excl = {str(s) for s in exclude_src}
+            keep = np.array([e.get("src") not in excl for e in entries], bool)
+            if not keep.all():
+                dropped = sorted({entries[i]["src"] for i in np.where(~keep)[0]})
+                print(f"CohortSampler: excluding {int((~keep).sum())} masks from "
+                      f"src={dropped} (data.cohort.exclude_src)", flush=True)
+            entries = [e for e, g in zip(entries, keep) if g]
+            size_mat = size_mat[keep]
+
+        self.entries = entries
         n = len(self.entries)
 
         # per-mask arrays for vectorized distance

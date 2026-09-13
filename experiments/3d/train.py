@@ -924,7 +924,10 @@ def _resolve_classes_for(cfg, classes_key):
     if src == "synth_gmm_maisi":
         from src.gmm_cohort_sampler import CohortSampler
         from data.maisi_classes import MAISI_IDX_TO_CLASS
-        cs = CohortSampler(cfg.paths.gmm_bank, k=cfg.data.context_size)
+        # exclude_src threaded through so the resolved class list matches what training
+        # actually samples from (see data.cohort.exclude_src).
+        excl = cfg.data.get("cohort", {}).get("exclude_src")
+        cs = CohortSampler(cfg.paths.gmm_bank, k=cfg.data.context_size, exclude_src=excl)
         return [MAISI_IDX_TO_CLASS.get(c, str(c)) for c in cs.classes]
     if src == "chemotox_bc":
         from src.chemotox_dataset import BC_NAMES

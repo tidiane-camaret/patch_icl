@@ -26,6 +26,10 @@ data:
     min_masks_per_class: null
     by_class_size_common_frac: 0.75
     by_class_size_mode: fraction
+    # this run also trains on the REAL TotalSegmentator CT source (multisource) -- exclude
+    # its own masks from the synth bank so synth can't just recolor anatomy layouts the model
+    # already sees as real data (297/4135 bank masks are src=TotalSegmentatorV2).
+    exclude_src: [TotalSegmentatorV2]
 
 augmentations:
   intensity:
