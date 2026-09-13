@@ -1192,3 +1192,49 @@ def test_run_cascade_center_mode_mapping_uses_eval_mode_at_eval():
                            training=False, step=0, seed=0, jitter=0, center_mode=spec)
     for b in range(B):
         assert res_eval.centers[1][b] not in blobs
+
+
+# --- arch.cascade_registers: level i-1's own register output threaded into level i -------
+
+class _RegisterSpyModel(torch.nn.Module):
+    """Records the cascade_regs tensor it receives per level; returns a level-tagged
+    'registers' output (value = 1-based call count) so a test can verify exactly what the
+    NEXT level receives is THIS level's own output."""
+    spacing_aware = False
+
+    def __init__(self, G=4, hot=(1, 1, 1), n_think=2, e=3):
+        super().__init__()
+        self.G, self.hot, self.n_think, self.e = G, hot, n_think, e
+        self.regs_seen = []
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        self.regs_seen.append(None if cascade_regs is None else cascade_regs.detach().clone())
+        B = image.shape[0]
+        lg = torch.full((B, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        lg[:, :, self.hot[0], self.hot[1], self.hot[2]] = 10.0
+        level = len(self.regs_seen)
+        regs = torch.full((B, self.n_think, self.e), float(level), device=image.device)
+        return {"final_logit": lg + self.p.to(image.device), "registers": regs}
+
+
+def test_run_cascade_threads_registers_across_levels():
+    B, T = 2, 8
+    model = _RegisterSpyModel(G=4)
+    run_cascade(model, _FakeProvider(T=T), _v2_batch(B=B, T=T), augmentor=None,
+               spacings=[3.0, 1.5], device=torch.device("cpu"),
+               training=True, step=0, seed=0)
+    assert model.regs_seen[0] is None                          # level 0: nothing to carry yet
+    assert torch.equal(model.regs_seen[1], torch.full((B, 2, 3), 1.0))  # level-0's own output
+
+
+def test_run_cascade_registers_inert_for_models_without_support():
+    """A model whose return dict has no 'registers' key (every existing fake/real model
+    predating this feature) never gets cascade_regs passed -- fully backward compatible."""
+    B, T = 2, 8
+    model = _FakeModel(G=4)   # forward() has no cascade_regs param at all
+    res = run_cascade(model, _FakeProvider(T=T), _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=True, step=0, seed=0)
+    assert len(res.logits) == 2   # no crash

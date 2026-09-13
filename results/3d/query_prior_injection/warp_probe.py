@@ -317,7 +317,7 @@ for step, batch in enumerate(loader):
     B = cur0["image"].shape[0]
 
     with torch.no_grad():
-        logit6 = _forward_level(model, cur0, S_COARSE)        # (B,1,T,T,T)
+        logit6, _ = _forward_level(model, cur0, S_COARSE)     # (B,1,T,T,T)
     prob6 = torch.sigmoid(logit6)
     gt6 = cur0["label"].unsqueeze(1).float()                  # (B,1,T,T,T) aug-6 GT
 

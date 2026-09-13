@@ -366,3 +366,83 @@ def test_mask_embed_rejects_unknown_value():
         assert False, "mask_embed='mlp' should have raised"
     except AssertionError as exc:
         assert "mask_embed" in str(exc)
+
+
+# --- arch.cascade_registers: carry level i-1's thinking-row state into level i ---------
+
+def test_cascade_registers_default_off():
+    """Default (cascade_registers=False): no new params, no 'registers' output -- byte-
+    identical to a model built before this feature existed."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    assert not hasattr(m, "cascade_proj") and not hasattr(m, "cascade_type")
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["registers"] is None
+
+
+def test_cascade_registers_on_returns_shape():
+    """cascade_registers=True (no cascade_regs input yet): returns this level's own
+    post-attention thinking-row state, mean-pooled over columns -> (B, thinking_rows, e)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   cascade_registers=True)
+    assert isinstance(m.cascade_proj, torch.nn.Linear)
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["registers"].shape == (2, 2, 32)
+
+
+def test_cascade_registers_injected_reaches_projection_and_backward():
+    """Passing cascade_regs=<prev level's registers> routes through cascade_proj/cascade_type
+    and changes the output vs. not passing it -- proves it's wired into the computation, not
+    a no-op -- and gradient reaches the new params."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   cascade_registers=True)
+    img, cin, cout = _dummy_batch(S=16)
+    prev_regs = torch.randn(2, 2, 32, requires_grad=True)
+
+    out_none = m(img, context_in=cin, context_out=cout)["final_logit"]
+    out_with = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)["final_logit"]
+    assert not torch.allclose(out_none, out_with)
+
+    out_with.mean().backward()
+    assert m.cascade_proj.weight.grad is not None
+    assert m.cascade_type.grad is not None
+    assert prev_regs.grad is not None
+
+
+def test_cascade_registers_works_with_transformer_rope():
+    """transformer_rope=True (m2_patchset_decoder's config, used by the live cascade
+    experiments) assigns row positions assuming a fixed [thinking, support, query] layout;
+    cascade_regs rows must be accounted for there too, or shapes mismatch / rope misaligns."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   cascade_registers=True, transformer_rope=True)
+    img, cin, cout = _dummy_batch(S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    out = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    assert out["registers"].shape == (2, 2, 32)
+
+
+def test_cascade_registers_requires_flag():
+    """Passing cascade_regs to a model built without cascade_registers=True fails loudly
+    (mismatched intent) rather than silently ignoring the tensor."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    img, cin, cout = _dummy_batch(S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    try:
+        m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "cascade_registers" in str(exc)
+
+
+def test_cascade_registers_rejects_register_routed():
+    """register_routed's block-mask partitioning assumes no extra prefix rows beyond the
+    model's own thinking rows -- the combination isn't supported, fail at construction."""
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  cascade_registers=True, register_routed=True)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "register_routed" in str(exc)

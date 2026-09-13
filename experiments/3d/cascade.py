@@ -332,12 +332,21 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     return incontext_collate_fn(items)
 
 
-def _forward_level(model, batch, spacing, query_prior=None):
+def _forward_level(model, batch, spacing, query_prior=None, cascade_regs=None):
+    """Returns (logit, registers). `registers` is the model's own "registers" output
+    (arch.cascade_registers; None for every model that doesn't return that key) -- the
+    caller threads it into the NEXT level's `cascade_regs`. `cascade_regs` is only ever
+    passed on when not None, so a model without cascade_regs in its forward signature is
+    never handed the kwarg."""
     sp = float(spacing) if getattr(model, "spacing_aware", False) else None
-    kw = {"query_prior": query_prior} if query_prior is not None else {}
+    kw = {}
+    if query_prior is not None:
+        kw["query_prior"] = query_prior
+    if cascade_regs is not None:
+        kw["cascade_regs"] = cascade_regs
     out = model(batch["image"], context_in=batch["context_in"],
                 context_out=batch["context_out"], mode="train", spacing=sp, **kw)
-    return out["final_logit"].float()
+    return out["final_logit"].float(), out.get("registers")
 
 
 # --------------------------------------------------------------------------------------------
@@ -600,6 +609,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     figs = [] if want_figure_arrays else None
     empty_hits = empty_total = 0
     prev_logit = prev_geo = prev_label = None                 # for the query_prior warp
+    prev_regs = None                                          # for arch.cascade_registers
 
     cur = _to_device(dict(batch), device)
     for i in range(N):
@@ -640,11 +650,12 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                     spacing_mm=spacings[i],
                     perturb_gen=_gen(geo_seed + PERTURB_OFFSET + i, device))
 
-        logit = _forward_level(model, cur, spacings[i], query_prior=prior)
+        logit, regs = _forward_level(model, cur, spacings[i], query_prior=prior,
+                                     cascade_regs=prev_regs)
         tgt = target_like(cur["label"].unsqueeze(1).float(), logit)
         logits.append(logit); targets.append(tgt)
         geoms.append(cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"])
-        prev_logit, prev_geo, prev_label = logit, geo, cur["label"]
+        prev_logit, prev_geo, prev_label, prev_regs = logit, geo, cur["label"], regs
         if want_hard_preds:
             hard.append(_hard_pred_native(logit, T, is_prob))
         if want_figure_arrays:

@@ -401,6 +401,7 @@ def build_model(cfg: DictConfig):
             "query_self_attn": a.get("query_self_attn", False),
             "register_routed": a.get("register_routed", False),
             "register_flex": a.get("register_flex", True),
+            "cascade_registers": a.get("cascade_registers", False),
             "image_size": list(cfg.data.image_size),
             "encoder": a.get("encoder", "conv"),
             "encoder_frozen": a.get("encoder_frozen", True),

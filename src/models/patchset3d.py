@@ -197,6 +197,7 @@ class PatchSet3D(nn.Module):
         query_self_attn: bool = False,
         register_routed: bool = False,
         register_flex: bool = True,
+        cascade_registers: bool = False,
         image_size=None,
         encoder: str = "conv",
         encoder_frozen: bool = True,
@@ -269,6 +270,15 @@ class PatchSet3D(nn.Module):
         # where flex's Triton kernel hangs in ptxas on a cold compile cache (Blackwell/cu13 seen
         # to stall >10 min). Dense is fine at small K; heavy at large K (see bench_attn_pattern.py).
         self.register_flex = register_flex
+        # cascade_registers: carry the PREVIOUS cascade level's own post-attention thinking-
+        # row state in as extra input rows (mirrors src/models/patchset_pfn.py's stage1_think
+        # mechanism). register_routed's block-mask partitioning assumes no prefix rows besides
+        # the model's own thinking rows -- unsupported combo, fail at construction rather than
+        # silently mis-masking.
+        assert not (cascade_registers and register_routed), (
+            "arch.cascade_registers=True is incompatible with arch.register_routed=True "
+            "(block-mask partitioning is not updated for the extra cascade-memory rows)")
+        self.cascade_registers = bool(cascade_registers)
         self.context_id_embed = context_id_embed
         self.max_context = max_context
         self.image_size = image_size          # metadata only (unused in forward)
@@ -415,6 +425,13 @@ class PatchSet3D(nn.Module):
             nn.init.normal_(self.ctx_id.weight, std=0.1)
             nn.init.normal_(self.qry_id, std=0.1)
         self.thinking = ThinkingRows(thinking_rows, e)
+        if self.cascade_registers:
+            # Projects the previous level's mean-pooled thinking rows (B, thinking_rows, e)
+            # into this level's own token space + tags them as carried memory (distinct from
+            # this level's own fresh thinking rows) via a learned type vector.
+            self.cascade_proj = nn.Linear(e, e)
+            self.cascade_type = nn.Parameter(torch.zeros(e))
+            nn.init.normal_(self.cascade_type, std=0.02)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
         # Decode head. Default (fine_decode=False): a per-token MLP emitting d^3 CONSTANTS per
         # cell. fine_decode=True picks between two heads via `decoder`:
@@ -600,14 +617,17 @@ class PatchSet3D(nn.Module):
                    .reshape(B, r * d, r * d, r * d)
                    .unsqueeze(1))
 
-    def _rope(self, K, spacing, device):
-        """3D axial RoPE cos/sin for the row sequence [thinking, K·N support, N query].
+    def _rope(self, K, spacing, device, n_extra=0):
+        """3D axial RoPE cos/sin for the row sequence [thinking, (cascade memory,) K·N
+        support, N query].
 
         Thinking rows get position (0,0,0) (no rotation); support/query use the (i,j,k)
         lattice. Positions are scaled by spacing/rope_train_mm when a spacing is given, so
-        adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme."""
+        adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme.
+        n_extra: cascade-memory rows prepended ahead of thinking (arch.cascade_registers) —
+        non-spatial like thinking rows, so they get the same (0,0,0) no-rotation treatment."""
         n_think = self.thinking.n
-        pos = torch.cat([torch.zeros(n_think, 3, device=device),
+        pos = torch.cat([torch.zeros(n_think + n_extra, 3, device=device),
                          self.ijk_base.repeat(K, 1).float(),
                          self.ijk_base.float()], dim=0)               # (R,3)
         if spacing is not None:
@@ -640,7 +660,8 @@ class PatchSet3D(nn.Module):
             return None
         return torch.rand(B, M, device=device) < ratio
 
-    def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None):
+    def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None,
+             cascade_regs=None):
         B, N = sup_feat.shape[0], self.N
         dev = sup_feat.device
         mask_support = self._sample_mask(B, K * N, self.token_mask_ratio_support, dev)
@@ -672,6 +693,15 @@ class PatchSet3D(nn.Module):
 
         sep = K * N
         x = torch.cat([sup_tok, qry_tok], dim=1)
+        n_extra = 0
+        if cascade_regs is not None:
+            assert self.cascade_registers, (
+                "cascade_regs given but arch.cascade_registers=False on this model")
+            mem = self.cascade_proj(cascade_regs) + self.cascade_type   # (B, R, e)
+            mem = mem.unsqueeze(2).expand(-1, -1, x.shape[2], -1)       # (B, R, c, e)
+            x = torch.cat([mem, x], dim=1)
+            n_extra = mem.shape[1]
+            sep += n_extra
         x, sep_t = self.thinking(x, sep)
         attn_mask = None
         block_mask = None
@@ -697,11 +727,15 @@ class PatchSet3D(nn.Module):
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
             attn_mask[:, :sep_t] = True
             attn_mask[sep_t:, sep_t:] = True
-        rope = self._rope(K, spacing, x.device) if self.transformer_rope else None
+        rope = (self._rope(K, spacing, x.device, n_extra=n_extra)
+               if self.transformer_rope else None)
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
                              rope=rope, block_mask=block_mask)
         q = x[:, sep_t:, self._decode_col, :]      # (B,Q,e) query row, arch.decode_source col
-        return q, mask_support, mask_query
+        # This level's OWN thinking-row output (unaffected by n_extra: self.thinking() always
+        # prepends its own tokens at the very front) -- for the NEXT cascade level, if wanted.
+        regs = x[:, :self.thinking.n].mean(dim=2) if self.cascade_registers else None
+        return q, mask_support, mask_query, regs
 
     def _decode(self, q, fine=None):
         """Query tokens (B,N,e) -> logits (B,1,G,G,G), G = resolution*mask_patch_decode_size.
@@ -768,10 +802,14 @@ class PatchSet3D(nn.Module):
         return logit
 
     def forward(self, image, context_in, context_out, mode="train", spacing=None,
-                query_prior=None):
+                query_prior=None, cascade_regs=None):
         """query_prior: optional (B,1,D,H,W) soft probability volume, already resampled onto
         THIS forward's grid frame (the cascade runner does the geometric warp). When given it
-        replaces the support-mean prior on the query's mask token — see _attn / _prior_occupancy."""
+        replaces the support-mean prior on the query's mask token — see _attn / _prior_occupancy.
+
+        cascade_regs: optional (B, thinking_rows, e) — the PREVIOUS cascade level's own
+        "registers" output (this method's own return value from that call), fed in as extra
+        input rows (arch.cascade_registers=True required; see _attn)."""
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
@@ -786,11 +824,12 @@ class PatchSet3D(nn.Module):
         else:
             feat_map = self._encode(x, spacing)                        # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        q, mask_support, mask_query = self._attn(
+        q, mask_support, mask_query, regs = self._attn(
             sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing,
-            query_prior=query_prior)
+            query_prior=query_prior, cascade_regs=cascade_regs)
         logit = self._decode(q, fine)
-        return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query}
+        return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query,
+               "registers": regs}
 
     def _encode(self, x, spacing, fine_rows=None):
         """Dispatch to the encoder, passing per-batch `spacing` only when it accepts it
