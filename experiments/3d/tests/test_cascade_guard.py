@@ -159,8 +159,13 @@ def test_allows_cascade_train_within_eval_range():
                                          {"levels": 2, "spacing_range": [1.5, 3]}}))
 
 
-def test_cascade_train_warns_out_of_eval_range():
-    with pytest.warns(UserWarning, match="cascade_train"):
+def test_cascade_train_allows_range_wider_than_eval_ladder():
+    # Deliberate design: training a broader spacing_range than the fixed eval ladder
+    # (data.cascade_spacings) covers is a supported robustness/ablation setup, not a
+    # misconfiguration -- no warning, no raise.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         _assert_cascade_supported(_cfg(data={"cascade_train":
                                              {"levels": 2, "spacing_range": [1.5, 6]}}))
 

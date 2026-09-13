@@ -293,14 +293,10 @@ def _assert_cascade_supported(cfg) -> None:
                          "exclusive (both set the per-batch physical spacing).")
     # data.cascade_train: random per-batch N-level ladder for TRAINING (eval keeps the
     # fixed data.cascade_spacings ladder). resolve_cascade_train validates the spec shape.
+    # Training a spacing_range wider than the eval ladder covers is a deliberate, supported
+    # design (e.g. spacing-robustness training with a fixed, narrower eval ladder for a
+    # stable metric) -- no consistency check against data.cascade_spacings here.
     ct = resolve_cascade_train(d)
-    if ct is not None:
-        _, _lo, _hi = ct
-        if _hi > _sp_f[0] or _lo < _sp_f[-1]:
-            warnings.warn(
-                f"data.cascade_train.spacing_range=[{_lo:g},{_hi:g}] extends past the eval "
-                f"ladder [{_sp_f[-1]:g},{_sp_f[0]:g}] (data.cascade_spacings) -- training "
-                f"spacings will fall outside the eval distribution.")
     w = cfg.get("train", {}).get("cascade_loss_weights")
     if w is not None:
         # Fixed ladder: exactly len(cascade_spacings). Random training ladder: either
