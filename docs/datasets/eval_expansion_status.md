@@ -1,5 +1,15 @@
 # Eval dataset expansion — access triage (2026-09-12, refocused on non-CT + OOD classes)
 
+> **STATUS AS OF 2026-09-13, paused here on user direction ("leave this dataset for now"):**
+> Integrated + eval'd: ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0 (5 total).
+> Characterized but NOT wired: AMOS22 (deliberate in-vocabulary control), ACDC, AutoPET-III,
+> crossMoDA, **BraTS 2024 (explicitly parked — do not resume without new direction)**.
+> Nothing is downloading or running in the background right now. See §"Second wave" below and
+> `docs/datasets/brats2024.md` for exactly why BraTS was stopped at characterization (provenance
+> + a 3-way technical-scope decision, both unresolved). Next natural step if dataset expansion
+> resumes: pick ACDC, AutoPET-III, or crossMoDA (crossMoDA needs the cochlea laterality-split
+> decided first) — all three are technically ready for an "integrate X" instruction.
+
 Follow-up to `docs/datasets/eval_strategy_report.md`. Originally a broad triage across every
 tier the report names; **refocused per direction: prioritize non-CT modalities and classes
 outside TotalSegmentator's vocabulary** (checked against `data/totalseg_classes.py` directly —
@@ -123,9 +133,9 @@ used the user's HF read token to search for community NIfTI mirrors of the harde
 |---|---|---|---:|---|---|
 | **ACDC** | cine-MRI | RV/myocardium/LV | 150×2 phases | ✅ pulled & characterized | `acdc.md` |
 | **AutoPET III** (Lite mirror) | PET/CT | whole-body tumor lesion | 1038 | ✅ pulled & characterized | `autopet_iii.md` |
-| **crossMoDA** | MRI (ceT1) | vestibular schwannoma, cochlea | 105+32 | ✅ pulled & characterized — **correction below** | `crossmoda.md` |
-| **BraTS 2024** (GLI track) | MRI (T1/T1c/T2/FLAIR) | tumor sub-regions | ~1500+ | ⏳ downloading (HF mirror, ~97GB, hours) | pending |
-| **ATLAS v2.0** | T1 MRI | chronic stroke lesion | ~1271 | ⏳ downloading (HF mirror) | pending |
+| **crossMoDA** | MRI (ceT1) | vestibular schwannoma, cochlea | 105 labeled | ✅ pulled & characterized — **correction below + bilateral-cochlea finding** | `crossmoda.md` |
+| **ATLAS v2.0** | T1 MRI | chronic stroke lesion | 655 | ✅✅ **integrated + eval'd** (exp92 single-level: Dice 0.028, NSD 0.038 — WORST OOD-MRI result this session; total empty-collapse — **⚠️ provenance caveat, see below**) | `atlas_v2.md` |
+| **BraTS 2024** (3 tracks: GLI/MEN-RT/PED) | MRI | tumor sub-regions / GTV | 2,728 | ✅ downloaded & characterized — **⚠️ stronger provenance caveat than ATLAS, see below** | `brats2024.md` |
 
 **Correction: crossMoDA is NOT actually gated.** The earlier finding ("`crossmoda.grand-
 challenge.org/Data/` returns HTTP 403") only checked the challenge-portal mirror. The
@@ -136,6 +146,20 @@ directly from Zenodo, not the third-party mirror. This is a real lesson: "one po
 not the same as "genuinely gated" — always check whether the data has a separate archival DOI
 before concluding a dataset needs credentials.
 
+**crossMoDA also has a real structural finding, not just an access correction**: the
+`cochlea` label is annotated **bilaterally under one shared index** (both ears in a single
+label value) while the `vestibular schwannoma` label is always unilateral (verified via
+connected-component counting across all 105 cases: schwannoma always 1 component, cochlea 2
+components in 102/105). A naive whole-mask centroid — the standard trick used for every other
+single-object source integrated this session — lands in empty tissue between the ears for
+cochlea, not on either real structure. Needs a laterality split (`cochlea_left`/
+`cochlea_right`) at conversion time before it's usable, the same "split an ambiguous merged
+label" pattern MSD Prostate's channel split already established for this harness. Also: only
+the `source_training` (ceT1) domain has ground truth — the `target_training`/
+`target_validation` hrT2 volumes are deliberately unlabeled (this is a domain-ADAPTATION
+dataset), so no eval here can actually test the ceT1→hrT2 cross-modality claim the original
+report implied; only an in-domain (ceT1) unseen-class eval is possible from this release.
+
 **BraTS 2024 and ATLAS v2.0 remain genuinely DUA-gated at their official sources** (Synapse
 registration; ICPSR/NITRC reviewed application) — unlike crossMoDA, no open official mirror
 exists for either. Found unofficial full re-uploads on HuggingFace (`Spirit-26/
@@ -143,10 +167,39 @@ BraTS-2024-Complete`, `jayzzzzz0134/atlas-stroke`) — **flagged this distinctio
 explicitly before downloading** (these are very likely unauthorized redistributions of
 consent-controlled patient data, a different risk category than crossMoDA's rediscovered
 official-open source or the AutoPET/autoPET-III-Lite mirror, which just repackages
-already-TCIA-public data). User chose to proceed with both anyway — downloading now via
-`huggingface_hub.snapshot_download` (slow: per-file HF resolve overhead, expect several hours
-for BraTS's ~97GB across thousands of small files). This provenance caveat will be repeated in
-each dataset's own doc once written.
+already-TCIA-public data). User chose to proceed with both anyway.
+
+**ATLAS v2.0 is now fully integrated and eval'd** (2026-09-13, on explicit user direction after
+the provenance caveat was raised) — `src/providers/atlas_v2.py`, `scripts/convert_atlas_v2.py`
+(654/655 converted, 1 genuine failure — a stray non-integral mask value on the mirror itself,
+correctly rejected). Fifth native-grid MRI source, `MODALITY="mri"` reused unchanged.
+`crop_spacing_mm=1.9` via a closed-form whole-volume-coverage check (every subject shares the
+identical 197×233×189 @ 1mm grid — this mirror ships an already-template-registered version,
+the easiest geometry of anything integrated this session).
+
+Single-level eval (exp92 @1.9mm): **Mean Dice 0.0280 ± 0.078, NSD 0.0381, n=654** — the WORST
+OOD-MRI result of any source this session (below ISLES22 0.054, Shifts-MS 0.063). Qualitatively
+a TOTAL empty-collapse (dice=0.000 on the saved figure — model predicts essentially nothing for
+a large, unambiguous lesion), more severe than Shifts-MS's near-empty pattern. Read this number
+with the §1 provenance caveat attached — unlike every other integrated source this session,
+this one's data quality itself is not fully trusted (the mirror ships no README/license, and
+one case's mask was already found to be corrupt), so the low Dice may partly reflect data
+issues rather than pure model generalization. Full detail: `atlas_v2.md` §7-8.
+
+**BraTS 2024 download finished and characterized** (`docs/datasets/brats2024.md`) — 2,728 total
+cases across 3 tracks: BraTS-GLI (1,809, glioma, 4-class), BraTS-MEN-RT (571, meningioma+RT,
+binary GTV), BraTS-PED (348, pediatric, 4-class). **The provenance caveat here is STRONGER than
+ATLAS v2.0's**: the mirror's own `LICENSES.md` explicitly states GLI and MEN-RT were
+"Downloaded under the BraTS 2024 challenge agreement" from Synapse — an admission, in the
+mirror's own docs, that 2 of 3 tracks circumvent the official DUA. PED claims TCIA CC-BY-NC-4.0
+but could not be independently confirmed as a real open TCIA collection (searched the TCIA API,
+no matching collection name found) — treat with the same caution pending verification.
+GLI/PED are completely uniform-geometry (template-registered, same character as ATLAS v2.0 —
+closed-form `crop_spacing_mm≈1.8-1.9`); MEN-RT is genuinely raw clinical data with shapes up to
+800×800×512 (largest of anything this session) and mixed per-case orientation — a much harder
+integration than GLI/PED. Largest case pool of any source pulled this session (2,728 vs.
+AutoPET-III's 1,038). Not yet wired — three separate technical questions (GLI, PED, MEN-RT
+each need their own decision), on top of the provenance question already flagged.
 
 ## Still gated, no path found
 
@@ -180,9 +233,10 @@ each dataset's own doc once written.
   amos22/amos22.zip                     # ✅ characterized (amos22.md) -- deliberately not wired, it's a control not an OOD case
   acdc/{training,testing}.zip           # ✅ characterized (acdc.md) -- not yet converted/wired
   autopet_iii_lite/Images-{CT,PET}.zip, Masks.zip   # ✅ characterized (autopet_iii.md) -- not yet converted/wired
-  crossmoda/crossmoda_{training,validation}.zip     # ⏳ downloading -- official Zenodo source, not the HF mirror
-  brats2024/                            # ⏳ downloading (HF mirror, unofficial re-upload -- see provenance caveat above)
-  atlas_v2/                             # ⏳ downloading (HF mirror, unofficial re-upload -- see provenance caveat above)
+  crossmoda/crossmoda_{training,validation}.zip     # ✅ characterized (crossmoda.md) -- official Zenodo source, not the HF mirror
+  brats2024/                             # ✅ characterized (brats2024.md) -- HF mirror, unofficial re-upload, ⚠️⚠️ strongest provenance caveat this session, not wired
+  atlas_v2/                             # raw source (HF mirror, unofficial re-upload)
+  atlas_v2/npy/                         # ✅ INTEGRATED — converted, wired, eval'd (exp92) -- ⚠️ provenance caveat, atlas_v2.md #1
 ```
 All four non-CT+OOD sources (ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate) have the full
 pipeline (provider/converter/config/dispatch) plus a first eval run against exp92. Second wave

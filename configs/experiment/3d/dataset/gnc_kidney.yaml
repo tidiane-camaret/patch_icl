@@ -1,0 +1,37 @@
+# @package _global_
+# GNC_705 kidney lesions — 610 (subject,visit) cases x up to 14 classes, water-channel Dixon
+# MRI, eval-only: no synth, no aug. LOCAL restricted-access National Cohort data, not a public
+# download — see docs/datasets/gnc_kidney_lesions.md for the full characterization + protocol.
+#
+#   python scripts/convert_gnc_kidney.py --workers 16      # once, GNC_705 -> native .npy
+#   python experiments/3d/eval.py dataset=gnc_kidney eval.model=patchset3d \
+#     eval.checkpoint=<ckpt>
+#
+# Zero overlap with TotalSegmentator: no kidney-LESION class exists there (only whole-organ
+# kidney_left/right). Native-grid MRI source (src/providers/native_grid.py MODALITY="mri",
+# per-subject mri_stats). `val_classes` below is the 13-class eval list, NOT the full 14 —
+# `hyper_mask_r` has only 1 subject total (no possible context-disjoint-from-target pair; would
+# silently self-context and inflate its own Dice, see src/providers/gnc_kidney.py docstring).
+paths:
+  gnc_kidney: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gnc_kidney/npy
+data:
+  source: gnc_kidney
+  loader_v2: true               # gnc_kidney is v2-only (GncKidneyProvider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 1.2mm: organ-extent clip-avoidance sweep over each label's ACTUAL nonzero content bbox
+  # (not raw file shape -- some files ship an oversized canvas around a tiny lesion, see
+  # docs/datasets/gnc_kidney_lesions.md #7 step 2 correction), read from all 1,499 label
+  # files. True max extent on any axis: 153.0mm (median just 18mm -- most lesions are small).
+  # FOV=128*1.2=153.6mm is the smallest pitch with zero clipping on the full set; native
+  # in-plane spacing is 1.40625mm so this is a mild in-plane downsample, not an upsample.
+  crop_spacing_mm: 1.2
+  val_classes: [hyper_r, hyper_l, hypo_r, hypo_l, complex_r, complex_l,
+               hyper_cyst_r, hyper_cyst_l, hyper_mask_l, hypo_mask_r, hypo_mask_l,
+               complex_cyst_r, complex_cyst_l]   # 13 of 14 -- see header note
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

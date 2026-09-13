@@ -103,7 +103,8 @@ def _source_root(cfg) -> tuple[str, str, bool]:
             raise ValueError(f"cfg.paths.{source} is not set "
                              f"(needed for data.source={source})")
         return source, root, False
-    if source in ("isles22", "shifts_ms", "msd_hippocampus", "msd_prostate"):
+    if source in ("isles22", "shifts_ms", "msd_hippocampus", "msd_prostate", "atlas_v2",
+                 "gnc_kidney"):
         root = cfg.paths.get(source)
         if root is None:
             raise ValueError(f"cfg.paths.{source} is not set "
@@ -259,7 +260,8 @@ def _assert_cascade_supported(cfg) -> None:
     # path (_recrop_level calls provider.load / .load_native_crop generically) -- see
     # src/providers/native_grid.py::NativeGridProvider.load_native_crop.
     _cascade_sources = _TOTALSEG_SOURCES | {"multisource", "nasalseg", "flare22", "isles22",
-                                            "shifts_ms", "msd_hippocampus", "msd_prostate"}
+                                            "shifts_ms", "msd_hippocampus", "msd_prostate",
+                                            "atlas_v2", "gnc_kidney"}
     if d.get("source", "totalseg") not in _cascade_sources:
         raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
                          f"cascade-capable source ({sorted(_cascade_sources)}).")
@@ -336,7 +338,7 @@ def build_dataset(cfg, split: str):
     """
     d = cfg.data
     if d.get("source") in ("flare22", "nasalseg", "isles22", "shifts_ms", "msd_hippocampus",
-                           "msd_prostate"):
+                           "msd_prostate", "atlas_v2", "gnc_kidney"):
         # Sources stored on their native anisotropic grid; the provider crops + resamples
         # to the isotropic model grid per item (src/providers/native_grid.py). v2 only.
         from src.incontext_dataset_v2 import InContextDataset
@@ -351,8 +353,12 @@ def build_dataset(cfg, split: str):
             from src.providers.shifts_ms import ShiftsMsProvider as _Provider
         elif d.get("source") == "msd_hippocampus":
             from src.providers.msd_hippocampus import MsdHippocampusProvider as _Provider
-        else:
+        elif d.get("source") == "msd_prostate":
             from src.providers.msd_prostate import MsdProstateProvider as _Provider
+        elif d.get("source") == "gnc_kidney":
+            from src.providers.gnc_kidney import GncKidneyProvider as _Provider
+        else:
+            from src.providers.atlas_v2 import AtlasV2Provider as _Provider
         is_train = split == "train"
         provider = _Provider(
             root=root,
@@ -917,7 +923,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
                             "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg",
                             "isles22", "shifts_ms", "msd_hippocampus", "msd_prostate",
-                            "multisource"):
+                            "atlas_v2", "gnc_kidney", "multisource"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool

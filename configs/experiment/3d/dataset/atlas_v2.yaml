@@ -1,0 +1,39 @@
+# @package _global_
+# ATLAS v2.0 -- 655 T1 MRI chronic-stroke-lesion cases (33 sites), 1 class, MRI.
+# Eval-only: no synth, no aug.
+#
+# !! PROVENANCE CAVEAT (docs/datasets/atlas_v2.md #1): the official ATLAS v2.0 release is
+# DUA-gated (ICPSR restricted-use, or a reviewed NITRC/INDI application). This source was
+# converted from an UNOFFICIAL HuggingFace re-upload with no README/license metadata, very
+# likely an unauthorized redistribution of consent-controlled patient data. Integrated on
+# explicit user direction after this was flagged -- not equivalent to every other dataset
+# config in this directory, which all read from a genuinely open official/archival source.
+#
+#   python scripts/convert_atlas_v2.py --workers 16       # once, .nii.gz -> native .npy
+#   python experiments/3d/eval.py dataset=atlas_v2 eval.model=patchset3d
+#
+# Zero overlap with TotalSegmentator (or this project's own data/totalseg_classes.py): no
+# lesion class of any kind exists there. Non-CT modality too -- a native-grid MRI source
+# (src/providers/native_grid.py's MODALITY="mri" branch, per-subject mri_stats normalization,
+# same mechanism ISLES22/Shifts-MS/Hippocampus/Prostate use). 655 x 1 = 655 (subject, class)
+# tasks.
+paths:
+  atlas_v2: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/atlas_v2/npy
+data:
+  source: atlas_v2
+  loader_v2: true               # atlas_v2 is v2-only (AtlasV2Provider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 1.9mm: every subject shares the exact same 197x233x189 @ 1mm/RAS native grid (uniform,
+  # already-template-registered mirror -- verified at characterization time). FOV=243.2mm
+  # covers all 3 axes at 100% with no clipping (the smallest pitch with zero clip; 1.8mm
+  # already clips the 233mm axis by <1%). Round-trip grid-occupancy sweep,
+  # docs/datasets/atlas_v2.md.
+  crop_spacing_mm: 1.9
+  val_classes: all              # the sole class, or explicit ["stroke_lesion"]
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

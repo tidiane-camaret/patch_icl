@@ -1,5 +1,29 @@
 # Change log
 
+## 2026-09-13 — GNC_705 kidney-lesion cohort: census + balanced subset selection
+
+Inspected the local GNC_705 restricted-access National Cohort MRI release (30,385 subjects,
+49,220 (subject,visit) cases, 4-channel Dixon MRI) for kidney lesion segmentation potential.
+Characterization only, no converter/provider yet — see `docs/datasets/gnc_kidney_lesions.md`.
+
+- Built `scripts/inspect_gnc_kidney.py`: threaded (128-worker) `os.listdir`-based census —
+  plain `find -maxdepth 2` didn't finish in 60s over this NFS tree, thread pool hides the
+  per-call latency (~305s for all 30,385 subjects).
+- Found labels are extremely sparse (610/49,220 visits, 1.24%) and are tight ROI crops (not
+  full-volume masks) sharing the composed image's spacing/orientation with an exact-integer
+  voxel origin offset — a converter can composite by array placement, no resampling.
+- Found the 14 canonical class names are NOT a clean subregion hierarchy: `mask_X` ⊆ `X` only
+  when their crop boxes coincide exactly; otherwise they're two separate lesion instances in the
+  same kidney (verified via affine-diff box comparison on several subjects).
+- Selected a rarity-weighted balanced subset: 181/610 labeled subjects (cap=60/class) —
+  `docs/datasets/gnc_kidney_lesions_subset.csv`.
+- Designed (not yet built) an eval protocol for all 610 labeled cases: 13/14 classes
+  (`mask_hyper.R` n=1 excluded, `mask_hyper.L` n=2 flagged underpowered), water-channel-only
+  first pass, `crop_spacing_mm=1.4` computed from real per-file label extents (max 174mm on the
+  clean set) after finding 4 corrupt whole-volume-bbox label files and 2 subjects with 6mm
+  Z-spacing (vs the cohort-typical 3mm) by reading all 1,499 label headers. See
+  `docs/datasets/gnc_kidney_lesions.md` §7.
+
 ## 2026-09-12 — cascade re-crop: `data.cascade_center_mode="random_fg"` (crop over the mask)
 
 COM (+jitter) re-crop centering is suboptimal for large/non-convex ROIs: the probability-
@@ -8143,3 +8167,132 @@ into the harness yet** — this session's second wave was acquire+characterize o
 the pre-integration pattern MSD Hippocampus/Prostate went through before their own
 "integrate X" instructions. Updated `docs/datasets/eval_expansion_status.md` and the
 `project_eval_dataset_expansion` memory file with the full second-wave status.
+
+## 2026-09-13 — crossMoDA + ATLAS v2.0 characterized (session resumed after container restart)
+
+Continued the second-wave dataset acquisition. Note: a container/session restart mid-download
+wiped `/tmp` scratch state (scripts, logs) but NOT the actual downloaded files on NFS —
+`snapshot_download`'s resume behavior meant restarting the BraTS/ATLAS scripts picked up
+exactly where they left off (skip-checked already-downloaded files fast, only fetched new
+ones). Lesson: always verify actual bytes-on-disk before assuming a download needs restarting
+from zero after any session interruption.
+
+- **crossMoDA fully characterized** (`docs/datasets/crossmoda.md`). Found a real structural
+  property, not just an access correction: `cochlea` is annotated BILATERALLY under one shared
+  label index (both ears share value 2), while `vestibular schwannoma` is always unilateral —
+  verified via connected-component counting across all 105 labeled cases (schwannoma always 1
+  component; cochlea 2 components in 102/105). A naive whole-mask centroid (the standard trick
+  for every other single-object source this session) lands in empty tissue between the ears
+  for cochlea — needs a laterality split (`cochlea_left`/`cochlea_right`) at conversion time,
+  the same "split an ambiguous merged label" pattern MSD Prostate's channel split established.
+  Also confirmed: only the `source_training` (ceT1) domain has GT; `target_training`/
+  `target_validation` (hrT2) are deliberately unlabeled (this is a domain-ADAPTATION dataset),
+  so no eval from this release can test the ceT1→hrT2 cross-modality claim the original report
+  implied — only an in-domain unseen-class eval is possible.
+- **ATLAS v2.0 download finished and characterized** (`docs/datasets/atlas_v2.md`). 655
+  (image, mask) pairs, 33 sites, uniform 197×233×189 @ 1mm/RAS across literally every single
+  subject — unlike every raw clinical source pulled this session, strongly suggesting this
+  mirror ships an already-template-registered version. Geometrically this would be the
+  EASIEST source to wire of anything pulled this session (no per-subject sweep even needed),
+  entirely gated on the provenance decision already flagged (unofficial re-upload, no
+  README/license metadata on the mirror at all, reinforcing the DUA-circumvention read), not
+  on any engineering difficulty. Lesion volume 13mm³-497,000mm³, the widest dynamic range of
+  any lesion source this session.
+- **BraTS 2024 download still in progress** (11,589 total files, ~97GB) — slow due to
+  per-file HF resolve overhead across thousands of small files.
+
+Updated `docs/datasets/eval_expansion_status.md` and the `project_eval_dataset_expansion`
+memory file with the finalized second-wave status.
+
+## 2026-09-13 (cont.) — ATLAS v2.0 integrated + eval'd (fifth native-grid MRI source; worst
+## OOD-MRI result this session, total empty-collapse)
+
+Integrated on explicit user instruction ("eval atlas") after the provenance caveat (unofficial
+HF re-upload of DUA-gated patient data, no README/license on the mirror) was already flagged
+and the user chose to proceed for their own research use.
+
+- `crop_spacing_mm=1.9` via a closed-form whole-volume-coverage sweep (every one of the 655
+  subjects shares the identical 197×233×189 @ 1mm/RAS grid, so this reduces to a 3-axis check
+  rather than a per-subject sweep) — smallest pitch with zero clipping on all axes.
+- `scripts/convert_atlas_v2.py`: **654/655 converted, 1 genuine failure** —
+  `sub-r039s002`'s mask has a stray non-integral value (0.01 instead of 1), a real data-quality
+  issue on the mirror itself, correctly caught and rejected by the strict integral-mask check
+  rather than silently coerced.
+- `src/providers/atlas_v2.py` (`AtlasV2Provider`), `configs/experiment/3d/dataset/
+  atlas_v2.yaml`, dispatch wired identically to the other 4 MRI sources. 212 tests pass, same
+  pre-existing unrelated failures.
+- Visual sanity (`results/3d/atlas_v2_items.png`): plausible chronic-stroke lesion patterns
+  across a wide size range.
+- **Eval (exp92, single-level @1.9mm): Mean Dice 0.0280 ± 0.078, NSD 0.0381, n=654** — the
+  WORST OOD-MRI result of any of the five sources integrated this session (below ISLES22's
+  0.054 and Shifts-MS's 0.063). Qualitative figure shows a TOTAL empty-collapse — the model
+  predicts essentially nothing for a large, unambiguous hemispheric lesion (dice=0.000), a more
+  severe version of Shifts-MS's near-empty pattern. Flagged explicitly in `atlas_v2.md` §8:
+  given the provenance caveat already on this source, this number should be read with that
+  caveat attached — the low Dice may partly reflect data-quality issues on the unofficial
+  mirror (one corrupt mask already found) rather than pure model generalization, unlike every
+  other source integrated this session, whose data provenance is clean.
+
+Updated `docs/datasets/atlas_v2.md`, `eval_expansion_status.md`, and the
+`project_eval_dataset_expansion` memory file.
+
+## 2026-09-13 (cont.) — BraTS 2024 download finished, characterized (strongest provenance
+## caveat of anything this session; not wired)
+
+- **11,589 files, ~97GB, fully downloaded** via `huggingface_hub.snapshot_download` (resumed
+  cleanly across the earlier session/container restart, per prior log entry).
+- **The mirror's own `LICENSES.md` explicitly states** GLI (1,809 cases) and MEN-RT (571 cases)
+  were "Downloaded under the BraTS 2024 challenge agreement" from Synapse.org — an admission,
+  in the redistributor's own documentation, that 2 of 3 tracks circumvent the official Synapse
+  DUA. This is a STRONGER provenance signal than ATLAS v2.0 had (that mirror shipped no
+  metadata either way; this one actively documents the source-DUA it's bypassing). PED (348
+  cases) claims TCIA CC-BY-NC-4.0, but a TCIA REST API search for matching collection names
+  ("brats"/"pediatric"/"brain-tum") found nothing — not independently confirmed as genuinely
+  open, treated with the same caution pending verification.
+- **Full geometry+label census** (GLI 1,621 train + PED 257 train + MEN-RT 500 train, ~2,378
+  files): GLI and PED are BOTH completely uniform in geometry across every single case (GLI:
+  182×218×182 @ 1mm/LAS; PED: 240×240×155 @ 1mm/LPS) — same "already-template-registered"
+  character as ATLAS v2.0, giving a trivial closed-form `crop_spacing_mm` (≈1.8 GLI, ≈1.9 PED).
+  Both share a 4-class tumor-subregion label schema with track-different presence rates (PED
+  shows much lower rates for the two rarer classes than GLI — consistent with known pediatric-
+  vs-adult glioma biology). **MEN-RT is the opposite**: real per-case orientation (473 RAS + 27
+  LAS of 500) and a shape range up to 800×800×512 — the largest native volumes of ANY source
+  pulled this session, even larger than AutoPET-III's whole-body 963-slice max — plus a
+  single-sequence (t1c-only) input and a binary GTV label, a genuinely different task from
+  GLI/PED's multi-region segmentation.
+- Wrote `docs/datasets/brats2024.md`. **Not wired** — three separate technical questions (GLI/
+  PED as one-vs-two providers, MEN-RT's much harder raw-geometry integration) sit on top of the
+  provenance question already flagged; deliberately left as characterization-only pending
+  explicit direction, mirroring how MSD Hippocampus/Prostate were treated before their own
+  "integrate X" instructions.
+
+Updated `docs/datasets/eval_expansion_status.md` and the `project_eval_dataset_expansion`
+memory file.
+
+## 2026-09-13 (cont.) — GCP: wired synth_gmm + SynthGmmProvider random_fg center mode
+
+- **GCP synth_gmm pipeline**: `paths.gmm_bank` was commented out in `configs/cluster/gcp.yaml`
+  (`data.p_synth>0` / `experiment=92_multisource_synth` hard-require it, `common.py:442`).
+  Uncommented it (`/mnt/data/gmm_bank`) and added the one-time bucket-seed + per-VM rsync
+  steps to `docs/GCP3.md`. Bank is **~250GB apparent size** (sparse on NFS, `du -sh` reports a
+  misleading 50GB — `du -sb`/the actual GCS transfer size is the real number), not the ~50GB
+  first assumed; `patch-icl-tokyo-data` resized 200GB→500GB (online `resize2fs`, no data loss)
+  to fit `totalseg + totalsegmri + results + gmm_bank` (~365GB). Verified end-to-end on a
+  fresh `patch-icl-h100` VM: `CohortSampler`/`SynthGmmMaisiDataset` load correctly from the
+  synced bank and a smoke run trains. Gotchas hit along the way: `uv run` (no `--extra`)
+  silently re-resolves to a different torch/CUDA build (cu130) than `uv sync --extra cu124`
+  installed — always pass the same `--extra` to both; a fresh VM's SSH user has `Linger=no`,
+  so `nohup`+`disown`'d background jobs get killed the moment the SSH session closes — use
+  `loginctl enable-linger` + a detached `tmux` session (matches GCP3.md's existing pattern) for
+  anything that must outlive the SSH connection.
+- **SynthGmmProvider random_fg center mode**: `src/providers/synth_gmm.py::load_native_crop`
+  previously raised `NotImplementedError` for `data.cascade_center_mode="random_fg"` (or its
+  `{mode, eval_mode}` mapping form), since it lacked per-voxel GT centroid resolution. Wired it
+  up by reusing `providers/totalseg.py::_resolve_center` directly (same helper `TotalSegProvider`/
+  `NativeGridProvider` already use) — `_build_nc` now loads the mmap'd mask (`arr`) before
+  resolving the center instead of after, and calls `_resolve_center` with the precomputed
+  centroid as fallback. Level-0 `assemble_task` is untouched (`center_mode` is a cascade-recrop-
+  only concept). Added `src/providers/test_synth_gmm.py` (tiny synthetic 2-mask bank, no real
+  `gmm_bank` needed) covering `com` (uses stored centroid), `random_fg` (samples an actual
+  fg voxel, matches `_resolve_center`'s draw exactly, replayed independently), and explicit-
+  center-always-wins. 142/142 existing cascade/provider tests still pass.

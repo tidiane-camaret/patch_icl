@@ -254,6 +254,14 @@ def main(cfg: DictConfig) -> None:
         from src.providers.msd_prostate import resolve_msd_prostate_classes
         root = cfg.paths.get("msd_prostate")
         classes = resolve_msd_prostate_classes(cfg.data.val_classes)
+    elif source == "atlas_v2":
+        from src.providers.atlas_v2 import resolve_atlas_v2_classes
+        root = cfg.paths.get("atlas_v2")
+        classes = resolve_atlas_v2_classes(cfg.data.val_classes)
+    elif source == "gnc_kidney":
+        from src.providers.gnc_kidney import resolve_gnc_kidney_classes
+        root = cfg.paths.get("gnc_kidney")
+        classes = resolve_gnc_kidney_classes(cfg.data.val_classes)
     elif source == "totalseg_more_labels":
         from data.totalseg_classes import resolve_more_labels_classes
         root = cfg.paths.get("totalseg_more_labels")
