@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from data.maisi_classes import MAISI_CLASS_TO_IDX, MAISI_IDX_TO_CLASS
 from src.gpu_gmm_intensity import sample_grouped_uniform
@@ -87,16 +86,20 @@ class SynthGmmProvider:
             image_size=(self.ds.T,) * 3, crop_mm=crop_mm, jitter=jitter, rng=rng)
         # Cap the native crop BEFORE the expensive paint (RNG draw + antialias + occupancy
         # resample, all at native res -- see docs/logs.md / memory project_synth_gmm_paint_perf):
-        # a wide-FOV level-0 crop can be ~400M-1.9B native voxels here, uncapped. Mirrors
-        # SynthGmmMaisiDataset._native_crop's own cap exactly (cheap nearest pre-downsample);
-        # out_sizes/pad_lo describe the TARGET grid placement and don't depend on the source
-        # array's shape, so capping here is a pure cost cut, not a correctness change.
-        crop_lbl = np.ascontiguousarray(crop_lbl, dtype=np.uint8)
+        # a wide-FOV level-0 crop can be ~400M-1.9B native voxels here, uncapped.
+        # crop_lbl is still a LAZY mmap view here (organ_crop_arrays only slices, doesn't
+        # copy) -- stride-slice it BEFORE materializing. Measured on the real gmm_bank: an
+        # earlier version of this cap called np.ascontiguousarray on the FULL native crop
+        # first and downsampled after, which pays the full materialize cost regardless of
+        # any cap (~1.3s of pure memcpy for a 512^3 uint8 crop, vs ~0.1s when the stride
+        # happens first on the still-lazy view) -- effectively a no-op cap. `out_sizes`/
+        # `pad_lo` describe the TARGET grid placement and don't depend on the source array's
+        # shape, so this is a pure cost cut, not a correctness change.
         cap = self.ds.gpu_realize_max_native
         if cap and max(crop_lbl.shape) > cap:
-            new = tuple(min(cap, s) for s in crop_lbl.shape)
-            crop_lbl = (F.interpolate(torch.from_numpy(crop_lbl.astype(np.float32))[None, None],
-                                      size=new, mode="nearest")[0, 0].to(torch.uint8).numpy())
+            step = tuple(-(-s // cap) for s in crop_lbl.shape)   # ceil division
+            crop_lbl = crop_lbl[::step[0], ::step[1], ::step[2]]
+        crop_lbl = np.ascontiguousarray(crop_lbl, dtype=np.uint8)
         img, mask = self.ds._resample_paint_mask(
             crop_lbl, out_sizes, pad_lo, cls_id, mu_e, sd, member_nrng)
 

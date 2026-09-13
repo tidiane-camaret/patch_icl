@@ -15,7 +15,6 @@ import random
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from data.maisi_classes import MAISI_IDX_TO_CLASS
@@ -188,12 +187,16 @@ class SynthGmmMaisiDataset(Dataset):
         _, crop_lbl, out_sizes, pad_lo, _ = organ_crop_arrays(
             arr, arr, center, e["spacing"], image_size=(self.T,) * 3,
             crop_mm=crop_mm, jitter=self.jitter, rng=rng)
-        native = np.ascontiguousarray(crop_lbl, dtype=np.uint8)         # ids 0..maxid<=255
+        # Stride-slice BEFORE materializing: crop_lbl is still a lazy mmap view here
+        # (organ_crop_arrays only slices, doesn't copy). ascontiguousarray on the FULL
+        # native crop first and downsampling after pays the full materialize cost
+        # regardless of any cap (measured ~1.3s of pure memcpy for a 512^3 uint8 crop vs
+        # ~0.1s when the stride happens first) -- see docs/logs.md / src/providers/synth_gmm.py.
         cap = self.gpu_realize_max_native
-        if cap and max(native.shape) > cap:                            # bound transfer/mem
-            new = tuple(min(cap, s) for s in native.shape)             # still >= out_sizes (<=T<=cap)
-            native = (F.interpolate(torch.from_numpy(native.astype(np.float32))[None, None],
-                                    size=new, mode="nearest")[0, 0].to(torch.uint8).numpy())
+        if cap and max(crop_lbl.shape) > cap:                          # bound transfer/mem
+            step = tuple(-(-s // cap) for s in crop_lbl.shape)         # ceil division
+            crop_lbl = crop_lbl[::step[0], ::step[1], ::step[2]]       # still >= out_sizes (<=T<=cap)
+        native = np.ascontiguousarray(crop_lbl, dtype=np.uint8)        # ids 0..maxid<=255
         return (torch.from_numpy(native),
                 torch.tensor(out_sizes, dtype=torch.long),
                 torch.tensor(pad_lo, dtype=torch.long))

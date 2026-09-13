@@ -132,3 +132,16 @@ def test_build_nc_uncapped_when_gpu_realize_max_native_is_zero(tmp_path):
     req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None, center_mode="com")
     shape = _native_shape_painted(provider, subject, str(CLS), req)
     assert shape == (16, 16, 16), shape
+
+
+def test_native_crop_gpu_realize_path_also_caps_before_materializing(tmp_path):
+    """SynthGmmMaisiDataset._native_crop (the standalone data.source=synth_gmm_maisi +
+    gpu_realize=True path) shares the same stride-before-materialize cap fix as
+    SynthGmmProvider._build_nc -- same bank fixture, direct call."""
+    bank_dir = _make_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              gpu_realize=True, gpu_realize_max_native=8)
+    e = ds.cs.entries[0]
+    native, out_sizes, pad_lo = ds._native_crop(e, CLS, random.Random(0), 3.0)
+    assert max(native.shape) <= 8, tuple(native.shape)

@@ -8434,3 +8434,42 @@ selected for the standalone `data.source=synth_gmm_maisi`, never for `multisourc
   blob (a shape it has strong priors for from TotalSegmentator's vertebra classes) rather than
   the small measurement ROI the GT actually marks — partial overlap from spatial proximity, not
   true agreement on the target's extent.
+
+## 2026-09-14 (cont.) — synth_gmm cascade path: the cap didn't help because materialize ran
+## before it (fixed: stride-slice the lazy mmap view before ascontiguousarray, not after)
+
+Re-measured the previous fix (capping the native crop to `gpu_realize_max_native` before
+painting) on the live GCP run: still ~20 min/epoch, and the per-step profile
+(`[e0] cascade per-step (ms): data 11 | realize0 5 | run_cascade 2345 | bwd 345`) showed
+`data_ms` (level-0, DataLoader-worker-parallel, prefetch-hidden) had dropped to noise, but
+almost the entire step (`recrop_ms≈2689ms`) was still going to cascade levels 1-2's re-crop —
+a synchronous, GPU-idle, thread-pool-fanned-out step that calls the SAME `_build_nc`/
+`_native_crop` code the cap fix touched.
+
+Root-caused directly on the VM (`bench_recrop2.py`, isolating each sub-step): the previous
+cap implementation called `np.ascontiguousarray(crop_lbl, dtype=np.uint8)` on the FULL
+native crop (still a lazy view over an `mmap_mode="r"` file at that point) *before* checking
+the cap, then downsampled via `F.interpolate` afterward. That materialize call alone costs
+~1.3s for a 512³ uint8 crop (measured, repeatable even with a warm page cache — pure
+memory-copy cost, not disk I/O) **regardless of what cap runs next** — the cap was
+downsampling only after already paying the full uncapped cost, making it a near-total no-op
+for the recrop path (level 0's cost happened to still drop because DataLoader worker
+parallelism + prefetch hides it, not because the cap itself worked there either).
+
+Fix: stride-slice the still-lazy view *before* calling `ascontiguousarray` — `crop_lbl =
+crop_lbl[::step0, ::step1, ::step2]` with `step = ceil(native_shape / cap)` per axis — then
+materialize only the already-≤cap-per-axis result. This is an exact nearest-neighbor
+decimation (matches the old `F.interpolate(mode="nearest")` semantics) and needs no
+torch/tensor round-trip. Measured on the real gmm_bank: 512³→256³ crop, **1310ms → 105ms**
+(12.4x), consistent across repeats (confirms it's the materialize, not disk I/O).
+- `src/providers/synth_gmm.py::SynthGmmProvider._build_nc`: cap block reordered to
+  stride-then-materialize. `torch.nn.functional` import removed (no longer used in this
+  file).
+- `src/synth_gmm_maisi_dataset.py::SynthGmmMaisiDataset._native_crop`: same latent bug,
+  same fix — this is the standalone `data.source=synth_gmm_maisi` + `gpu_realize=True`
+  path that the cascade fix's cap was originally copied from, so it had the identical
+  no-op-cap flaw. `F` import removed (now fully unused in this file).
+- New test in `src/providers/test_synth_gmm.py` covering `_native_crop` directly (the
+  cascade-path cap already had coverage from the previous fix). Full suite: 290/298 pass,
+  same 8 pre-existing unrelated `test_infer_nifti.py` failures.
+- Not yet re-measured end-to-end on the GCP run at time of writing — next step.
