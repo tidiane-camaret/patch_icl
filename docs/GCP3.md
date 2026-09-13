@@ -1,5 +1,5 @@
 export PROJECT=atomic-acrobat-308517
-export ZONE=europe-north1-c   # Finland preferred (cheapest H100 ~$1.09/hr); fallback asia-northeast1-c (Tokyo ~$2.58/hr)
+export ZONE=asia-northeast1-c #europe-north1-c   # Finland preferred (cheapest H100 ~$1.09/hr); fallback asia-northeast1-c (Tokyo ~$2.58/hr)
 export CPU_VM=patch-icl-prep
 export GPU_VM=patch-icl-h100
 export DATA_DISK=patch-icl-tokyo-data  # permanent 200GB disk in asia-northeast1-c; recreate in target zone if switching
