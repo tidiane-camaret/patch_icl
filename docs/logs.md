@@ -8410,3 +8410,27 @@ selected for the standalone `data.source=synth_gmm_maisi`, never for `multisourc
   (`data.source=synth_gmm_maisi` standalone). Making the cascade path use GPU paint would
   mean teaching `_realize_member` a "needs paint" branch, not just flipping a flag —
   deferred pending a re-measurement of this cap's impact on the GCP run.
+
+- 2026-09-14 — **zanderch HU_Messung (`hu_lwk1`) integrated + eval'd (single-level + cascade)**:
+  local NFS polytrauma whole-body CT cohort, 36 cases with a single novel class (`l1_center`,
+  a small ~15mm HU-measurement ROI at the L1 vertebral centrum, NOT a vertebra segmentation —
+  see `docs/datasets/hu_lwk1.md`). First CT (not MRI) native-grid eval source in this family;
+  `HuLwk1Provider` (`src/providers/hu_lwk1.py`) is a plain `NativeGridProvider` subclass (single
+  partitioning class, no per-class-plane override needed, unlike GNC). Converter
+  (`scripts/convert_hu_lwk1.py`) matches each label to the correct sibling `.nii` series by
+  shape+affine (a visit dir can hold several kernel/phase variants), 36/37 usable (1 case has
+  no image at all, excluded). Wired into `experiments/3d/common.py`/`eval.py` alongside the
+  other native-grid sources, `configs/experiment/3d/dataset/hu_lwk1.yaml`,
+  `configs/cluster/nfs.yaml`. Cascade `[6,3,1]` mm (coarse/mid reused from exp92's own trained
+  ladder `[6,3,1.5]`, fine point corrected to this dataset's measured target scale, same
+  methodology as GNC's `[6,3,1.2]`) ran clean on the first try — the `native_gt`/`gt_loader`
+  generalization built for GNC already covers a plain single-class source with zero extra code.
+  Results (exp92 ckpt): single-level (1mm) **Dice 0.1164, NSD 0.1313, n=36** — notably higher
+  than GNC (0.0585) / ISLES22 (0.0544), consistent with this being same-modality CT with a
+  novel-but-not-OOD-modality class. Cascade **Dice 0.1287, NSD 0.0729** (per-level stitched
+  dice 6mm=0.041 -> 3mm=0.075 -> 1mm=0.130) — unlike GNC/ISLES22, cascading does NOT hurt here
+  (finest level ~matches single-level). Qualitative figure shows a real semantic-mismatch
+  failure mode, not a localization bug: the model predicts a plausible whole-vertebral-body
+  blob (a shape it has strong priors for from TotalSegmentator's vertebra classes) rather than
+  the small measurement ROI the GT actually marks — partial overlap from spatial proximity, not
+  true agreement on the target's extent.

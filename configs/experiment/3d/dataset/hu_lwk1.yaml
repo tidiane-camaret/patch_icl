@@ -1,0 +1,32 @@
+# @package _global_
+# zanderch HU_Messung — 36 polytrauma whole-body CT cases, single class (l1_center), eval-only:
+# no synth, no aug. LOCAL cohort, not a public download — see docs/datasets/hu_lwk1.md for the
+# full characterization + protocol.
+#
+#   python scripts/convert_hu_lwk1.py --workers 16      # once, raw NFS -> native .npy
+#   python experiments/3d/eval.py dataset=hu_lwk1 eval.model=patchset3d eval.checkpoint=<ckpt>
+#
+# First CT (not MRI) native-grid eval source in this family (src/providers/native_grid.py
+# MODALITY="ct" default, global normalize_ct fingerprint — no per-subject stats needed).
+# `l1_center` is a small (~15mm typical, 9-23.4mm range across all 36 cases) HU-measurement
+# ROI at the L1 vertebral body centrum, not a vertebra segmentation — see docs/datasets/hu_lwk1.md
+# #2 for why this is a small-target localization task (closer to ISLES22/GNC than a TotalSeg
+# organ class) and #3 for how crop_spacing_mm / cascade_spacings below were picked.
+paths:
+  hu_lwk1: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/hu_lwk1/npy
+data:
+  source: hu_lwk1
+  loader_v2: true               # hu_lwk1 is v2-only (HuLwk1Provider + InContextDataset)
+  image_size: [128, 128, 128]
+  context_size: 1
+  use_crop: true
+  # 1mm: near-native in-plane resolution (native in-plane spacing 0.645-0.977mm across the 36
+  # cases) -- FOV=128mm gives ~5.5x margin over the largest target (23.4mm), matching the
+  # single-level baseline to the cascade's finest level (docs/datasets/hu_lwk1.md #3).
+  crop_spacing_mm: 1
+  val_classes: [l1_center]
+  max_val_subjects: null
+  mask_downsample: occupancy
+  mask_occupancy_thr: 0.5
+  image_antialias: true
+  class_balanced: false

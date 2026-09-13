@@ -262,6 +262,10 @@ def main(cfg: DictConfig) -> None:
         from src.providers.gnc_kidney import resolve_gnc_kidney_classes
         root = cfg.paths.get("gnc_kidney")
         classes = resolve_gnc_kidney_classes(cfg.data.val_classes)
+    elif source == "hu_lwk1":
+        from src.providers.hu_lwk1 import resolve_hu_lwk1_classes
+        root = cfg.paths.get("hu_lwk1")
+        classes = resolve_hu_lwk1_classes(cfg.data.val_classes)
     elif source == "totalseg_more_labels":
         from data.totalseg_classes import resolve_more_labels_classes
         root = cfg.paths.get("totalseg_more_labels")

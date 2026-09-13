@@ -97,12 +97,12 @@ def _source_root(cfg) -> tuple[str, str, bool]:
             raise ValueError("cfg.paths.totalseg_more_labels is not set "
                              "(needed for data.source=totalseg_more_labels)")
         return source, root, False
-    if source in ("flare22", "nasalseg"):
+    if source in ("flare22", "nasalseg", "hu_lwk1"):
         root = cfg.paths.get(source)
         if root is None:
             raise ValueError(f"cfg.paths.{source} is not set "
                              f"(needed for data.source={source})")
-        return source, root, False
+        return source, root, False   # native-grid CT sources
     if source in ("isles22", "shifts_ms", "msd_hippocampus", "msd_prostate", "atlas_v2",
                  "gnc_kidney"):
         root = cfg.paths.get(source)
@@ -261,7 +261,7 @@ def _assert_cascade_supported(cfg) -> None:
     # src/providers/native_grid.py::NativeGridProvider.load_native_crop.
     _cascade_sources = _TOTALSEG_SOURCES | {"multisource", "nasalseg", "flare22", "isles22",
                                             "shifts_ms", "msd_hippocampus", "msd_prostate",
-                                            "atlas_v2", "gnc_kidney"}
+                                            "atlas_v2", "gnc_kidney", "hu_lwk1"}
     if d.get("source", "totalseg") not in _cascade_sources:
         raise ValueError(f"data.cascade_spacings: source {d.get('source')!r} is not a "
                          f"cascade-capable source ({sorted(_cascade_sources)}).")
@@ -338,7 +338,7 @@ def build_dataset(cfg, split: str):
     """
     d = cfg.data
     if d.get("source") in ("flare22", "nasalseg", "isles22", "shifts_ms", "msd_hippocampus",
-                           "msd_prostate", "atlas_v2", "gnc_kidney"):
+                           "msd_prostate", "atlas_v2", "gnc_kidney", "hu_lwk1"):
         # Sources stored on their native anisotropic grid; the provider crops + resamples
         # to the isotropic model grid per item (src/providers/native_grid.py). v2 only.
         from src.incontext_dataset_v2 import InContextDataset
@@ -357,6 +357,8 @@ def build_dataset(cfg, split: str):
             from src.providers.msd_prostate import MsdProstateProvider as _Provider
         elif d.get("source") == "gnc_kidney":
             from src.providers.gnc_kidney import GncKidneyProvider as _Provider
+        elif d.get("source") == "hu_lwk1":
+            from src.providers.hu_lwk1 import HuLwk1Provider as _Provider
         else:
             from src.providers.atlas_v2 import AtlasV2Provider as _Provider
         is_train = split == "train"
@@ -928,7 +930,7 @@ def make_eval_loader(cfg, classes, split: str = "test", spacing: float | None = 
     if d.get("source") in ("omnisynth3d", "anchor_synth3d", "totalseg_more_labels",
                             "chemotox_bc", "synth_gmm_maisi", "flare22", "nasalseg",
                             "isles22", "shifts_ms", "msd_hippocampus", "msd_prostate",
-                            "atlas_v2", "gnc_kidney", "multisource"):
+                            "atlas_v2", "gnc_kidney", "hu_lwk1", "multisource"):
         # omniSynth3D / anchor_synth3d / totalseg_more_labels compose their own
         # deterministic multi-class eval datasets; route through build_dataset (the
         # same dataset the trainer uses, deterministic for val/test). Their pool
