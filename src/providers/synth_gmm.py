@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from data.maisi_classes import MAISI_CLASS_TO_IDX, MAISI_IDX_TO_CLASS
 from src.gpu_gmm_intensity import sample_grouped_uniform
@@ -84,8 +85,20 @@ class SynthGmmProvider:
         _, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
             arr, arr, center, list(e["spacing"]),
             image_size=(self.ds.T,) * 3, crop_mm=crop_mm, jitter=jitter, rng=rng)
+        # Cap the native crop BEFORE the expensive paint (RNG draw + antialias + occupancy
+        # resample, all at native res -- see docs/logs.md / memory project_synth_gmm_paint_perf):
+        # a wide-FOV level-0 crop can be ~400M-1.9B native voxels here, uncapped. Mirrors
+        # SynthGmmMaisiDataset._native_crop's own cap exactly (cheap nearest pre-downsample);
+        # out_sizes/pad_lo describe the TARGET grid placement and don't depend on the source
+        # array's shape, so capping here is a pure cost cut, not a correctness change.
+        crop_lbl = np.ascontiguousarray(crop_lbl, dtype=np.uint8)
+        cap = self.ds.gpu_realize_max_native
+        if cap and max(crop_lbl.shape) > cap:
+            new = tuple(min(cap, s) for s in crop_lbl.shape)
+            crop_lbl = (F.interpolate(torch.from_numpy(crop_lbl.astype(np.float32))[None, None],
+                                      size=new, mode="nearest")[0, 0].to(torch.uint8).numpy())
         img, mask = self.ds._resample_paint_mask(
-            np.asarray(crop_lbl), out_sizes, pad_lo, cls_id, mu_e, sd, member_nrng)
+            crop_lbl, out_sizes, pad_lo, cls_id, mu_e, sd, member_nrng)
 
         T = self.ds.T
         return self._NativeCrop(

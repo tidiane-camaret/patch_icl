@@ -464,6 +464,11 @@ def build_dataset(cfg, split: str):
                 cohort=(OmegaConf.to_container(cohort_cfg, resolve=True)
                         if OmegaConf.is_config(cohort_cfg) else dict(cohort_cfg)),
                 gpu_realize=False,   # cascade path builds NativeCrop directly
+                # not the GPU-realize pipeline itself (that stays off, see above) -- just the
+                # cheap nearest-pre-downsample cap _build_nc applies before painting (dead
+                # here before this fix: the constructor call never threaded this through, so
+                # the CLI override silently kept the class default; see docs/logs.md).
+                gpu_realize_max_native=int(d.get("gpu_realize_max_native", 256) or 0),
                 eval_seed=None,
                 paint_mask_aligned=bool((g.get("paint_mask_aligned")
                                          if OmegaConf.is_config(g)

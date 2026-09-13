@@ -89,3 +89,46 @@ def test_center_mode_random_fg_respects_an_explicit_center(tmp_path):
     req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0,
                       center=explicit, center_mode="random_fg")
     assert _center_used(provider, subject, str(CLS), req) == explicit
+
+
+def _native_shape_painted(provider, subject, cls, req):
+    """Run load_native_crop, return the crop_lbl.shape actually handed to
+    _resample_paint_mask (i.e. after any gpu_realize_max_native cap)."""
+    from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
+    real = SynthGmmMaisiDataset._resample_paint_mask
+    with patch.object(SynthGmmMaisiDataset, "_resample_paint_mask",
+                      autospec=True, side_effect=real) as m:
+        provider.load_native_crop(subject, cls, req)
+    return tuple(m.call_args.args[1].shape)  # args: (self, crop_lbl, out_sizes, ...)
+
+
+def test_build_nc_caps_native_crop_before_painting(tmp_path):
+    """DIM (32) > gpu_realize_max_native (8) -> _build_nc must pre-downsample the native
+    crop_lbl to <=8/axis before the expensive paint, mirroring _native_crop's cap."""
+    bank_dir = _make_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              gpu_realize_max_native=8)
+    provider = SynthGmmProvider(ds, cascade=True)
+    subject = "m00000.npy|1|0"
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None, center_mode="com")
+    shape = _native_shape_painted(provider, subject, str(CLS), req)
+    assert max(shape) <= 8, shape
+
+
+def test_build_nc_uncapped_when_gpu_realize_max_native_is_zero(tmp_path):
+    """gpu_realize_max_native=0 (falsy) -> unchanged behavior, native crop_lbl untouched.
+
+    organ_crop_arrays itself already shrinks DIM (32) down to the physical crop size
+    (T*crop_mm/spacing = 16*3/3 = 16) before _build_nc ever sees it, so the uncapped
+    shape here is 16, not DIM -- this pins that geometry so the cap test above (cap=8)
+    is verified against a real >cap native shape rather than an already-small one."""
+    bank_dir = _make_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              gpu_realize_max_native=0)
+    provider = SynthGmmProvider(ds, cascade=True)
+    subject = "m00000.npy|1|0"
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None, center_mode="com")
+    shape = _native_shape_painted(provider, subject, str(CLS), req)
+    assert shape == (16, 16, 16), shape

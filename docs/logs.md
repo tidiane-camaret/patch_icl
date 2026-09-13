@@ -8370,3 +8370,43 @@ memory file.
   via a spy model). Verified end-to-end against the real `92_multisource_synth` config
   (`+arch.cascade_registers=true`): builds, forwards, backward reaches the new params.
   268/268 existing tests still pass. Not yet enabled on the live GCP run.
+
+## 2026-09-14 — synth_gmm cascade path: cap the native crop before painting
+
+`data.p_synth=0.3` on `92_multisource_synth` was measured at ~3.3x the epoch time of
+`data.p_synth=0` (~20 vs ~6 min/epoch on GCP H100). Root cause: `SynthGmmProvider._build_nc`
+(the cascade path `multisource`+`p_synth` actually uses) ran the GMM paint — RNG draw +
+antialias prefilter + a separate occupancy area-pool, all in `SynthGmmMaisiDataset.
+_resample_paint_mask` — at the FULL NATIVE resolution of the `gmm_bank` mask, uncapped. The
+bank is near-native res (median dim 512³, ~0.8mm/voxel finest axis), so a level-0 crop at
+`crop_spacing_mm=6`/`image_size=128` pulls a native volume with median ~394M / 95th-pct
+~1.9B voxels through that pipeline, per member, per cascade level. The user's own attempted
+fix (`+data.gpu_realize=true +data.gpu_realize_max_native=512`) did nothing, for three
+independent reasons: `gpu_realize` is hardcoded `False` for this constructor call
+(`experiments/3d/common.py`, "cascade path builds NativeCrop directly"), `gpu_realize_max_native`
+was never threaded through to the dataset at all, and the GPU-realize collate path is only
+selected for the standalone `data.source=synth_gmm_maisi`, never for `multisource`.
+- `src/providers/synth_gmm.py::SynthGmmProvider._build_nc`: after `organ_crop_arrays`,
+  cap the native `crop_lbl` to `self.ds.gpu_realize_max_native` via a cheap nearest
+  pre-downsample (0/falsy = uncapped) BEFORE calling `_resample_paint_mask` — mirrors
+  `SynthGmmMaisiDataset._native_crop`'s own existing cap exactly. `out_sizes`/`pad_lo`
+  describe the target grid placement and don't depend on the source array's shape, so this
+  changes cost only, not correctness (place_image/resample_binary resize FROM whatever
+  shape they're handed TO out_sizes regardless).
+- `experiments/3d/common.py`: threaded `data.gpu_realize_max_native` (default 256, matching
+  the class default) into the `SynthGmmMaisiDataset(...)` construction — previously missing
+  entirely, so the CLI override silently no-opped. `gpu_realize` itself stays hardcoded
+  `False` for this path — this fix is CPU-only, no GPU plumbing.
+- 2 new tests in `src/providers/test_synth_gmm.py` (cap engages at cap=8 on a 16-voxel
+  native crop; cap=0 leaves it uncapped at 16) confirming the array handed to
+  `_resample_paint_mask` is actually reduced. Full suite: 269/277 pass, same 8
+  pre-existing `test_infer_nifti.py` failures as on HEAD (unrelated, confirmed via
+  `git stash`).
+- Deferring GPU-realize wiring for this path (i.e. running the paint itself on GPU, not
+  just this CPU cap): the existing CT-native-crop GPU pipeline (`src/gpu_realize_crop.py`,
+  already used by real `multisource` sources) is modality-agnostic but expects
+  `image`/`label_frac` already continuous (paint done); `src/gpu_synth_realize.py`'s
+  `SynthRealizer` does paint on GPU but only via its own incompatible collate
+  (`data.source=synth_gmm_maisi` standalone). Making the cascade path use GPU paint would
+  mean teaching `_realize_member` a "needs paint" branch, not just flipping a flag —
+  deferred pending a re-measurement of this cap's impact on the GCP run.
