@@ -13,7 +13,10 @@
 > decision, both unresolved). Next natural step if the *download-triage* queue resumes: pick
 > ACDC, AutoPET-III, or crossMoDA (crossMoDA needs the cochlea laterality-split decided first).
 > The *local-cohort* track (§ Third wave) has no queue — it proceeds only when the user names a
-> new local NFS path to inspect.
+> new local NFS path to inspect. **Two model/checkpoint-comparison sweeps now also exist on top
+> of these 7 sources** (§"Medverse (released weights) vs. patchset3d exp92" and §"patchset3d
+> `cascade_registers` checkpoint vs. exp92_orig") plus a marimo comparison notebook
+> (`results/presentations/val/per_dataset_analysis.py`) — see those sections for details.
 >
 > **Master results table (every source integrated so far, all exp92 checkpoint, ranked by
 > single-level Dice)** — see each row's doc for full detail, caveats, and figures:
@@ -373,6 +376,80 @@ RTX A6000 (`thor`); one harness `run_in_background` bash job was killed by a ses
 interruption partway through (mid-`cascade_msd_hippocampus`) and had to be resumed by
 re-launching only the incomplete jobs — a reminder that a single long `run_in_background`
 script is not robust across session boundaries, only within one continuous session.
+
+## patchset3d `cascade_registers` checkpoint vs. exp92_orig, across all 7 sources (2026-09-14)
+
+A third axis: a NEW `patchset3d` checkpoint, `2026-09-14_92_multisource_synth_cascade_register/
+best.pt` (wandb `o036jpot`), compared against the exp92_orig checkpoint already in the master
+table. **Same `experiment=92_multisource_synth` Hydra config, same recipe** (`data.
+cascade_spacings=[6,3,1.5]`, same `cascade_query_prior` mixture, same multisource CT+MRI mix) —
+the only difference is **`arch.cascade_registers=true`** (the register-carry mechanism, see
+[[project_cascade_register_carry]], previously implemented but gated off by default), and the
+run was **resumed from `2026-09-12_90_multisource_random_cascade_center/best.pt`** rather than
+trained from scratch. Because `eval.py` rebuilds `cfg.arch` from the checkpoint's own stored
+`arch`, the exact same master-table eval skeleton applies unchanged — only `eval.checkpoint`
+differs. **Caveat**: the wandb run was still `state: running` (epoch 36/140, `val/best_dice=
+0.5047` in-vocabulary TotalSeg) when this sweep was queued — `best.pt` is a snapshot of a
+still-training checkpoint, evaluated on explicit user direction ("eval this snapshot now"), not
+a finished model.
+
+Reran BOTH single-level and cascade for all 7 sources (the cascade ladder for sources that had
+no prior patchset3d cascade result — shifts_ms/msd_hippocampus/msd_prostate/atlas_v2 — reuses
+the same new `[6,3,fine]` ladders established for the medverse sweep above, for direct
+comparability).
+
+| dataset | single-level exp92_orig | single-level cascade_register | cascade exp92_orig | cascade cascade_register |
+|---|---:|---:|---:|---:|
+| hu_lwk1 | 0.1164 | **0.1611** | **0.1287** | 0.0935 |
+| isles22 | 0.0544 | **0.0615** | 0.0460 | **0.0525** |
+| shifts_ms | 0.0632 | **0.0831** | not run | 0.0517 (new) |
+| msd_hippocampus | **0.4809** | 0.4768 | not run | 0.3768 (new) |
+| msd_prostate | **0.2946** | 0.2802 | not run | 0.3681 (new) |
+| atlas_v2 | **0.0280** | 0.0229 | not run | 0.0234 (new) |
+| gnc_kidney | **0.0585** | 0.0606 | **0.0189** | unobtained (see below) |
+
+(bold = better of the two directly-comparable numbers per column-pair; "not run"/"new" cells
+have no prior patchset3d baseline to compare against)
+
+**Mixed result, not a clean win**: single-level improves on 3/7 sources (hu_lwk1 +0.045,
+isles22 +0.007, shifts_ms +0.020), is roughly flat-to-slightly-worse on 3/7 (msd_hippocampus
+−0.004, msd_prostate −0.014, atlas_v2 −0.005), and is a small improvement on gnc_kidney
+(+0.002). Cascade is more clearly positive where comparable (isles22 +0.007) but the one
+directly-comparable regression is notable: **hu_lwk1's cascade drops from 0.1287 to 0.0935**
+(−0.035) — the ONE source where cascading was previously found to help (see the Third-wave
+section above), now hurt by enabling `cascade_registers`. Given the checkpoint was still
+training at 26% of its schedule when evaluated, none of this should be read as a final verdict
+on the register-carry mechanism — a re-eval once training completes (or plateaus) is the
+natural next step.
+
+**gnc_kidney's cascade result is UNOBTAINED after 3 attempts** — a real operational finding,
+not a modeling one:
+1. First attempt: `wandb.init()` timed out after 90s (`CommError`, SSL retry failures) —
+   transient network issue.
+2. Second attempt: the eval loop completed all 187 batches (1490 samples, 100%), but the process then
+   vanished from `ps aux` with no `Mean Dice`/`Error`/`Traceback` ever written — a silent death
+   in the post-loop wandb-upload phase (no OOM evidence, GPU fully freed after).
+3. Third attempt: `wandb.project=null` (disabled entirely) to rule out wandb — the eval loop
+   again completed cleanly, but post-loop scoring then stalled for 16+ minutes with 32 idle
+   `torch._inductor.compile_worker` processes sitting at 0% CPU and no log growth — consistent
+   with a hung `torch.compile` recompile (this checkpoint has `arch.compile=true` +
+   `cascade_registers=true`, a different graph than exp92_orig, possibly triggering a fresh
+   compile on some late-batch edge case in gnc_kidney's 13-class per-class-plane cascade
+   scoring path that never got exercised by the other 6 sources). Killed after 16 min of no
+   progress. **Not retried a 4th time** — every other cell in the table above is solid; this is
+   the one gap. Worth root-causing separately if this checkpoint (or `cascade_registers`
+   generally) becomes a priority — the failure signature (idle compile workers, no log growth)
+   points at `torch.compile`, not the cascade/scoring logic itself.
+
+**Per-dataset comparison notebook**: `results/presentations/val/per_dataset_analysis.py` (a
+marimo notebook) now covers exp92_orig, this `cascade_register` checkpoint, and the released-
+Medverse sweep together — 4-metric grids (Dice/NSD/ms-per-sample/GFLOPs, one panel per
+dataset, all variants at once) plus a "what drives Dice" section that extracts real per-class
+task properties (mask size, bbox extent, blob-vs-scattered via connected-component count,
+fg/bg intensity contrast — via `results/presentations/val/compute_class_properties.py`,
+cached in `class_props_cache.json`) and correlates them against Dice per model/checkpoint
+family. Self-contained: rescans `eval.json` outputs on every open, no manual CSV exports to
+keep in sync.
 
 ## Still gated, no path found
 

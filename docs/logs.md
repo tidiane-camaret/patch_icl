@@ -8601,3 +8601,40 @@ still `state: running` (epoch 36/140) when inspected — `best.pt` a moving targ
 user chose to eval the snapshot now anyway. Queued a 14-job single-level+cascade sweep across
 all 7 sources (`scripts` in scratchpad), chained to start automatically once the medverse sweep
 above released the shared local GPU.
+
+## 2026-09-14 — cascade_register checkpoint sweep results + a marimo comparison notebook
+
+Full results: `docs/datasets/eval_expansion_status.md` new "patchset3d `cascade_registers`
+checkpoint vs. exp92_orig" section. Mixed, not a clean win: single-level improves on 3/7
+sources (hu_lwk1 +0.045, isles22 +0.007, shifts_ms +0.020), flat-to-slightly-worse on
+msd_hippocampus/msd_prostate/atlas_v2, small improvement on gnc_kidney. Cascade improves on
+isles22 (+0.007, the one directly-comparable case) but **hu_lwk1's cascade regresses from
+0.1287 to 0.0935** — the one source where cascading previously helped, now hurt by enabling
+`arch.cascade_registers`. Checkpoint was still training (epoch 36/140) when evaluated, so none
+of this is a final verdict.
+
+**gnc_kidney's cascade cell is unobtained after 3 attempts** — a real operational finding:
+attempt 1 hit a `wandb.init()` 90s timeout (SSLError retries, transient network); attempt 2
+completed the full eval loop (1490 samples) but the process then vanished silently in the
+post-loop wandb-upload phase (no traceback, no OOM evidence); attempt 3 ran with
+`wandb.project=null` to rule out wandb, again completed the eval loop, but then stalled 16+
+minutes with 32 idle `torch._inductor.compile_worker` processes at 0% CPU and no log growth —
+consistent with a hung `torch.compile` recompile specific to this checkpoint
+(`arch.compile=true` + `cascade_registers=true`, a different graph than exp92_orig) hitting
+gnc_kidney's 13-class per-class-plane cascade-scoring path. Killed after 16 min; not retried a
+4th time. Worth root-causing separately (points at torch.compile, not the scoring logic) if
+this checkpoint becomes a priority.
+
+**New**: `results/presentations/val/per_dataset_analysis.py`, a marimo notebook (first in this
+repo outside `experiments/totalseg_more_labels/explore.py`) comparing exp92_orig,
+cascade_register, and the released-Medverse sweep together. Self-contained — rescans
+`eval.json` under `3d_eval/` on every open (no manual CSV to keep in sync). Sections: full
+per-class table, 4-metric grids (Dice/NSD/ms-per-sample/GFLOPs × 7-dataset subplot grid, no
+dropdown — everything visible at once, per explicit user direction), and a "what drives Dice"
+analysis: `compute_class_properties.py` extracts real per-(source,class) task properties
+directly from native-grid GT via `provider.native_gt()` (mask size, bbox extent, blob-vs-
+scattered via connected-component count, fg/bg intensity contrast; ~4 min, cached to
+`class_props_cache.json`, committed alongside the notebook), then scatter-plots + a Spearman
+correlation table quantify which property actually predicts Dice per model/checkpoint family.
+Verified 3 ways at each edit: `marimo check` (lint), `marimo export script` + execution
+(dependency-graph + runtime correctness), and a live `marimo run --headless` smoke test.
