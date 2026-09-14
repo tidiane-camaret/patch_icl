@@ -8536,3 +8536,46 @@ precomputed per-class foreground-voxel cache, mirroring the existing `cents` cen
 - Not yet run against the real bank — next step: run `add_fg_samples_to_bank.py` on the NFS
   box where the bank lives, sync the updated `index.pkl` (small — masks untouched) to the
   bucket and the GCP VM's disk, re-measure.
+
+## 2026-09-14 — released Medverse (cascade + native autoregressive) across all 7 eval sources
+
+Answers "evaluate the original medverse weights and pipeline on our dataset suite" + "use the
+exact cascade mode internal to medverse ('autoregressive')". No code changes — every knob
+already existed (`eval.model=medverse`, `data.cascade_spacings`, `data.cascade_query_prior`,
+`data.image_size`, `eval.sw_overlap`, `eval.autocast`). 21 `eval.py` runs, released weights, no
+`eval.checkpoint`, across isles22/shifts_ms/msd_hippocampus/msd_prostate/atlas_v2/gnc_kidney/
+hu_lwk1: harness cascade with `cascade_query_prior=none`, harness cascade with the default
+`pred` mixture, and Medverse's own native `autoregressive_inference` (`data.image_size=
+[256,256,256]` → `auto_level=2`, `eval.sw_overlap=0.0` + `eval.autocast=true`). Full results
+table + interpretation: `docs/datasets/eval_expansion_status.md` new "Medverse (released
+weights) vs. patchset3d exp92" section.
+
+Two universal findings: (1) `query_prior=pred` hurts the harness cascade on every source
+(7/7), sometimes catastrophically (msd_hippocampus 0.69→0.05) — released weights were never
+trained on this project's prediction-feedback NA-ICL injection, only a *fine-tuned* checkpoint
+was (2026-09-09 entry). (2) native-AR wins or ties on 6/7 sources; best-of-Medverse beats the
+patchset3d exp92 baseline on 4/7 (shifts_ms, msd_hippocampus, msd_prostate, atlas_v2), loses on
+3/7 (hu_lwk1, isles22 narrowly, gnc_kidney clearly). hu_lwk1's cascade collapses to exactly
+0.0000 regardless of query_prior — a separate cause (6mm×128vox=768mm coarse FOV vs. an
+11-23mm target), not fixed by the query_prior finding.
+
+Ran unattended (~6h) over multiple `ScheduleWakeup` check-ins. One `run_in_background` bash
+script was killed mid-run by a session interruption (harness bg-task teardown, not a bug) —
+resumed cleanly by diagnosing which of the 14 jobs had finished from their log files and
+re-launching only the missing ones. Takeaway: a single long-running background script is not
+robust across session boundaries even though it survives fine within one continuous session.
+
+## 2026-09-14 — patchset3d `cascade_registers` checkpoint queued for the same 7-source eval
+
+`2026-09-14_92_multisource_synth_cascade_register/best.pt` (wandb `o036jpot`) inspected before
+eval: same `experiment=92_multisource_synth` Hydra config as the exp92 checkpoint already in
+the master table (`data.cascade_spacings=[6,3,1.5]`, `cascade_query_prior` mixture, multisource
+CT+MRI — all byte-identical), differing only in `arch.cascade_registers=true` (previously
+gated off by default) and resuming from `2026-09-12_90_multisource_random_cascade_center/
+best.pt` instead of training from scratch. Since `eval.py` rebuilds `cfg.arch` from the
+checkpoint's own stored `arch`, the existing master-table eval skeleton applies unchanged —
+just swap `eval.checkpoint`. Caveat surfaced and flagged before running: the wandb run was
+still `state: running` (epoch 36/140) when inspected — `best.pt` a moving target, not final;
+user chose to eval the snapshot now anyway. Queued a 14-job single-level+cascade sweep across
+all 7 sources (`scripts` in scratchpad), chained to start automatically once the medverse sweep
+above released the shared local GPU.

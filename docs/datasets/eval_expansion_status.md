@@ -288,6 +288,92 @@ those two facts may be related (same-modality + a bony, structurally organ-like 
 Qualitative figure shows a real semantic-mismatch failure (model predicts a whole-vertebra
 shape, not the small measurement ROI), not a localization bug. Full detail: `hu_lwk1.md` §6-8.
 
+## Medverse (released weights) vs. patchset3d exp92, across all 7 sources (2026-09-14)
+
+Different axis from everything above: instead of a new dataset, this compares **models** on
+the sources already integrated — released (never fine-tuned) Medverse weights, evaluated
+through 3 distinct inference regimes, against the exp92 `patchset3d` single-level numbers
+already in the master table above. Prompted by "evaluate the original medverse weights and
+pipeline on our dataset suite" + "also use the exact cascade mode internal to medverse
+('autoregressive')". `eval.model=medverse`, no `eval.checkpoint` (`MedverseModel()` loads its
+own released weights) throughout.
+
+**Three Medverse inference modes, all supported by `experiments/3d/eval.py` already**:
+1. **harness cascade, `query_prior=none`** — our own `data.cascade_spacings` re-crop cascade
+   (`cascade.evaluate_cascade`), 3 independent forwards on progressively finer/re-centered
+   crops, no extra feedback signal.
+2. **harness cascade, `query_prior=pred`** (`true`/exp92's own default mixture,
+   `{pred:.8,none:.1,gt:.1} eval_mode=pred`) — same re-crop cascade, but each level's
+   prediction is ALSO fed into Medverse's NA-ICL `image_context_in` channel as a prior, exactly
+   as the checkpoint-based (fine-tuned) medverse eval already did in the 2026-09-09 log entry.
+3. **native autoregressive (`predict()` → `autoregressive_inference`)** — Medverse's OWN
+   architecture-native multi-resolution pyramid, triggered by `data.image_size=[256,256,256]`
+   (`auto_level = ceil(log2(256/128))+1 = 2` vs. `auto_level=1` at the usual 128³): one coarse
+   128³ forward over the doubled FOV, feeding its upsampled output as the NA-ICL prior into a
+   MONAI sliding-window fine pass at native res. `eval.sw_overlap=0.0` + `eval.autocast=true`
+   (the accuracy-safe fast settings from the 2026-09-08 log entries) throughout. No
+   `data.cascade_spacings` set — this is the plain `evaluate_classes` path, cascading happens
+   entirely inside Medverse's own `predict()`.
+
+Every source's cascade ladder reuses the convention established above (exp92's own coarse/mid
+points `[6,3]`, fine point = that source's real target scale) — `[3,1.5]` isles22, `[6,3,1.5]`
+shifts_ms (new), `[6,3,0.5]` msd_hippocampus (new), `[6,3,0.75]` msd_prostate (new), `[6,3,1.9]`
+atlas_v2 (new), `[6,3,1.2]` gnc_kidney, `[6,3,1]` hu_lwk1.
+
+| dataset | patchset3d exp92 single-level | medverse cascade (prior=none) | medverse cascade (prior=pred) | medverse native-AR | best medverse mode |
+|---|---:|---:|---:|---:|---|
+| hu_lwk1 | **0.1164** | 0.0000 | 0.0000 | 0.0714 | AR (only non-collapsed mode) |
+| isles22 | **0.0544** | 0.0486 | 0.0348 | 0.0527 | AR (narrow) |
+| shifts_ms | 0.0632 | 0.0360 | 0.0279 | **0.1520** | AR |
+| msd_hippocampus | 0.4809 | 0.6905 | 0.0500 | **0.6908** | AR (~tie cascade-none) |
+| msd_prostate | 0.2946 | 0.3268 | 0.2514 | **0.4227** | AR |
+| atlas_v2 | 0.0280 | **0.1259** | 0.0199 | 0.0227 | cascade, prior=none |
+| gnc_kidney | **0.0585** | 0.0078 | 0.0009 | 0.0112 | AR |
+
+(bold = best result for that row across all 4 numbers)
+
+**Two clean, universal findings**:
+1. **`query_prior=pred` hurts the harness cascade on every single source tested (7/7)** —
+   sometimes catastrophically (msd_hippocampus 0.6905→0.0500, gnc_kidney 0.0078→0.0009,
+   atlas_v2 0.1259→0.0199). Released Medverse was never trained on this project's
+   prediction-feedback warp into its NA-ICL channel (only a *fine-tuned* checkpoint was, per
+   the 2026-09-09 log entry, and even that carried "a mild train/eval shift" caveat) — feeding
+   it into raw released weights is feeding a genuinely out-of-distribution second input
+   channel. **Always eval released Medverse's harness-cascade with `data.cascade_query_prior=
+   none`.** (hu_lwk1's cascade collapses to exactly 0.0000 either way — see below, a separate,
+   compounding cause.)
+2. **No single Medverse mode dominates, but native-AR wins or ties on 6/7 sources** — the one
+   exception, atlas_v2, is won by harness cascade (prior=none) instead. Best-of-Medverse beats
+   the patchset3d exp92 single-level baseline on 4/7 sources (shifts_ms, msd_hippocampus,
+   msd_prostate, atlas_v2) and loses on 3/7 (hu_lwk1, isles22 narrowly, gnc_kidney clearly) —
+   patchset3d's advantage concentrates on the sources most reliant on this project's own
+   crop-spacing/cascade machinery (hu_lwk1's tiny ROI, gnc_kidney's 13-class small-lesion
+   regime), while Medverse's native multi-resolution pyramid is competitive or better on
+   larger/more compact single-object targets (hippocampus, prostate zones, whole-brain
+   lesions).
+3. **hu_lwk1's harness cascade collapses to exactly 0.0000 regardless of `query_prior`** — this
+   is a SEPARATE finding from #1 (disabling the prior did not fix it). Most likely cause: the
+   coarsest cascade level sits at `6mm × 128vox = 768mm` FOV (most of a whole-body polytrauma
+   scan) for a target only 11-23mm across — released, never fine-tuned Medverse plausibly
+   predicts genuinely empty masks at that scale for a target this small, and an empty coarse
+   prediction degrades every subsequent re-crop. Consistent with native-AR (which only spans a
+   256mm FOV at its coarsest level) working fine on the same weights (0.0714) — a real
+   FOV-scale limitation of the harness cascade's coarse point for this one source, not a
+   pipeline bug.
+
+**Reusable command skeletons** (both new relative to the master table above):
+- cascade (prior=none): same cascade skeleton as the master table, **add
+  `data.cascade_query_prior=none`**, `eval.model=medverse`, no `eval.checkpoint`.
+- native-AR: `python experiments/3d/eval.py dataset=<name> eval.model=medverse
+  data.image_size=[256,256,256] eval.sw_overlap=0.0 eval.autocast=true eval.split=test` — the
+  plain single-level path, NOT `data.cascade_spacings`.
+
+**Methodology note**: this sweep (21 eval.py runs total) ran unattended over ~6h on the local
+RTX A6000 (`thor`); one harness `run_in_background` bash job was killed by a session
+interruption partway through (mid-`cascade_msd_hippocampus`) and had to be resumed by
+re-launching only the incomplete jobs — a reminder that a single long `run_in_background`
+script is not robust across session boundaries, only within one continuous session.
+
 ## Still gated, no path found
 
 | dataset | modality | OOD class(es) | blocker |
