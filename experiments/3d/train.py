@@ -1138,6 +1138,15 @@ def main(cfg: DictConfig) -> None:
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
         msg = f"Compiled net.transformer + Newton–Schulz (dynamic={_cdyn})"
+        if hasattr(net, "compressor"):
+            # seq_compress's Stage A/C: _compress/_expand are methods looping over an
+            # nn.ModuleList (no forward of its own to compile directly) — shadow them with
+            # compiled callables the same way compile_decoder shadows _decode below. No
+            # separate flag: automatic whenever arch.compile and arch.seq_compress are both
+            # true. Likely NOT bit-exact vs eager either, same caveat as compile_decoder.
+            net._compress = torch.compile(net._compress, dynamic=_cdyn)
+            net._expand = torch.compile(net._expand, dynamic=_cdyn)
+            msg += " + seq_compress stages"
         msg += _compile_encoder(net, cfg)
         if cfg.arch.get("compile_decoder", False):
             # _decode is a method, so this shadows it with a compiled callable on the instance —

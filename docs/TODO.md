@@ -228,3 +228,47 @@ Rough estimate: tens of MB extra per level-transition (not negligible, unlike
 measurement before committing to it, not just this reasoning. Only the `pred` mode is
 affected (`gt_coarse`/`gt_fine` modes use dataloader GT tensors, already non-differentiable,
 so detaching them is a no-op either way).
+
+---
+
+## seq_compress: wire RoPE through Stage A/C (currently asserted incompatible)
+
+Spec: `docs/superpowers/specs/2026-09-14-patchset3d-sequence-compression-design.md`. Today
+`PatchSet3D.__init__` hard-fails the combination:
+
+```python
+assert not (self.seq_compress and self.transformer_rope), (
+    "arch.seq_compress=True does not carry RoPE through the compress/expand stages -- "
+    "incompatible with arch.transformer_rope=True for now")
+```
+
+**Why this is a real correctness gap, not just a missing perf path.** When
+`arch.transformer_rope=True`, `self.pos` (the additive Fourier position embedding baked into
+every token in `_tokens`) is set to `None` — position is instead carried entirely by RoPE
+rotations inside the main transformer's row-axis attention (`_rope`). `RowCrossAttention`
+(Stage A/C, `src/models/pfn_seg_2d.py`) has no RoPE support at all — plain cross-attention,
+no positional term. So under `transformer_rope=True` + `seq_compress=True`, a raw per-cell
+token entering Stage A would carry **zero** position information (no additive PE, no RoPE),
+and the compressor wouldn't know which cell it's pooling; Stage C's expand wouldn't know
+where in the volume each output belongs either. The `assert` exists to fail loudly instead of
+silently shipping position-blind compression/expansion.
+
+**Practical scope today:** `transformer_rope` is unset (default `False`) in
+`configs/experiment/3d/model/patchset3d.yaml` and in the `92_multisource_synth` lineage, so
+`seq_compress` works fine there. It blocks `seq_compress` on `model/m1.yaml`,
+`model/m2_patchset_decoder.yaml`, and experiments 37/40/42/43 (all set `transformer_rope: true`).
+
+**Sketch to lift it.** Wire real RoPE cos/sin into `RowCrossAttention` for the *raw per-cell*
+side only:
+- Stage A: KV side (the volume's raw `N` cells) gets real `(i,j,k)` positions; the Q side
+  (learned `compress_slots`) gets `(0,0,0)` — no rotation, same treatment `_rope` already
+  gives `thinking`/cascade-memory rows.
+- Stage C: Q side (the query's raw per-cell tokens) gets real positions; the KV side
+  (post-transformer compressed rows) gets `(0,0,0)`.
+
+Needs `RowCrossAttention.forward` to accept separate `rope_q`/`rope_kv` cos/sin pairs (Q and
+KV have different row-position meanings and counts, unlike `TransformerEncoderLayer`'s
+self-attention where q/k share one row indexing) and `apply_rope` calls on each side
+independently before the cross-attention SDPA call. Deliberately scoped out of `seq_compress`
+v1 to avoid shipping an untested RoPE-through-cross-attention scheme; revisit if a
+`transformer_rope=True` recipe wants `seq_compress` too.

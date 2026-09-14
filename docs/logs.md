@@ -22,6 +22,22 @@ blocks do — they were only excluded before by an accident of parameter-name ma
 `compress_slots` (a bare learned `(n,e)` `nn.Parameter`) stays on AdamW, matching
 `thinking.tokens`'s treatment; this was a deliberate fix-wave decision, not an oversight.
 
+**Follow-up: `arch.compile` now also covers Stage A/C.** `_compress`/`_expand` previously ran
+eager always — under `arch.seq_compress=true`, `LowerPrecisionRMSNorm`'s deliberate
+disable-autocast-to-force-upcast behavior (pre-existing, used throughout the dual-axis
+transformer) triggered a `UserWarning: Mismatch dtype between input and weight ... Cannot
+dispatch to fused implementation` at every step from `RowCrossAttention`'s new norm call
+sites — harmless (correct results, just the slower unfused kernel) but audible only from
+Stage A/C because they're eager, whereas the same call pattern inside the compiled
+`net.transformer` doesn't replay the warning per step. `experiments/3d/train.py::build_model`
+now compiles `net._compress`/`net._expand` (method-level, mirroring how `compile_decoder`
+shadows `_decode` — `_compress`/`_expand` loop over an `nn.ModuleList`, which has no `forward`
+of its own to compile directly) whenever `hasattr(net, "compressor")`, i.e. automatically
+whenever `arch.compile` and `arch.seq_compress` are both true — no new flag. Verified (CPU,
+no GPU on this node): compiles cleanly, eager-vs-compiled max abs diff 1.6e-7 (fp noise, same
+"not bit-exact" caveat as the other compile extensions), and handles a varying context size K
+across calls under `dynamic=True` without recompiling per K.
+
 ## 2026-09-14 — GNC_705 kidney lesions: converter + provider + eval (single-level and cascade)
 
 Built and ran the full pipeline for GNC_705 (`scripts/convert_gnc_kidney.py`,
