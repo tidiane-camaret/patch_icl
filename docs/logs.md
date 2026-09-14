@@ -8435,6 +8435,19 @@ selected for the standalone `data.source=synth_gmm_maisi`, never for `multisourc
   the small measurement ROI the GT actually marks — partial overlap from spatial proximity, not
   true agreement on the target's extent.
 
+- 2026-09-14 — **Consolidated all eval-expansion results into one master table**
+  (`docs/datasets/eval_expansion_status.md`, top of file): every source integrated + eval'd
+  against exp92 so far (7 total — ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS
+  v2.0, GNC_705, HU_LWK1), ranked by single-level Dice, with cascade numbers/ladders/verdicts
+  where run, the shared checkpoint path, reusable single-level/cascade `eval.py` command
+  skeletons, the cascade-ladder convention (reuse exp92's own trained coarse/mid points [6,3],
+  correct only the fine point per-dataset), and both general infra fixes now in play
+  (`native_gt`/`gt_loader` cascade-scoring hook; the first-eval centroid-cache-hang
+  workaround). Added a new "Third wave" section documenting the local-NFS-cohort track
+  (GNC_705, HU_LWK1) that runs separately from the download-triage queue above it. Purpose:
+  a single up-to-date entry point for resuming this work later without re-deriving numbers
+  from each dataset's own doc.
+
 ## 2026-09-14 (cont.) — synth_gmm cascade path: the cap didn't help because materialize ran
 ## before it (fixed: stride-slice the lazy mmap view before ascontiguousarray, not after)
 

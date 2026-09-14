@@ -1,14 +1,63 @@
 # Eval dataset expansion — access triage (2026-09-12, refocused on non-CT + OOD classes)
 
-> **STATUS AS OF 2026-09-13, paused here on user direction ("leave this dataset for now"):**
-> Integrated + eval'd: ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0 (5 total).
-> Characterized but NOT wired: AMOS22 (deliberate in-vocabulary control), ACDC, AutoPET-III,
-> crossMoDA, **BraTS 2024 (explicitly parked — do not resume without new direction)**.
-> Nothing is downloading or running in the background right now. See §"Second wave" below and
-> `docs/datasets/brats2024.md` for exactly why BraTS was stopped at characterization (provenance
-> + a 3-way technical-scope decision, both unresolved). Next natural step if dataset expansion
-> resumes: pick ACDC, AutoPET-III, or crossMoDA (crossMoDA needs the cochlea laterality-split
-> decided first) — all three are technically ready for an "integrate X" instruction.
+> **STATUS AS OF 2026-09-14** (updated to fold in the "local NFS cohort" track — GNC_705,
+> HU_LWK1 — which started as a separate user-directed thread, not part of the original
+> download-triage queue below, but is now the same kind of "integrated + eval'd against exp92"
+> source and belongs in the same running tally):
+> Integrated + eval'd: ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0, **GNC_705
+> kidney lesions, HU_LWK1 L1-vertebra ROI** (7 total). Characterized but NOT wired: AMOS22
+> (deliberate in-vocabulary control), ACDC, AutoPET-III, crossMoDA, **BraTS 2024 (explicitly
+> parked — do not resume without new direction)**. Nothing is downloading or running in the
+> background right now. See §"Second wave"/§"Third wave" below and `docs/datasets/brats2024.md`
+> for exactly why BraTS was stopped at characterization (provenance + a 3-way technical-scope
+> decision, both unresolved). Next natural step if the *download-triage* queue resumes: pick
+> ACDC, AutoPET-III, or crossMoDA (crossMoDA needs the cochlea laterality-split decided first).
+> The *local-cohort* track (§ Third wave) has no queue — it proceeds only when the user names a
+> new local NFS path to inspect.
+>
+> **Master results table (every source integrated so far, all exp92 checkpoint, ranked by
+> single-level Dice)** — see each row's doc for full detail, caveats, and figures:
+>
+> | dataset | modality | n | single-level Dice / NSD | cascade Dice / NSD (ladder) | cascade verdict |
+> |---|---|---:|---:|---:|---|
+> | MSD Hippocampus | MRI (T1) | 260 | 0.481 / 0.719 | not run | — |
+> | MSD Prostate | MRI (T2/ADC) | 124 | 0.295 / 0.321 | not run | — |
+> | HU_LWK1 (l1_center) | **CT** | 36 | 0.116 / 0.131 | 0.129 / 0.073 `[6,3,1]` | **does NOT hurt** (only source where this is true) |
+> | Shifts-MS | MRI (FLAIR) | 46 | 0.063 / 0.165 | not run | — |
+> | ISLES22 | MRI (DWI) | 247-250 | 0.054 / 0.074 | 0.046 / — `[3,1.5]` | hurts — report single-level |
+> | GNC_705 (13 kidney-lesion classes) | MRI (Dixon water) | 1490 | 0.0585 / 0.0784 | 0.0189 / 0.0293 `[6,3,1.2]` | hurts — report single-level |
+> | ATLAS v2.0 | MRI (T1) | 654 | 0.028 / 0.038 | not run | — (⚠️ provenance caveat) |
+>
+> **Checkpoint used for every row above**: `.../3d_train/2026-09-11_92_multisource_synth/
+> best.pt` (exp92, `patchset3d`, trained cascade ladder `[6, 3, 1.5]`). **Reusable command
+> skeleton** (single-level): `python experiments/3d/eval.py dataset=<name> eval.model=
+> patchset3d eval.checkpoint=<ckpt>`; (cascade): `python experiments/3d/eval.py experiment=
+> 92_multisource_synth eval.model=patchset3d eval.checkpoint=<ckpt> data.source=<name>
+> data.crop_spacing_mm=<coarse> data.cascade_spacings=[<coarse>,<mid>,<fine>]
+> data.mask_downsample=occupancy data.gpu_realize_crop=false data.val_classes=<list>
+> train.cascade_loss_weights=[1,1,1] eval.split=test eval.cascade_figures=true`. Cascade
+> spacing-ladder convention established across GNC/HU_LWK1: **reuse exp92's own trained
+> coarse/mid points (6, 3) unchanged, correct only the fine point to the new dataset's real
+> measured max target extent** (don't reuse another dataset's fine point blindly).
+>
+> **Two general infra fixes surfaced by this work, both live now** (benefit any future
+> native-grid source, not dataset-specific):
+> 1. `NativeGridProvider.native_gt(subject, cls)` hook (`src/providers/native_grid.py`) +
+>    `gt_loader` param threaded through `evaluate._stitched_native_metrics_multi`/
+>    `_stitched_native_dice_multi` + `cascade.py` — cascade's native-space scorer used to
+>    hardcode reading a shared `label.npy`, crashing on GNC's per-class-plane storage (classes
+>    that don't partition the volume). Default reproduces the old behavior exactly (byte-
+>    verified vs. ATLAS v2.0); a new source only needs to override `native_gt` if its classes
+>    don't partition (GNC does; HU_LWK1 didn't need to). **NOT fixed**: the older pre-v2
+>    `evaluate.evaluate_spacing_sweep(cascade=True)` path has the same gap, untouched (unused
+>    by anything integrated so far).
+> 2. **Latent hang on ANY brand-new source's first-ever eval**: `eval.workers=20` (repo
+>    default) + no pre-existing `.centroid_cache*.pkl` → every DataLoader worker independently
+>    spawns its own nested `ProcessPoolExecutor(16)` for centroid building → 20×16 process
+>    explosion, hangs (confirmed via `pstree`). **Workaround** (not yet fixed upstream): before
+>    the first `eval.py` run on a new source, pre-build the cache once in the main process
+>    (e.g. `HuLwk1Provider(root=..., classes=...)` directly) so every worker takes the fast
+>    `pickle.load` path instead.
 
 Follow-up to `docs/datasets/eval_strategy_report.md`. Originally a broad triage across every
 tier the report names; **refocused per direction: prioritize non-CT modalities and classes
@@ -201,6 +250,44 @@ integration than GLI/PED. Largest case pool of any source pulled this session (2
 AutoPET-III's 1,038). Not yet wired — three separate technical questions (GLI, PED, MEN-RT
 each need their own decision), on top of the provenance question already flagged.
 
+## Third wave (2026-09-13/14): local NFS cohorts, user-directed one-at-a-time
+
+Different track from the download-triage queue above: the user names a specific local NFS
+path, we inspect/census it, design an eval protocol, convert+wire it, and eval against exp92.
+No backlog/queue here — it proceeds only when a new path is named.
+
+| dataset | modality | OOD class(es) | n usable | status | doc |
+|---|---|---|---:|---|---|
+| **GNC_705 kidney lesions** | MRI (Dixon, water channel) | 14 kidney-lesion classes (hyper/hypo/complex ×L/R + cyst/mask variants) | 610 (subject,visit) cases | ✅✅ **integrated + eval'd** (single-level Dice 0.0585; cascade `[6,3,1.2]` Dice 0.0189, WORSE) | `gnc_kidney_lesions.md` |
+| **HU_LWK1** (zanderch HU_Messung) | **CT** (first CT native-grid source) | `l1_center`, small L1-vertebra HU-measurement ROI | 36 cases | ✅✅ **integrated + eval'd** (single-level Dice 0.1164; cascade `[6,3,1]` Dice 0.1287, does NOT hurt) | `hu_lwk1.md` |
+
+**GNC_705** (`/nfs/data/nii/data0/GNC/GNC_705/`, local restricted-access National Cohort MRI):
+30,385 subjects total, 49,220 (subject,visit) cases, but labels only 1.24% sparse (610 cases).
+Census done via threaded NFS scan (`scripts/inspect_gnc_kidney.py`, `ThreadPoolExecutor(128)`,
+~305s for 30k dirs). Key finding driving the whole design: the 14 class names are **NOT** a
+clean subset hierarchy — `mask_X` overlaps `X` only when crop boxes coincide exactly, so
+`GncKidneyProvider` stores **one binary plane per class** (`label_{cls}.npy`) instead of a
+shared multi-valued array, and needed 3 method overrides
+(`_load_or_build_centroids`/`load`/`load_native_crop`) plus the `native_gt` hook mentioned
+above. `val_classes` excludes `hyper_mask_r` (only 1 subject total — no valid context/target
+split possible). Cascade crashed on the first attempt (`FileNotFoundError: label.npy` — the
+per-class-plane storage broke the old hardcoded scorer) — this is what motivated fix #1 above.
+Full detail incl. qualitative figure (model predicts a plausible bright-intensity-tracking
+blob, real under-segmentation not a pipeline bug): `gnc_kidney_lesions.md` §7-9a.
+
+**HU_LWK1** (`/nfs/data/nii/data1/zanderch___HU_Messung/`, local NFS polytrauma whole-body CT):
+687 subjects, only 37 have the GT label (36 usable — 1 case has no matching image at all).
+Much simpler design than GNC: single class, no overlap question, label shares the full image
+grid+affine (no ROI-crop offset) — `HuLwk1Provider` needed **zero method overrides** (a plain
+`NativeGridProvider` subclass), and its cascade eval ran clean on the FIRST try (fix #1 above
+already covered it via the default `native_gt`). The one real wrinkle: a visit dir can hold
+multiple `.nii` series (different kernels), so the converter matches the correct one to the
+label by shape+affine rather than picking positionally. Notable result: this is the only
+integrated source where cascading does NOT hurt vs. single-level, and the only CT source, so
+those two facts may be related (same-modality + a bony, structurally organ-like target).
+Qualitative figure shows a real semantic-mismatch failure (model predicts a whole-vertebra
+shape, not the small measurement ROI), not a localization bug. Full detail: `hu_lwk1.md` §6-8.
+
 ## Still gated, no path found
 
 | dataset | modality | OOD class(es) | blocker |
@@ -237,9 +324,13 @@ each need their own decision), on top of the provenance question already flagged
   brats2024/                             # ✅ characterized (brats2024.md) -- HF mirror, unofficial re-upload, ⚠️⚠️ strongest provenance caveat this session, not wired
   atlas_v2/                             # raw source (HF mirror, unofficial re-upload)
   atlas_v2/npy/                         # ✅ INTEGRATED — converted, wired, eval'd (exp92) -- ⚠️ provenance caveat, atlas_v2.md #1
+  gnc_kidney/npy/                       # ✅ INTEGRATED — converted (per-class-plane), wired, eval'd (exp92); raw source stays at /nfs/data/nii/data0/GNC/GNC_705/ (separate NFS mount, local restricted-access cohort)
+  hu_lwk1/npy/                          # ✅ INTEGRATED — converted, wired, eval'd (exp92); raw source stays at /nfs/data/nii/data1/zanderch___HU_Messung/ (local NFS cohort)
 ```
 All four non-CT+OOD sources (ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate) have the full
 pipeline (provider/converter/config/dispatch) plus a first eval run against exp92. Second wave
 (ACDC, AutoPET-III-Lite, crossMoDA, BraTS 2024, ATLAS v2.0) is pulled/characterized or still
 downloading — none wired yet, all are candidates for the next "integrate X" instruction. AMOS22
-remains a deliberately-unwired in-vocabulary control.
+remains a deliberately-unwired in-vocabulary control. Third wave (GNC_705, HU_LWK1 — local NFS
+cohorts, see § above) are both fully integrated + eval'd; that track has no queue, it resumes
+only when the user names a new local path.
