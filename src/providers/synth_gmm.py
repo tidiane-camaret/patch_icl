@@ -77,8 +77,13 @@ class SynthGmmProvider:
         # a voxel from (mirrors providers/totalseg.py::_resolve_center; same helper, reused).
         cents = e["cents"].get(cls_id)
         fallback = tuple(cents[:3]) if cents is not None else None
+        # fg_samples (precomputed by add_fg_samples_to_bank.py): a bounded per-class voxel
+        # subset that lets random_fg draw in O(1) instead of scanning the mmap'd `arr` --
+        # see docs/logs.md. None on an un-augmented bank -- _resolve_center falls back to
+        # the live scan exactly as before.
+        fg_samples = e.get("fg_samples", {}).get(cls_id)
         center = _resolve_center(SimpleNamespace(center=center, center_mode=center_mode, rng=rng),
-                                  arr, cls_id, fallback)
+                                  arr, cls_id, fallback, fg_samples=fg_samples)
         if jitter is None:
             jitter = self.ds.jitter
         _, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(

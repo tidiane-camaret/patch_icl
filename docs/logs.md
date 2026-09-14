@@ -8473,3 +8473,53 @@ torch/tensor round-trip. Measured on the real gmm_bank: 512³→256³ crop, **13
   cascade-path cap already had coverage from the previous fix). Full suite: 290/298 pass,
   same 8 pre-existing unrelated `test_infer_nifti.py` failures.
 - Not yet re-measured end-to-end on the GCP run at time of writing — next step.
+
+## 2026-09-14 (cont.) — synth_gmm cascade path: cap=128 + found the third (biggest) cost:
+## random_fg's live argwhere scan on context recrops, precomputed fg_samples fix
+
+Re-measured the materialize-order fix live on GCP epoch 0: 1352.9s -> 1104.5s (-18%,
+steps/s 0.37->0.45) — real, but smaller than the isolated microbenchmark's 12x for two
+reasons. (1) `gpu_realize_max_native=256` (the default) still costs ~600ms/call of genuine
+paint work post-fix; lowering to 128 (added to `92_multisource_synth.yaml`, measured
+603ms->123ms/call, 5x, no quality loss since 128 == the model's grid size T) dropped epoch 0
+further to 895.0s (steps/s 0.56, -34% vs. original baseline). (2) A real ~400s stall
+occurred once (steps ~313-326: progress-bar elapsed barely advanced despite ~7min of real
+wall-clock; dmesg/journalctl clean, no OOM/disk/preemption) but did not recur in either of
+the next two runs — added a diagnostic (`cascade.py::_recrop_level`'s `_load_nc` now prints
+subject/modality/spacing when a single call exceeds 1.5s) rather than chase it blind.
+
+That diagnostic immediately surfaced a THIRD, bigger-than-expected cost, unrelated to
+painting: **100% of the flagged slow calls (88/88 in the cap=128 epoch) were the CONTEXT
+member, never the target**, each 1.5-3.2s. Root cause: `_recrop_level` always passes
+`center=None` for context tasks (by design — "context always GT-centered every level," per
+its own docstring). With `data.cascade_center_mode.mode=random_fg` set, `_resolve_center`
+(`src/providers/totalseg.py`) takes the random-foreground-voxel branch whenever center is
+`None` — cheap for the real CT/MRI sources (label array is RAM-resident via `volume_cache`),
+but for synth it's `np.argwhere(arr == cls_id)` on the mmap'd, uncached gmm_bank file: a full
+~512³-voxel scan, on EVERY context recrop. ~88 calls x ~2s ≈ 176s of the 895s epoch (~20%)
+was this alone — and it explains why the isolated microbenchmark (which hardcoded
+`center_mode="com"`) understated the real win: it never exercised this path.
+
+This is an unintended interaction, not deliberate design (random_fg was built/tested for the
+*target's* prediction-fallback case; it reaches context only because `center_mode` is
+threaded through `_recrop_level` as one global value for every task). Decision: keep
+context's randomized centering (user's call, not a design revert) but make it O(1) via a
+precomputed per-class foreground-voxel cache, mirroring the existing `cents` centroid cache.
+- `experiments/3d/synth_task_generation/add_fg_samples_to_bank.py` (new): augments an
+  EXISTING bank's `index.pkl` in place (reads already-resampled `masks/*.npy`, no MAISI zip
+  needed) with `entry["fg_samples"][cls] = int16 (k<=64,3) coords`. One `np.argsort` per
+  mask (not one `np.argwhere` per class — bank masks average ~20-30 present classes each,
+  so this is O(native voxels) once per mask instead of O(classes x native voxels)),
+  bucketed by label value. `ProcessPoolExecutor`-parallel; writes a `.bak` before
+  overwriting. 5 unit tests for the core `fg_samples_for_mask` function.
+- `src/providers/totalseg.py::_resolve_center` gains an optional `fg_samples` param: when
+  given (non-empty), `random_fg` draws from it directly (O(1)); `None`/empty falls through
+  to the existing live scan unchanged (backward-compatible with an un-augmented bank on
+  other clusters). 3 new tests, incl. one that breaks `np.argwhere` via monkeypatch to prove
+  the fast path never calls it.
+- `src/providers/synth_gmm.py::_build_nc` passes `e.get("fg_samples", {}).get(cls_id)`
+  through. 1 new integration test (same argwhere-breaking technique, through the provider).
+- Full suite: 299/307 pass, same 8 pre-existing unrelated `test_infer_nifti.py` failures.
+- Not yet run against the real bank — next step: run `add_fg_samples_to_bank.py` on the NFS
+  box where the bank lives, sync the updated `index.pkl` (small — masks untouched) to the
+  bucket and the GCP VM's disk, re-measure.

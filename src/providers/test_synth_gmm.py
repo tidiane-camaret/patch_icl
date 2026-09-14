@@ -134,6 +134,36 @@ def test_build_nc_uncapped_when_gpu_realize_max_native_is_zero(tmp_path):
     assert shape == (16, 16, 16), shape
 
 
+def test_build_nc_uses_precomputed_fg_samples_without_scanning_arr(tmp_path, monkeypatch):
+    """entry carries fg_samples (add_fg_samples_to_bank.py output) -> random_fg draws from
+    it in O(1); proven here by breaking np.argwhere (the live-scan fallback) and confirming
+    the resolved center still lands on one of the stored samples, not FALLBACK_CENT."""
+    bank_dir = _make_bank(tmp_path)
+    with open(bank_dir / "index.pkl", "rb") as f:
+        index = pickle.load(f)
+    fg_samples = np.array([[2, 2, 2], [3, 3, 3]])
+    for e in index["entries"]:
+        e["fg_samples"] = {CLS: fg_samples}
+    with open(bank_dir / "index.pkl", "wb") as f:
+        pickle.dump(index, f)
+
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256)
+    provider = SynthGmmProvider(ds, cascade=True)
+    subject = "m00000.npy|1|0"
+
+    def _boom(*a, **k):
+        raise AssertionError("np.argwhere must not run when fg_samples is stored")
+    monkeypatch.setattr("src.providers.totalseg.np.argwhere", _boom)
+
+    for seed in range(5):
+        req = LoadRequest(rng=random.Random(seed), crop_spacing_mm=3.0,
+                          center=None, center_mode="random_fg")
+        center = _center_used(provider, subject, str(CLS), req)
+        assert center in {(2, 2, 2), (3, 3, 3)}, center
+        assert center != tuple(FALLBACK_CENT)
+
+
 def test_native_crop_gpu_realize_path_also_caps_before_materializing(tmp_path):
     """SynthGmmMaisiDataset._native_crop (the standalone data.source=synth_gmm_maisi +
     gpu_realize=True path) shares the same stride-before-materialize cap fix as

@@ -178,6 +178,40 @@ def test_resolve_center_random_fg_falls_back_when_class_absent():
     assert _resolve_center(req, lbl, class_idx=-1, fallback=(3, 3, 3)) == (3, 3, 3)
 
 
+def test_resolve_center_random_fg_uses_precomputed_fg_samples_when_given():
+    """fg_samples given -> draw from it, never scan label_np (proven here by an
+    all-zero label_np that has NO class-1 voxels at all: a live scan would fall back
+    to `fallback`, so landing on an fg_samples coord instead proves the precomputed
+    path ran)."""
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    fg_samples = np.array([[2, 3, 4], [5, 5, 5]])
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    result = _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0), fg_samples=fg_samples)
+    assert result in {(2, 3, 4), (5, 5, 5)}
+
+
+def test_resolve_center_random_fg_never_scans_label_np_when_fg_samples_given(monkeypatch):
+    fg_samples = np.array([[2, 3, 4]])
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+
+    def _boom(*a, **k):
+        raise AssertionError("np.argwhere must not run when fg_samples is given")
+    monkeypatch.setattr(np, "argwhere", _boom)
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0),
+                           fg_samples=fg_samples) == (2, 3, 4)
+
+
+def test_resolve_center_random_fg_empty_fg_samples_falls_back_to_live_scan():
+    """An empty fg_samples (e.g. a class present in label_list but with zero stored
+    samples -- shouldn't happen, but must not crash) behaves as if not given."""
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    lbl[2, 3, 4] = 1
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_fg")
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0),
+                           fg_samples=np.zeros((0, 3))) == (2, 3, 4)
+
+
 def test_resolve_center_random_fg_is_seeded_by_req_rng():
     lbl = np.zeros((6, 6, 6), dtype=np.uint8)
     lbl[1, 1, 1] = 1; lbl[4, 4, 4] = 1

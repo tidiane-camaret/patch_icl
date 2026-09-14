@@ -165,7 +165,7 @@ def _resolve_jitter(req: LoadRequest, default: int) -> int:
     return int(req.jitter) if req.jitter is not None else int(default)
 
 
-def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback):
+def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback, fg_samples=None):
     """Fill in a crop center when `req.center` is None, per `req.center_mode`.
 
     "com" (default): `fallback` — the provider's precomputed centroid, byte-identical to
@@ -175,10 +175,17 @@ def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback):
     (e.g. a synth/goal-mask edit emptied it) or `class_idx < 0` (unknown class).
 
     Cost note: "random_fg" scans the full (already-loaded-for-the-crop) label array —
-    unavoidable without a precomputed per-class voxel cache. Only paid when requested."""
+    cheap when label_np is RAM-resident (the real CT/MRI providers), but O(native voxels)
+    of disk/page-cache traffic against an mmap'd, uncached array (the synth_gmm provider) —
+    see docs/logs.md. `fg_samples`, when given (a precomputed (n,3) array of foreground
+    voxel coords for this exact class, e.g. from build_gmm_mask_bank's
+    add_fg_samples_to_bank.py), draws from that bounded set instead — O(1), no scan at
+    all. Falls through to the live scan if `fg_samples` is None or empty."""
     if req.center is not None:
         return req.center
     if req.center_mode == "random_fg" and class_idx >= 0:
+        if fg_samples is not None and len(fg_samples) > 0:
+            return tuple(int(v) for v in fg_samples[req.rng.randrange(len(fg_samples))])
         coords = np.argwhere(label_np == class_idx)
         if coords.shape[0] > 0:
             return tuple(int(v) for v in coords[req.rng.randrange(coords.shape[0])])
