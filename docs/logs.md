@@ -1,5 +1,20 @@
 # Change log
 
+## 2026-09-14 — PatchSet3D IRIS-style sequence compression (`arch.seq_compress`)
+
+Added an optional 3-stage compression pipeline to `PatchSet3D` (`src/models/patchset3d.py`),
+inspired by Iris's decoupled task-encoding (`docs/methods/iris.md`). New `RowCrossAttention`
+module (`src/models/pfn_seg_2d.py`) does asymmetric Q/KV row-axis cross-attention (Q and KV
+row counts may differ — `TransformerEncoderLayer`'s self-attention can't express this). Stage
+A compresses each of the K+1 volumes' `R³` raw cell tokens to `arch.compress_m` tokens
+(weight-shared, `arch.compress_layers` deep). Stage B is the existing `TransformerEncoderStack`
+unmodified, now fed the compressed `K·m+m` sequence instead of `K·N+N`. Stage C cross-attends
+the query's original (never-compressed) per-cell tokens into Stage B's output to reconstitute
+a per-cell `q` for `_decode`. `arch.seq_compress` defaults to `False` (byte-identical to
+today); assert-incompatible with `arch.register_routed` (Stage A already partitions
+per-volume) and `arch.transformer_rope` (Stage A/C carry no RoPE yet — a known gap, not
+silently ignored). Spec: docs/superpowers/specs/2026-09-14-patchset3d-sequence-compression-design.md.
+
 ## 2026-09-14 — GNC_705 kidney lesions: converter + provider + eval (single-level and cascade)
 
 Built and ran the full pipeline for GNC_705 (`scripts/convert_gnc_kidney.py`,

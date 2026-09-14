@@ -55,6 +55,16 @@ arch:
                               #  Set false to force the dense r×r bool-mask SDPA — needed on nodes
                               #  where flex's Triton kernel hangs in ptxas on a COLD compile cache
                               #  (Blackwell/cu13). Dense is fine at small K, heavy at large K.
+  seq_compress: false          # IRIS-style: compress each volume's N raw cell tokens to
+                               # compress_m before the heavy transformer (Stage A), run the
+                               # transformer over the compressed sequence, expand back to N
+                               # per-cell tokens for decode (Stage C). Incompatible with
+                               # register_routed and transformer_rope (see
+                               # docs/superpowers/specs/2026-09-14-patchset3d-sequence-
+                               # compression-design.md).
+  compress_m: 32               # tokens per volume after Stage A compression (tune; only
+                               # used when seq_compress=true)
+  compress_layers: 1           # depth of the Stage A/Stage C RowCrossAttention stacks, each
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:
