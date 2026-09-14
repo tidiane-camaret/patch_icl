@@ -132,7 +132,16 @@ MAISI_IDX_TO_CLASS = {
     128: 'bone lesion',
     132: 'airway',
     200: 'body',
+    195: 'shape_blob',
+    196: 'shape_splatter',
+    197: 'shape_disk',
+    198: 'shape_cylinder',
 }
 
 MAISI_CLASS_TO_IDX = {v: k for k, v in MAISI_IDX_TO_CLASS.items()}
 MAISI_CLASSES = [MAISI_IDX_TO_CLASS[k] for k in sorted(MAISI_IDX_TO_CLASS)]
+
+# Shape-mode pseudo-class ids (docs/superpowers/specs/
+# 2026-09-14-cohort-consistent-synthetic-shapes-design.md) -> the bare family name
+# ShapeCohortSpec.family_weights and shapes3d.primitives.make_shape use.
+SHAPE_ID_TO_FAMILY = {195: 'blob', 196: 'splatter', 197: 'disk', 198: 'cylinder'}
