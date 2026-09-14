@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import (
-    ThinkingRows, TransformerEncoderStack, build_register_block_mask)
+    ThinkingRows, TransformerEncoderStack, build_register_block_mask, RowCrossAttention)
 from src.rope import build_3d_rope_freqs_from_positions
 
 
@@ -198,6 +198,9 @@ class PatchSet3D(nn.Module):
         register_routed: bool = False,
         register_flex: bool = True,
         cascade_registers: bool = False,
+        seq_compress: bool = False,
+        compress_m: int = 32,
+        compress_layers: int = 1,
         image_size=None,
         encoder: str = "conv",
         encoder_frozen: bool = True,
@@ -432,6 +435,27 @@ class PatchSet3D(nn.Module):
             self.cascade_proj = nn.Linear(e, e)
             self.cascade_type = nn.Parameter(torch.zeros(e))
             nn.init.normal_(self.cascade_type, std=0.02)
+        # seq_compress (IRIS-style): compress each volume's N raw cell tokens down to
+        # compress_m tokens before the heavy transformer (Stage A), run the transformer over
+        # the compressed sequence (Stage B, unmodified below), then expand back to N per-cell
+        # tokens for decode (Stage C) via a fresh cross-attention read-out. See
+        # docs/superpowers/specs/2026-09-14-patchset3d-sequence-compression-design.md.
+        self.seq_compress = bool(seq_compress)
+        self.compress_m = int(compress_m)
+        assert not (self.seq_compress and self.transformer_rope), (
+            "arch.seq_compress=True does not carry RoPE through the compress/expand stages -- "
+            "incompatible with arch.transformer_rope=True for now")
+        assert not (self.seq_compress and self.register_routed), (
+            "arch.seq_compress=True already partitions per-volume in Stage A -- "
+            "arch.register_routed's block-mask has nothing left to restrict in Stage B")
+        if self.seq_compress:
+            assert compress_layers >= 1, "arch.compress_layers must be >= 1 when seq_compress=True"
+            self.compress_slots = nn.Parameter(torch.empty(self.compress_m, e))
+            nn.init.normal_(self.compress_slots, std=0.02)
+            self.compressor = nn.ModuleList(
+                [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
+            self.expander = nn.ModuleList(
+                [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
         # Decode head. Default (fine_decode=False): a per-token MLP emitting d^3 CONSTANTS per
         # cell. fine_decode=True picks between two heads via `decoder`:
@@ -660,6 +684,31 @@ class PatchSet3D(nn.Module):
             return None
         return torch.rand(B, M, device=device) < ratio
 
+    def _compress(self, tok: torch.Tensor, n_vol: int) -> torch.Tensor:
+        """(B, n_vol*N, 2, e) -> (B, n_vol*compress_m, 2, e): per-volume compression via
+        self.compressor (arch.compress_layers RowCrossAttention layers, weight-shared across
+        all n_vol volumes by folding them into the batch dim). Each layer iteratively refines
+        the running query against the SAME raw N-cell kv (DETR-decoder-style), starting from
+        the learned self.compress_slots. See docs/superpowers/specs/2026-09-14-patchset3d-
+        sequence-compression-design.md Stage A."""
+        B, e = tok.shape[0], tok.shape[-1]
+        kv = tok.reshape(B * n_vol, self.N, 2, e)
+        q = self.compress_slots.unsqueeze(0).unsqueeze(2).expand(B * n_vol, -1, 2, -1)
+        for layer in self.compressor:
+            q = layer(q, kv)
+        return q.reshape(B, n_vol * self.compress_m, 2, e)
+
+    def _expand(self, q_raw: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        """(B,N,2,e) raw query cells, (B,K*compress_m+compress_m,2,e) post-transformer
+        compressed rows -> (B,N,2,e): per-cell read-out via self.expander (Stage C). q_raw
+        supplies real spatial identity (never compressed away); kv is fixed across all
+        arch.compress_layers layers (DETR-decoder-style iterative refinement of q_raw against
+        the same memory)."""
+        q = q_raw
+        for layer in self.expander:
+            q = layer(q, kv)
+        return q
+
     def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None,
              cascade_regs=None):
         B, N = sup_feat.shape[0], self.N
@@ -684,14 +733,25 @@ class PatchSet3D(nn.Module):
         sup_tok = self._tokens(sup_feat, sup_occ, sup_ijk, mask=mask_support, content_type=ctype_sup)
         qry_tok = self._tokens(qry_feat, qry_occ, qry_ijk, mask=mask_query, content_type=ctype_qry)
 
+        # arch.seq_compress (Stage A): compress each of the K+1 volumes' N raw cell tokens to
+        # compress_m tokens BEFORE the heavy transformer. qry_tok_raw is kept aside, untouched,
+        # as Stage C's per-cell read-out query — see docs/superpowers/specs/2026-09-14-
+        # patchset3d-sequence-compression-design.md.
+        qry_tok_raw = qry_tok
+        n_per_vol = N
+        if self.seq_compress:
+            combined = self._compress(torch.cat([sup_tok, qry_tok], dim=1), K + 1)
+            n_per_vol = self.compress_m
+            sup_tok, qry_tok = combined[:, :K * n_per_vol], combined[:, K * n_per_vol:]
+
         if self.context_id_embed:
             assert K <= self.max_context, f"context_size {K} exceeds max_context {self.max_context}"
             e_dim = sup_tok.shape[-1]
-            ctx_emb = self.ctx_id(torch.arange(K, device=sup_tok.device)).repeat_interleave(N, dim=0)
-            sup_tok = sup_tok + ctx_emb.view(1, K * N, 1, e_dim)
+            ctx_emb = self.ctx_id(torch.arange(K, device=sup_tok.device)).repeat_interleave(n_per_vol, dim=0)
+            sup_tok = sup_tok + ctx_emb.view(1, K * n_per_vol, 1, e_dim)
             qry_tok = qry_tok + self.qry_id.view(1, 1, 1, e_dim)
 
-        sep = K * N
+        sep = K * n_per_vol
         x = torch.cat([sup_tok, qry_tok], dim=1)
         n_extra = 0
         if cascade_regs is not None:
@@ -731,7 +791,17 @@ class PatchSet3D(nn.Module):
                if self.transformer_rope else None)
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
                              rope=rope, block_mask=block_mask)
-        q = x[:, sep_t:, self._decode_col, :]      # (B,Q,e) query row, arch.decode_source col
+
+        if self.seq_compress:
+            # Stage C: qry_tok_raw's REAL per-cell tokens read out of the post-transformer
+            # (context-aware) compressed rows -- support AND query compressed rows both, per
+            # the design spec (the query's own compressed representation is itself context
+            # -informed and should feed its own expansion).
+            kv_expand = x[:, self.thinking.n + n_extra:]     # (B, K*compress_m+compress_m, 2, e)
+            q_out = self._expand(qry_tok_raw, kv_expand)
+            q = q_out[:, :, self._decode_col, :]              # (B,N,e)
+        else:
+            q = x[:, sep_t:, self._decode_col, :]      # (B,Q,e) query row, arch.decode_source col
         # This level's OWN thinking-row output (unaffected by n_extra: self.thinking() always
         # prepends its own tokens at the very front) -- for the NEXT cascade level, if wanted.
         regs = x[:, :self.thinking.n].mean(dim=2) if self.cascade_registers else None

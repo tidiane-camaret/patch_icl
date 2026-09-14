@@ -446,3 +446,81 @@ def test_cascade_registers_rejects_register_routed():
         assert False, "should have raised"
     except AssertionError as exc:
         assert "register_routed" in str(exc)
+
+
+# --- arch.seq_compress: IRIS-style per-volume token compression before the heavy transformer ---
+
+def test_seq_compress_default_off():
+    """Default (seq_compress=False): no new params, forward shape/behavior unchanged."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    assert not hasattr(m, "compressor") and not hasattr(m, "expander")
+    assert not hasattr(m, "compress_slots")
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+
+
+def test_seq_compress_forward_shape_and_backward():
+    """seq_compress=True: output shape unchanged (compression is internal); gradient reaches
+    every param including the new compressor/expander/compress_slots."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   seq_compress=True, compress_m=3, compress_layers=2)
+    assert len(m.compressor) == 2 and len(m.expander) == 2
+    assert m.compress_slots.shape == (3, 32)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_seq_compress_changes_output_vs_uncompressed():
+    """Sanity: with the same seed, seq_compress=True must produce different logits than
+    seq_compress=False (different architecture, not silently falling back)."""
+    torch.manual_seed(0)
+    kw = dict(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    m_off = PatchSet3D(seq_compress=False, **kw)
+    torch.manual_seed(0)
+    m_on = PatchSet3D(seq_compress=True, compress_m=3, compress_layers=1, **kw)
+    m_off.eval(); m_on.eval()
+    torch.manual_seed(1)
+    img, cin, cout = _dummy_batch(S=16)
+    out_off = m_off(img, context_in=cin, context_out=cout)["final_logit"]
+    out_on = m_on(img, context_in=cin, context_out=cout)["final_logit"]
+    assert out_off.shape == out_on.shape
+    assert not torch.allclose(out_off, out_on)
+
+
+def test_seq_compress_rejects_register_routed():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  seq_compress=True, register_routed=True)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "register_routed" in str(exc)
+
+
+def test_seq_compress_rejects_transformer_rope():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  seq_compress=True, transformer_rope=True)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "transformer_rope" in str(exc)
+
+
+def test_seq_compress_works_with_context_id_embed_and_cascade_registers():
+    """Both context_id_embed's per-volume tag and cascade_registers' carried memory must
+    still work correctly at the compressed (compress_m-per-volume) granularity."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   seq_compress=True, compress_m=3, compress_layers=1,
+                   context_id_embed=True, cascade_registers=True)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    out = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    assert out["registers"].shape == (2, 2, 32)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
