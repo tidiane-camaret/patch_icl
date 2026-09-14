@@ -11,7 +11,15 @@ class ShapeCohortSpec:
     `intensity_between_ratio=None` (default) means the shape's pseudo-class uses
     whatever the provider's own gmm.between_ratio setting already gives every other
     class -- set it to override just the shape's intensity consistency independently
-    of that global toggle."""
+    of that global toggle.
+
+    KNOWN LIMITATION: `size_frac_range` and every position/shape param below are
+    resolved relative to the CROP GRID a shape is rasterized into (see
+    rasterize_shape_in_crop), not in world/mm space -- unlike mu/sd (physically
+    resolution-independent scalars), a shape's absolute physical size/position is NOT
+    guaranteed consistent across cascade levels that use a different crop_spacing_mm.
+    Safe for single-level (or single-crop_spacing_mm) use; needs a world-space
+    redesign before combining shape mode with multi-level cascade training."""
     family_weights: dict = field(default_factory=lambda: {
         "blob": 1.0, "splatter": 1.0, "disk": 1.0, "cylinder": 1.0})
     size_frac_range: tuple = (0.02, 0.15)

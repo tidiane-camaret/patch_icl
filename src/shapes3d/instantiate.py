@@ -130,7 +130,14 @@ def rasterize_shape_in_crop(crop_lbl, host_cls_id, shape_id, member_draw, rng):
     own bounding box within this crop. Loose containment (design doc sec 2.3): if the
     host class has no voxels here, falls back to the whole crop as the placement region
     -- the shape's rasterization itself is never clipped to the host boundary either
-    way. Mutates `crop_lbl` in place."""
+    way. Mutates `crop_lbl` in place -- caller must ensure it is writeable (a
+    zero-copy view of an mmap_mode="r" array is not).
+
+    KNOWN LIMITATION: `member_draw.size_frac` and `.position_uvw` are both resolved
+    relative to THIS crop's own grid/bbox, not in world/mm space -- a shape's absolute
+    physical size/position is not guaranteed consistent across calls made at a
+    different crop_spacing_mm (e.g. a different cascade level). See ShapeCohortSpec's
+    docstring."""
     shape = crop_lbl.shape
     host_fg = np.argwhere(crop_lbl == host_cls_id)
     if host_fg.size > 0:
