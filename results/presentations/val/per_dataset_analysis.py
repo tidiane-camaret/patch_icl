@@ -264,5 +264,107 @@ def _():
     return (plt,)
 
 
+@app.cell
+def _(mo):
+    mo.md(
+        "## What drives Dice?\n"
+        "Per-(source, class) task properties, extracted directly from native-grid ground "
+        "truth via each source's `provider.native_gt(subject, cls)` (up to 40 sampled "
+        "subjects/class, seeded) -- **not** copied from prose descriptions in the per-source "
+        "docs. Precomputed by `compute_class_properties.py` into `class_props_cache.json` "
+        "(~4 min, gnc_kidney's 13 classes dominate the cost) since re-scanning NFS on every "
+        "notebook open would make it slow; re-run that script if a source's labels change or "
+        "a new source is added."
+    )
+    return
+
+
+@app.cell
+def _(json, os, pd):
+    _cache_path = os.path.join(os.path.dirname(__file__), "class_props_cache.json")
+    class_props_df = pd.DataFrame(json.load(open(_cache_path)))
+    class_props_df
+    return (class_props_df,)
+
+
+@app.cell
+def _(class_props_df, per_class_df, pd):
+    merged_df = per_class_df.merge(class_props_df, on=["source", "class"], how="left",
+                                    suffixes=("", "_prop"))
+    return (merged_df,)
+
+
+@app.cell
+def _(merged_df, plt):
+    # Dice vs. each extracted task property, every (source, class, variant) row as one point,
+    # colored by checkpoint family (same convention as the metric grids above). Mask size and
+    # bbox extent on a log-x axis (span orders of magnitude across sources).
+    def _color(variant):
+        if "exp92_orig" in variant:
+            return "#8a8f98"
+        if "exp_cascade_register" in variant:
+            return "#2a78d6"
+        return "#eb6834"
+
+    _colors = merged_df["variant"].map(_color)
+    _panels = [
+        ("mean_voxels", "mask size (voxels, log)", True),
+        ("mean_bbox_extent_mm", "bbox max extent (mm, log)", True),
+        ("frac_single_component", "frac. single-component (blob<-->scattered)", False),
+        ("mean_contrast", "fg/bg intensity contrast", False),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), dpi=140)
+    for ax, (col, label, logx) in zip(axes, _panels):
+        ax.scatter(merged_df[col], merged_df["mean_dice"], c=_colors, s=22, alpha=0.75,
+                   edgecolors="white", linewidths=0.3)
+        if logx:
+            ax.set_xscale("log")
+        ax.set_xlabel(label)
+        ax.set_ylabel("Dice")
+    fig.suptitle("Dice vs. task properties -- every (source, class, variant) row "
+                "(gray=exp92_orig, blue=exp_cascade_register, orange=medverse)")
+    fig.tight_layout()
+    fig
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Modality** (CT vs. MRI) isn't a scatter axis -- only hu_lwk1 is CT (6/7 sources "
+        "are MRI), so it collapses to a single point per checkpoint family rather than a "
+        "trend. See the per-dataset grids above for the CT-vs-MRI split explicitly (hu_lwk1's "
+        "panel vs. the rest)."
+    )
+    return
+
+
+@app.cell
+def _(merged_df, pd):
+    # Spearman rank correlation of each task property against Dice, computed within each
+    # model/checkpoint family separately (pooling all sources/classes/query_prior variants of
+    # that family) -- a monotonic-only, outlier-robust "what predicts Dice" summary.
+    _props = ["mean_voxels", "mean_bbox_extent_mm", "frac_single_component", "mean_contrast",
+             "mean_n_components"]
+
+    def _family(variant):
+        if "exp92_orig" in variant:
+            return "patchset3d / exp92_orig"
+        if "exp_cascade_register" in variant:
+            return "patchset3d / exp_cascade_register"
+        return "medverse / released"
+
+    _fam = merged_df.assign(family=merged_df["variant"].map(_family))
+    _rows = []
+    for fam, g in _fam.groupby("family"):
+        row = {"family": fam, "n": len(g)}
+        for p in _props:
+            row[p] = round(g["mean_dice"].corr(g[p], method="spearman"), 3)
+        _rows.append(row)
+    correlation_df = pd.DataFrame(_rows).sort_values("family").reset_index(drop=True)
+    correlation_df
+    return
+
+
 if __name__ == "__main__":
     app.run()
