@@ -262,6 +262,63 @@ class TransformerEncoderLayer(nn.Module):
         return src + self.mlp(self.norm3(src))
 
 
+class RowCrossAttention(nn.Module):
+    """Row-axis cross-attention: Q rows attend into a DIFFERENT (kv) row-set's K/V, then the
+    Q-side output runs the same column-axis self-attention + MLP TransformerEncoderLayer uses.
+    Q and KV row counts may differ (r_q != r_kv) -- the asymmetric primitive
+    TransformerEncoderLayer's self-attention (single input, single row count) can't express.
+    Used by PatchSet3D's compress (Stage A: q=learned slots, kv=raw cells) and expand
+    (Stage C: q=raw query cells, kv=compressed rows) stages -- same module, opposite argument
+    order. No RoPE support (see PatchSet3D's arch.seq_compress/arch.transformer_rope
+    incompatibility assert). See docs/superpowers/specs/2026-09-14-patchset3d-sequence
+    -compression-design.md."""
+
+    def __init__(self, a: int, e: int, h: int):
+        super().__init__()
+        assert e % a == 0
+        self.a = a
+        self.d = e // a
+        self.q_proj = nn.Linear(e, e)
+        self.kv_proj = nn.Linear(e, 2 * e)
+        self.qkv_col = nn.Linear(e, 3 * e)
+        self.norm_q = LowerPrecisionRMSNorm(e)
+        self.norm_kv = LowerPrecisionRMSNorm(e)
+        self.norm_col = LowerPrecisionRMSNorm(e)
+        self.norm_mlp = LowerPrecisionRMSNorm(e)
+        self.mlp = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
+
+    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor) -> torch.Tensor:
+        """q_in (B,r_q,c,e), kv_in (B,r_kv,c,e), same c and e -> (B,r_q,c,e)."""
+        b, rq, c, e = q_in.shape
+        rkv = kv_in.shape[1]
+        a, d = self.a, self.d
+
+        # -- Row-axis cross-attention: rq queries read rkv keys/values, per column --------
+        qn = self.norm_q(q_in).permute(0, 2, 1, 3).reshape(b * c, rq, e)
+        kn = self.norm_kv(kv_in).permute(0, 2, 1, 3).reshape(b * c, rkv, e)
+        qh = self.q_proj(qn).reshape(b * c, rq, a, d).transpose(1, 2)          # (b*c,a,rq,d)
+        kvh = self.kv_proj(kn).reshape(b * c, rkv, 2, a, d).permute(2, 0, 3, 1, 4)
+        x = batched_sdpa(qh, kvh[0], kvh[1])                                    # (b*c,a,rq,d)
+        x = x.transpose(1, 2).reshape(b * c, rq, e).reshape(b, c, rq, e).permute(0, 2, 1, 3)
+        q_in = q_in + x                                                         # (b,rq,c,e)
+
+        # -- Column-axis self-attention (img/mask mix) -- identical shape/logic to
+        # TransformerEncoderLayer's feature-axis block, applied to the cross-attended Q ---
+        y = q_in.reshape(b * rq, c, e)
+        res = y
+        y = self.norm_col(y)
+        qkv = self.qkv_col(y).reshape(b * rq, c, 3, a, d).permute(2, 0, 3, 1, 4)
+        if c <= _SMALL_SEQ_ATTN:
+            y = _small_seq_attn(qkv[0], qkv[1], qkv[2])
+        else:
+            y = batched_sdpa(qkv[0], qkv[1], qkv[2])
+        y = y.transpose(1, 2).reshape(b * rq, c, e)
+        q_in = (res + y).reshape(b, rq, c, e)
+
+        # -- MLP --
+        return q_in + self.mlp(self.norm_mlp(q_in))
+
+
 class TransformerEncoderStack(nn.Module):
     def __init__(self, l: int, a: int, e: int, h: int, residual_decay: float):
         super().__init__()
