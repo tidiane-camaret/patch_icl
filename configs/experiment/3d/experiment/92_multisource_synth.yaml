@@ -10,6 +10,12 @@ defaults:
 
 data:
   p_synth: 0.3
+  # Cascade re-crop (levels 1-2) is a synchronous, GPU-idle step; the native-crop stride-cap
+  # (docs/logs.md) still costs ~600ms/call at the default 256. Measured on this bank: 128
+  # cuts that to ~120ms (5x) with no quality loss vs. what the model sees anyway -- 128
+  # equals the model's own grid size T, so a capped crop is already at grid resolution
+  # before painting.
+  gpu_realize_max_native: 128
   gmm:
     paint_mask_aligned: true
     var_max: 80

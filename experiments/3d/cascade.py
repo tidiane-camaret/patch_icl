@@ -199,6 +199,8 @@ def _to_device(batch, device):
 _RECROP_POOL = None
 _RECROP_POOL_SIZE = 0
 _RECROP_POOL_LOCK = threading.Lock()
+# Diagnostic threshold for _recrop_level's per-task slow-call flag (see docstring there).
+_SLOW_RECROP_S = 1.5
 
 
 def _recrop_pool(workers):
@@ -283,9 +285,19 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
             b, _k, subj, center, rk, mod = t
             req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
                               center=center, jitter=jitter, center_mode=center_mode)
-            if mod is not None:
-                return provider.load_native_crop(subj, clss[b], req, modality=mod)
-            return provider.load_native_crop(subj, clss[b], req)
+            t0 = time.perf_counter()
+            r = (provider.load_native_crop(subj, clss[b], req, modality=mod) if mod is not None
+                else provider.load_native_crop(subj, clss[b], req))
+            # Diagnostic only (docs/logs.md / memory project_synth_gmm_paint_perf): recrop is a
+            # synchronous, GPU-idle barrier in the training step, and its per-task cost is
+            # currently unexplained-variable (a ~400s stall was observed once per ~300+ calls
+            # with no OS-level cause). Flags whichever single call was actually slow, so the
+            # next occurrence pins down subject/modality/spacing instead of just the aggregate.
+            dt = time.perf_counter() - t0
+            if dt > _SLOW_RECROP_S:
+                print(f"[recrop SLOW] {dt*1000:.0f}ms subj={subj!r} mod={mod} level_mm={sp} "
+                      f"center={'pred' if center is not None else 'none'}", flush=True)
+            return r
 
         flat = _run_pool(_load_nc, tasks, recrop_workers)
         # group by each task's own row index (tasks are emitted target-then-contexts
