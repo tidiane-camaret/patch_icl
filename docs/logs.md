@@ -15,6 +15,13 @@ today); assert-incompatible with `arch.register_routed` (Stage A already partiti
 per-volume) and `arch.transformer_rope` (Stage A/C carry no RoPE yet — a known gap, not
 silently ignored). Spec: docs/superpowers/specs/2026-09-14-patchset3d-sequence-compression-design.md.
 
+**Final-review fix-wave note:** `experiments/3d/train.py`'s Muon-routing predicate now also
+matches `"compressor"`/`"expander"` (previously only `"transformer"`), so the new
+`RowCrossAttention` stacks' 2-D weight matrices route to Muon like the main transformer's
+blocks do — they were only excluded before by an accident of parameter-name matching.
+`compress_slots` (a bare learned `(n,e)` `nn.Parameter`) stays on AdamW, matching
+`thinking.tokens`'s treatment; this was a deliberate fix-wave decision, not an oversight.
+
 ## 2026-09-14 — GNC_705 kidney lesions: converter + provider + eval (single-level and cascade)
 
 Built and ran the full pipeline for GNC_705 (`scripts/convert_gnc_kidney.py`,

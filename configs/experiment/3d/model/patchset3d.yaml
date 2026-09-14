@@ -65,6 +65,7 @@ arch:
   compress_m: 32               # tokens per volume after Stage A compression (tune; only
                                # used when seq_compress=true)
   compress_layers: 1           # depth of the Stage A/Stage C RowCrossAttention stacks, each
+                               # (independent, not weight-shared)
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:

@@ -450,6 +450,7 @@ class PatchSet3D(nn.Module):
             "arch.register_routed's block-mask has nothing left to restrict in Stage B")
         if self.seq_compress:
             assert compress_layers >= 1, "arch.compress_layers must be >= 1 when seq_compress=True"
+            assert compress_m >= 1, "arch.compress_m must be >= 1 when seq_compress=True"
             self.compress_slots = nn.Parameter(torch.empty(self.compress_m, e))
             nn.init.normal_(self.compress_slots, std=0.02)
             self.compressor = nn.ModuleList(
@@ -693,7 +694,7 @@ class PatchSet3D(nn.Module):
         sequence-compression-design.md Stage A."""
         B, e = tok.shape[0], tok.shape[-1]
         kv = tok.reshape(B * n_vol, self.N, 2, e)
-        q = self.compress_slots.unsqueeze(0).unsqueeze(2).expand(B * n_vol, -1, 2, -1)
+        q = self.compress_slots.unsqueeze(0).unsqueeze(2).expand(B * n_vol, -1, 2, -1).contiguous()
         for layer in self.compressor:
             q = layer(q, kv)
         return q.reshape(B, n_vol * self.compress_m, 2, e)
@@ -737,9 +738,9 @@ class PatchSet3D(nn.Module):
         # compress_m tokens BEFORE the heavy transformer. qry_tok_raw is kept aside, untouched,
         # as Stage C's per-cell read-out query — see docs/superpowers/specs/2026-09-14-
         # patchset3d-sequence-compression-design.md.
-        qry_tok_raw = qry_tok
         n_per_vol = N
         if self.seq_compress:
+            qry_tok_raw = qry_tok
             combined = self._compress(torch.cat([sup_tok, qry_tok], dim=1), K + 1)
             n_per_vol = self.compress_m
             sup_tok, qry_tok = combined[:, :K * n_per_vol], combined[:, K * n_per_vol:]

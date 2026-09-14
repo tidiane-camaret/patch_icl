@@ -1169,10 +1169,17 @@ def main(cfg: DictConfig) -> None:
     # cosine/plateau scheduler drives AdamW only (= optimizers[0]); Muon is unscheduled.
     use_muon = is_patchset and cfg.train.get("muon", True)
     if use_muon:
+        # "compressor"/"expander" match arch.seq_compress's RowCrossAttention stacks -- same
+        # q/kv/mlp-projection role as transformer's blocks, only excluded before by an accident
+        # of parameter-name matching. compress_slots (bare (n,e) nn.Parameter, no substring
+        # match) correctly stays on AdamW, matching thinking.tokens's treatment. See
+        # docs/logs.md 2026-09-14 (seq_compress Muon routing note).
         muon_params = [p for n, p in net.named_parameters()
-                       if p.requires_grad and p.ndim == 2 and "transformer" in n]
+                       if p.requires_grad and p.ndim == 2
+                       and any(k in n for k in ("transformer", "compressor", "expander"))]
         adam_named = [(n, p) for n, p in net.named_parameters()
-                      if p.requires_grad and not (p.ndim == 2 and "transformer" in n)]
+                      if p.requires_grad and not (p.ndim == 2
+                          and any(k in n for k in ("transformer", "compressor", "expander")))]
         adam_groups, enc_info = encoder_groups(cfg, adam_named)
         optimizer = torch.optim.AdamW(adam_groups, lr=float(cfg.train.lr),
                                       weight_decay=float(cfg.train.get("weight_decay", 0.01)))
