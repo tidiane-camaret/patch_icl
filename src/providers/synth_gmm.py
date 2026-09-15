@@ -12,6 +12,11 @@ as "<filename>|<gmm_seed>|<member_idx>". load_native_crop re-derives the same co
 shared mu/sd from the seed, and the per-member paint nrng from (gmm_seed, member_idx),
 giving an identical color palette at every cascade level for the same member.
 
+_build_nc (cascade=True) ships a NATIVE-resolution painted crop (the GMM paint itself
+is cheap; only the resample-to-grid was ever the expensive part) rather than doing that
+resample here on CPU -- src/gpu_realize_crop.py's generic, already-active cascade GPU
+step does it instead, batched with every other source. See docs/logs.md 2026-09-15.
+
 Shape mode (p_shape > 0, cascade=True only): a `p_shape` coin flip per cohort swaps the
 sampled cohort's target for a procedurally generated geometric shape (blob/splatter/
 disk/cylinder, see src/shapes3d/) stamped into the sampled hosts' real anatomy under a
@@ -35,6 +40,7 @@ from src.gpu_gmm_intensity import sample_grouped_uniform
 from src.providers.totalseg import _resolve_center
 from src.shapes3d.instantiate import draw_cohort_hyperparams, draw_member_shape, rasterize_shape_in_crop
 from src.shapes3d.spec import ShapeCohortSpec
+from src.synth_gmm_maisi_dataset import GMM_MEAN, GMM_STD
 from src.totalseg_dataloader_incontext import organ_crop_arrays
 
 # Sentinel second seed-key for the cohort-level shape hyperparameter draw (vs. real
@@ -168,22 +174,37 @@ class SynthGmmProvider:
                 mu_e[shape_id] = (mu[shape_id] + self.shape_spec.intensity_between_ratio
                                   * sd[shape_id] * fresh_noise)
 
-        img, mask = self.ds._resample_paint_mask(
-            crop_lbl, out_sizes, pad_lo, target_cls, mu_e, sd, member_nrng)
+        # GMM paint at native (possibly cap-strided) resolution -- a cheap vectorized op
+        # (indexing + multiply-add), unlike the antialiased resample-to-T this used to
+        # also do here on CPU (self.ds._resample_paint_mask/place_image). Shipping the
+        # native painted crop instead of a pre-resampled T^3 one lets the ALREADY-ACTIVE
+        # gpu_realize_crop step (src/gpu_realize_crop.py -- on by default for any cascade
+        # config, see common.py's "Cascade train runs default gpu_realize_crop ON")
+        # actually do that resample on GPU, batched with every other source, instead of
+        # being a no-op pass-through for an already-realized crop. See docs/logs.md
+        # 2026-09-15.
+        noise = member_nrng.standard_normal(crop_lbl.shape).astype(np.float32)
+        paint_native = mu_e[crop_lbl] + sd[crop_lbl] * noise
+        paint_native = (paint_native - GMM_MEAN) / GMM_STD
+        target_mask_native = (crop_lbl == target_cls)
+        has_fg = bool(target_mask_native.any())
 
-        T = self.ds.T
+        paint_mask_aligned = bool(self.ds.paint_mask_aligned)
         return self._NativeCrop(
-            image=img[0].half(),
-            label_frac=mask.float().half(),
+            image=torch.from_numpy(paint_native).half(),
+            label_frac=torch.from_numpy(target_mask_native.astype(np.float32)).half(),
             class_idx=target_cls,
-            has_fg=bool(mask.any()),
-            out_sizes=[T, T, T],
-            pad_lo=[0, 0, 0],
+            has_fg=has_fg,
+            out_sizes=list(out_sizes),
+            pad_lo=list(pad_lo),
             crop_geom=geom,
             crop_spacing_mm=float(crop_mm),
-            decim=(1, 1, 1),
+            decim=step,
             modality="synth",
             norm=self._SYNTH_NORM,
+            paint_mask_aligned=paint_mask_aligned,
+            target_mu=(float(mu_e[target_cls]) if paint_mask_aligned else None),
+            target_sd=(float(sd[target_cls]) if paint_mask_aligned else None),
         )
 
     # --- cohort hook ---

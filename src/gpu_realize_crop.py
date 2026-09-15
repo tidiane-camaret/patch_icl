@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from src.synth_gmm_maisi_dataset import GMM_MEAN, GMM_STD
 from src.totalseg_dataloader_incontext import _area_pool_3d
 
 
@@ -66,6 +67,21 @@ def _realize_member(nc, T, mask_downsample, occ_thr, ct_spec, device):
         if not bool(m.any()) and nc.has_fg:
             m.view(-1)[int(frac.argmax())] = True
         mask = m.long()
+
+    if getattr(nc, "paint_mask_aligned", False) and nc.target_mu is not None:
+        # synth_gmm only (data.gmm.paint_mask_aligned): overwrite the supervised
+        # (mask=1) pixels with a fresh draw of the target class's own Gaussian, so the
+        # supervised region is never contaminated by a resample-blended neighbor at the
+        # boundary -- mirrors gpu_synth_realize._resample_member's identical step. Must
+        # happen HERE (post-resample, pre-pad, on the discretized `mask`) -- doing it at
+        # native resolution instead can't replicate the effect, since "boundary" only
+        # exists once the output-grid mask is thresholded. No cross-cascade-level RNG
+        # reproducibility is needed here (unlike mu/sd): the per-voxel noise draw was
+        # never bit-reproducible across levels anyway (different crop resolution ->
+        # different noise array size every time), only its distribution is.
+        fresh = torch.randn(img.shape, device=device)
+        target_val = (nc.target_mu + nc.target_sd * fresh - GMM_MEAN) / GMM_STD
+        img = torch.where(mask.bool(), target_val, img)
 
     if size == (T, T, T):
         return img[None], mask

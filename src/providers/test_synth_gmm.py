@@ -95,14 +95,12 @@ def test_center_mode_random_fg_respects_an_explicit_center(tmp_path):
 
 
 def _native_shape_painted(provider, subject, cls, req):
-    """Run load_native_crop, return the crop_lbl.shape actually handed to
-    _resample_paint_mask (i.e. after any gpu_realize_max_native cap)."""
-    from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
-    real = SynthGmmMaisiDataset._resample_paint_mask
-    with patch.object(SynthGmmMaisiDataset, "_resample_paint_mask",
-                      autospec=True, side_effect=real) as m:
-        provider.load_native_crop(subject, cls, req)
-    return tuple(m.call_args.args[1].shape)  # args: (self, crop_lbl, out_sizes, ...)
+    """Run load_native_crop, return the shape of the NATIVE (possibly capped) crop
+    actually shipped in the returned NativeCrop.image -- _build_nc ships the native
+    painted crop directly now (docs/logs.md 2026-09-15), rather than resampling it to
+    the T grid itself, so `nc.image.shape` IS the post-cap native shape."""
+    nc = provider.load_native_crop(subject, cls, req)
+    return tuple(nc.image.shape)
 
 
 def test_build_nc_caps_native_crop_before_painting(tmp_path):
@@ -387,3 +385,41 @@ def test_load_native_crop_supports_a_different_crop_spacing_mm_without_raising(t
                           center_mode="com")
         rebuilt = provider.load_native_crop(task["subject"], task["label_name"], req)
         assert rebuilt.class_idx in SHAPE_ID_TO_FAMILY
+
+
+def test_build_nc_ships_native_unresampled_crop(tmp_path):
+    """docs/logs.md 2026-09-15: _build_nc no longer resamples to the T grid itself --
+    the shipped NativeCrop.image/label_frac are at NATIVE (post-cap) resolution, with
+    real out_sizes/pad_lo from organ_crop_arrays (not a hardcoded [T,T,T]/[0,0,0]),
+    decim=step, so the already-active gpu_realize_crop step does the real resample."""
+    provider = _make_provider(tmp_path)
+    subject = "m00000.npy|1|0"
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None, center_mode="com")
+    nc = provider.load_native_crop(subject, str(CLS), req)
+    assert nc.image.shape == nc.label_frac.shape
+    assert nc.decim == (1, 1, 1)          # no cap fired at this fixture's small DIM
+    assert list(nc.out_sizes) != [0, 0, 0] and list(nc.pad_lo) is not None
+
+
+def test_build_nc_ships_paint_mask_aligned_target_gaussian_when_enabled(tmp_path):
+    bank_dir = _make_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              paint_mask_aligned=True)
+    provider = SynthGmmProvider(ds, cascade=True)
+    rng = random.Random(0)
+    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+    nc = task["native_crop"][0]
+    mu, sd = provider._draw_gmm(int(task["subject"].split("|")[1]))
+    assert nc.paint_mask_aligned is True
+    assert nc.target_mu == pytest.approx(float(mu[CLS]))
+    assert nc.target_sd == pytest.approx(float(sd[CLS]))
+
+
+def test_build_nc_omits_paint_mask_aligned_target_by_default(tmp_path):
+    provider = _make_provider(tmp_path)   # paint_mask_aligned defaults to False
+    rng = random.Random(0)
+    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+    nc = task["native_crop"][0]
+    assert nc.paint_mask_aligned is False
+    assert nc.target_mu is None and nc.target_sd is None

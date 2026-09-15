@@ -455,3 +455,38 @@ def test_incontext_collate_omits_modality_when_absent():
     from src.totalseg_dataloader_incontext import incontext_collate_fn
     b = incontext_collate_fn([_incontext_item(), _incontext_item()])
     assert "tgt_modality" not in b and "ctx_modality" not in b
+
+
+def test_paint_mask_aligned_overwrites_supervised_pixels_with_target_gaussian():
+    """synth_gmm's data.gmm.paint_mask_aligned, now applied by realize_native_crops
+    itself (docs/logs.md 2026-09-15) instead of CPU-side _resample_paint_mask: with
+    target_sd=0 the aligned value is deterministic, so every mask=1 pixel must equal it
+    exactly, and mask=0 pixels (still the untouched base image) must not."""
+    from src.synth_gmm_maisi_dataset import GMM_MEAN, GMM_STD
+    T = 8
+    nc = _fake_nc(T, class_idx=7, fg=(slice(2, 6), slice(2, 6), slice(2, 6)))
+    nc.paint_mask_aligned = True
+    nc.target_mu = 200.0
+    nc.target_sd = 0.0   # zero noise -> deterministic target value, exact comparison
+    out = realize_native_crops([[nc]], T=T, mask_downsample="occupancy", occ_thr=0.1,
+                               ct_spec=resolve_ct_norm(None), device="cpu")
+    expected = (200.0 - GMM_MEAN) / GMM_STD
+    img = out["image"][0, 0]
+    mask = out["label"][0].bool()
+    assert mask.any()
+    torch.testing.assert_close(img[mask], torch.full_like(img[mask], expected), atol=1e-4, rtol=0)
+    assert not torch.allclose(img[~mask], torch.full_like(img[~mask], expected))
+
+
+def test_paint_mask_aligned_false_leaves_image_untouched():
+    """Default (real classes, and synth with data.gmm.paint_mask_aligned=false): no
+    aligned-paint post-step at all -- image is whatever the plain resample produced."""
+    T = 8
+    nc = _fake_nc(T, class_idx=7, fg=(slice(2, 6), slice(2, 6), slice(2, 6)))
+    assert nc.paint_mask_aligned is False and nc.target_mu is None
+    out = realize_native_crops([[nc]], T=T, mask_downsample="occupancy", occ_thr=0.1,
+                               ct_spec=resolve_ct_norm(None), device="cpu")
+    # _fake_nc's base image is all zeros -> normalize_ct_gpu(zeros) is constant everywhere,
+    # inside and outside the mask alike (no aligned-paint step ran to differentiate them).
+    img = out["image"][0, 0]
+    assert torch.allclose(img, img.flatten()[0].expand_as(img))

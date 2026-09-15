@@ -48,8 +48,15 @@ class NativeCrop:
     crop_geom: torch.Tensor       # (4,3) int64 — identical to crop_and_place's
     crop_spacing_mm: float
     decim: tuple                  # per-axis integer decimation factor (>=1)
-    modality: str = "ct"         # "ct" | "mri" — carried for the GPU realize/aug frame
+    modality: str = "ct"         # "ct" | "mri" | "synth" — carried for the GPU realize/aug frame
     norm: "CtNormSpec | None" = None  # per-crop normalization spec (global CT / per-subject MRI)
+    # synth_gmm only (data.gmm.paint_mask_aligned): after the generic GPU resample below,
+    # overwrite the supervised (mask=1) pixels with a fresh draw of the target class's own
+    # Gaussian -- see gpu_realize_crop._realize_member and docs/logs.md 2026-09-15. None/False
+    # for every other provider (real classes have no GMM mu/sd to draw from).
+    paint_mask_aligned: bool = False
+    target_mu: "float | None" = None
+    target_sd: "float | None" = None
 
 
 def _decim_avg_pool(arr_t, decim):
