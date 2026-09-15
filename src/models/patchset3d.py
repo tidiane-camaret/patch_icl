@@ -668,8 +668,9 @@ class PatchSet3D(nn.Module):
         Thinking rows get position (0,0,0) (no rotation); support/query use the (i,j,k)
         lattice. Positions are scaled by spacing/rope_train_mm when a spacing is given, so
         adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme.
-        n_extra: cascade-memory rows prepended ahead of thinking (arch.cascade_registers) —
-        non-spatial like thinking rows, so they get the same (0,0,0) no-rotation treatment."""
+        n_extra: cascade-memory and/or pool-token rows prepended ahead of thinking
+        (arch.cascade_registers / arch.pool_token) — non-spatial like thinking rows, so they
+        get the same (0,0,0) no-rotation treatment."""
         n_think = self.thinking.n
         pos = torch.cat([torch.zeros(n_think + n_extra, 3, device=device),
                          self.ijk_base.repeat(K, 1).float(),
@@ -751,9 +752,21 @@ class PatchSet3D(nn.Module):
             qry_mask = sup_mask.mean(dim=1, keepdim=True)                  # (B,1,S,S,S)
 
         def masked_avg(f, m):
-            w = m.unsqueeze(2)                                # (B,n,1,S,S,S)
-            num = (f * w).sum(dim=(-3, -2, -1))
-            den = w.sum(dim=(-3, -2, -1)).clamp_min(1e-6)
+            # Per-volume z-score before the masked reduction -- mirrors _decode's fine_filter
+            # normalization (mu/sig over each volume's OWN spatial extent), so support and
+            # query prototype vectors land in a comparable scale/frame before pool_proj. Stats
+            # are per-(batch,n,channel) over the trailing 3 spatial dims only -- NEVER across
+            # the n/K dim (that would be _feat_norm's "context" mode, which computes std over
+            # K rows and returns NaN whenever K=1, a common config here).
+            mu = f.mean(dim=(-3, -2, -1), keepdim=True)
+            sig = f.std(dim=(-3, -2, -1), keepdim=True) + 1e-8
+            f = self._zscore(f, mu, sig)
+            # bmm-based reduction: keeps f's own dtype (no elementwise f*w upcast-to-fp32
+            # under bf16 autocast, which would ~double this step's transient memory).
+            B_, n, Cf_, S_ = f.shape[0], f.shape[1], f.shape[2], f.shape[-1]
+            num = torch.bmm(f.reshape(B_ * n, Cf_, S_ ** 3),
+                            m.to(f.dtype).reshape(B_ * n, S_ ** 3, 1)).reshape(B_, n, Cf_)
+            den = m.sum(dim=(-3, -2, -1)).clamp_min(1e-6).unsqueeze(-1)   # (B,n,1)
             return num / den                                   # (B,n,Cf)
 
         return torch.cat([masked_avg(sup_feat, sup_mask), masked_avg(qry_feat, qry_mask)],
@@ -814,6 +827,10 @@ class PatchSet3D(nn.Module):
             sep += n_extra
         if pool_feat is not None:
             assert self.pool_token, "pool_feat given but arch.pool_token=False on this model"
+            # Under the default full_attn=True (all three fine_decode model configs), support
+            # rows CAN read the query's own pool row -- unlike real content, which is only kept
+            # context-read-only under full_attn=False/query_self_attn masking. Harmless: the
+            # query pool row is built from a soft prior/support-mean, never real GT.
             pool = self.pool_proj(pool_feat) + self.pool_type       # (B,K+1,e)
             if self.context_id_embed:
                 ctx_tag = torch.cat([
@@ -946,7 +963,14 @@ class PatchSet3D(nn.Module):
 
         cascade_regs: optional (B, thinking_rows, e) — the PREVIOUS cascade level's own
         "registers" output (this method's own return value from that call), fed in as extra
-        input rows (arch.cascade_registers=True required; see _attn)."""
+        input rows (arch.cascade_registers=True required; see _attn).
+
+        arch.pool_token (constructor flag, not a forward argument) changes this method's own
+        internal behavior: when set, the unpooled fine-map extraction below widens from
+        query-only rows to all K+1 volumes (support + query), since _pool_tokens needs every
+        volume's finest fine map to build its foreground-masked prototype row; the fine maps
+        are re-sliced back down to query-only before _decode (see the `pool_token` branch
+        below and _pool_tokens)."""
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)

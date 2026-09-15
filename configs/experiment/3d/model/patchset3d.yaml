@@ -72,7 +72,12 @@ arch:
                                # arch.fine_decode=true. Extends fine-map extraction to all K+1
                                # volumes (memory cost scales with K, vs. query-only otherwise).
                                # Incompatible with arch.register_routed (same reason
-                               # cascade_registers is).
+                               # cascade_registers is). NOTE: this base patchset3d.yaml has no
+                               # fine_decode: true model config, so exercising arch.pool_token=
+                               # true today means using model=m2_patchset_decoder (the one
+                               # existing fine_decode: true model config) with
+                               # +arch.pool_token=true, or any future config that sets
+                               # fine_decode: true.
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:

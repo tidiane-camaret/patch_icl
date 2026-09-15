@@ -630,3 +630,29 @@ def test_pool_tokens_all_background_support_mask_no_nan():
     cout = torch.zeros(2, 2, 16, 16, 16, dtype=torch.long)     # all background
     out = m(img, context_in=cin, context_out=cout, mode="train")["final_logit"]
     assert torch.isfinite(out).all()
+
+
+def test_pool_token_with_query_prior():
+    """pool_token=True with an explicit query_prior (the branch every cascade/production
+    forward actually takes, as opposed to the support-mean fallback) -- finite output."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, image_size=(16, 16, 16), fine_decode=True, fine_stage=1)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    prior = torch.rand(2, 1, 16, 16, 16)
+    out = m(img, context_in=cin, context_out=cout, query_prior=prior, mode="train")["final_logit"]
+    assert out.shape == (2, 1, 4, 4, 4)
+    assert torch.isfinite(out).all()
+
+
+def test_pool_token_with_seq_compress():
+    """pool_token=True + seq_compress=True together -- both features insert extra
+    n_extra-accounted prefix rows; confirm they compose (shapes + full gradient coverage)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, seq_compress=True, compress_m=3, compress_layers=1,
+                   image_size=(16, 16, 16), fine_decode=True, fine_stage=1)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
