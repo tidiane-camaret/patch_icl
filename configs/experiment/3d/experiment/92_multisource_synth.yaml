@@ -32,7 +32,7 @@ data:
     # synth cohorts) -- not yet calibrated against eval; watch epoch throughput before
     # raising p_shape or the size/spread mm ranges (rasterization cost scales with the
     # requested physical size at fine crop_spacing_mm, see docs/logs.md).
-    p_shape: 0.1
+    p_shape: 0
     shape: {}   # ShapeCohortSpec defaults (docs/logs.md 2026-09-15)
   cohort:
     w_span: 0

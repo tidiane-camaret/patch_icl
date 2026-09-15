@@ -45,17 +45,48 @@ _FIDELITY_KEYS = ("image_size", "crop_spacing_mm", "use_crop", "context_size",
                   # prior must be evaluated the same way (see the data.cascade_spacings branch
                   # in main), else the fine level runs without the prior it was trained on and
                   # Dice is understated. None of these are restored from the checkpoint.
-                  "cascade_spacings", "cascade_query_prior", "cascade_query_prior_hard")
+                  "cascade_spacings", "cascade_query_prior", "cascade_query_prior_hard",
+                  # data.cascade_center_mode picks how each level>0 re-crop centre is chosen
+                  # ("com" centroid vs "random_fg" a random in-mask voxel; cascade.py
+                  # run_cascade). Silently drops to "com" at eval/infer if not re-supplied.
+                  "cascade_center_mode", "cascade_center_fg_thr")
 
 
-def _warn_uninherited_data(cfg: DictConfig) -> None:
+def _explicitly_overridden(dotted_key: str, explicit_keys=None) -> bool:
+    """True if `dotted_key` (e.g. 'data.mask_occupancy_thr') was a deliberate user choice for
+    this run, not just whatever the composed config's own default happens to be.
+
+    `explicit_keys`, when given (a non-Hydra-CLI caller, e.g. infer_cli.py's programmatic
+    `compose()`), is checked directly — that caller knows which of its own CLI flags were
+    actually passed. Otherwise falls back to Hydra's raw override list (`+`/`++` stripped),
+    available whenever running under @hydra.main; returns False (best-effort) if neither
+    applies, so an unrecognized context defaults to "treat as not overridden"."""
+    if explicit_keys is not None:
+        return dotted_key in explicit_keys
+    try:
+        from hydra.core.hydra_config import HydraConfig
+        overrides = HydraConfig.get().overrides.task
+    except Exception:
+        return False
+    return any(o.lstrip("+").split("=", 1)[0] == dotted_key for o in overrides)
+
+
+def _warn_uninherited_data(cfg: DictConfig, explicit_keys=None) -> None:
     """Warn about eval-config data params that differ from the checkpoint's training data.
 
     The checkpoint stores the full training `cfg.data` but eval.py does NOT restore it (only
     `arch`): the eval config stays authoritative. So a run trained at crop_spacing_mm=2 /
     occupancy masks but evaluated with the loader defaults (1.5 / nearest) reports a
     train-test mismatch as if nothing were wrong. This prints those uninherited differences up
-    front so the user can re-supply matching data.* overrides."""
+    front so the user can re-supply matching data.* overrides.
+
+    Exception: data.mask_occupancy_thr is auto-inherited (not just warned about) when the user
+    hasn't explicitly set it. train.py's own validation pass reuses the SAME
+    cfg.data.mask_occupancy_thr as training (no train/eval split for this key — see
+    train.py's realize_cascade_level0/native-crop call sites), so "the value training's own
+    eval used" IS the checkpoint's stored value; defaulting to anything else (a disconnected
+    constant, or whatever a composed dataset group happens to set) is drift by construction.
+    `explicit_keys`: see _explicitly_overridden."""
     ckpt_path = cfg.eval.get("checkpoint")
     if not ckpt_path:
         return
@@ -65,6 +96,17 @@ def _warn_uninherited_data(cfg: DictConfig) -> None:
         print("  [warn] checkpoint has no stored `data` (older run) — cannot check eval-config "
               "drift; ensure data.* matches training manually.")
         return
+
+    if "mask_occupancy_thr" in train_data and not _explicitly_overridden(
+            "data.mask_occupancy_thr", explicit_keys):
+        from omegaconf import open_dict
+        inherited = train_data["mask_occupancy_thr"]
+        if cfg.data.get("mask_occupancy_thr") != inherited:
+            with open_dict(cfg):
+                cfg.data.mask_occupancy_thr = inherited
+            print(f"  [info] data.mask_occupancy_thr not set -> inherited from the "
+                  f"checkpoint's training value: {inherited}")
+
     drift = []
     for k in _FIDELITY_KEYS:
         ev = cfg.data.get(k)

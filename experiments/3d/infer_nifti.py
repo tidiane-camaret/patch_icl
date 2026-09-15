@@ -12,6 +12,7 @@ See docs/superpowers/specs/2026-08-12-nifti-incontext-cascade-inference-design.m
 import random
 import re
 import sys
+import time
 import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -46,6 +47,20 @@ def load_nifti(path):
 def voxel_spacing(affine):
     """Per-axis mm/voxel (3,) from the affine, aligned with the array axes."""
     return [float(v) for v in voxel_sizes(affine)]
+
+
+def _resolve_context_center(req, binmask):
+    """Context crop centre per req.center_mode, mirroring providers/totalseg.py
+    _resolve_center: "com" (default) -> the mask centroid; "random_fg" -> a uniformly
+    random in-mask voxel drawn via req.rng (falls back to the centroid if the mask is
+    empty). An explicit req.center always wins."""
+    if req.center is not None:
+        return req.center
+    if req.center_mode == "random_fg":
+        coords = np.argwhere(np.asarray(binmask))
+        if coords.shape[0] > 0:
+            return tuple(int(v) for v in coords[req.rng.randrange(coords.shape[0])])
+    return mask_centroid(binmask)
 
 
 def mask_centroid(mask):
@@ -117,7 +132,7 @@ class NiftiProvider:
             k = int(subject[3:])                      # 'ctx0' -> 0
             c_ct, c_idmask, c_sp = self.contexts[k]
             binmask = (c_idmask > 0) if cls == _FG else (c_idmask == int(cls))
-            center = req.center if req.center is not None else mask_centroid(binmask)
+            center = _resolve_context_center(req, binmask)
             img_t, label_t, geom = prep_context(
                 c_ct, binmask, c_sp, center, T=self.T, crop_mm=sp,
                 mask_downsample=self.mask_downsample, occ_thr=self.occ_thr)
@@ -241,7 +256,7 @@ def _output_label_table(gt_path, context_pairs, keep_ids):
 
 
 def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
-                  gt_path=None, out_path=None):
+                  gt_path=None, out_path=None, explicit_data_keys=None):
     """Run the v2 coarse->fine in-context cascade on nifti files (GT-free target).
 
     Wraps cascade.run_cascade over an in-memory NiftiProvider: level 0 crops the target on
@@ -251,9 +266,13 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
 
     cfg            : OmegaConf cfg (same surface as experiments/3d/eval.py). Uses
                      data.image_size / mask_downsample / mask_occupancy_thr /
-                     cascade_spacings / cascade_query_prior[_hard] / cascade_recrop_workers
-                     and eval.model / eval.checkpoint. Falls back to eval.spacing_sweep for
-                     the spacing schedule when data.cascade_spacings is unset.
+                     cascade_spacings / cascade_query_prior[_hard] / cascade_recrop_workers /
+                     cascade_center_mode / cascade_center_fg_thr and eval.model /
+                     eval.checkpoint. Falls back to eval.spacing_sweep for the spacing
+                     schedule when data.cascade_spacings is unset. None of these are
+                     restored from the checkpoint (only `arch` is) -- re-supply the
+                     training values via --override for a faithful eval; _warn_uninherited_data
+                     (eval.py._FIDELITY_KEYS) flags drift on the ones it tracks.
     target_path    : target CT .nii.gz.
     context_pairs  : list[(image_path, mask_path)] for the same organ(s), K = len. Each
                      mask is binarized (>0) in single-label mode, or read as an id-valued
@@ -274,13 +293,25 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
                      file's original orientation + affine, so it overlays the input by voxel
                      index (see _to_original_orientation).
 
-    Returns {"pred", "affine", "dice", "coarse_only_dice", "pred_path"}; multi-label adds
-    "labels" and "macro_dice" and makes dice/coarse_only per-label dicts.
+    Returns {"pred", "affine", "dice", "coarse_only_dice", "pred_path", "timing"}; multi-label
+    adds "labels" and "macro_dice" and makes dice/coarse_only per-label dicts. "timing" is
+    {"total_s": whole-call wall time, "cascade_s": time spent in the per-chunk cascade
+    forward loop, "per_label_ms": {label: per-label cascade ms} (multi-label only; each
+    chunk's wall time split evenly over its batch_size labels, same convention as
+    cascade.py's evaluate_cascade per_sample_ms)}.
+
+    explicit_data_keys : dotted data.* keys (e.g. {"data.mask_occupancy_thr"}) the CALLER
+                         knows were a deliberate user choice this run (infer_cli.py's own CLI
+                         flags), not just a composed-config default -- see
+                         eval._explicitly_overridden. Needed because this function is reached
+                         via a programmatic hydra.compose(), where the Hydra-CLI-override
+                         detection eval.py's own callers rely on isn't available.
     """
     if not context_pairs:
         raise ValueError("predict_nifti needs at least one context pair (in-context model)")
+    t_start = time.perf_counter()
 
-    _warn_uninherited_data(cfg)
+    _warn_uninherited_data(cfg, explicit_keys=explicit_data_keys)
     model = _build_model(cfg)
     if hasattr(model, "eval"):
         model.eval()
@@ -296,6 +327,8 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
     qp = cfg.data.get("cascade_query_prior", "pred")
     qp_hard = bool(cfg.data.get("cascade_query_prior_hard", False))
     recrop_workers = int(cfg.data.get("cascade_recrop_workers", 1))
+    center_mode = cfg.data.get("cascade_center_mode", "com")
+    center_fg_thr = float(cfg.data.get("cascade_center_fg_thr", 0.5))
     from train import model_output_is_prob
     is_prob = bool(model_output_is_prob(cfg))
     N = len(spacings)
@@ -331,6 +364,7 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
     tasks = [{"label": lab, "passes": []} for lab in labels]
 
     # --- coarse->fine cascade (cascade.run_cascade), batched over labels -------
+    cascade_s = 0.0
     for chunk in _iter_chunks(tasks, batch_size):
         B = len(chunk)
         meta = {
@@ -342,15 +376,25 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         batch0 = _recrop_level(provider, meta, [None] * B, spacings[0],
                                step=0, seed=0, level=0, jitter=0,
                                recrop_workers=recrop_workers)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        t0_chunk = time.perf_counter()
         with torch.no_grad():
             res = run_cascade(model, provider, batch0, augmentor=None, spacings=spacings,
                               device=DEVICE, training=False, step=0, seed=0, jitter=0,
                               is_prob=is_prob, want_hard_preds=True,
                               recrop_workers=recrop_workers,
-                              query_prior=qp, query_prior_hard=qp_hard)
+                              query_prior=qp, query_prior_hard=qp_hard,
+                              center_mode=center_mode, center_fg_thr=center_fg_thr)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        dt_chunk = time.perf_counter() - t0_chunk
+        cascade_s += dt_chunk
+        per_label_ms = dt_chunk * 1e3 / B     # even split across this chunk's batched labels
         for j, task in enumerate(chunk):
             task["passes"] = [(res.hard_preds[li][j].cpu().numpy().astype(bool),
                                res.geoms[li][j].cpu().numpy()) for li in range(N)]
+            task["time_ms"] = round(per_label_ms, 1)
 
     gt_ml = None
     if gt_path is not None:
@@ -373,8 +417,10 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         if out_path is not None:
             nib.save(nib.Nifti1Image(pred_native.astype(np.uint8), out_affine), str(out_path))
             pred_path = Path(out_path)
+        timing = {"total_s": round(time.perf_counter() - t_start, 2),
+                  "cascade_s": round(cascade_s, 2)}
         return {"pred": pred_native, "affine": out_affine, "dice": dice,
-                "coarse_only_dice": coarse_only, "pred_path": pred_path}
+                "coarse_only_dice": coarse_only, "pred_path": pred_path, "timing": timing}
 
     # --- multi-label: per-label metrics + small-organ-wins id-valued stitch ------
     # Bounded memory: materialize one label's native at a time (never all at once).
@@ -410,7 +456,10 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         nib.save(out_img, str(out_path))
         pred_path = Path(out_path)
 
+    timing = {"total_s": round(time.perf_counter() - t_start, 2),
+              "cascade_s": round(cascade_s, 2),
+              "per_label_ms": {t["label"]: t["time_ms"] for t in tasks}}
     return {"pred": pred_native, "affine": out_affine, "dice": dice,
             "coarse_only_dice": coarse_only, "macro_dice": macro,
             "labels": [t["label"] for t in tasks], "label_names": label_names,
-            "pred_path": pred_path}
+            "pred_path": pred_path, "timing": timing}

@@ -106,6 +106,11 @@ def _cfg():
                  "mask_occupancy_thr": 0.1, "source": "totalseg",
                  "cascade_spacings": [4, 1.5], "cascade_query_prior": "pred"},
         "eval": {"model": "stub", "checkpoint": None},
+        # _StubModel emits real logits (needs a sigmoid), not medverse's [0,1] regression --
+        # pin cfg.model so train.model_output_is_prob's medverse branch (which dereferences
+        # cfg.train) is never reached. Pre-existing gap in this fixture, unrelated to the
+        # mask_occupancy_thr/explicit_data_keys change that surfaced it.
+        "model": "patchset3d",
     })
 
 
@@ -113,7 +118,7 @@ def test_predict_nifti_end_to_end(tmp_path, monkeypatch):
     import infer_nifti
     # Bypass the real model builder + drift warning (no checkpoint in the test).
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
 
     shape = (32, 32, 32)
     ct = np.zeros(shape, dtype=np.int16)
@@ -147,7 +152,7 @@ def test_predict_nifti_output_matches_target_orientation(tmp_path, monkeypatch):
     orientation + affine so it overlays the input CT voxel-for-voxel."""
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
 
     shape = (32, 32, 32)
     ct = np.zeros(shape, dtype=np.int16)
@@ -199,7 +204,7 @@ def test_predict_nifti_multilabel_matches_per_label_loop(tmp_path, monkeypatch):
     combining with the documented small-organ-wins overlap rule."""
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _EchoStubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
 
     shape = (32, 32, 32)
     ct = np.zeros(shape, dtype=np.int16)
@@ -236,7 +241,7 @@ def test_predict_nifti_multilabel_all_and_dice(tmp_path, monkeypatch):
     """--labels 'all' resolves to the context's non-zero ids; gt gives per-label + macro Dice."""
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _EchoStubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
 
     shape = (32, 32, 32)
     ct = np.zeros(shape, dtype=np.int16)
@@ -296,7 +301,7 @@ def _ml_case(tmp_path, monkeypatch):
     """Shared multi-label fixture: returns (cfg-runner args) tgt, cimg, ml paths."""
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _EchoStubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
     shape = (32, 32, 32)
     ct = np.zeros(shape, dtype=np.int16)
     ml = np.zeros(shape, dtype=np.uint8)
@@ -364,7 +369,7 @@ def test_multilabel_label_table_falls_back_to_context(tmp_path, monkeypatch):
 def test_predict_nifti_requires_context(tmp_path, monkeypatch):
     import infer_nifti
     monkeypatch.setattr(infer_nifti, "_build_model", lambda cfg: _StubModel())
-    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg: None)
+    monkeypatch.setattr(infer_nifti, "_warn_uninherited_data", lambda cfg, **kw: None)
     ct = np.zeros((8, 8, 8), dtype=np.int16)
     aff = np.eye(4)
     tgt = tmp_path / "t.nii.gz"; nib.save(nib.Nifti1Image(ct, aff), str(tgt))

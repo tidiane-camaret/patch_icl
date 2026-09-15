@@ -43,7 +43,12 @@ def _build_cfg(args):
         f"++data.cascade_spacings=[{args.crop_spacings}]",
         f"++data.cascade_query_prior={args.query_prior}",
         f"data.mask_downsample={args.mask_downsample}",
-        f"data.mask_occupancy_thr={args.mask_occupancy_thr}",
+        # mask_occupancy_thr: omitted here when the user didn't pass --mask-occupancy-thr, so
+        # _warn_uninherited_data (called from predict_nifti) auto-inherits the checkpoint's own
+        # training value instead of silently forcing an unrelated constant. See main()'s
+        # explicit_data_keys, which tells that check this WAS a deliberate CLI choice when set.
+        *([f"data.mask_occupancy_thr={args.mask_occupancy_thr}"]
+          if args.mask_occupancy_thr is not None else []),
         "wandb.project=null",
         *(args.override or []),
     ]
@@ -91,7 +96,8 @@ def build_parser():
     ap.add_argument("--mask-downsample", dest="mask_downsample", default="occupancy",
                     help="context-mask downsample: occupancy|nearest (default occupancy)")
     ap.add_argument("--mask-occupancy-thr", dest="mask_occupancy_thr", type=float,
-                    default=0.1, help="occupancy threshold (default 0.1)")
+                    default=None, help="occupancy threshold; default = the checkpoint's own "
+                    "training value (auto-inherited, see eval._warn_uninherited_data)")
     ap.add_argument("--override", action="append", metavar="KEY=VALUE",
                     help="extra Hydra override, passed through to the cfg (repeatable)")
     return ap
@@ -114,8 +120,14 @@ def main(argv=None):
         print(f"labels     : {label_ids}   batch_size={args.batch_size}")
 
     cfg = _build_cfg(args)
+    explicit_data_keys = ({"data.mask_occupancy_thr"}
+                          if args.mask_occupancy_thr is not None else set())
     res = predict_nifti(cfg, args.target, contexts, label_ids=label_ids,
-                        batch_size=args.batch_size, gt_path=args.gt, out_path=args.out)
+                        batch_size=args.batch_size, gt_path=args.gt, out_path=args.out,
+                        explicit_data_keys=explicit_data_keys)
+
+    timing = res.get("timing") or {}
+    per_label_ms = timing.get("per_label_ms") or {}
 
     print(f"\n  pred nonzero voxels : {int((res['pred'] > 0).sum())}  shape={res['pred'].shape}")
     if res.get("labels") is not None:                       # multi-label
@@ -123,11 +135,16 @@ def main(argv=None):
         print(f"  labels segmented    : {res['labels']}")
         if names:
             print(f"  label table         : {', '.join(f'{k}={names[k]}' for k in res['labels'] if k in names)}")
+        for lab in res["labels"]:
+            nm = f" ({names[lab]})" if lab in names else ""
+            parts = []
+            if res["dice"] is not None:
+                parts.append(f"dice={res['dice'][lab]:.4f}  coarse={res['coarse_only_dice'][lab]:.4f}")
+            if lab in per_label_ms:
+                parts.append(f"time={per_label_ms[lab]:.0f}ms")
+            if parts:
+                print(f"    label {lab:>3}{nm} : {'  '.join(parts)}")
         if res["dice"] is not None:
-            for lab in res["labels"]:
-                nm = f" ({names[lab]})" if lab in names else ""
-                print(f"    label {lab:>3}{nm} : dice={res['dice'][lab]:.4f}  "
-                      f"coarse={res['coarse_only_dice'][lab]:.4f}")
             print(f"  macro dice          : {res['macro_dice']:.4f}")
     elif res["dice"] is not None:                           # single-organ
         print(f"  dice                : {res['dice']:.4f}")
@@ -135,6 +152,9 @@ def main(argv=None):
         print(f"  gain (fine-coarse)  : {res['dice'] - res['coarse_only_dice']:+.4f}")
     if res["pred_path"] is not None:
         print(f"  written             : {res['pred_path']}")
+    if timing:
+        print(f"  cascade time        : {timing['cascade_s']:.1f}s"
+              f"  (total incl. model load/IO: {timing['total_s']:.1f}s)")
     return 0
 
 
