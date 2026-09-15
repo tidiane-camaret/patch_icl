@@ -524,3 +524,109 @@ def test_seq_compress_works_with_context_id_embed_and_cascade_registers():
     out["final_logit"].mean().backward()
     missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
     assert not missing, f"no grad reached: {missing}"
+
+
+# --- arch.pool_token: IRIS-style foreground-masked pooling token (finest fine_decode stage) ---
+
+_FINE_KW = dict(image_size=(16, 16, 16), fine_decode=True, fine_stage=1)
+
+
+def test_pool_token_default_off():
+    """Default (pool_token=False): no new params, forward shape/behavior unchanged, fine map
+    stays query-only."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_FINE_KW)
+    assert not hasattr(m, "pool_proj") and not hasattr(m, "pool_type")
+    img, cin, cout = _dummy_batch(S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+
+
+def test_pool_token_forward_shape_and_backward():
+    """pool_token=True: output shape unchanged; gradient reaches pool_proj/pool_type."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, **_FINE_KW)
+    assert m.pool_proj.in_features == 8      # dims[1] (fine_stage=1 -> enc_dims[1])
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_pool_token_changes_output_vs_off():
+    """Sanity: with the same seed, pool_token=True must produce different logits than
+    pool_token=False."""
+    torch.manual_seed(0)
+    kw = dict(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2, **_FINE_KW)
+    m_off = PatchSet3D(pool_token=False, **kw)
+    torch.manual_seed(0)
+    m_on = PatchSet3D(pool_token=True, **kw)
+    m_off.eval(); m_on.eval()
+    torch.manual_seed(1)
+    img, cin, cout = _dummy_batch(S=16)
+    out_off = m_off(img, context_in=cin, context_out=cout)["final_logit"]
+    out_on = m_on(img, context_in=cin, context_out=cout)["final_logit"]
+    assert out_off.shape == out_on.shape
+    assert not torch.allclose(out_off, out_on)
+
+
+def test_pool_token_requires_fine_decode():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  pool_token=True, fine_decode=False)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "fine_decode" in str(exc)
+
+
+def test_pool_token_rejects_register_routed():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  pool_token=True, register_routed=True, **_FINE_KW)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "register_routed" in str(exc)
+
+
+def test_pool_token_fine_map_stays_query_only_for_decode():
+    """_decode must still receive query-only fine maps (B,Cf,S,S,S), not (B*T,...) -- the
+    easiest place for an off-by-one/wrong-slice bug to hide."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, **_FINE_KW)
+    captured = {}
+    orig_decode = m._decode
+
+    def spy(q, fine=None):
+        captured["fine_shapes"] = [f.shape for f in fine]
+        return orig_decode(q, fine)
+    m._decode = spy
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    m(img, context_in=cin, context_out=cout, mode="train")
+    assert captured["fine_shapes"] == [(2, 8, 8, 8, 8)]   # (B, Cf, S, S, S), B=2 not B*T
+
+
+def test_pool_token_with_context_id_embed_and_cascade_registers_and_mask_slots():
+    """Combined smoke test: context_id_embed/cascade_registers/mask_slots tagging all apply
+    correctly to pool rows alongside real content rows, and everything still trains."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, context_id_embed=True, cascade_registers=True,
+                   mask_slots=2, **_FINE_KW)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    out = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_pool_tokens_all_background_support_mask_no_nan():
+    """An all-zero support mask for one context volume must not produce NaN/Inf (den clamp)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, **_FINE_KW)
+    img, cin, _ = _dummy_batch(B=2, K=2, S=16)
+    cout = torch.zeros(2, 2, 16, 16, 16, dtype=torch.long)     # all background
+    out = m(img, context_in=cin, context_out=cout, mode="train")["final_logit"]
+    assert torch.isfinite(out).all()
