@@ -8654,3 +8654,25 @@ scattered via connected-component count, fg/bg intensity contrast; ~4 min, cache
 correlation table quantify which property actually predicts Dice per model/checkpoint family.
 Verified 3 ways at each edit: `marimo check` (lint), `marimo export script` + execution
 (dependency-graph + runtime correctness), and a live `marimo run --headless` smoke test.
+
+**2026-09-15 — flare22 + nasalseg folded into the per-dataset comparison (9 sources total)**.
+User pointed at pre-existing `eval.py` runs in `wandb/` (13 runs after 2026-08-25, spanning 5
+checkpoint generations 52→92 — these predate the eval-expansion effort and were not a
+structured sweep). Filtered to `data.source in {flare22, nasalseg}` × `eval.model in
+{medverse, patchset3d}`, cross-referenced against `eval.json` outputs under `3d_eval/` (config
+doesn't log `data.source`, only class names — verified no other tracked-checkpoint eval.json
+reuses these organ/nasal-cavity class names before trusting the class-name→source mapping).
+3 of 13 runs failed (flare22 exp59 cascade: unsupported on non-TotalSeg-v2 source at the time;
+nasalseg exp92 cascade ×2: config error then "no valid samples" from too-tight spacing).
+Results written up in `docs/datasets/flare22.md` §8 and `docs/datasets/nasalseg.md` §7 (both
+report **crop-space** Dice against each doc's own GT-fidelity ceiling, not native-space).
+flare22: newest exp92_orig cascade wins clearly (0.723). nasalseg: the flip case among all 9
+sources — released medverse (0.660) beats every patchset3d checkpoint including exp92_orig's
+own cascade (0.551), unlike everywhere else patchset3d has tested ahead.
+
+Added both sources to `results/presentations/val/per_dataset_analysis.py`'s `SOURCE_BY_CLASS`
+(13 flare22 organ classes + 5 nasalseg classes) and to `compute_class_properties.py`'s
+`REGISTRY` (`Flare22Provider`, `NasalSegProvider`) — both already had the provider
+infrastructure from the FLARE22/NasalSeg integration, zero new code needed beyond the mapping.
+`exp_cascade_register` and a matched medverse sweep (cascade prior=none/pred, native-AR) have
+not yet been run for either source.

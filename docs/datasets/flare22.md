@@ -235,3 +235,25 @@ our flat `nsd_tolerance_mm: 3.0`; and that the GT-centroid crop is **oracle loca
 a protocol choice to declare (challenge submissions segment the whole volume).
 
 Not pulled: the 50 validation cases (doubles the pool, needs grand-challenge registration).
+
+## 8. Results (2026-09-15)
+
+Six `eval.py` runs across five checkpoint generations, `data.source=flare22`, `n_subjects=null`
+(all 50). All numbers are **crop-space** Dice/NSD — remember the round-trip ceiling from §7
+(0.79–0.98, organ-dependent), and the ~30%-larger-organ annotation-convention gap from §6
+(caps Dice at ~0.82–0.92 even for a perfectly-shaped prediction on 7 organs).
+
+| checkpoint (date) | model | mode | macro Dice | macro NSD | GFLOPs |
+|---|---|---|---:|---:|---:|
+| `54_organs_fine_decode_0_1` (08-25) | patchset3d | single-level | 0.689 | 0.714 | 10000 |
+| `58_organs_synth_gmm` (08-27) | patchset3d | single-level | 0.524 | 0.524 | 6521 |
+| released weights (08-27) | medverse | single-level | 0.488 | 0.477 | 4492 |
+| `61_plainconv_K_1` (08-29) | patchset3d | single-level | 0.704 | 0.713 | 3891 |
+| `67_cascade_qprior_pred` (09-01) | patchset3d | cascade `[6,3]` | **failed** — `cascade_spacings` unsupported for non-TotalSeg-v2 sources at that time (fixed by exp92's cascade generalization, see below) |
+| `92_multisource_synth` (09-11) | patchset3d | cascade `[6,3,2.5]` | **0.723** (finest, r2.5), 0.573 (coarsest, r6) | 0.745 | 11673 |
+
+Best result is the newest `exp92_orig` checkpoint's cascade, clearly ahead of every earlier
+checkpoint and of released medverse. Now tracked in
+`results/presentations/val/per_dataset_analysis.py` (`SOURCE_BY_CLASS`) alongside the 7
+eval-expansion sources — `exp_cascade_register` and a matched medverse-cascade/native-AR sweep
+have not yet been run for flare22.

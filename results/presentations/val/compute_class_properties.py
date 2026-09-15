@@ -26,11 +26,13 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT_DIR))
 
 from src.providers.atlas_v2 import AtlasV2Provider
+from src.providers.flare22 import Flare22Provider
 from src.providers.gnc_kidney import GncKidneyProvider
 from src.providers.hu_lwk1 import HuLwk1Provider
 from src.providers.isles22 import Isles22Provider
 from src.providers.msd_hippocampus import MsdHippocampusProvider
 from src.providers.msd_prostate import MsdProstateProvider
+from src.providers.nasalseg import NasalSegProvider
 from src.providers.shifts_ms import ShiftsMsProvider
 
 DATA_ROOT = (
@@ -45,6 +47,8 @@ REGISTRY = {
     "msd_prostate": (MsdProstateProvider, f"{DATA_ROOT}/msd_prostate/npy"),
     "atlas_v2": (AtlasV2Provider, f"{DATA_ROOT}/atlas_v2/npy"),
     "gnc_kidney": (GncKidneyProvider, f"{DATA_ROOT}/gnc_kidney/npy"),
+    "flare22": (Flare22Provider, f"{DATA_ROOT}/flare22/npy"),
+    "nasalseg": (NasalSegProvider, f"{DATA_ROOT}/nasalseg/npy"),
 }
 N_SAMPLE = 40
 SEED = 42

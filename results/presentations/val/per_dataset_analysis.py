@@ -6,8 +6,8 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    # Per-dataset eval comparison across the 7 eval-expansion sources (isles22, shifts_ms,
-    # msd_hippocampus, msd_prostate, atlas_v2, gnc_kidney, hu_lwk1). Compares:
+    # Per-dataset eval comparison across the 9 eval-expansion sources (isles22, shifts_ms,
+    # msd_hippocampus, msd_prostate, atlas_v2, gnc_kidney, hu_lwk1, flare22, nasalseg). Compares:
     #   - patchset3d exp92_orig     (.../3d_train/2026-09-11_92_multisource_synth/best.pt)
     #   - patchset3d exp_cascade_register (.../checkpoints/2026-09-14_92_multisource_synth_cascade_register/best.pt,
     #     arch.cascade_registers=true, see docs/datasets/eval_expansion_status.md)
@@ -21,7 +21,7 @@ def _():
     mo.md(
         "# Per-dataset eval comparison\n"
         "patchset3d (exp92_orig vs exp_cascade_register) vs. released Medverse "
-        "(harness cascade prior=none/pred, native autoregressive), across all 7 "
+        "(harness cascade prior=none/pred, native autoregressive), across all 9 "
         "eval-expansion sources. Rescans `eval.json` outputs on every run."
     )
     return (mo,)
@@ -58,6 +58,18 @@ def _():
         "hyper_mask_l": "gnc_kidney",
         "hypo_mask_r": "gnc_kidney", "hypo_mask_l": "gnc_kidney",
         "complex_cyst_r": "gnc_kidney", "complex_cyst_l": "gnc_kidney",
+        # flare22 (13 abdominal organs) -- these class names are plain TotalSeg organ names,
+        # only safe because no other eval.json under our 2 tracked checkpoints uses them
+        # (verified 2026-09-15: only patchset_92_flare22/nasalseg do).
+        "liver": "flare22", "kidney_right": "flare22", "spleen": "flare22",
+        "pancreas": "flare22", "aorta": "flare22", "inferior_vena_cava": "flare22",
+        "adrenal_gland_right": "flare22", "adrenal_gland_left": "flare22",
+        "gallbladder": "flare22", "esophagus": "flare22", "stomach": "flare22",
+        "duodenum": "flare22", "kidney_left": "flare22",
+        # nasalseg (5 air-filled cavities)
+        "maxillary_sinus_left": "nasalseg", "maxillary_sinus_right": "nasalseg",
+        "nasal_cavity_left": "nasalseg", "nasal_cavity_right": "nasalseg",
+        "nasopharynx": "nasalseg",
     }
 
     # checkpoint path suffix -> short tag used throughout the eval-expansion docs.
@@ -87,7 +99,7 @@ def _(CKPT_TAG, SOURCE_BY_CLASS, defaultdict, glob, json, os, pd, re, EVAL_ROOT)
         return ("cascade", "pred") if has_cascade else ("single", "")
 
     def load_eval_df():
-        """Scan every eval.json under EVAL_ROOT, keep only rows from our 7 tracked sources
+        """Scan every eval.json under EVAL_ROOT, keep only rows from our 9 tracked sources
         + our 2 tracked patchset3d checkpoints + released medverse, dedupe by keeping the
         most-recently-written run per (source, model, checkpoint, mode, query_prior, class)."""
         best = {}
@@ -109,6 +121,15 @@ def _(CKPT_TAG, SOURCE_BY_CLASS, defaultdict, glob, json, os, pd, re, EVAL_ROOT)
                 if src is None and cls == "stroke_lesion":
                     src = "atlas_v2" if row.get("n_samples", 0) > 400 else "isles22"
                 if src is None:
+                    continue
+                # flare22/nasalseg classes are plain TotalSeg organ names (liver, aorta, ...)
+                # or generic anatomy names -- collide with many unrelated medverse eval runs
+                # (e.g. "..._totalseg_medverse", "medverse_ts256_1p5mm_all") that happen to
+                # score the same class names on ordinary TotalSegmentator. Every genuine
+                # flare22/nasalseg run_dir in this repo's history names the source explicitly
+                # (verified 2026-09-15), so require that as an extra guard for these 2 sources
+                # only -- the other 7 sources' class names are unique enough to not need it.
+                if src in ("flare22", "nasalseg") and src not in run_dir:
                     continue
                 has_cascade = any(k.startswith("dice_r") for k in row)
                 mode, qp = _classify_run(run_dir, has_cascade)
@@ -331,10 +352,9 @@ def _(merged_df, plt):
 @app.cell
 def _(mo):
     mo.md(
-        "**Modality** (CT vs. MRI) isn't a scatter axis -- only hu_lwk1 is CT (6/7 sources "
-        "are MRI), so it collapses to a single point per checkpoint family rather than a "
-        "trend. See the per-dataset grids above for the CT-vs-MRI split explicitly (hu_lwk1's "
-        "panel vs. the rest)."
+        "**Modality** (CT vs. MRI) isn't a scatter axis -- hu_lwk1/flare22/nasalseg are CT, "
+        "the other 6 sources are MRI, so it's a coarse 3-vs-6 split rather than a smooth "
+        "trend. See the per-dataset grids above for the CT-vs-MRI split explicitly."
     )
     return
 

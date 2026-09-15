@@ -157,3 +157,29 @@ The nasal cavities are the binding class at ~0.86 — read their Dice against th
 not against 1.0. The same crop-space-vs-native-space caveat as FLARE22 applies (see
 `docs/datasets/flare22.md` §7); `NasalSegProvider.native_meta()` supplies what a native-space
 metric needs.
+
+## 7. Results (2026-09-15)
+
+Four `eval.py` runs (two more crashed — see below) across four checkpoint generations,
+`data.source=nasalseg`, `n_subjects=null` (all 107). All numbers are **crop-space** Dice/NSD —
+read against the round-trip ceiling above (~0.86 nasal cavities, ~0.94–0.95 maxillary
+sinuses/nasopharynx).
+
+| checkpoint (date) | model | mode | macro Dice | macro NSD | GFLOPs |
+|---|---|---|---:|---:|---:|
+| `54_organs_fine_decode_0_1` (08-25) | patchset3d | single-level | 0.267 | 0.295 | 10000 |
+| `58_organs_synth_gmm` (08-27) | patchset3d | single-level | 0.263 | 0.295 | 6521 |
+| released weights (08-27) | medverse | single-level | **0.660** | **0.750** | 4492 |
+| `61_plainconv_K_1` (08-29) | patchset3d | single-level | 0.197 | 0.331 | 3891 |
+| `92_multisource_synth` (09-12, spacings `[1.5,1]`) | patchset3d | cascade | **failed** — `cascade_loss_weights` length mismatch (config error) |
+| `92_multisource_synth` retry (09-12, spacings `[1.5,1]`) | patchset3d | cascade | **failed** — "no valid samples" on all 5 classes (spacing too tight for nasalseg's small extent — the 128mm crop FOV at 1.5mm undercuts the head) |
+| `92_multisource_synth` (09-12, spacings `[1.5,0.8]`) | patchset3d | cascade | 0.551 (r0.8/r1.5 ~identical) | 0.727 | 7782 |
+
+Nasalseg is the flip case among all 9 eval-expansion sources: **released medverse weights
+(0.660) beat every patchset3d checkpoint tried**, including the latest exp92 cascade (0.551) —
+unlike flare22 or the 7-source expansion set, where patchset3d generally wins. The contrast-
+polarity shift (§5, air cavity vs. TotalSeg/FLARE22's bright-on-dark organs) may hit patchset3d's
+class-held-out generalization harder than medverse's. Now tracked in
+`results/presentations/val/per_dataset_analysis.py` (`SOURCE_BY_CLASS`) alongside the 7
+eval-expansion sources — `exp_cascade_register` and a matched medverse-cascade/native-AR sweep
+have not yet been run for nasalseg.
