@@ -482,7 +482,16 @@ def build_dataset(cfg, split: str):
                 sd_between_ratio=(g.get("sd_between_ratio") if OmegaConf.is_config(g)
                                   else g.get("sd_between_ratio")),
             )
-            synth_prov = SynthGmmProvider(synth_ds, cascade=True)
+            p_shape = float(g.get("p_shape", 0.0) or 0.0)
+            shape_spec = None
+            if p_shape > 0.0:
+                from src.shapes3d.spec import ShapeCohortSpec
+                shape_cfg = g.get("shape", {}) or {}
+                shape_kwargs = (OmegaConf.to_container(shape_cfg, resolve=True)
+                                if OmegaConf.is_config(shape_cfg) else dict(shape_cfg))
+                shape_spec = ShapeCohortSpec(**shape_kwargs)
+            synth_prov = SynthGmmProvider(synth_ds, cascade=True, p_shape=p_shape,
+                                          shape_spec=shape_spec)
             provider = TriSourceProvider(
                 provider, synth_prov, p_synth=p_synth,
                 epoch_length=_epoch_len, gpu_realize_crop=_realize)

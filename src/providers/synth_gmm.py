@@ -17,8 +17,13 @@ sampled cohort's target for a procedurally generated geometric shape (blob/splat
 disk/cylinder, see src/shapes3d/) stamped into the sampled hosts' real anatomy under a
 new pseudo-class id (data.maisi_classes.SHAPE_ID_TO_FAMILY). The host's real class
 still drives crop placement (center resolution against real anatomy); only the painted
-target and its label change. See docs/superpowers/specs/
-2026-09-14-cohort-consistent-synthetic-shapes-design.md.
+target and its label change. Shape size/position are physical (mm), anchored to the
+host's own precomputed centroid (`e["cents"]`, level-invariant) rather than the
+resolved crop center or any crop-relative fraction -- so the SAME shape (same physical
+size and position) is what every cascade level re-crops toward, however that level's
+`crop_spacing_mm` differs. See docs/superpowers/specs/
+2026-09-14-cohort-consistent-synthetic-shapes-design.md and docs/logs.md 2026-09-15
+(world-space redesign, superseding the initial crop-relative one).
 """
 from types import SimpleNamespace
 
@@ -123,6 +128,7 @@ class SynthGmmProvider:
         # `pad_lo` describe the TARGET grid placement and don't depend on the source array's
         # shape, so this is a pure cost cut, not a correctness change.
         cap = self.ds.gpu_realize_max_native
+        step = (1, 1, 1)
         if cap and max(crop_lbl.shape) > cap:
             step = tuple(-(-s // cap) for s in crop_lbl.shape)   # ceil division
             crop_lbl = crop_lbl[::step[0], ::step[1], ::step[2]]
@@ -138,7 +144,22 @@ class SynthGmmProvider:
             # writes in place, so force an actual copy first if that view is read-only.
             if not crop_lbl.flags.writeable:
                 crop_lbl = crop_lbl.copy()
-            rasterize_shape_in_crop(crop_lbl, cls_id, shape_id, member_draw, member_nrng)
+            # World-space anchor: `fallback` (e["cents"][cls_id], the host's own
+            # precomputed centroid) is level-invariant -- unlike the resolved `center`
+            # above, which can be a live random_fg draw or a cascade-predicted center
+            # and so is NOT guaranteed identical across cascade levels. Anchoring the
+            # shape's position to `fallback` instead (plus a fixed per-member mm
+            # offset) is what makes the shape the SAME physical object at every level.
+            spacing = np.asarray(e["spacing"], dtype=np.float64)
+            center_native = np.asarray(fallback if fallback is not None else (0.0, 0.0, 0.0),
+                                       dtype=np.float64)
+            center_native = center_native + (
+                np.asarray(member_draw.position_offset_mm, dtype=np.float64) / spacing)
+            starts = geom[0].numpy().astype(np.float64)
+            center_local = (center_native - starts) / np.asarray(step, dtype=np.float64)
+            mm_per_voxel = tuple((spacing * np.asarray(step, dtype=np.float64)).tolist())
+            rasterize_shape_in_crop(crop_lbl, shape_id, member_draw, mm_per_voxel,
+                                    center_local, member_nrng)
             target_cls = shape_id
             if self.shape_spec.intensity_between_ratio is not None:
                 if mu_e is mu:          # avoid mutating the cohort-shared mu array in place
@@ -230,15 +251,10 @@ class SynthGmmProvider:
 
         shape_hp, shape_id = None, None
         if host_cls_id is not None:
-            if req.center is not None:
-                raise NotImplementedError(
-                    "shape-mode cohorts do not yet support cascade re-crop with a predicted "
-                    "center: shape size/position are crop-relative, not world-relative, so a "
-                    "re-crop at a different FOV would supervise a physically different object "
-                    "than level 0. See docs/superpowers/specs/"
-                    "2026-09-14-cohort-consistent-synthetic-shapes-design.md sec 2 and "
-                    "docs/logs.md for the known limitation this guards against."
-                )
+            # req.center may be a cascade-predicted center or None (same-level
+            # reconstruction) -- either way it only affects WHERE the crop window
+            # looks; the shape's own position is anchored to the host's fixed centroid
+            # (see _build_nc), independent of it. See docs/logs.md 2026-09-15.
             shape_hp = draw_cohort_hyperparams(
                 np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
             shape_id = cls_id

@@ -23,6 +23,17 @@ data:
     mu_group_ids: null
     mu_group_rho: null
     sd_between_ratio: null
+    # Procedural blob/splatter/disk/cylinder shapes stamped into real hosts under a new
+    # pseudo-class id (src/shapes3d/, docs/logs.md 2026-09-15) -- a distinct failure
+    # mode from real-anatomy synth cohorts: the model has to find a sub-region shape
+    # living inside a known organ, not just recognize the organ itself. Shape size and
+    # position are physical (mm), anchored to the host's own centroid, so the SAME
+    # shape is what every cascade level re-crops toward. Starting conservative (10% of
+    # synth cohorts) -- not yet calibrated against eval; watch epoch throughput before
+    # raising p_shape or the size/spread mm ranges (rasterization cost scales with the
+    # requested physical size at fine crop_spacing_mm, see docs/logs.md).
+    p_shape: 0.1
+    shape: {}   # ShapeCohortSpec defaults (docs/logs.md 2026-09-15)
   cohort:
     w_span: 0
     w_fov: 0

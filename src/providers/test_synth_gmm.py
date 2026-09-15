@@ -218,10 +218,11 @@ def _make_wide_bank(tmp_path):
     return tmp_path
 
 
-def _make_wide_shape_provider(tmp_path, p_shape=1.0, shape_spec=None):
+def _make_wide_shape_provider(tmp_path, p_shape=1.0, shape_spec=None, crop_jitter=None):
     bank_dir = _make_wide_bank(tmp_path)
     ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
-                              crop_spacing_mm=3.0, classes=[CLS], maxid=256)
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              crop_jitter=crop_jitter)
     return SynthGmmProvider(ds, cascade=True, p_shape=p_shape,
                             shape_spec=shape_spec or ShapeCohortSpec())
 
@@ -270,28 +271,30 @@ def test_assemble_task_p_shape_zero_never_returns_a_shape_class(tmp_path):
 
 
 def test_load_native_crop_reproduces_the_same_shape_at_the_same_crop_spacing(tmp_path):
-    """Single-level re-crop consistency ONLY: re-deriving from the subject string alone,
-    at the SAME crop_spacing_mm assemble_task used, must reproduce the identical shape
-    mask AND painted image. This does NOT test (and shape mode does not guarantee)
-    reproducing the same shape across cascade levels that use a DIFFERENT
-    crop_spacing_mm -- size_frac and position_uvw are resolved relative to the crop grid
-    they're rasterized into, not in world/mm space, so a shape's absolute size/position
-    can drift across levels with different physical FOVs. See ShapeCohortSpec's
-    docstring and rasterize_shape_in_crop's docstring for the limitation.
+    """Re-crop consistency at a FIXED crop_spacing_mm: re-deriving from the subject
+    string alone must reproduce the identical shape mask AND painted image.
 
-    Uses _make_wide_shape_provider (DIM=96), not the module's default _make_shape_provider
-    (DIM=32): with DIM=32, the crop-jitter window's high end coincidentally sits exactly at
-    smax (dim - crop_size), so this test used to pass even with jitter/RNG-stream alignment
-    completely broken -- reconstructing with req.rng seeded 0, 1, 2, 99 all produced
-    bit-identical crops regardless, and only `.label_frac` was compared, which never
-    touches the member_nrng-seeded paint path. DIM=96 removes that coincidence (crop
-    genuinely lands at a different native start per req.rng seed -- verified directly:
-    20/20 distinct starts across 20 seeds), and the assertions below additionally check
-    that the crop start DOES move and that `.image` (which exercises `_resample_paint_mask`'s
-    member_nrng stream, unlike `.label_frac`) still reproduces exactly regardless of where
-    the (crop-relative) shape and paint land -- proving reproduction is driven by
-    (gmm_seed, member_idx), not by hitting the same native crop window by chance."""
-    provider = _make_wide_shape_provider(tmp_path, p_shape=1.0)
+    Uses crop_jitter=0 on BOTH sides: `assemble_task`'s own level-0 build applies
+    self.ds.jitter same as any other call (jitter is a training-time augmentation, not
+    something load_native_crop can retroactively cancel out), so a nonzero jitter would
+    make even a real (non-shape) class's crop window land at a DIFFERENT native start
+    on each call regardless of shape mode -- an apples-to-oranges comparison, not a
+    shape regression. Pinning jitter=0 isolates the comparison to what this test
+    actually means to prove: member_nrng-driven shape/paint consistency (keyed off
+    gmm_seed/member_idx), independent of the crop window's own placement.
+
+    (Reproducing across DIFFERENT req.rng jitter draws -- i.e. reconstructing a crop
+    whose WINDOW itself is only known up to a random jitter offset -- was never a
+    documented guarantee for any class, shape or real; it also isn't how any real
+    cascade re-crop calls load_native_crop, which always supplies an explicit predicted
+    `center` and thus jitter=0 anyway, see _build_nc's "no jitter for cascade recrops"
+    comment. See test_load_native_crop_supports_a_different_crop_spacing_mm_without_raising
+    below for the jittered/center=None path -- it only asserts no crash.)
+
+    Physical consistency ACROSS DIFFERENT crop_spacing_mm -- the harder claim -- is
+    covered separately: precisely, at the pure-function level, by
+    src/shapes3d/test_instantiate.py::test_rasterize_shape_in_crop_is_physically_consistent_across_crop_resolutions."""
+    provider = _make_wide_shape_provider(tmp_path, p_shape=1.0, crop_jitter=0)
     rng = random.Random(0)
     task = provider.assemble_task(rng, crop_spacing_mm=3.0)
     original = task["native_crop"][0]
@@ -303,16 +306,6 @@ def test_load_native_crop_reproduces_the_same_shape_at_the_same_crop_spacing(tmp
     assert rebuilt.class_idx == original.class_idx
     np.testing.assert_array_equal(rebuilt.label_frac.numpy(), original.label_frac.numpy())
     np.testing.assert_array_equal(rebuilt.image.numpy(), original.image.numpy())
-
-    # Prove the crop-jitter mechanism this test is meant to exercise actually has room to
-    # move (not a no-op): reconstructing at several different req.rng seeds must land on
-    # more than one distinct native crop start.
-    starts = {tuple(provider.load_native_crop(
-        task["subject"], task["label_name"],
-        LoadRequest(rng=random.Random(seed), crop_spacing_mm=3.0, center=None,
-                    center_mode="com")).crop_geom[0].tolist())
-        for seed in range(8)}
-    assert len(starts) > 1, "crop start never moved across req.rng seeds -- jitter is a no-op"
 
 
 def test_shape_mode_subject_string_carries_the_host_class_as_a_fourth_field(tmp_path):
@@ -372,34 +365,25 @@ def test_shape_mode_intensity_between_ratio_does_not_mutate_shared_mu(tmp_path):
     np.testing.assert_array_equal(captured["mu_ref"], captured["mu_snapshot"])
 
 
-def test_load_native_crop_rejects_a_predicted_center_for_a_shape_mode_subject(tmp_path):
-    """Guard: shape size_frac/position_uvw are crop-relative, not world-relative (see
-    docs/superpowers/specs/2026-09-14-cohort-consistent-synthetic-shapes-design.md sec 2
-    and docs/logs.md's Known Limitation). A cascade re-crop with a predicted center
-    (req.center is not None) would re-derive the shape into a DIFFERENT physical FOV than
-    level 0 showed the model, silently supervising a different object. That must raise
-    loudly instead of returning a wrong-but-plausible NativeCrop."""
-    provider = _make_shape_provider(tmp_path, p_shape=1.0)
+def test_load_native_crop_supports_a_different_crop_spacing_mm_without_raising(tmp_path):
+    """World-space fix regression: a shape-mode subject used to be REJECTED
+    (NotImplementedError) whenever a cascade re-crop supplied a predicted (non-None)
+    center, because shape size/position were crop-relative and could not be
+    consistently re-derived at a different FOV. Now that size/position are anchored to
+    the host's own centroid in physical (mm) units (see synth_gmm.py's shape branch and
+    rasterize_shape_in_crop), both a predicted center AND a different crop_spacing_mm
+    (like a different cascade level) must work without raising. Precise physical-size/
+    position consistency across resolutions is proven at the pure-function level in
+    src/shapes3d/test_instantiate.py::test_rasterize_shape_in_crop_is_physically_consistent_across_crop_resolutions;
+    this test only proves the provider-level plumbing (native-origin lookup via
+    crop_geom, cap-stride, spacing conversion) doesn't crash end-to-end."""
+    provider = _make_wide_shape_provider(tmp_path, p_shape=1.0)
     rng = random.Random(0)
-    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+    task = provider.assemble_task(rng, crop_spacing_mm=6.0)
     assert task["subject"].split("|")[3].startswith("host")  # confirms shape mode fired
 
-    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=(1, 2, 3),
-                      center_mode="com")
-    with pytest.raises(NotImplementedError):
-        provider.load_native_crop(task["subject"], task["label_name"], req)
-
-
-def test_load_native_crop_allows_a_shape_mode_subject_when_center_is_none(tmp_path):
-    """Complement of the guard test above: center=None (same-level reconstruction, the
-    only case any current caller -- the reproduction test or a same-level realize -- ever
-    passes) must NOT raise."""
-    provider = _make_shape_provider(tmp_path, p_shape=1.0)
-    rng = random.Random(0)
-    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
-    assert task["subject"].split("|")[3].startswith("host")
-
-    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None,
-                      center_mode="com")
-    rebuilt = provider.load_native_crop(task["subject"], task["label_name"], req)
-    assert rebuilt.class_idx in SHAPE_ID_TO_FAMILY
+    for center, spacing in [(None, 3.0), (tuple(_WIDE_CENTER), 1.5)]:
+        req = LoadRequest(rng=random.Random(0), crop_spacing_mm=spacing, center=center,
+                          center_mode="com")
+        rebuilt = provider.load_native_crop(task["subject"], task["label_name"], req)
+        assert rebuilt.class_idx in SHAPE_ID_TO_FAMILY

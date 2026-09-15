@@ -1,39 +1,44 @@
 """Per-axis cohort-consistency instantiation for shape-mode cohorts: a cohort-level
 draw (shared, like synth_gmm's mu/sd) blended toward each member's independent draw by
 that axis's *_between_ratio (like synth_gmm's mu_e). See
-docs/superpowers/specs/2026-09-14-cohort-consistent-synthetic-shapes-design.md."""
+docs/superpowers/specs/2026-09-14-cohort-consistent-synthetic-shapes-design.md.
+
+Size and position are drawn in PHYSICAL units (mm) so the same member_draw resolves to
+the same physical object at every cascade level -- see rasterize_shape_in_crop and
+docs/logs.md 2026-09-15."""
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from .primitives import make_shape
+from .primitives import make_shape, reach_vox
+
+_EPS = 1e-9
 
 # (family, param key) -> ShapeCohortSpec attribute holding that param's [lo, hi] prior
 # range -- used to draw both the cohort baseline and each member's fresh redraw.
 _CONTINUOUS_RANGE = {
     ("blob", "roughness"): "blob_roughness_range",
-    ("splatter", "spread_frac"): "splatter_spread_frac_range",
+    ("splatter", "spread_mm"): "splatter_spread_mm_range",
     ("splatter", "roughness"): "splatter_roughness_range",
     ("disk", "aspect_ratio"): "disk_aspect_ratio_range",
-    ("cylinder", "radius_frac"): "cylinder_radius_frac_range",
-    ("cylinder", "length_frac"): "cylinder_length_frac_range",
+    ("cylinder", "length_mm"): "cylinder_length_mm_range",
 }
 
 
 @dataclass
 class CohortHyperparams:
     family: str
-    size_frac: float
-    position_uvw: np.ndarray            # (3,) in [0,1], cohort baseline
+    size_mm: float
+    position_offset_mm: np.ndarray      # (3,) mm offset from the host's centroid, cohort baseline
     shape_params: dict = field(default_factory=dict)
 
 
 @dataclass
 class MemberShapeDraw:
     family: str
-    size_frac: float
-    position_uvw: np.ndarray
+    size_mm: float
+    position_offset_mm: np.ndarray
     shape_params: dict = field(default_factory=dict)
 
 
@@ -56,8 +61,8 @@ def draw_cohort_hyperparams(rng, spec):
     weights = np.array([float(spec.family_weights[f]) for f in families], dtype=float)
     family = families[int(rng.choice(len(families), p=weights / weights.sum()))]
 
-    size_frac = float(rng.uniform(*spec.size_frac_range))
-    position_uvw = rng.uniform(0.15, 0.85, size=3)
+    size_mm = float(rng.uniform(*spec.size_mm_range))
+    position_offset_mm = rng.uniform(*spec.position_offset_mm_range, size=3)
 
     if family == "blob":
         shape_params = {"roughness": float(rng.uniform(*spec.blob_roughness_range))}
@@ -65,7 +70,7 @@ def draw_cohort_hyperparams(rng, spec):
         lo, hi = spec.splatter_n_components_range
         shape_params = {
             "n_components": int(rng.integers(int(lo), int(hi) + 1)),
-            "spread_frac": float(rng.uniform(*spec.splatter_spread_frac_range)),
+            "spread_mm": float(rng.uniform(*spec.splatter_spread_mm_range)),
             "roughness": float(rng.uniform(*spec.splatter_roughness_range)),
         }
     elif family == "disk":
@@ -75,16 +80,15 @@ def draw_cohort_hyperparams(rng, spec):
         }
     elif family == "cylinder":
         shape_params = {
-            "radius_frac": float(rng.uniform(*spec.cylinder_radius_frac_range)),
-            "length_frac": float(rng.uniform(*spec.cylinder_length_frac_range)),
+            "length_mm": float(rng.uniform(*spec.cylinder_length_mm_range)),
             "azimuth": float(rng.uniform(0, 2 * np.pi)),
             "elevation": float(rng.uniform(-np.pi / 2, np.pi / 2)),
         }
     else:
         raise ValueError(f"unknown shape family {family!r}")
 
-    return CohortHyperparams(family=family, size_frac=size_frac,
-                             position_uvw=position_uvw, shape_params=shape_params)
+    return CohortHyperparams(family=family, size_mm=size_mm,
+                             position_offset_mm=position_offset_mm, shape_params=shape_params)
 
 
 def draw_member_shape(member_rng, cohort_hp, spec):
@@ -92,11 +96,12 @@ def draw_member_shape(member_rng, cohort_hp, spec):
     same stream synth_gmm's own per-member intensity draw already uses)."""
     family = cohort_hp.family
 
-    fresh_size = float(member_rng.uniform(*spec.size_frac_range))
-    size_frac = _blend(cohort_hp.size_frac, fresh_size, spec.size_between_ratio)
+    fresh_size = float(member_rng.uniform(*spec.size_mm_range))
+    size_mm = _blend(cohort_hp.size_mm, fresh_size, spec.size_between_ratio)
 
-    fresh_uvw = member_rng.uniform(0.15, 0.85, size=3)
-    position_uvw = _blend(cohort_hp.position_uvw, fresh_uvw, spec.position_between_ratio)
+    fresh_offset = member_rng.uniform(*spec.position_offset_mm_range, size=3)
+    position_offset_mm = _blend(cohort_hp.position_offset_mm, fresh_offset,
+                                spec.position_between_ratio)
 
     shape_params = dict(cohort_hp.shape_params)
     for (fam, key), range_attr in _CONTINUOUS_RANGE.items():
@@ -111,6 +116,16 @@ def draw_member_shape(member_rng, cohort_hp, spec):
         shape_params["n_components"] = int(round(
             _blend(shape_params["n_components"], fresh_n, spec.shape_between_ratio)))
 
+    if family == "disk":
+        # discrete param: the natural analog of "blend" is a probabilistic redraw
+        # (shape_between_ratio=0 -> never redraw, =1 -> always redraw) -- a linear
+        # blend doesn't make sense for a categorical axis choice. Drawn unconditionally
+        # (not just when the redraw fires) so RNG consumption is deterministic.
+        redraw = member_rng.random() < spec.shape_between_ratio
+        fresh_axis = int(member_rng.integers(0, 3))
+        if redraw:
+            shape_params["flatten_axis"] = fresh_axis
+
     if family == "cylinder":
         fresh_az = float(member_rng.uniform(0, 2 * np.pi))
         shape_params["azimuth"] = float(
@@ -120,33 +135,61 @@ def draw_member_shape(member_rng, cohort_hp, spec):
         shape_params["elevation"] = _blend(shape_params["elevation"], fresh_el,
                                            spec.shape_between_ratio)
 
-    return MemberShapeDraw(family=family, size_frac=size_frac,
-                           position_uvw=position_uvw, shape_params=shape_params)
+    return MemberShapeDraw(family=family, size_mm=size_mm,
+                           position_offset_mm=position_offset_mm, shape_params=shape_params)
 
 
-def rasterize_shape_in_crop(crop_lbl, host_cls_id, shape_id, member_draw, rng):
-    """Stamp one member's shape into `crop_lbl` (uint8, native crop grid) under
-    `shape_id`, positioned at `member_draw.position_uvw` relative to the HOST class's
-    own bounding box within this crop. Loose containment (design doc sec 2.3): if the
-    host class has no voxels here, falls back to the whole crop as the placement region
-    -- the shape's rasterization itself is never clipped to the host boundary either
-    way. Mutates `crop_lbl` in place -- caller must ensure it is writeable (a
-    zero-copy view of an mmap_mode="r" array is not).
+def rasterize_shape_in_crop(crop_lbl, shape_id, member_draw, mm_per_voxel, center_local, rng):
+    """Stamp one member's shape into `crop_lbl` (uint8) under `shape_id`.
 
-    KNOWN LIMITATION: `member_draw.size_frac` and `.position_uvw` are both resolved
-    relative to THIS crop's own grid/bbox, not in world/mm space -- a shape's absolute
-    physical size/position is not guaranteed consistent across calls made at a
-    different crop_spacing_mm (e.g. a different cascade level). See ShapeCohortSpec's
-    docstring."""
-    shape = crop_lbl.shape
-    host_fg = np.argwhere(crop_lbl == host_cls_id)
-    if host_fg.size > 0:
-        bbox_lo, bbox_hi = host_fg.min(0).astype(np.float64), host_fg.max(0).astype(np.float64)
-    else:
-        bbox_lo, bbox_hi = np.zeros(3), np.array(shape, dtype=np.float64) - 1.0
-    center = bbox_lo + member_draw.position_uvw * (bbox_hi - bbox_lo)
+    `center_local`: the shape's center already resolved into crop_lbl's own local array
+    coordinates by the caller (bank/crop-geometry glue -- mapping a fixed native
+    coordinate through the crop's native-array origin and any cap-stride decimation --
+    deliberately kept out of this pure module; see src/providers/synth_gmm.py).
+
+    `mm_per_voxel`: this crop's CURRENT effective voxel size (a 3-tuple/array, e.g. the
+    host's native spacing times any cap-stride decimation). Converts
+    `member_draw.size_mm` (and, for cylinder, `shape_params["length_mm"]`; for
+    splatter, `shape_params["spread_mm"]`) from physical mm into this crop's local
+    voxel units. Because these physical mm values are resolved fresh from whatever
+    `mm_per_voxel` is current, the SAME member_draw produces a shape of the SAME
+    PHYSICAL size and position at any cascade level, however that level's crop
+    resolution differs -- this is what makes shape-mode cohorts cascade-consistent
+    (replacing an earlier crop-relative size_frac/position_uvw design that was not; see
+    docs/logs.md 2026-09-15).
+
+    Rasterizes into a local sub-box around `center_local` sized by
+    `primitives.reach_vox` (not the full crop) for performance, then copies the result
+    into `crop_lbl` at the right offset -- clipped to the crop's own array bounds
+    (loose containment: never clipped against any organ boundary, only the crop's own
+    bounds; if the shape's reach doesn't touch this crop at all, nothing is stamped).
+    Mutates `crop_lbl` in place -- caller must ensure it is writeable (a zero-copy view
+    of an mmap_mode="r" array is not)."""
+    mm_per_voxel = np.asarray(mm_per_voxel, dtype=np.float64)
+    vox_mm3 = float(np.prod(mm_per_voxel))
+    mm_per_voxel_iso = vox_mm3 ** (1.0 / 3.0)   # isotropic approx (see spec docstring)
+
+    target_mm3 = (4.0 / 3.0) * np.pi * (member_draw.size_mm / 2.0) ** 3
+    size_vox = target_mm3 / max(vox_mm3, _EPS)
 
     params = dict(member_draw.shape_params)
-    params["size_frac"] = member_draw.size_frac
-    mask, _meta = make_shape(member_draw.family, shape, center, params, rng)
-    crop_lbl[mask.astype(bool)] = shape_id
+    params["size_vox"] = size_vox
+    if member_draw.family == "cylinder":
+        params["length_vox"] = params.pop("length_mm") / mm_per_voxel_iso
+    if member_draw.family == "splatter":
+        params["spread_vox"] = params.pop("spread_mm") / mm_per_voxel_iso
+
+    crop_shape = np.array(crop_lbl.shape, dtype=np.int64)
+    center_local = np.asarray(center_local, dtype=np.float64)
+    reach = reach_vox(member_draw.family, params) * 1.2   # small extra margin
+    lo = np.clip(np.floor(center_local - reach).astype(np.int64), 0, crop_shape)
+    hi = np.clip(np.ceil(center_local + reach).astype(np.int64) + 1, 0, crop_shape)
+    sub_shape = tuple((hi - lo).tolist())
+    if any(s <= 0 for s in sub_shape):
+        return   # shape's reach doesn't touch this crop at all -- nothing to stamp
+    sub_center = tuple((center_local - lo).tolist())
+
+    mask, _meta = make_shape(member_draw.family, sub_shape, sub_center, params, rng)
+    sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    sub_view = crop_lbl[sl]
+    sub_view[mask.astype(bool)] = shape_id
