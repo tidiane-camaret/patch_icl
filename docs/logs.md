@@ -1,5 +1,25 @@
 # Change log
 
+## 2026-09-14 — PatchSet3D IRIS-style pooling token (`arch.pool_token`)
+
+Added an optional foreground-masked pooling token to `PatchSet3D` (`src/models/patchset3d.py`),
+mirroring Iris's `T_f` (`docs/methods/iris.md` §4.1: `T_f = Pool(Upsample(F_s) ⊙ y_s)`). Unlike
+a version pooling over the coarse `R³` token grid, this pools over `arch.fine_decode`'s finest
+requested unpooled stage (`min(self.fine_stage)`), matching the property Iris's own ablation
+credits for a large small-object Dice gain (masking AFTER upsampling, not before). One extra
+prefix row per volume (`K` support + 1 query, `K+1` total) computed as a mask-weighted average
+of fine image features — support: real GT mask; query: soft prior/support-mean, both derived
+directly from native-resolution `context_out`/`query_prior` (not routed through the coarse
+`R³`-tiled occupancy `qry_occ` already used elsewhere). Requires `arch.fine_decode=true`
+(extends its row selection from query-only to all `K+1` volumes — a real `K`-scaling memory
+cost, accepted deliberately rather than compromise on resolution); assert-incompatible with
+`arch.register_routed` for the same reason `arch.cascade_registers` already is. Inserted as
+extra prefix rows via the exact mechanism `cascade_regs`/`mem` already use, so
+`register_routed`'s block mask, `_rope`, `_grid_tokens`, and `context_id_embed`'s
+`repeat_interleave` are completely untouched; pool rows reuse `ctx_id`/`qry_id`/`slot_pos`
+tagging the same way real content rows do. `arch.pool_token` defaults to `false` (byte-identical
+to today). Spec: docs/superpowers/specs/2026-09-14-patchset3d-pool-token-design.md.
+
 ## 2026-09-14 — PatchSet3D IRIS-style sequence compression (`arch.seq_compress`)
 
 Added an optional 3-stage compression pipeline to `PatchSet3D` (`src/models/patchset3d.py`),

@@ -66,6 +66,13 @@ arch:
                                # used when seq_compress=true)
   compress_layers: 1           # depth of the Stage A/Stage C RowCrossAttention stacks, each
                                # (independent, not weight-shared)
+  pool_token: false            # IRIS-style foreground-masked pooling token per volume (K+1
+                               # extra prefix rows, one per support + query). Pools
+                               # arch.fine_decode's finest requested stage -- requires
+                               # arch.fine_decode=true. Extends fine-map extraction to all K+1
+                               # volumes (memory cost scales with K, vs. query-only otherwise).
+                               # Incompatible with arch.register_routed (same reason
+                               # cascade_registers is).
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:

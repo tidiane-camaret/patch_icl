@@ -405,6 +405,7 @@ def build_model(cfg: DictConfig):
             "seq_compress": a.get("seq_compress", False),
             "compress_m": a.get("compress_m", 32),
             "compress_layers": a.get("compress_layers", 1),
+            "pool_token": a.get("pool_token", False),
             "image_size": list(cfg.data.image_size),
             "encoder": a.get("encoder", "conv"),
             "encoder_frozen": a.get("encoder_frozen", True),
