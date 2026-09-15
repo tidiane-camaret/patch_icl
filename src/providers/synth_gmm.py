@@ -230,6 +230,15 @@ class SynthGmmProvider:
 
         shape_hp, shape_id = None, None
         if host_cls_id is not None:
+            if req.center is not None:
+                raise NotImplementedError(
+                    "shape-mode cohorts do not yet support cascade re-crop with a predicted "
+                    "center: shape size/position are crop-relative, not world-relative, so a "
+                    "re-crop at a different FOV would supervise a physically different object "
+                    "than level 0. See docs/superpowers/specs/"
+                    "2026-09-14-cohort-consistent-synthetic-shapes-design.md sec 2 and "
+                    "docs/logs.md for the known limitation this guards against."
+                )
             shape_hp = draw_cohort_hyperparams(
                 np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
             shape_id = cls_id
