@@ -174,12 +174,25 @@ sinuses/nasopharynx).
 | `92_multisource_synth` (09-12, spacings `[1.5,1]`) | patchset3d | cascade | **failed** — `cascade_loss_weights` length mismatch (config error) |
 | `92_multisource_synth` retry (09-12, spacings `[1.5,1]`) | patchset3d | cascade | **failed** — "no valid samples" on all 5 classes (spacing too tight for nasalseg's small extent — the 128mm crop FOV at 1.5mm undercuts the head) |
 | `92_multisource_synth` (09-12, spacings `[1.5,0.8]`) | patchset3d | cascade | 0.551 (r0.8/r1.5 ~identical) | 0.727 | 7782 |
+| released weights (09-15, native-AR, `image_size=256`) | medverse | native autoregressive | **0.735** | **0.842** | 29875 |
 
-Nasalseg is the flip case among all 9 eval-expansion sources: **released medverse weights
-(0.660) beat every patchset3d checkpoint tried**, including the latest exp92 cascade (0.551) —
-unlike flare22 or the 7-source expansion set, where patchset3d generally wins. The contrast-
-polarity shift (§5, air cavity vs. TotalSeg/FLARE22's bright-on-dark organs) may hit patchset3d's
-class-held-out generalization harder than medverse's. Now tracked in
-`results/presentations/val/per_dataset_analysis.py` (`SOURCE_BY_CLASS`) alongside the 7
-eval-expansion sources — `exp_cascade_register` and a matched medverse-cascade/native-AR sweep
-have not yet been run for nasalseg.
+Nasalseg is the flip case among all 9 eval-expansion sources: **released medverse weights beat
+every patchset3d checkpoint tried**, including the latest exp92 cascade (0.551) — unlike
+flare22 or the 7-source expansion set, where patchset3d generally wins. The contrast-polarity
+shift (§5, air cavity vs. TotalSeg/FLARE22's bright-on-dark organs) may hit patchset3d's
+class-held-out generalization harder than medverse's.
+
+**Native-AR pushed medverse even further ahead (0.660 → 0.735 macro Dice, 0.750 → 0.842 NSD)**,
+despite the head FOV already being ~100% covered at single-level (128³@0.8mm, per the
+round-trip table above) — so this is not a missing-context/localization fix, same as
+msd_hippocampus/msd_prostate's earlier AR gains. Every class improved (single-level → AR):
+`nasal_cavity_left` 0.497→0.635, `nasal_cavity_right` 0.453→0.555, `maxillary_sinus_right`
+0.714→0.814, `maxillary_sinus_left` 0.838→0.859, `nasopharynx` 0.797→0.811 — biggest gains on
+the thin, convoluted nasal cavities and the weaker maxillary sinus side, smallest on the two
+classes that were already strongest, consistent with AR mainly helping medverse resolve fine
+structure/shape rather than find the target. Contrast with flare22
+(`docs/datasets/flare22.md` §8), where the identical recipe made things *worse* — the deciding
+factor appears to be target complexity/shape, not native volume size, as originally
+hypothesized. Now tracked in `results/presentations/val/per_dataset_analysis.py`
+(`SOURCE_BY_CLASS`) alongside the 7 eval-expansion sources — `exp_cascade_register` and a
+matched medverse-cascade sweep have not yet been run for nasalseg.

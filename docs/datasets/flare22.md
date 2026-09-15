@@ -251,9 +251,22 @@ Six `eval.py` runs across five checkpoint generations, `data.source=flare22`, `n
 | `61_plainconv_K_1` (08-29) | patchset3d | single-level | 0.704 | 0.713 | 3891 |
 | `67_cascade_qprior_pred` (09-01) | patchset3d | cascade `[6,3]` | **failed** — `cascade_spacings` unsupported for non-TotalSeg-v2 sources at that time (fixed by exp92's cascade generalization, see below) |
 | `92_multisource_synth` (09-11) | patchset3d | cascade `[6,3,2.5]` | **0.723** (finest, r2.5), 0.573 (coarsest, r6) | 0.745 | 11673 |
+| released weights (09-15, native-AR, `image_size=256`) | medverse | native autoregressive | 0.440 | 0.417 | 29875 |
 
 Best result is the newest `exp92_orig` checkpoint's cascade, clearly ahead of every earlier
-checkpoint and of released medverse. Now tracked in
+checkpoint and of released medverse in either mode. Now tracked in
 `results/presentations/val/per_dataset_analysis.py` (`SOURCE_BY_CLASS`) alongside the 7
-eval-expansion sources — `exp_cascade_register` and a matched medverse-cascade/native-AR sweep
-have not yet been run for flare22.
+eval-expansion sources — `exp_cascade_register` and a matched medverse-cascade sweep have not
+yet been run for flare22.
+
+**Native-AR made medverse WORSE here (0.488 → 0.440), not better** — the opposite of the
+initial hypothesis (that flare22's large native FOV, and the hu_lwk1 precedent where native-AR
+was medverse's best CT mode, would favor AR). Likely explanation: flare22's per-organ eval is
+already a GT-centroid-oracle-localized crop at single-level (128³@1.5mm = 192mm FOV, already
+big enough to contain any single organ, round-trip ceiling ≥0.79 everywhere per §7) — so there
+is no missing localization for AR's coarse-to-fine pyramid to recover, and blowing the input up
+to 256³ (384mm FOV, still not covering the full 407mm abdomen) just adds more irrelevant
+surrounding anatomy as noise ahead of the same underlying single-organ segmentation problem.
+Contrast with nasalseg (`docs/datasets/nasalseg.md` §7), where the identical recipe improved
+medverse substantially — the deciding factor appears to be target complexity/shape, not FOV
+size, matching the msd_hippocampus/msd_prostate precedent more than the hu_lwk1 one.

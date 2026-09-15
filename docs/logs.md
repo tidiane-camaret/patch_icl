@@ -8676,3 +8676,22 @@ Added both sources to `results/presentations/val/per_dataset_analysis.py`'s `SOU
 infrastructure from the FLARE22/NasalSeg integration, zero new code needed beyond the mapping.
 `exp_cascade_register` and a matched medverse sweep (cascade prior=none/pred, native-AR) have
 not yet been run for either source.
+
+**2026-09-15 — medverse native-AR eval added for flare22/nasalseg, hypothesis partly wrong**.
+User asked whether medverse's native `autoregressive_inference` mode (`data.image_size=256`,
+same recipe as the other 7 sources) made sense given flare22/nasalseg's size, since only
+single-level (128) had been run. Predicted flare22 (large native FOV, only other CT source
+hu_lwk1 saw AR go 0.0000→0.0714, its best mode) would benefit most, and nasalseg (already ~100%
+covered by its single-level crop) would benefit less if at all. **Result was the opposite**:
+flare22 macro Dice went **0.488→0.440 (worse)**, nasalseg went **0.660→0.735 (better)**, NSD
+moved the same direction in both cases. Revised read: AR gains track target complexity/shape,
+not FOV/native-volume size — matches msd_hippocampus/msd_prostate (already-covered organs that
+still gained from AR) better than it matches hu_lwk1 (a genuine small-target localization
+problem AR helped solve). flare22's per-organ task is already GT-centroid-oracle-localized at
+single-level with a comfortable round-trip ceiling, so AR's extra 256³ FOV just dilutes the
+crop with irrelevant surrounding anatomy instead of fixing anything. Full writeup with per-class
+breakdowns: `docs/datasets/flare22.md` §8, `docs/datasets/nasalseg.md` §7. Both new `eval.json`
+runs surface automatically in `per_dataset_analysis.py` (verified via `marimo export script` +
+execution, no code change needed — `_classify_run` already recognizes the `medverse_ar_*`
+wandb-name convention and the existing run_dir substring guard already requires "flare22"/
+"nasalseg" in the run_dir, which both new runs satisfy).
