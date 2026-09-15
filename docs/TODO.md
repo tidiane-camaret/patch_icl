@@ -1,5 +1,16 @@
 # TODO
 
+## pool_token ablation — support-only pool row as its own control (from final review, 2026-09-14)
+
+Spec: `docs/superpowers/specs/2026-09-14-patchset3d-pool-token-design.md`. `arch.pool_token`
+computes a prototype row for **both** support and query (a deliberate deviation from Iris,
+which only computes `T_f` for the reference/support side — see the spec's decision 2). The
+query's pool row, in the non-cascade case, is weighted by the AVERAGE of the K support masks —
+a fairly arbitrary spatial prior over the query volume's own anatomy, not real information
+about the query itself. When this feature is actually trained/ablated, run a support-only
+pool-row variant (mask out or omit the query row) as its own ablation cell, rather than
+confounding "does the query pool row help" into a single on/off `pool_token` comparison.
+
 ## anchor_synth3d — follow-ups (from blend analysis, 2026-07-22)
 
 Spec/plan: `docs/superpowers/specs/2026-07-22-anchor-synth3d-design.md`,

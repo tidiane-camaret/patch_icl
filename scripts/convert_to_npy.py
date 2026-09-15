@@ -11,7 +11,8 @@ With --size D H W (e.g. --size 128 128 128), also writes:
 
 Modality handling (--modality):
   ct  (default) : reads ct.nii.gz; clips HU to [CT_CLIP_MIN, CT_CLIP_MAX]; global z-score.
-  mri           : reads mri.nii.gz; clips to [0, per-volume 99.5th percentile of foreground];
+  mri           : reads mri.nii.gz; clips to [0, per-volume 99.5th percentile of foreground]
+                  by default (--mri-percentile-lo/--mri-percentile-hi to override);
                   per-volume z-score (foreground mean/std).  Output still named ct.npy so the
                   dataloader needs no changes.
 
@@ -180,6 +181,8 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
     modality = task["modality"]
     store_raw = task["store_raw"]
     target_sp = task.get("target_spacing")
+    mri_pct_lo = task.get("mri_percentile_lo", 0.5)
+    mri_pct_hi = task.get("mri_percentile_hi", 99.5)
     subj = subj_dir.name
 
     ct_out    = subj_dir / "ct.npy"
@@ -218,7 +221,7 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
             native_shape = list(raw.shape)
 
             if modality == "mri":
-                stats = mri_stats(raw)                  # whole-volume stats (sidecar)
+                stats = mri_stats(raw, pct_lo=mri_pct_lo, pct_hi=mri_pct_hi)  # whole-volume stats (sidecar)
                 if need_raw:
                     # MRI has no canonical integer range; keep raw as float16.
                     np.save(ct_raw_out, raw.astype(np.float16))
@@ -370,6 +373,12 @@ def main():
                              "(default: keep full native)")
     parser.add_argument("--limit", type=int, default=None,
                         help="convert only the first N subjects (smoke test)")
+    parser.add_argument("--mri-percentile-lo", type=float, default=0.5, dest="mri_percentile_lo",
+                        help="mri only: lower foreground percentile for the clip window "
+                             "written to ct_stats.json (default: 0.5)")
+    parser.add_argument("--mri-percentile-hi", type=float, default=99.5, dest="mri_percentile_hi",
+                        help="mri only: upper foreground percentile for the clip window "
+                             "written to ct_stats.json (default: 99.5)")
     args = parser.parse_args()
 
     data_dir = args.data
@@ -383,7 +392,8 @@ def main():
     size = tuple(args.size) if args.size else None
     for t in subjects:
         t.update(overwrite=args.overwrite, size=size, target_spacing=args.target_spacing,
-                 source=args.source, modality=args.modality, store_raw=args.store_raw)
+                 source=args.source, modality=args.modality, store_raw=args.store_raw,
+                 mri_percentile_lo=args.mri_percentile_lo, mri_percentile_hi=args.mri_percentile_hi)
     print(f"source={args.source} | {total} subjects | out={out_root} | "
           f"target_spacing={args.target_spacing} | size={size}")
 

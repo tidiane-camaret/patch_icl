@@ -105,16 +105,17 @@ def normalize_ct(vol: np.ndarray, spec=None) -> np.ndarray:
     return (vol - s.mean) / s.std
 
 
-def mri_stats(vol: np.ndarray) -> dict:
+def mri_stats(vol: np.ndarray, pct_lo: float = 0.5, pct_hi: float = 99.5) -> dict:
     """Per-volume MRI normalization stats from the WHOLE volume: foreground percentile clip
-    bounds + foreground mean/std. Computed once (at convert time) and stored in a sidecar so
-    a crop can be normalized with whole-volume stats — crop-local stats would be inconsistent
-    across target/context and across crops of the same subject."""
+    bounds + foreground mean/std. Computed once (at convert time, see convert_to_npy.py's
+    --mri-percentile-lo/--mri-percentile-hi) and stored in a sidecar so a crop can be
+    normalized with whole-volume stats — crop-local stats would be inconsistent across
+    target/context and across crops of the same subject."""
     fg = vol[vol > 0]
     if fg.size == 0:
         return {"clip_lo": 0.0, "clip_hi": 0.0, "mean": 0.0, "std": 1.0}
-    lo = float(np.percentile(fg, 0.5))
-    hi = float(np.percentile(fg, 99.5))
+    lo = float(np.percentile(fg, pct_lo))
+    hi = float(np.percentile(fg, pct_hi))
     clipped = np.clip(vol, lo, hi)
     fg2 = clipped[clipped > 0]
     mean, std = float(fg2.mean()), float(fg2.std())

@@ -36,6 +36,17 @@
 # BATCH SIZE / LR: batch_size=2 + lr=1e-5 as run 87 (loki 48 GB). On a larger GPU use
 # `train.batch_size=4 train.lr=1.4e-5 train.epochs=200` -- sqrt(B) lr scaling, step-matched
 # so the cosine covers the same ~50k updates.
+#
+# MRI NORMALIZATION: this dataset is CT-only (dataset=d1), so nothing here wires an MRI
+# percentile at train time -- src.totalseg_dataset.mri_stats runs offline, once, inside
+# convert_to_npy.py, and writes clip_lo/clip_hi into ct_stats.json. For any experiment that
+# swaps in an MRI/totalsegmri source with a tighter clip window than the 0.5/99.5 default,
+# regenerate that source's ct_stats.json first:
+#   python scripts/convert_to_npy.py --modality mri --store-raw --overwrite \
+#     --mri-percentile-lo 2 --mri-percentile-hi 98 --data <totalsegmri root>
+# (--overwrite is required to recompute stats for subjects already converted -- without it
+# ct_raw.npy/ct.npy already existing short-circuits the whole subject, sidecar included.
+# Percentiles are baked into ct_stats.json at conversion time; there is no live data.* key.)
 
 defaults:
   - /encoder: e4_plainconv_ts
