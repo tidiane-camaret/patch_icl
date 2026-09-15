@@ -11,26 +11,43 @@ GMM consistency across cascade levels: the GMM seed is embedded in the subject s
 as "<filename>|<gmm_seed>|<member_idx>". load_native_crop re-derives the same cohort-
 shared mu/sd from the seed, and the per-member paint nrng from (gmm_seed, member_idx),
 giving an identical color palette at every cascade level for the same member.
+
+Shape mode (p_shape > 0, cascade=True only): a `p_shape` coin flip per cohort swaps the
+sampled cohort's target for a procedurally generated geometric shape (blob/splatter/
+disk/cylinder, see src/shapes3d/) stamped into the sampled hosts' real anatomy under a
+new pseudo-class id (data.maisi_classes.SHAPE_ID_TO_FAMILY). The host's real class
+still drives crop placement (center resolution against real anatomy); only the painted
+target and its label change. See docs/superpowers/specs/
+2026-09-14-cohort-consistent-synthetic-shapes-design.md.
 """
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from data.maisi_classes import MAISI_CLASS_TO_IDX, MAISI_IDX_TO_CLASS
+from data.maisi_classes import MAISI_CLASS_TO_IDX, MAISI_IDX_TO_CLASS, SHAPE_ID_TO_FAMILY
 from src.gpu_gmm_intensity import sample_grouped_uniform
 from src.providers.totalseg import _resolve_center
+from src.shapes3d.instantiate import draw_cohort_hyperparams, draw_member_shape, rasterize_shape_in_crop
+from src.shapes3d.spec import ShapeCohortSpec
 from src.totalseg_dataloader_incontext import organ_crop_arrays
+
+# Sentinel second seed-key for the cohort-level shape hyperparameter draw (vs. real
+# member indices 0, 1, 2, ...) -- np.random.default_rng's SeedSequence coerces every
+# entry to uint32, so this must be a valid non-negative int, not -1.
+_SHAPE_COHORT_HP_SEED_KEY = 2**32 - 1
 
 
 class SynthGmmProvider:
     """Cohort-hook provider wrapping a SynthGmmMaisiDataset for InContextDataset."""
 
-    def __init__(self, dataset, *, cascade=False):
+    def __init__(self, dataset, *, cascade=False, p_shape=0.0, shape_spec=None):
         self.ds = dataset
         self.epoch_length = len(dataset)
         self.classes = [MAISI_IDX_TO_CLASS.get(c, str(c)) for c in dataset.cs.classes]
         self.cascade = cascade
+        self.p_shape = float(p_shape)
+        self.shape_spec = shape_spec or ShapeCohortSpec()
         if cascade:
             self._entry_by_file = {e["file"]: e for e in dataset.cs.entries}
             from src.providers.totalseg import NativeCrop
@@ -64,8 +81,13 @@ class SynthGmmProvider:
         return mu, sd
 
     def _build_nc(self, e, cls_id, rng, crop_mm, mu, sd, gmm_seed, member_idx, *,
-                  center=None, jitter=None, center_mode="com"):
-        """Crop + paint one MAISI bank entry → NativeCrop. cascade=True required."""
+                  center=None, jitter=None, center_mode="com",
+                  shape_hp=None, shape_id=None):
+        """Crop + paint one MAISI bank entry → NativeCrop. cascade=True required.
+
+        Shape mode (shape_hp/shape_id both set): `cls_id` still drives crop placement
+        against `e`'s real anatomy (the host); the painted/returned class becomes
+        `shape_id` instead."""
         # per-member nrng keyed to (gmm_seed, member_idx): reproducible at L1 recrops
         member_nrng = np.random.default_rng([int(gmm_seed), int(member_idx)])
         n = self.ds.maxid + 1
@@ -105,14 +127,34 @@ class SynthGmmProvider:
             step = tuple(-(-s // cap) for s in crop_lbl.shape)   # ceil division
             crop_lbl = crop_lbl[::step[0], ::step[1], ::step[2]]
         crop_lbl = np.ascontiguousarray(crop_lbl, dtype=np.uint8)
+
+        target_cls = cls_id
+        if shape_hp is not None:
+            member_draw = draw_member_shape(member_nrng, shape_hp, self.shape_spec)
+            # np.ascontiguousarray above is a no-op (returns the SAME buffer) whenever
+            # crop_lbl is already C-contiguous uint8 -- which includes the common case
+            # where the gpu_realize_max_native cap didn't fire, leaving crop_lbl a
+            # zero-copy view of the mmap_mode="r" bank file. rasterize_shape_in_crop
+            # writes in place, so force an actual copy first if that view is read-only.
+            if not crop_lbl.flags.writeable:
+                crop_lbl = crop_lbl.copy()
+            rasterize_shape_in_crop(crop_lbl, cls_id, shape_id, member_draw, member_nrng)
+            target_cls = shape_id
+            if self.shape_spec.intensity_between_ratio is not None:
+                if mu_e is mu:          # avoid mutating the cohort-shared mu array in place
+                    mu_e = mu_e.copy()
+                fresh_noise = member_nrng.standard_normal()
+                mu_e[shape_id] = (mu[shape_id] + self.shape_spec.intensity_between_ratio
+                                  * sd[shape_id] * fresh_noise)
+
         img, mask = self.ds._resample_paint_mask(
-            crop_lbl, out_sizes, pad_lo, cls_id, mu_e, sd, member_nrng)
+            crop_lbl, out_sizes, pad_lo, target_cls, mu_e, sd, member_nrng)
 
         T = self.ds.T
         return self._NativeCrop(
             image=img[0].half(),
             label_frac=mask.float().half(),
-            class_idx=cls_id,
+            class_idx=target_cls,
             has_fg=bool(mask.any()),
             out_sizes=[T, T, T],
             pad_lo=[0, 0, 0],
@@ -133,14 +175,30 @@ class SynthGmmProvider:
         # cascade mode: return native_crop payload compatible with native_crop_collate_fn
         gmm_seed = rng.getrandbits(64)
         mu, sd = self._draw_gmm(gmm_seed)
-        cls_id, cohort = self.ds.cs.sample_cohort(rng)
-        ncs = [self._build_nc(e, cls_id, rng, float(crop_spacing_mm), mu, sd, gmm_seed, i)
+        host_cls_id, cohort = self.ds.cs.sample_cohort(rng)
+
+        shape_hp, shape_id = None, None
+        if self.p_shape > 0.0 and rng.random() < self.p_shape:
+            shape_hp = draw_cohort_hyperparams(
+                np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
+            family_by_shape_name = {v: k for k, v in SHAPE_ID_TO_FAMILY.items()}
+            shape_id = family_by_shape_name[shape_hp.family]
+
+        ncs = [self._build_nc(e, host_cls_id, rng, float(crop_spacing_mm), mu, sd, gmm_seed, i,
+                              shape_hp=shape_hp, shape_id=shape_id)
                for i, e in enumerate(cohort)]
-        name = MAISI_IDX_TO_CLASS.get(cls_id, str(cls_id))
+
+        if shape_hp is not None:
+            name = MAISI_IDX_TO_CLASS[shape_id]
+            host_suffix = f"|host{host_cls_id}"
+        else:
+            name = MAISI_IDX_TO_CLASS.get(host_cls_id, str(host_cls_id))
+            host_suffix = ""
+
         return {
             "native_crop": ncs,
-            "subject": f"{cohort[0]['file']}|{gmm_seed}|0",
-            "context_subjects": [f"{e['file']}|{gmm_seed}|{i + 1}"
+            "subject": f"{cohort[0]['file']}|{gmm_seed}|0{host_suffix}",
+            "context_subjects": [f"{e['file']}|{gmm_seed}|{i + 1}{host_suffix}"
                                   for i, e in enumerate(cohort[1:])],
             "label_name": name,
             "aug_mode": torch.tensor(0, dtype=torch.long),
@@ -152,7 +210,13 @@ class SynthGmmProvider:
         """Cascade re-crop: re-derive same GMM + member paint nrng from subject string."""
         if not self.cascade:
             raise RuntimeError("SynthGmmProvider.load_native_crop requires cascade=True")
-        filename, gmm_seed_str, member_idx_str = subject.rsplit("|", 2)
+        parts = subject.split("|")
+        if parts[-1].startswith("host"):
+            filename, gmm_seed_str, member_idx_str, host_str = parts
+            host_cls_id = int(host_str[len("host"):])
+        else:
+            filename, gmm_seed_str, member_idx_str = parts
+            host_cls_id = None
         gmm_seed = int(gmm_seed_str)
         member_idx = int(member_idx_str)
         mu, sd = self._draw_gmm(gmm_seed)
@@ -163,8 +227,30 @@ class SynthGmmProvider:
                 cls_id = int(cls)
             except (ValueError, TypeError):
                 raise ValueError(f"SynthGmmProvider.load_native_crop: unknown class {cls!r}")
+
+        shape_hp, shape_id = None, None
+        if host_cls_id is not None:
+            if req.center is not None:
+                raise NotImplementedError(
+                    "shape-mode cohorts do not yet support cascade re-crop with a predicted "
+                    "center: shape size/position are crop-relative, not world-relative, so a "
+                    "re-crop at a different FOV would supervise a physically different object "
+                    "than level 0. See docs/superpowers/specs/"
+                    "2026-09-14-cohort-consistent-synthetic-shapes-design.md sec 2 and "
+                    "docs/logs.md for the known limitation this guards against."
+                )
+            shape_hp = draw_cohort_hyperparams(
+                np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
+            shape_id = cls_id
+            assert SHAPE_ID_TO_FAMILY.get(shape_id) == shape_hp.family, (
+                f"shape id/family mismatch: cls={cls_id!r} resolved family "
+                f"{SHAPE_ID_TO_FAMILY.get(shape_id)!r} != redrawn cohort family "
+                f"{shape_hp.family!r} -- mis-routed cls or subject string")
+            cls_id = host_cls_id       # resolve center/crop against the real host anchor
+
         # no jitter for cascade recrops (center is predicted, not default centroid)
         jitter = 0 if req.center is not None else self.ds.jitter
         return self._build_nc(e, cls_id, req.rng, req.crop_spacing_mm, mu, sd,
                                gmm_seed, member_idx, center=req.center, jitter=jitter,
-                               center_mode=getattr(req, "center_mode", "com"))
+                               center_mode=getattr(req, "center_mode", "com"),
+                               shape_hp=shape_hp, shape_id=shape_id)

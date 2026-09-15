@@ -162,6 +162,10 @@ def _build_registry() -> dict[str, ClassDef]:
     registry["bone_lesion"] = ClassDef("bone_lesion", "bone lesion", 128, None, cat)
     registry["airway"] = ClassDef("airway", "airway", 132, None, cat)
     registry["body"] = ClassDef("body", "body", 200, None, cat)
+    registry["shape_blob"] = ClassDef("shape_blob", "shape_blob", 195, None, cat)
+    registry["shape_splatter"] = ClassDef("shape_splatter", "shape_splatter", 196, None, cat)
+    registry["shape_disk"] = ClassDef("shape_disk", "shape_disk", 197, None, cat)
+    registry["shape_cylinder"] = ClassDef("shape_cylinder", "shape_cylinder", 198, None, cat)
 
     # === TOTALSEG-ONLY CLASSES (MRI, subtasks) ===
     cat = "TotalSeg-only"

@@ -94,6 +94,6 @@ class TestRegistryCompleteness:
             assert canon == ts_name
 
     def test_registry_stats(self):
-        assert len(CLASS_REGISTRY) == 130
-        assert len(all_with_maisi()) == 125
+        assert len(CLASS_REGISTRY) == 134
+        assert len(all_with_maisi()) == 129
         assert len(all_with_totalseg()) == 122
