@@ -34,6 +34,20 @@ data:
     # requested physical size at fine crop_spacing_mm, see docs/logs.md).
     p_shape: 0
     shape: {}   # ShapeCohortSpec defaults (docs/logs.md 2026-09-15)
+    # Multi-octave correlated paint noise ("fractal value noise"), replacing the flat
+    # per-voxel i.i.d. GMM noise -- TextureSpec defaults (n_octaves=1) are an identity
+    # passthrough, byte-identical to the old behavior; set n_octaves>1 to enable. See
+    # the synth_gmm intra-mask realism investigation in docs/datasets/
+    # eval_expansion_status.md (real tissue lag-1 autocorrelation ~0.6 vs the old
+    # noise's ~0) and src/providers/synth_gmm.py::TextureSpec/_fractal_value_noise.
+    texture: {}
+    # Core/rim multi-region target paint (SyntheticTumors/DiffTumor-style threshold-
+    # noise blob map), independent cohort-level coin flip from p_shape/p_synth -- off
+    # by default. Targets the lesion-heavy far-OOD failure mode (isles22/gnc_kidney/
+    # hu_lwk1) directly, per the 2026-09-16 literature survey in this thread. See
+    # src/providers/synth_gmm.py::HeterogeneitySpec/_heterogeneity_map.
+    p_heterogeneity: 0
+    heterogeneity: {}   # HeterogeneitySpec defaults (docs/logs.md 2026-09-16)
   cohort:
     w_span: 0
     w_fov: 0

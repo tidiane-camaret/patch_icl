@@ -1,0 +1,23 @@
+# @package _global_
+# 93_multisource_synth_texture — 92_multisource_synth + multi-octave correlated paint
+# noise enabled (TextureSpec.n_octaves>1), replacing the flat per-voxel i.i.d. GMM
+# noise. See docs/datasets/eval_expansion_status.md (synth_gmm intra-mask realism
+# investigation: real tissue lag-1 voxel autocorrelation ~0.6 vs the old noise's ~0)
+# and src/providers/synth_gmm.py::TextureSpec/_fractal_value_noise.
+#
+# Starting point, not yet tuned against eval -- rerun the investigation's
+# lag-1-autocorrelation diagnostic against this config's painted output and adjust
+# base_scale_mm/persistence toward the real-tissue range before trusting Dice deltas.
+#
+#   python experiments/3d/train.py experiment=93_multisource_synth_texture
+
+defaults:
+  - 92_multisource_synth
+  - _self_
+
+data:
+  gmm:
+    texture:
+      n_octaves: 4
+      persistence: 0.5
+      base_scale_mm: 15.0

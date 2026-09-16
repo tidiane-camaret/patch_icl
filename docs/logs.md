@@ -8757,3 +8757,102 @@ Fixed by splitting the two steps that `_build_nc` used to do together: paint (ch
 One gap this surfaced: `data.gmm.paint_mask_aligned` (on in `92_multisource_synth.yaml`) is a *post*-resample step (overwrite supervised pixels with a fresh draw of the target's own Gaussian, after the output-grid mask is thresholded — doing it pre-resample can't reproduce the effect, since "boundary" only exists once that discretization happens). Added it to `gpu_realize_crop._realize_member` as an optional step, gated by three new `NativeCrop` fields (`paint_mask_aligned: bool`, `target_mu`/`target_sd: float | None`, all default off/None — zero effect on real classes or any other caller). Mirrors `gpu_synth_realize._resample_member`'s identical existing step (that module is unaffected, still serves the other, non-cascade `gpu_realize` path).
 
 Verified end-to-end against the real `gmm_bank` on GPU hardware: native crop correctly capped (`gpu_realize_max_native`), real non-trivial `out_sizes`/`pad_lo` geometry (not a full-grid placeholder), `realize_native_crops` produces the correct final grid, and the aligned-paint post-step's supervised-region mean/std land within sampling noise of the analytically expected target Gaussian. Full test suite (`src/providers/test_synth_gmm.py`, `experiments/3d/tests/test_gpu_realize_crop.py`, `test_cascade*.py`, `test_recrop_modality.py`, `test_native_grid_provider.py`, `test_multisource.py`) green — 233 tests, no regressions to the shared `NativeCrop`/`gpu_realize_crop` machinery real classes also use.
+
+## 2026-09-16 — synth_gmm intra-mask texture realism: multi-octave correlated paint noise
+
+User's hypothesis: `SynthGmmProvider`'s flat per-voxel i.i.d. GMM noise (`mu[cls] + sd[cls] *
+standard_normal(shape)`) is too unrealistic (no intra-mask spatial structure), and this may
+hurt generalization to far-OOD eval classes. Investigated first (see
+`docs/datasets/eval_expansion_status.md` and the `project_synth_gmm_paint_perf`/`project_maisi_gmm_synthseg`
+memory threads): measured real tissue's lag-1 voxel autocorrelation at ~0.59 (hu_lwk1 CT) /
+~0.64 (msd_hippocampus MRI) vs. the synth paint's ~0.00 at NATIVE resolution — confirmed. But
+the antialiased downsample in `gpu_realize_crop.py` (added purely for the perf reason logged
+2026-09-15 above, not for realism) already box-filters that native noise before the model ever
+sees it, landing post-resample autocorrelation at ~0.53 — much closer to real tissue than the
+native number suggests. The remaining gap is about *kind*, not *amount*: the resample gives one
+fixed, isotropic, structureless correlation length; real tissue has multi-scale, heterogeneous
+texture (matters most for tumor cores/rims, vessel walls, trabecular bone — exactly the far-OOD
+classes motivating this).
+
+**Fix**: new `TextureSpec` dataclass + `_fractal_value_noise()` helper in
+`src/providers/synth_gmm.py` — sums `n_octaves` coarse-to-fine random grids (each drawn at a
+resolution set by `base_scale_mm` halved per octave, upsampled to the crop's shape via
+`scipy.ndimage.zoom(order=1)`), weighted by `persistence**k` and quadrature-normalized (then
+z-scored) to exactly zero-mean/unit-variance — so total per-class variance stays pinned to the
+existing `sd[cls]` calibration (`analyze_totalseg_intensity.py`); only the noise's spatial shape
+changes. `base_scale_mm` is physical, converted to voxels via the crop's own effective spacing
+(`e["spacing"] * step`, accounting for the `gpu_realize_max_native` cap stride) so the
+correlation length stays anatomically meaningful regardless of cap/crop_spacing_mm.
+`TextureSpec()` default (`n_octaves=1`) is a pure passthrough — byte-identical to the old
+`rng.standard_normal(shape)` call — so this ships fully opt-in, same pattern as `p_shape`/
+`ShapeCohortSpec`. `SynthGmmProvider.__init__` gains `texture_spec=None`; `_build_nc`'s noise
+line swaps to `_fractal_value_noise(crop_lbl.shape, member_nrng, eff_spacing, self.texture_spec)`.
+
+**Config wiring**: `experiments/3d/common.py`'s multisource+synth path reads `data.gmm.texture`
+(mirrors the `p_shape`/`shape` block right above it) into `TextureSpec(**kwargs)`.
+`92_multisource_synth.yaml` gets an identity-default `texture: {}` block (no behavior change).
+New `configs/experiment/3d/experiment/93_multisource_synth_texture.yaml` turns it on
+(`n_octaves=4, persistence=0.5, base_scale_mm=15.0`) as an unvalidated starting point for the
+next eval pass — not yet calibrated; rerun the investigation's lag-1-autocorrelation diagnostic
+against this config's real painted output and tune before trusting any resulting Dice deltas.
+
+TDD throughout (`src/providers/test_synth_gmm.py`): pure-function tests for the identity
+passthrough (byte-identical), zero-mean/unit-variance, spatial correlation vs. plain noise, and
+determinism; a provider-level test confirming texture changes the painted image but not the
+resolved crop geometry (needed `background_mode="uniform"` in the fixture — the default `"zero"`
+bg mode has `sd[0]==0`, so a crop that misses the tiny fixture's foreground cube would show no
+noise at all regardless of generator, a pre-existing fixture quirk documented inline). Full
+`src/providers/` + `src/shapes3d/` suite green (61 tests), Hydra compose verified for both new
+and existing experiment configs.
+
+## 2026-09-16 (cont.) — synth_gmm core/rim multi-region target paint (heterogeneity mode)
+
+Follow-up literature survey (user: "research more about anatomical texture generation")
+found the highest-leverage next step isn't more octaves of the texture noise just shipped, but
+multi-region-WITHIN-mask heterogeneity (core/rim/edema-style), citing the actual technique
+behind SyntheticTumors/DiffTumor ([2308.03008](https://arxiv.org/abs/2308.03008)): smooth a
+random field, threshold it, blur again → a continuous `[0,1]` map with organic blob-shaped
+sub-regions, used to blend intensity between two anchors. This directly targets the failure mode
+motivating the whole thread — isles22/gnc_kidney/hu_lwk1 (the worst-performing far-OOD sources,
+`docs/datasets/eval_expansion_status.md`) are all heterogeneous-lesion-style targets, and
+synth_gmm previously had no way to paint anything but one flat mu/sd per class per mask.
+
+**Implemented**: `HeterogeneitySpec` dataclass + `_heterogeneity_map()` in
+`src/providers/synth_gmm.py`. Simplified the reference technique from two independently
+thresholded fields to one field thresholded at a percentile (`core_fraction`, computed within
+the target mask) — iso-level sets of a single smooth Gaussian random field already give the same
+organic multi-blob character, with a direct, controllable coverage-fraction knob instead of
+leaving it to chance. Gated by a new cohort-level `p_heterogeneity` coin flip in `assemble_task`
+(independent of `p_shape` — applies to whichever class ends up painted, real host or shape
+pseudo-class), decided once per cohort (all K+1 members share it, since target/context represent
+the same task). `_build_nc` blends only `mu` between the class's own flat value (rim) and a
+fresh per-member `core` draw (`core_offset_ratio`, same `between_ratio`-style mechanic as the
+existing per-member mu perturbation); `sd` stays the flat per-class value throughout, per
+explicit design choice (the literature only demonstrates the mean-shift effect, not
+variance-blending). `TextureSpec`'s per-voxel noise layers on top of the blended mu unchanged —
+the two features compose without special-casing each other.
+
+**Subject-string format changed** from a fixed-position 4th field to order-independent trailing
+markers: `"<filename>|<gmm_seed>|<member_idx>[|host<id>][|het]"` — `load_native_crop` now scans
+all trailing parts for either marker instead of assuming `host<id>` is always last, since
+heterogeneity's `|het` marker needed to coexist with shape mode's existing `|host<id>` field in
+either presence/order. Backward compatible (old subjects have zero trailing parts, existing
+shape-mode subjects unaffected — `parts[3]` is still `host<id>` when heterogeneity is off).
+
+**Config wiring**: `experiments/3d/common.py` reads `data.gmm.p_heterogeneity`/
+`data.gmm.heterogeneity` into `HeterogeneitySpec(**kwargs)`, same pattern as `p_shape`/`texture`.
+`92_multisource_synth.yaml` gets identity-default `p_heterogeneity: 0`/`heterogeneity: {}` (no
+behavior change). New `configs/experiment/3d/experiment/94_multisource_synth_heterogeneity.yaml`
+builds on `93_multisource_synth_texture` (not `92`) so a clean 3-way ablation is possible:
+92 (baseline) vs. 93 (+texture) vs. 94 (+texture+heterogeneity). `p_heterogeneity: 0.3`,
+`HeterogeneitySpec` defaults — an unvalidated starting point, same caveat as 93.
+
+TDD throughout: pure-function tests for `_heterogeneity_map` (range, `core_fraction` respected,
+deterministic, empty-mask-safe), provider tests for the `p_heterogeneity=0`/`1` subject-marker
+round-trip, cascade re-crop reproducing the identical heterogeneous paint, a non-flat-within-mask
+sanity check (var_max≈0 isolates the mu-blend effect from ordinary GMM noise), and both markers
+parsing together regardless of order. Full `src/providers/` + `src/shapes3d/` suite green (70
+tests), Hydra compose verified for all three experiment configs.
+
+Same caveat as the texture-noise work: implementation-correct and tested, but **not yet
+validated** — no eval run against 94 has happened.

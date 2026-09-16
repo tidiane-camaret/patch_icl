@@ -434,7 +434,7 @@ def build_dataset(cfg, split: str):
         p_synth = float(d.get("p_synth", 0.0))
         if p_synth > 0 and is_train:
             from omegaconf import OmegaConf
-            from src.providers.synth_gmm import SynthGmmProvider
+            from src.providers.synth_gmm import HeterogeneitySpec, SynthGmmProvider, TextureSpec
             from src.providers.tri_source import TriSourceProvider
             from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
             from src.gpu_gmm_intensity import (CT_GROUP_MAISI_IDS, CT_GROUP_RHO,
@@ -490,8 +490,20 @@ def build_dataset(cfg, split: str):
                 shape_kwargs = (OmegaConf.to_container(shape_cfg, resolve=True)
                                 if OmegaConf.is_config(shape_cfg) else dict(shape_cfg))
                 shape_spec = ShapeCohortSpec(**shape_kwargs)
+            texture_cfg = g.get("texture", {}) or {}
+            texture_kwargs = (OmegaConf.to_container(texture_cfg, resolve=True)
+                              if OmegaConf.is_config(texture_cfg) else dict(texture_cfg))
+            texture_spec = TextureSpec(**texture_kwargs)
+            p_heterogeneity = float(g.get("p_heterogeneity", 0.0) or 0.0)
+            heterogeneity_cfg = g.get("heterogeneity", {}) or {}
+            heterogeneity_kwargs = (OmegaConf.to_container(heterogeneity_cfg, resolve=True)
+                                    if OmegaConf.is_config(heterogeneity_cfg)
+                                    else dict(heterogeneity_cfg))
+            heterogeneity_spec = HeterogeneitySpec(**heterogeneity_kwargs)
             synth_prov = SynthGmmProvider(synth_ds, cascade=True, p_shape=p_shape,
-                                          shape_spec=shape_spec)
+                                          shape_spec=shape_spec, texture_spec=texture_spec,
+                                          p_heterogeneity=p_heterogeneity,
+                                          heterogeneity_spec=heterogeneity_spec)
             provider = TriSourceProvider(
                 provider, synth_prov, p_synth=p_synth,
                 epoch_length=_epoch_len, gpu_realize_crop=_realize)

@@ -13,7 +13,9 @@ import pytest
 
 from data.maisi_classes import SHAPE_ID_TO_FAMILY
 from src.incontext_dataset_v2 import LoadRequest
-from src.providers.synth_gmm import SynthGmmProvider
+from src.providers.synth_gmm import (
+    HeterogeneitySpec, SynthGmmProvider, TextureSpec, _fractal_value_noise, _heterogeneity_map,
+)
 from src.shapes3d.spec import ShapeCohortSpec
 from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
 from src.totalseg_dataloader_incontext import organ_crop_arrays as _real_organ_crop_arrays
@@ -423,3 +425,210 @@ def test_build_nc_omits_paint_mask_aligned_target_by_default(tmp_path):
     nc = task["native_crop"][0]
     assert nc.paint_mask_aligned is False
     assert nc.target_mu is None and nc.target_sd is None
+
+
+# --- _fractal_value_noise / TextureSpec (multi-octave correlated paint noise) ---
+# See docs/datasets/eval_expansion_status.md investigation: real tissue has lag-1
+# voxel autocorrelation ~0.6, the old per-voxel i.i.d. GMM noise has ~0. TextureSpec's
+# default (n_octaves=1) must reduce to exactly that old i.i.d. behavior -- opt-in only.
+
+def test_fractal_value_noise_default_is_byte_identical_to_plain_standard_normal():
+    shape = (6, 7, 5)
+    expected = np.random.default_rng(42).standard_normal(shape).astype(np.float32)
+    actual = _fractal_value_noise(shape, np.random.default_rng(42), (1.0, 1.0, 1.0), TextureSpec())
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_fractal_value_noise_multi_octave_is_zero_mean_unit_variance():
+    shape = (40, 40, 40)
+    spec = TextureSpec(n_octaves=4, persistence=0.5, base_scale_mm=15.0)
+    field = _fractal_value_noise(shape, np.random.default_rng(0), (1.0, 1.0, 1.0), spec)
+    assert abs(float(field.mean())) < 0.1
+    assert float(field.std()) == pytest.approx(1.0, abs=0.05)
+
+
+def test_fractal_value_noise_multi_octave_is_spatially_correlated_unlike_plain_noise():
+    shape = (40, 40, 40)
+    spec = TextureSpec(n_octaves=4, persistence=0.5, base_scale_mm=15.0)
+    field = _fractal_value_noise(shape, np.random.default_rng(1), (1.0, 1.0, 1.0), spec)
+    plain = np.random.default_rng(1).standard_normal(shape).astype(np.float32)
+
+    def _lag1_autocorr(a):
+        a0, a1 = a[:-1], a[1:]
+        return np.corrcoef(a0.ravel(), a1.ravel())[0, 1]
+
+    assert _lag1_autocorr(field) > 0.3
+    assert abs(_lag1_autocorr(plain)) < 0.05
+
+
+def test_fractal_value_noise_is_deterministic_given_the_same_seed():
+    shape = (20, 20, 20)
+    spec = TextureSpec(n_octaves=3, persistence=0.6, base_scale_mm=10.0)
+    a = _fractal_value_noise(shape, np.random.default_rng(7), (2.0, 2.0, 2.0), spec)
+    b = _fractal_value_noise(shape, np.random.default_rng(7), (2.0, 2.0, 2.0), spec)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_provider_texture_spec_multi_octave_changes_painted_image_not_geometry(tmp_path):
+    """Same seed/geometry either way (texture only changes HOW noise is drawn, not the
+    RNG calls that resolve crop window/center) -- label_frac identical, image differs.
+
+    background_mode="uniform" (sd[0] > 0) makes this robust even though this fixture's
+    "com" crop window is centered far from the tiny fg cube (see FALLBACK_CENT comment
+    above) and so is mostly/entirely background class 0 -- with the default "zero" bg
+    mode sd[0]==0 and the noise generator's choice would never show up in the image."""
+    bank_dir = _make_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256,
+                              background_mode="uniform")
+    provider_plain = SynthGmmProvider(ds, cascade=True)
+    provider_textured = SynthGmmProvider(
+        ds, cascade=True,
+        texture_spec=TextureSpec(n_octaves=4, persistence=0.5, base_scale_mm=6.0))
+
+    task_plain = provider_plain.assemble_task(random.Random(0), crop_spacing_mm=3.0)
+    task_textured = provider_textured.assemble_task(random.Random(0), crop_spacing_mm=3.0)
+    nc_plain, nc_textured = task_plain["native_crop"][0], task_textured["native_crop"][0]
+
+    np.testing.assert_array_equal(nc_plain.label_frac.numpy(), nc_textured.label_frac.numpy())
+    assert not np.allclose(nc_plain.image.numpy(), nc_textured.image.numpy())
+
+
+# --- HeterogeneitySpec / _heterogeneity_map (core/rim multi-region target paint) ---
+# See docs/logs.md 2026-09-16: SyntheticTumors/DiffTumor-style threshold-noise blob map,
+# used to blend a target mask's mu between a "rim" (the class's own mu_e) and a fresh
+# "core" draw, layered UNDER TextureSpec's per-voxel noise (unaffected by this feature).
+
+def _het_spec(**kw):
+    return HeterogeneitySpec(**kw)
+
+
+def test_heterogeneity_map_values_are_in_unit_range_within_mask():
+    mask = np.ones((30, 30, 30), dtype=bool)
+    m = _heterogeneity_map(mask, np.random.default_rng(0), _het_spec())
+    assert m.shape == mask.shape
+    assert m[mask].min() >= 0.0 and m[mask].max() <= 1.0
+
+
+def test_heterogeneity_map_respects_core_fraction_roughly():
+    mask = np.ones((40, 40, 40), dtype=bool)
+    spec = _het_spec(core_fraction=0.3, sigma1_range=(2.0, 2.0), sigma2_range=(0.5, 0.5))
+    m = _heterogeneity_map(mask, np.random.default_rng(1), spec)
+    core_frac_observed = float((m[mask] > 0.5).mean())
+    assert 0.15 < core_frac_observed < 0.45   # loose band -- blur softens the hard cut
+
+
+def test_heterogeneity_map_is_deterministic_given_the_same_seed():
+    mask = np.ones((20, 20, 20), dtype=bool)
+    spec = _het_spec()
+    a = _heterogeneity_map(mask, np.random.default_rng(3), spec)
+    b = _heterogeneity_map(mask, np.random.default_rng(3), spec)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_heterogeneity_map_handles_an_empty_mask_without_raising():
+    mask = np.zeros((10, 10, 10), dtype=bool)
+    m = _heterogeneity_map(mask, np.random.default_rng(0), _het_spec())
+    assert m.shape == mask.shape
+    assert not m.any()
+
+
+def _make_full_bank(tmp_path):
+    """Bank where the ENTIRE native array is class CLS (not a small cube) -- so any
+    resolved crop is fully foreground, needed to observe within-mask heterogeneity."""
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    entries, size_vecs = [], []
+    for i in range(2):
+        arr = np.full((DIM, DIM, DIM), CLS, dtype=np.uint8)
+        fname = f"m{i:05d}.npy"
+        np.save(masks_dir / fname, arr)
+        counts = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
+        size_vecs.append((counts / counts[1:].sum()).astype(np.float32))
+        entries.append({"file": fname, "spacing": [3.0, 3.0, 3.0], "dim": [DIM, DIM, DIM],
+                         "label_list": [CLS], "span": (1, 1),
+                         "cents": {CLS: [DIM // 2, DIM // 2, DIM // 2]}})
+    index = {"maxid": 256, "spacing": 3.0, "entries": entries, "size_mat": np.stack(size_vecs)}
+    with open(tmp_path / "index.pkl", "wb") as f:
+        pickle.dump(index, f)
+    return tmp_path
+
+
+def _make_full_provider(tmp_path, p_heterogeneity=0.0, heterogeneity_spec=None):
+    bank_dir = _make_full_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256)
+    return SynthGmmProvider(ds, cascade=True, p_heterogeneity=p_heterogeneity,
+                            heterogeneity_spec=heterogeneity_spec)
+
+
+def test_assemble_task_p_heterogeneity_zero_never_marks_subject_het(tmp_path):
+    provider = _make_full_provider(tmp_path, p_heterogeneity=0.0)
+    rng = random.Random(0)
+    for _ in range(10):
+        task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+        assert "het" not in task["subject"].split("|")
+        for s in task["context_subjects"]:
+            assert "het" not in s.split("|")
+
+
+def test_assemble_task_p_heterogeneity_one_marks_subject_het(tmp_path):
+    provider = _make_full_provider(tmp_path, p_heterogeneity=1.0)
+    rng = random.Random(0)
+    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+    assert "het" in task["subject"].split("|")
+    for s in task["context_subjects"]:
+        assert "het" in s.split("|")
+
+
+def test_build_nc_heterogeneous_target_paint_is_not_flat_within_mask(tmp_path):
+    """p_heterogeneity=1.0 -> the painted image must show real spread within the fully-
+    foreground mask (beyond what plain noise alone gives), i.e. the core/rim mu blend
+    actually fires and changes the local mean, not just per-voxel noise."""
+    bank_dir = _make_full_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256, var_max=0.01)
+    provider_flat = SynthGmmProvider(ds, cascade=True, p_heterogeneity=0.0)
+    provider_het = SynthGmmProvider(ds, cascade=True, p_heterogeneity=1.0,
+                                    heterogeneity_spec=HeterogeneitySpec(core_offset_ratio=3.0))
+
+    task_flat = provider_flat.assemble_task(random.Random(0), crop_spacing_mm=3.0)
+    task_het = provider_het.assemble_task(random.Random(0), crop_spacing_mm=3.0)
+    img_flat = task_flat["native_crop"][0].image.numpy()
+    img_het = task_het["native_crop"][0].image.numpy()
+
+    assert img_flat.std() < 1e-3          # var_max~0 -> flat target is ~uniform
+    assert img_het.std() > img_flat.std() * 5   # heterogeneous target has real structure
+
+
+def test_load_native_crop_reproduces_the_same_heterogeneous_paint_at_the_same_spacing(tmp_path):
+    provider = _make_full_provider(tmp_path, p_heterogeneity=1.0)
+    rng = random.Random(0)
+    ds = provider.ds
+    ds.jitter = 0
+    task = provider.assemble_task(rng, crop_spacing_mm=3.0)
+    original = task["native_crop"][0]
+
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=3.0, center=None, center_mode="com")
+    rebuilt = provider.load_native_crop(task["subject"], str(CLS), req)
+
+    np.testing.assert_array_equal(rebuilt.image.numpy(), original.image.numpy())
+
+
+def test_het_and_host_markers_both_parse_regardless_of_order(tmp_path):
+    """Shape mode's |host<id> field and heterogeneity's |het field are independent and
+    optional -- load_native_crop must handle a subject carrying both."""
+    bank_dir = _make_full_bank(tmp_path)
+    ds = SynthGmmMaisiDataset(bank_dir, image_size=(T, T, T), context_size=1,
+                              crop_spacing_mm=3.0, classes=[CLS], maxid=256, crop_jitter=0)
+    provider = SynthGmmProvider(ds, cascade=True, p_shape=1.0, p_heterogeneity=1.0,
+                                shape_spec=ShapeCohortSpec())
+    rng = random.Random(0)
+    task = provider.assemble_task(rng, crop_spacing_mm=12.0)
+    subject = task["subject"]
+    assert "het" in subject.split("|")
+    assert any(p.startswith("host") for p in subject.split("|"))
+
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=12.0, center=None, center_mode="com")
+    rebuilt = provider.load_native_crop(subject, task["label_name"], req)
+    assert rebuilt.class_idx in SHAPE_ID_TO_FAMILY
