@@ -494,6 +494,8 @@ class PatchSet3D(nn.Module):
         # Both need an encoder exposing unpooled stages (conv | nnunet_ts | resenc_ts | plainconv_ts).
         self.fine_decode = bool(fine_decode)
         self.decoder_kind = str(decoder)
+        assert not (self.decoder_kind == "iris" and not self.fine_decode), (
+            "arch.decoder='iris' requires arch.fine_decode=True (needs unpooled per-stage maps)")
         # int or list: fine_filter sums the projected stages at the finest grid; conv uses
         # them as the skip pyramid (coarse->fine order is derived, any order accepted here).
         self.fine_stage = tuple(int(st) for st in (
@@ -1116,8 +1118,13 @@ class PatchSet3D(nn.Module):
         if self.decoder_kind == "iris":
             # Eq 3-4 task encoding (support-only) + Eq 5-6 decoding: independent of `q`/the main
             # transformer above, which still runs unchanged for parity (see design spec).
-            T_c = self._iris_task_encode(sup_feat, context_out, B, K)
-            qry_img_pre = self.img_embed(qry_feat)
+            # img_embed is SHARED with the main path (_attn's _feat_norm'd sup_feat/qry_feat) —
+            # apply the same normalization here so img_embed always sees the same input
+            # distribution regardless of decoder_kind (safe to call _feat_norm again here: it's
+            # a pure function of its inputs, no state, no mutation of sup_feat/qry_feat).
+            norm_sup, norm_qry = self._feat_norm(sup_feat, qry_feat)
+            T_c = self._iris_task_encode(norm_sup, context_out, B, K)
+            qry_img_pre = self.img_embed(norm_qry)
             logit = self._decode_iris(qry_img_pre, T_c, fine)
         else:
             logit = self._decode(q, fine)

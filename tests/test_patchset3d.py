@@ -759,3 +759,34 @@ def test_iris_decoder_noop_when_not_selected():
     img, cin, cout = _dummy_batch(B=2, K=2, S=16)
     out = m(img, context_in=cin, context_out=cout, mode="train")
     assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+
+
+def test_decode_iris_multi_stage_shape_and_backward():
+    """The composed production config (95_iris_decoder -> ... -> m2_patchset_decoder.yaml)
+    uses fine_stage=[0,1] (two stages) -- the single-stage _IRIS_KW tests never exercise the
+    multi-stage skip-fusion loop's indexing (self._iris_stage_order/_iris_sides). This test
+    covers that geometry directly."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   image_size=(16, 16, 16), fine_decode=True, fine_stage=[0, 1], decoder="iris",
+                   iris_pixelshuffle_r=2, iris_m=4, iris_ctx_layers=1)
+    B, N, e = 2, m.N, 32
+    F_q = torch.randn(B, N, e, requires_grad=True)
+    T = torch.randn(B, 4, e, requires_grad=True)
+    # fine_stage=[0,1] on enc_dims=(8,8,8), image_size=16: stage 0 (stem) is full-res (16),
+    # channels=enc_dims[0]=8; stage 1 (first downsample) is half-res (8), channels=enc_dims[1]=8.
+    fine = (torch.randn(B, 8, 16, 16, 16), torch.randn(B, 8, 8, 8, 8))
+    logit = m._decode_iris(F_q, T, fine)
+    assert logit.shape == (B, 1, m.grid_size, m.grid_size, m.grid_size)
+    logit.mean().backward()
+    assert F_q.grad is not None and T.grad is not None
+
+
+def test_iris_decoder_requires_fine_decode():
+    """arch.decoder='iris' with arch.fine_decode=False should raise a clear AssertionError at
+    construction time, not an AttributeError deep in forward()."""
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  decoder="iris", fine_decode=False)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "fine_decode" in str(exc)

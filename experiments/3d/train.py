@@ -1159,6 +1159,13 @@ def main(cfg: DictConfig) -> None:
             # memory-bound elementwise work that inductor fuses.
             net._decode = torch.compile(net._decode, dynamic=_cdyn)
             msg += " + decode head"
+            if getattr(net, "decoder_kind", None) == "iris":
+                # arch.decoder=iris has no _decode call at all (forward() calls these two
+                # methods directly) — cover them too, so exp95 is compiled the same way exp92's
+                # conv decoder already is (a fair A/B needs both compiled or neither).
+                net._iris_task_encode = torch.compile(net._iris_task_encode, dynamic=_cdyn)
+                net._decode_iris = torch.compile(net._decode_iris, dynamic=_cdyn)
+                msg += " + iris task-encode/decode"
         print(msg)
 
     # Medverse perf knobs (medverse.grad_checkpoint / .compile — see model/medverse.yaml,
