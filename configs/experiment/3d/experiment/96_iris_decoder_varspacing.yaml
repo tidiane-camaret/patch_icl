@@ -1,0 +1,158 @@
+# @package _global_
+# 96_iris_decoder_varspacing — arch.decoder=iris (see 95_iris_decoder.yaml) on the same
+# multisource CT+MRI+synth pipeline as 92_multisource_synth, but trained variable-spacing
+# [3, 6] mm (NO cascade) instead of the [6, 3, 1.5] mm cascade. Cascade finetuning is deferred
+# to a later stage on top of this base -- mirrors 88_cascade's own pattern (cascade is a
+# finetune ON a fixed-pitch/varspacing base, not a from-scratch regime).
+#
+# WHY: 95_iris_decoder's cascade profile_timing showed run_cascade (~380-400ms/step, mostly
+# CPU-bound native-crop re-load + GMM paint for cascade levels >0) dominating step time, with
+# GPU at only ~35% memory / bursty utilization. Dropping the cascade's levels>0 re-crop
+# entirely (not just parallelizing it) removes that cost at the source.
+#
+# Composes multisource_ct_mri directly (not through 88_cascade/89_multisource_cascade/
+# 92_multisource_synth's inheritance chain), since those all layer the cascade bundle on top --
+# easier to compose the non-cascade base fresh than to un-set every cascade key one at a time.
+# multisource_ct_mri's OWN group default is already train_spacing_range=[1.5,6.0]/
+# crop_spacing_mm=3/mask_downsample=soft -- only the spacing range narrows here.
+#
+# gpu_realize_crop / ram_cache are in fact cascade-EXCLUSIVE, not merely cascade-default:
+# common.py::_assert_cascade_supported raises ValueError if gpu_realize_crop=true without
+# cascade_spacings (the native-crop payload is only consumed by the cascade train loop), and
+# ram_cache is gated by that same resolved flag, so it no-ops without cascade regardless --
+# corrected after a first draft of this file set both and hit that exact error at launch.
+# This is what actually answers "put synth_gmm on gpu_realize": there is no separate flag to
+# enable here. synth_gmm's own GMM paint intentionally stays on cheap CPU regardless of regime
+# (docs/logs.md 2026-09-15 -- no GPU-paint branch was ever built, deemed unnecessary); the
+# resample-to-grid step gpu_realize_crop would otherwise cover doesn't exist outside cascade in
+# the first place -- non-cascade crops go through the standard CPU dataloader collate. The
+# actual "make synth_gmm crops fast" lever in THIS regime is dropping cascade's levels>0
+# re-crop entirely (this file's whole point), not a GPU-paint toggle.
+#
+#   python experiments/3d/train.py experiment=96_iris_decoder_varspacing \
+#     train.checkpoint=<a 92-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  # Same encoder-width/stage choice as 88_cascade/95_iris_decoder (exp68's line).
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance   # modality-agnostic (CT+MRI), per 89_multisource_cascade
+  compile_dynamic: false         # fixed-shape kernels (train_spacing_range batches are still
+                                 # fixed-shape per batch via SpacingBatchSampler)
+  # --- REMOVED failure hypothesis bundle (same revert 88_cascade made) ---
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  # --- the whole point of this experiment ---
+  decoder: iris
+
+data:
+  train_spacing_range: [3, 6]   # narrower than the group default [1.5,6] -- coarser two of the
+                                # original cascade's [6,3,1.5] levels, finest (1.5mm) deferred
+                                # to the later cascade-finetune stage
+  crop_spacing_mm: 4.24         # eval-only fixed pitch, geometric midpoint sqrt(3*6) of the
+                                # trained range (same convention d2_varspacing_15_6 uses)
+  # gpu_realize_crop / ram_cache are in fact cascade-EXCLUSIVE (common.py::_assert_cascade_
+  # supported raises if gpu_realize_crop=true without cascade_spacings; ram_cache is gated by
+  # the resolved cascade/gpu_realize flag too, so it no-ops without cascade regardless) --
+  # corrected after this first draft raised that exact ValueError at launch. Without cascade,
+  # the standard dataloader collate handles crops on CPU; the standalone [volume_cache]
+  # mechanism (always-on, not gated by either flag) still covers raw-volume caching.
+
+  p_synth: 0.3
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture: {}
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    # this run also trains on the REAL TotalSegmentator CT source (multisource) -- exclude
+    # its own masks from the synth bank, same reasoning as 92_multisource_synth.
+    exclude_src: [TotalSegmentatorV2]
+
+  source_mix:
+    regime_p: [0.4, 0.4, 0.2]
+    per_source_train_classes: [balanced, balanced]
+    eval_epoch_length: 800
+
+augmentations:
+  intensity:
+    gin:
+      p: 0.6
+    bias_field:
+      p: 0.4
+      magnitude: 0.3
+      coarse: 4
+    gamma:
+      range: [0.6, 1.7]
+    gaussian_noise:
+      p: 0.15
+    simulate_low_resolution:
+      p: 0.35
+      scale_min: 0.25
+      anisotropic: true
+    invert:
+      p: 0.15
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 140
+  batch_size: 4          # this GPU has ample headroom (34/98 GB at batch_size=2 on the cascade
+                         # run); 4 is also this model/encoder's native from-scratch batch_size
+                         # (70_patchset_varspacing_6_1_5.yaml)
+  lr: 2.1e-5             # sqrt(2)-scaled from the cascade line's gentle-resume 1.5e-5 (B=2->4)
+  encoder_lr_scale: 0.5
+  eval_every: 5
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+  warmup_epochs: 3
+  loss: bce_dice
+  dice_weight: 1.0
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 96_iris_decoder_varspacing

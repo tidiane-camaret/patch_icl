@@ -391,11 +391,16 @@ def build_dataset(cfg, split: str):
         which = "train" if is_train else "val"
         split_map = sm.get("split_map", {}) or {}
         # Cascade train runs default gpu_realize_crop ON (native-crop payload path); a
-        # non-cascade config leaves it off. ram_cache follows the RESOLVED realize flag —
-        # `load_native_crop` is its only reader — so it stays off otherwise.
+        # non-cascade config leaves it off. ram_cache defaults to the RESOLVED realize flag,
+        # but an explicit data.ram_cache=true wins outright — TotalSegProvider.load() (not
+        # just load_native_crop) has read _ram since 2026-09-09 (docs/logs.md), so a
+        # non-cascade/non-realize varspacing run benefits too, same as the single-source
+        # loader_v2 branch below already lets it (this branch previously ANDed ram_cache with
+        # _realize, silently dropping an explicit override -- the gap that single-source fix
+        # never got extended to here).
         _casc = bool(d.get("cascade_spacings"))
         _realize = is_train and bool(d.get("gpu_realize_crop", _casc))
-        _ram = _realize and bool(d.get("ram_cache", False))
+        _ram = is_train and bool(d.get("ram_cache", _realize))
         subs = {}
         for src, mod, spec, root in _multisource_specs(cfg, which):
             sub_split = split_map.get(src, {}).get(split, split)
@@ -500,7 +505,14 @@ def build_dataset(cfg, split: str):
                                     if OmegaConf.is_config(heterogeneity_cfg)
                                     else dict(heterogeneity_cfg))
             heterogeneity_spec = HeterogeneitySpec(**heterogeneity_kwargs)
-            synth_prov = SynthGmmProvider(synth_ds, cascade=True, p_shape=p_shape,
+            # cascade=_realize (not hardcoded True): SynthGmmProvider.assemble_task branches
+            # on this exactly like MultiSourceProvider already does on gpu_realize_crop=_realize
+            # a few lines up -- when _realize is False (no cascade_spacings / gpu_realize_crop),
+            # it must return a normal image-bearing dict via self.ds.assemble(...), not an
+            # imageless native_crop payload the standard incontext_collate_fn can't consume.
+            # Was hardcoded True unconditionally, breaking every non-cascade multisource +
+            # p_synth>0 run with a `KeyError: 'image'` in incontext_collate_fn.
+            synth_prov = SynthGmmProvider(synth_ds, cascade=_realize, p_shape=p_shape,
                                           shape_spec=shape_spec, texture_spec=texture_spec,
                                           p_heterogeneity=p_heterogeneity,
                                           heterogeneity_spec=heterogeneity_spec)

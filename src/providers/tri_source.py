@@ -8,8 +8,13 @@ At cascade recrop time (load_native_crop / load), routes by modality:
   'synth': SynthGmmProvider.load_native_crop (re-crop + re-paint the same MAISI mask)
   other:   MultiSourceProvider.load_native_crop (real CT or MRI sub-provider)
 
-Configure via data.p_synth in the experiment config. The synth sub-provider must have
-cascade=True (SynthGmmProvider(dataset, cascade=True)).
+Configure via data.p_synth in the experiment config. The synth sub-provider's own `cascade`
+flag must match this run's resolved realize flag, same as MultiSourceProvider's
+`gpu_realize_crop`: `SynthGmmProvider(dataset, cascade=_realize)` — cascade=True for a
+gpu_realize_crop/cascade_spacings run (native_crop payload), cascade=False otherwise (a normal
+image-bearing dict via SynthGmmMaisiDataset.assemble). Passing a hardcoded True regardless of
+the run's actual mode breaks every non-cascade multisource + p_synth>0 run (see
+experiments/3d/common.py's build_dataset, `source=="multisource"` branch).
 """
 
 
