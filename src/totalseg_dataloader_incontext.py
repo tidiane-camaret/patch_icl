@@ -1591,15 +1591,26 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
     # doesn't populate it, not a training-time value.
     if any("meta" in b for b in batch):
         out["meta"] = [b.get("meta") for b in batch]  # per-sample provenance (sample-table detail)
-    if "crop_geom" in batch[0]:
-        out["crop_geom"] = torch.stack([b["crop_geom"] for b in batch])  # (B, 4, 3) cascade inversion
+    # any()-gated + NaN-pad, same reasoning and pattern as synth_radii_mm/synth_coord below:
+    # crop_geom is only ever set by the cascade-inversion-producing branch (line ~1351), so a
+    # mixed real+synth batch has it on some items and not others -- NaN rows are simply the
+    # ones a non-cascade/no-inversion-needed item never populated (unused for such an item's
+    # own training either way, per its own "cascade inversion" comment).
+    if any("crop_geom" in b for b in batch):
+        nan43 = torch.full((4, 3), float("nan"))
+        out["crop_geom"] = torch.stack(  # (B, 4, 3) cascade inversion
+            [b["crop_geom"].float() if "crop_geom" in b else nan43 for b in batch])
     if "aug_mode" in batch[0]:
         out["aug_mode"] = torch.stack([b["aug_mode"] for b in batch])  # (B,) int64
-    if "modality" in batch[0]:
-        out["modality"] = [b["modality"] for b in batch]  # (B,) list[str], unused downstream
-    if "tgt_modality" in batch[0]:
-        out["tgt_modality"] = [b["tgt_modality"] for b in batch]  # (B,) list[str], cascade re-crop routing
-        out["ctx_modality"] = [b["ctx_modality"] for b in batch]
+    # any()-gated (not batch[0]-only), same reasoning as meta/crop_geom above: MultiSourceProvider
+    # sets modality/tgt_modality/ctx_modality, but SynthGmmMaisiDataset.assemble()'s non-cascade
+    # item does not -- default missing items to "synth", the exact tag the cascade branch
+    # (SynthGmmProvider.assemble_task) already uses for this same case, not an arbitrary sentinel.
+    if any("modality" in b for b in batch):
+        out["modality"] = [b.get("modality", "synth") for b in batch]  # (B,) list[str], unused downstream
+    if any("tgt_modality" in b for b in batch):
+        out["tgt_modality"] = [b.get("tgt_modality", "synth") for b in batch]  # (B,) list[str], cascade re-crop routing
+        out["ctx_modality"] = [b.get("ctx_modality", "synth") for b in batch]
     # Per-item NaN-pad so mixed synth+real batches still log radii/coords for their synth items
     # (an all()-gate dropped both keys whenever a single real sample shared the batch).
     if any("synth_radii_mm" in b for b in batch):
