@@ -14,11 +14,15 @@ through `train.py::build_model`. New experiment `95_iris_decoder.yaml` (92 + `ar
 iris`) for a direct A/B. Design: `docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder
 -design.md`. TDD throughout (PixelShuffle round-trip, construction/shape/gradient tests per new
 method, end-to-end forward/backward, no-op guarantee for every other `decoder` value) — **not
-yet validated**, no eval run against 95 has happened. Two existing knobs become silently inert
-under `decoder=iris`: `token_mask_ratio_support`/`token_mask_ratio_query` (SimMIM masking
-perturbs a transformer whose output this decoder discards) and `eval.feat_norm` sweeps (the
-transformer path's `_feat_norm` mode no longer affects the final logit, only `_attn`'s now-unused
-`q`) — don't read an exp95 result as evidence about either.
+yet validated**, no eval run against 95 has happened. `token_mask_ratio_support`/
+`token_mask_ratio_query` become silently inert under `decoder=iris` (SimMIM masking perturbs a
+transformer whose output this decoder discards) — don't read an exp95 result as evidence about
+either. `eval.feat_norm`/`arch.feat_norm` is NOT inert here: `forward()`'s iris branch calls
+`self._feat_norm(sup_feat, qry_feat)` before `img_embed`/`_iris_task_encode`, matching what
+`_attn` already does for every other decoder — so it does affect this decoder's final logit too
+(fixed post-final-review: the iris branch originally bypassed `_feat_norm` entirely, feeding
+`img_embed` a different input distribution than the main path, which would have silently
+degraded a `train.checkpoint`-resumed run).
 
 ## 2026-09-14 — PatchSet3D IRIS-style pooling token (`arch.pool_token`)
 
