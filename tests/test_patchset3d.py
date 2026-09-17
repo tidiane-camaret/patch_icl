@@ -734,3 +734,25 @@ def test_decode_iris_shape_and_backward():
               and n.startswith(("iris_t2f", "iris_f2t", "iris_token_proj", "iris_blocks",
                                 "iris_class_embed"))]
     assert not missing, f"no grad reached: {missing}"
+
+
+def test_iris_decoder_end_to_end_shape_and_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_IRIS_KW)
+    img, cin, cout = _dummy_batch(B=2, K=3, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_iris_decoder_noop_when_not_selected():
+    """decoder != 'iris' (existing configs): forward() takes the original branch, no iris_*
+    attributes exist, output shape/behavior unchanged."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   image_size=(16, 16, 16), fine_decode=True, fine_stage=1, decoder="conv")
+    assert not hasattr(m, "iris_t2f") and not hasattr(m, "iris_ctx_query")
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)

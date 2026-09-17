@@ -1113,7 +1113,14 @@ class PatchSet3D(nn.Module):
         q, mask_support, mask_query, regs = self._attn(
             sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing,
             query_prior=query_prior, cascade_regs=cascade_regs, pool_feat=pool_feat)
-        logit = self._decode(q, fine)
+        if self.decoder_kind == "iris":
+            # Eq 3-4 task encoding (support-only) + Eq 5-6 decoding: independent of `q`/the main
+            # transformer above, which still runs unchanged for parity (see design spec).
+            T_c = self._iris_task_encode(sup_feat, context_out, B, K)
+            qry_img_pre = self.img_embed(qry_feat)
+            logit = self._decode_iris(qry_img_pre, T_c, fine)
+        else:
+            logit = self._decode(q, fine)
         return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query,
                "registers": regs}
 
