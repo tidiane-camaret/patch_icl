@@ -1,5 +1,21 @@
 # Change log
 
+## 2026-09-17 — PatchSet3D Iris-decoder (`arch.decoder=iris`)
+
+**arch.decoder=iris** (`src/models/patchset3d.py`): literal reproduction of Iris's contextual
+-stream task encoding (§4.2, Eq 3-4 — PixelShuffle-fused support features+mask -> `m=10` learned
+tokens `T_c`, support-only, independent of the query and of the main transformer) and mask
+-decoding module (§5, Eq 5-6 — bidirectional cross-attention between `T_c` and the query's
+pre-transformer image embedding, then a plain skip-connected conv up-path read out by one global
+per-volume filter dot product). Deliberately does not reuse `_build_conv_decoder`'s
+FiLM/z-score/token-residual fusion tricks. New constructor kwargs `iris_pixelshuffle_r`
+(default 4, needs `e % r^3 == 0`), `iris_m` (default 10), `iris_ctx_layers` (default 2), threaded
+through `train.py::build_model`. New experiment `95_iris_decoder.yaml` (92 + `arch.decoder:
+iris`) for a direct A/B. Design: `docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder
+-design.md`. TDD throughout (PixelShuffle round-trip, construction/shape/gradient tests per new
+method, end-to-end forward/backward, no-op guarantee for every other `decoder` value) — **not
+yet validated**, no eval run against 95 has happened.
+
 ## 2026-09-14 — PatchSet3D IRIS-style pooling token (`arch.pool_token`)
 
 Added an optional foreground-masked pooling token to `PatchSet3D` (`src/models/patchset3d.py`),

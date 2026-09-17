@@ -1,0 +1,16 @@
+# @package _global_
+# 95_iris_decoder — 92_multisource_synth with the literal Iris task-encoding + decoding modules
+# (arch.decoder=iris, docs/methods/iris.md §4.2 + §5) swapped in for the progressive conv decoder.
+#
+#   python experiments/3d/train.py experiment=95_iris_decoder \
+#     train.checkpoint=<a 92-line best.pt> train.resume_weights_only=true
+
+defaults:
+  - 92_multisource_synth
+  - _self_
+
+arch:
+  decoder: iris
+
+wandb:
+  name: 95_iris_decoder

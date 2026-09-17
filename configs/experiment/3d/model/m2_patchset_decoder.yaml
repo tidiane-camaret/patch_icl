@@ -46,6 +46,15 @@ arch:
   # finest), 3x3x3 conv per level, 1x1x1 head + a token-only residual. ~6x the decode FLOPs.
   decoder: conv
   decoder_dim: 64               # base width of the conv decoder (halves per level, >=8)
+  # iris = literal Iris (docs/methods/iris.md §4.2+§5) task-encoding + decoding: PixelShuffle
+  # -fused support-only contextual-stream task tokens (Eq 3-4) cross-attend the query's
+  # pre-transformer image embedding (Eq 5), then a plain skip-connected conv up-path + one
+  # global per-volume filter dot product (Eq 6) -- no FiLM/z-score/token-residual tricks.
+  # Bypasses `q` (the main transformer's query-row output) entirely for this decoder's logits.
+  # See docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder-design.md.
+  iris_pixelshuffle_r: 4        # PixelShuffle factor for Eq 3-4's mask fusion; e % r^3 must == 0
+  iris_m: 10                    # learned contextual-stream query tokens (Iris's m, paper default)
+  iris_ctx_layers: 2            # {cross-attn,self-attn,MLP} blocks building T_c (paper's default)
   compile: true                 # torch.compile the transformer + Muon Newton-Schulz
   compile_encoder: true         # image encoder stack
   compile_decoder: true         # decode head

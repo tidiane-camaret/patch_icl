@@ -435,6 +435,9 @@ def build_model(cfg: DictConfig):
             "fine_proj_dim": a.get("fine_proj_dim", 64),
             "decoder": a.get("decoder", "fine_filter"),
             "decoder_dim": a.get("decoder_dim", 64),
+            "iris_pixelshuffle_r": a.get("iris_pixelshuffle_r", 4),
+            "iris_m": a.get("iris_m", 10),
+            "iris_ctx_layers": a.get("iris_ctx_layers", 2),
         }
         return PatchSet3D(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
