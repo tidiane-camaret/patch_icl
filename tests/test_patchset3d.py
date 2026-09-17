@@ -668,3 +668,36 @@ def test_pool_token_with_seq_compress():
     out["final_logit"].mean().backward()
     missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
     assert not missing, f"no grad reached: {missing}"
+
+
+# --- arch.decoder="iris": literal Iris §4.2+§5 task-encoding/decoding modules ---
+
+_IRIS_KW = dict(image_size=(16, 16, 16), fine_decode=True, fine_stage=1, decoder="iris",
+               iris_pixelshuffle_r=2, iris_m=4, iris_ctx_layers=1)
+
+
+def test_iris_decoder_builds_expected_modules():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_IRIS_KW)
+    assert m.decoder_kind == "iris"
+    assert m.iris_ctx_query.shape == (4, 32)
+    assert m.iris_class_embed.out_features == m.iris_blocks[-1][-1].conv.out_channels
+
+
+def test_iris_decoder_rejects_bad_pixelshuffle_r():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  image_size=(16, 16, 16), fine_decode=True, fine_stage=1, decoder="iris",
+                  iris_pixelshuffle_r=3)          # 32 % 27 != 0
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "iris_pixelshuffle_r" in str(exc)
+
+
+def test_decoder_invalid_raises_mentions_iris():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  image_size=(16, 16, 16), fine_decode=True, fine_stage=1, decoder="bogus")
+        assert False, "should have raised"
+    except ValueError as exc:
+        assert "iris" in str(exc)

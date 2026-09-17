@@ -246,6 +246,9 @@ class PatchSet3D(nn.Module):
         fine_proj_dim: int = 64,
         decoder: str = "fine_filter",
         decoder_dim: int = 64,
+        iris_pixelshuffle_r: int = 4,
+        iris_m: int = 10,
+        iris_ctx_layers: int = 2,
         pool_token: bool = False,
     ):
         super().__init__()
@@ -537,8 +540,12 @@ class PatchSet3D(nn.Module):
                           f"capped at {sum(chans)} — the extra width is unused.")
             elif self.decoder_kind == "conv":
                 self._build_conv_decoder(e, int(image_size[0]), resolution, int(decoder_dim))
+            elif self.decoder_kind == "iris":
+                self._build_iris_decoder(e, int(image_size[0]), resolution, int(decoder_dim), a,
+                                         int(iris_pixelshuffle_r), int(iris_m),
+                                         int(iris_ctx_layers))
             else:
-                raise ValueError(f"arch.decoder {self.decoder_kind!r} (fine_filter | conv)")
+                raise ValueError(f"arch.decoder {self.decoder_kind!r} (fine_filter | conv | iris)")
         # pool_token (IRIS-style T_f): foreground-masked average of fine-resolution image
         # features, one extra prefix row per volume (K support + 1 query) -- inserted the same
         # way arch.cascade_registers' carried memory is (see _attn), not as an extra per-cell
@@ -597,6 +604,46 @@ class PatchSet3D(nn.Module):
             prev = dims[i]
         self.dec_head = nn.Conv3d(prev, 1, 1)
         self.dec_token_residual = nn.Conv3d(c_d, 1, 1)
+
+    def _build_iris_decoder(self, e: int, in_size: int, resolution: int, c_d: int, a: int,
+                            r: int, m: int, ctx_layers: int):
+        """arch.decoder=iris: literal Iris task-encoding (Eq 3-4, §4.2) + mask-decoding (Eq 5-6,
+        §5) modules -- see docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder-design.md.
+        No FiLM/z-score/token-residual fusion tricks (those are _build_conv_decoder's own
+        adaptations, not what Iris does)."""
+        assert e % (r ** 3) == 0, (
+            f"arch.iris_pixelshuffle_r={r} requires e % r^3 == 0 (e={e}, r^3={r ** 3})")
+        self.iris_r = r
+        c_shuf = e // (r ** 3)
+        self.iris_ctx_conv = nn.Conv3d(c_shuf + 1, c_shuf, 1)          # +1 = concatenated mask
+        self.iris_ctx_query = nn.Parameter(torch.empty(m, e))
+        nn.init.normal_(self.iris_ctx_query, std=0.02)
+        self.iris_ctx_cross = nn.ModuleList(
+            [nn.MultiheadAttention(e, a, batch_first=True) for _ in range(ctx_layers)])
+        self.iris_ctx_self = nn.ModuleList(
+            [nn.MultiheadAttention(e, a, batch_first=True) for _ in range(ctx_layers)])
+        self.iris_ctx_mlp = nn.ModuleList(
+            [nn.Sequential(nn.Linear(e, 4 * e), nn.GELU(), nn.Linear(4 * e, e))
+             for _ in range(ctx_layers)])
+        self.iris_ctx_norms = nn.ModuleList(
+            [nn.ModuleList([nn.LayerNorm(e) for _ in range(3)]) for _ in range(ctx_layers)])
+
+        self.iris_t2f = nn.MultiheadAttention(e, a, batch_first=True)
+        self.iris_f2t = nn.MultiheadAttention(e, a, batch_first=True)
+        stages = sorted(self.fine_stage,
+                        key=lambda st: self.encoder.fine_stage_size(in_size, st))
+        self._iris_stage_order = [self.fine_stage.index(st) for st in stages]
+        self._iris_sides = [self.encoder.fine_stage_size(in_size, st) for st in stages]
+        chans = [self.encoder.fine_stage_channels(st) for st in stages]
+        dims = [max(c_d // (2 ** i), 8) for i in range(len(stages))]
+        self.iris_token_proj = nn.Linear(e, c_d)
+        self.iris_blocks = nn.ModuleList()
+        prev = c_d
+        for i in range(len(stages)):
+            self.iris_blocks.append(nn.Sequential(_ConvNormAct(prev + chans[i], dims[i]),
+                                                  _ConvNormAct(dims[i], dims[i])))
+            prev = dims[i]
+        self.iris_class_embed = nn.Linear(e, prev)      # C_m = final taper width
 
     @property
     def grid_size(self) -> int:
