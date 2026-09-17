@@ -701,3 +701,18 @@ def test_decoder_invalid_raises_mentions_iris():
         assert False, "should have raised"
     except ValueError as exc:
         assert "iris" in str(exc)
+
+
+def test_iris_task_encode_shape_and_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_IRIS_KW)
+    B, K, Cf = 2, 3, m.encoder.out_ch
+    sup_feat = torch.randn(B, K * m.N, Cf, requires_grad=True)
+    context_out = (torch.rand(B, K, 16, 16, 16) > 0.5).float()
+    T_c = m._iris_task_encode(sup_feat, context_out, B, K)
+    assert T_c.shape == (B, 4, 32)          # (B, iris_m, e)
+    T_c.mean().backward()
+    assert sup_feat.grad is not None
+    missing = [n for n, p in m.named_parameters()
+              if p.requires_grad and p.grad is None and n.startswith("iris_ctx")]
+    assert not missing, f"no grad reached: {missing}"

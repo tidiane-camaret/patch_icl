@@ -1021,6 +1021,28 @@ class PatchSet3D(nn.Module):
             logit = F.interpolate(logit, size=(gs, gs, gs), mode="trilinear", align_corners=False)
         return logit
 
+    def _iris_task_encode(self, sup_feat, context_out, B, K):
+        """Iris §4.2 contextual stream (Eq 3-4), support-only, independent of the query and the
+        main transformer. sup_feat: (B,K*N,Cf) raw (pre-img_embed) encoder grid tokens.
+        context_out: (B,K,D,H,W) support GT masks. Returns T_c: (B, iris_m, e)."""
+        R = self.resolution
+        F_s = self.img_embed(sup_feat).reshape(B * K, R, R, R, -1).permute(0, 4, 1, 2, 3)
+        r, side = self.iris_r, R * self.iris_r
+        y_s = F.interpolate(context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
+                            size=(side, side, side), mode="trilinear", align_corners=False)
+        shuffled = _pixel_shuffle_3d(F_s.contiguous(), r)
+        fused = self.iris_ctx_conv(torch.cat([shuffled, y_s.to(shuffled.dtype)], dim=1))
+        Fhat_s = _pixel_unshuffle_3d(fused, r)
+        kv = Fhat_s.flatten(2).transpose(1, 2).reshape(B, K * R ** 3, -1)
+        q = self.iris_ctx_query.unsqueeze(0).expand(B, -1, -1)
+        for cross, selfattn, mlp, norms in zip(self.iris_ctx_cross, self.iris_ctx_self,
+                                               self.iris_ctx_mlp, self.iris_ctx_norms):
+            n1, n2, n3 = norms
+            q = q + cross(n1(q), kv, kv)[0]
+            q = q + selfattn(n2(q), n2(q), n2(q))[0]
+            q = q + mlp(n3(q))
+        return q
+
     def forward(self, image, context_in, context_out, mode="train", spacing=None,
                 query_prior=None, cascade_regs=None):
         """query_prior: optional (B,1,D,H,W) soft probability volume, already resampled onto
