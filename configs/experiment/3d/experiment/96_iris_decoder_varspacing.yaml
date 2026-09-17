@@ -63,10 +63,14 @@ data:
                                 # to the later cascade-finetune stage
   crop_spacing_mm: 4.24         # eval-only fixed pitch, geometric midpoint sqrt(3*6) of the
                                 # trained range (same convention d2_varspacing_15_6 uses)
-  # gpu_realize_crop IS genuinely cascade-exclusive (common.py::_assert_cascade_supported
-  # raises if gpu_realize_crop=true without cascade_spacings -- the imageless native_crop
-  # payload it produces is only consumed by cascade.py's recrop loop; making it work
-  # non-cascade needs a new realize call site in train.py's plain loop, out of scope here).
+  # Epoch 0 of this experiment (no gpu_realize_crop) profiled at data_ms=1946ms/step (~80% of
+  # step time) -- everything (synth GMM paint, GIN/IPA aug, resample) ran synchronously on
+  # CPU, since gpu_realize_crop's GPU offload was cascade-exclusive. Extended it to
+  # data.source=multisource's non-cascade path (train.py now wires a "native_crop" in batch
+  # realize hook in the plain train_epoch body, reusing the exact same realize_cascade_level0
+  # cascade level-0 already calls) -- see experiments/3d/common.py::_assert_cascade_supported
+  # and train.py's crop_realizer construction/hook for the mechanism.
+  gpu_realize_crop: true
   # ram_cache is NOT actually cascade-exclusive at the TotalSegProvider.load() level (fixed
   # 2026-09-09 for the single-source loader_v2 branch; the multisource branch used here had
   # the same gap until this experiment's launch surfaced it -- see experiments/3d/common.py's

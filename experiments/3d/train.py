@@ -666,6 +666,14 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                 torch.cuda.synchronize()
                 t_prev = time.perf_counter()
             continue
+        if crop_realizer is not None and "native_crop" in batch:
+            # Non-cascade counterpart of the cascade branch's own level-0 realize (line ~562
+            # above) -- same crop_realizer callable, same trigger key, just reached here
+            # instead of `continue`ing into run_cascade. Turns the imageless native_crop
+            # payload into a plain image/label/context_in/context_out dict (byte-identical
+            # shape to incontext_collate_fn's output), so everything below this block is
+            # unchanged regardless of which collate produced `batch`.
+            batch = crop_realizer(batch)
         if synth_realizer is not None and "native_lbls" in batch:
             # GPU-realize: occupancy resample + SynthSeg paint on device -> fills
             # image/label/context_in/context_out before augmentation (replaces the ~15 s/item
@@ -1336,11 +1344,16 @@ def main(cfg: DictConfig) -> None:
     else:
         synth_realizer = None
 
-    # GPU-realize the cascade level-0 train batches: the v2 loader ships imageless
-    # `native_crop` payloads (data.gpu_realize_crop, default on under data.cascade_spacings);
-    # realize_cascade_level0 resamples / normalizes / centre-pads them on device before
-    # run_cascade. None (unchanged path) unless the cascade + realize are both on.
-    if _cascade_on and bool(cfg.data.get("gpu_realize_crop", True)):
+    # GPU-realize native_crop train batches: the v2 loader ships imageless `native_crop`
+    # payloads whenever data.gpu_realize_crop resolves true (default on under
+    # data.cascade_spacings; also usable standalone for data.source=multisource, see
+    # common.py::_assert_cascade_supported); realize_cascade_level0 resamples / normalizes /
+    # centre-pads them on device -- reused verbatim for the non-cascade case too despite its
+    # cascade-sounding name, since it has no level argument or cascade-only side effect
+    # (docs/logs.md). Consumed either by run_cascade (cascade path) or directly in
+    # train_epoch's plain non-cascade body (the "native_crop" in batch hook below). None
+    # (unchanged path) unless gpu_realize_crop is actually on.
+    if bool(cfg.data.get("gpu_realize_crop", _cascade_on)):
         from cascade import realize_cascade_level0
         _rc_T = int(cfg.data.image_size[0])
         _rc_md = cfg.data.get("mask_downsample", "occupancy")

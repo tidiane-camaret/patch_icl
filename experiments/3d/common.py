@@ -246,11 +246,17 @@ def _assert_cascade_supported(cfg) -> None:
     d = cfg.data
     spacings = d.get("cascade_spacings")
     if not spacings:
-        if d.get("gpu_realize_crop"):
+        # source=multisource has a non-cascade realize consumer (train.py's plain train_epoch
+        # body calls the same realize_cascade_level0 the cascade path uses, gated on
+        # "native_crop" in batch, not on cascade_spacings) -- see docs/logs.md. Every other
+        # source has no such consumer, so the native-crop payload would still strand there.
+        if d.get("gpu_realize_crop") and d.get("source") != "multisource":
             raise ValueError(
-                "data.gpu_realize_crop=true requires data.cascade_spacings (the native-crop "
-                "payload is only consumed by the cascade train loop; without it the loader "
-                "would ship NativeCrop dataclasses into the default stacking collate).")
+                "data.gpu_realize_crop=true without data.cascade_spacings is only supported "
+                "for data.source=multisource (train.py wires a non-cascade realize call site "
+                "for that source only); for other sources the native-crop payload has no "
+                "consumer outside the cascade train loop, and would ship NativeCrop "
+                "dataclasses into the default stacking collate.")
         return
     if cfg.get("model") not in ("patchset3d", "medverse"):
         raise ValueError("data.cascade_spacings requires model=patchset3d or model=medverse.")
@@ -903,8 +909,11 @@ def train_loader(cfg) -> DataLoader:
             if max_len is not None else RandomSampler(ds))
     # gpu_realize ships variable-shape native crops -> a list-preserving collate; the
     # SynthRealizer paints them on GPU in the train loop. Otherwise the default stacking collate.
-    _casc_realize = (bool(cfg.data.get("cascade_spacings"))
-                     and bool(cfg.data.get("gpu_realize_crop", True)))
+    # Not ANDed with cascade_spacings (was, until source=multisource's non-cascade realize path
+    # was wired in train.py): an explicit gpu_realize_crop=true alone now selects this collate,
+    # matching how build_dataset's own _realize flag (~line 401) already defaults to whether
+    # cascade is on but lets an explicit override win either way.
+    _casc_realize = bool(cfg.data.get("gpu_realize_crop", bool(cfg.data.get("cascade_spacings"))))
     if cfg.data.get("source") == "synth_gmm_maisi" and cfg.data.get("gpu_realize", False):
         from src.gpu_synth_realize import synth_gpu_collate_fn
         collate = synth_gpu_collate_fn
