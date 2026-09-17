@@ -16,6 +16,18 @@ def test_mask_tiles_3d_shape_and_occupancy():
     assert tiles.shape == (2, 64, 8)
     # cell (0,0,0) fully inside the ones block -> all-ones tile
     assert torch.allclose(tiles[0, 0], torch.ones(8))
+
+from src.models.patchset3d import _pixel_shuffle_3d, _pixel_unshuffle_3d
+
+
+def test_pixel_shuffle_3d_roundtrip():
+    for C, D, r in [(64, 4, 2), (24, 8, 2), (128, 2, 4)]:
+        x = torch.randn(2, C, D, D, D)
+        shuffled = _pixel_shuffle_3d(x, r)
+        assert shuffled.shape == (2, C // r ** 3, D * r, D * r, D * r)
+        back = _pixel_unshuffle_3d(shuffled, r)
+        assert torch.allclose(back, x)
+
 from src.models.patchset3d import PatchSet3D
 
 

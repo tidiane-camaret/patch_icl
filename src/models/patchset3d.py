@@ -54,6 +54,25 @@ def _mask_tiles_3d(mask: torch.Tensor, grid_res: int, p: int) -> torch.Tensor:
                 .reshape(B, grid_res ** 3, p ** 3))
 
 
+def _pixel_shuffle_3d(x: torch.Tensor, r: int) -> torch.Tensor:
+    """(N,C,D,H,W) -> (N,C/r^3,D*r,H*r,W*r), C % r^3 == 0. 3D analog of nn.PixelShuffle
+    (channel-to-space rearrangement, no interpolation/conv) -- Iris Eq 3."""
+    N, C, D, H, W = x.shape
+    Co = C // (r ** 3)
+    x = x.reshape(N, Co, r, r, r, D, H, W)
+    x = x.permute(0, 1, 5, 2, 6, 3, 7, 4)
+    return x.reshape(N, Co, D * r, H * r, W * r).contiguous()
+
+
+def _pixel_unshuffle_3d(x: torch.Tensor, r: int) -> torch.Tensor:
+    """(N,C,D,H,W) -> (N,C*r^3,D/r,H/r,W/r) -- exact inverse of _pixel_shuffle_3d -- Iris Eq 4."""
+    N, C, D, H, W = x.shape
+    Dd, Hh, Ww = D // r, H // r, W // r
+    x = x.reshape(N, C, Dd, r, Hh, r, Ww, r)
+    x = x.permute(0, 1, 3, 5, 7, 2, 4, 6)
+    return x.reshape(N, C * (r ** 3), Dd, Hh, Ww).contiguous()
+
+
 class MaskConvEmbed(nn.Module):
     """p³ occupancy tile -> e via strided Conv3d (mirrors ConvEncoder3D's cbr block), instead
     of a flat Linear(p³,e) over every voxel independently. Weight-shared, translation
