@@ -1582,8 +1582,15 @@ def incontext_collate_fn(batch: list[dict]) -> dict:
         out["context_subjects"] = [b["context_subjects"] for b in batch]  # (B) list[list[str]]
     if "label_palette" in batch[0]:
         out["label_palette"] = torch.stack([b["label_palette"] for b in batch])  # (B, L+1, 3)
-    if "meta" in batch[0]:
-        out["meta"] = [b["meta"] for b in batch]  # per-sample provenance (sample-table detail)
+    # any()-gated (not batch[0]-only): a mixed real+synth batch can have "meta" on the real
+    # items and not the synth ones (or vice versa) -- a batch[0]-only check silently dropped
+    # the whole key whenever the first shuffled item happened to lack it, and crashed outright
+    # (KeyError) whenever a LATER item lacked it while batch[0] had it. Same class of bug the
+    # synth_radii_mm/synth_coord fix below already addresses; meta is a per-sample diagnostic
+    # dict (sample-table detail), so None is a safe per-item default for whichever provider
+    # doesn't populate it, not a training-time value.
+    if any("meta" in b for b in batch):
+        out["meta"] = [b.get("meta") for b in batch]  # per-sample provenance (sample-table detail)
     if "crop_geom" in batch[0]:
         out["crop_geom"] = torch.stack([b["crop_geom"] for b in batch])  # (B, 4, 3) cascade inversion
     if "aug_mode" in batch[0]:
