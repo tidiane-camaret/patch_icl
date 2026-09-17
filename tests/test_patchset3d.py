@@ -716,3 +716,21 @@ def test_iris_task_encode_shape_and_backward():
     missing = [n for n, p in m.named_parameters()
               if p.requires_grad and p.grad is None and n.startswith("iris_ctx")]
     assert not missing, f"no grad reached: {missing}"
+
+
+def test_decode_iris_shape_and_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_IRIS_KW)
+    B, N, e = 2, m.N, 32
+    F_q = torch.randn(B, N, e, requires_grad=True)
+    T = torch.randn(B, 4, e, requires_grad=True)
+    fine = (torch.randn(B, 8, 8, 8, 8),)      # (B,Cf=8,S=8,...) matches fine_stage=1, enc_dims=(8,8,8)
+    logit = m._decode_iris(F_q, T, fine)
+    assert logit.shape == (B, 1, m.grid_size, m.grid_size, m.grid_size)
+    logit.mean().backward()
+    assert F_q.grad is not None and T.grad is not None
+    missing = [n for n, p in m.named_parameters()
+              if p.requires_grad and p.grad is None
+              and n.startswith(("iris_t2f", "iris_f2t", "iris_token_proj", "iris_blocks",
+                                "iris_class_embed"))]
+    assert not missing, f"no grad reached: {missing}"

@@ -1043,6 +1043,33 @@ class PatchSet3D(nn.Module):
             q = q + mlp(n3(q))
         return q
 
+    def _decode_iris(self, F_q, T, fine):
+        """Iris §5 mask decoding module (Eq 5-6), literal reproduction -- see
+        docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder-design.md. F_q: (B,N,e)
+        query's PRE-transformer image embedding. T: (B,iris_m,e) = _iris_task_encode's T_c.
+        fine: query-only unpooled encoder stage maps, self.fine_stage order."""
+        t2, _ = self.iris_t2f(T, F_q, F_q)          # tokens attend image
+        T2 = T + t2
+        f2, _ = self.iris_f2t(F_q, T2, T2)          # image attends updated tokens
+        Fq2 = F_q + f2
+
+        B = Fq2.shape[0]
+        R = self.resolution
+        x = self.iris_token_proj(Fq2).transpose(1, 2).reshape(B, -1, R, R, R)
+        for i, block in enumerate(self.iris_blocks):
+            s = self._iris_sides[i]
+            x = F.interpolate(x, size=(s, s, s), mode="trilinear", align_corners=False)
+            skip = fine[self._iris_stage_order[i]]
+            x = block(torch.cat([x, skip], dim=1))
+        mask_features = x
+
+        class_embed = self.iris_class_embed(T2.mean(dim=1))
+        logit = torch.einsum('bc,bcdhw->bdhw', class_embed, mask_features).unsqueeze(1)
+        g = self.grid_size
+        if logit.shape[-1] != g:
+            logit = F.interpolate(logit, size=(g, g, g), mode="trilinear", align_corners=False)
+        return logit
+
     def forward(self, image, context_in, context_out, mode="train", spacing=None,
                 query_prior=None, cascade_regs=None):
         """query_prior: optional (B,1,D,H,W) soft probability volume, already resampled onto
