@@ -637,6 +637,10 @@ class PatchSet3D(nn.Module):
         self._iris_stage_order = [self.fine_stage.index(st) for st in stages]
         self._iris_sides = [self.encoder.fine_stage_size(in_size, st) for st in stages]
         chans = [self.encoder.fine_stage_channels(st) for st in stages]
+        # T_f (Eq 2, §4.1): a masked-average pool of the FINEST requested fine_decode stage
+        # (stages[-1]/chans[-1], since `stages` is sorted coarse->fine) -> e. See
+        # _iris_foreground_pool.
+        self.iris_tf_proj = nn.Linear(chans[-1], e)
         dims = [max(c_d // (2 ** i), 8) for i in range(len(stages))]
         self.iris_token_proj = nn.Linear(e, c_d)
         self.iris_blocks = nn.ModuleList()
@@ -1023,10 +1027,38 @@ class PatchSet3D(nn.Module):
             logit = F.interpolate(logit, size=(gs, gs, gs), mode="trilinear", align_corners=False)
         return logit
 
-    def _iris_task_encode(self, sup_feat, context_out, B, K):
-        """Iris §4.2 contextual stream (Eq 3-4), support-only, independent of the query and the
-        main transformer. sup_feat: (B,K*N,Cf) raw (pre-img_embed) encoder grid tokens.
-        context_out: (B,K,D,H,W) support GT masks. Returns T_c: (B, iris_m, e)."""
+    def _iris_foreground_pool(self, fine_finest, context_out, B, K, T):
+        """Iris §4.1 foreground stream (Eq 2): T_f = Pool(Upsample(F_s) (x) y_s) -- masking
+        AFTER upsampling to full resolution, per Iris's own ablation (this is the property
+        that matters, not an incidental detail -- see docs/superpowers/specs/2026-09-17-
+        patchset3d-iris-decoder-design.md). Joint-pooled across all K support volumes: one
+        combined foreground-voxel pool spanning every support together, not one row per
+        volume -- the same K-combination policy _iris_task_encode's contextual-stream
+        cross-attention already uses (confirmed design choice, not an independent one).
+        fine_finest: (B*T,Cf,S,S,S) ALL volumes' finest requested fine_decode stage (forward's
+        `fine` before query-only re-slicing) -- only the first K of each batch's T rows are
+        used. context_out: (B,K,D,H,W) support GT masks. Returns T_f: (B,1,e)."""
+        Cf, S = fine_finest.shape[1], fine_finest.shape[-1]
+        sup_fine = fine_finest.reshape(B, T, Cf, S, S, S)[:, :K]          # (B,K,Cf,S,S,S)
+        mask = F.interpolate(context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
+                             size=(S, S, S), mode="trilinear", align_corners=False
+                             ).reshape(B, K, S, S, S)
+        # bmm-based reduction (keeps sup_fine's own dtype under bf16 autocast, same reasoning
+        # as _pool_tokens): flatten K and spatial together so the pool is genuinely joint --
+        # one foreground-voxel pool across every support volume -- not an average of K
+        # per-volume means.
+        sup_flat = sup_fine.permute(0, 2, 1, 3, 4, 5).reshape(B, Cf, K * S ** 3)
+        mask_flat = mask.reshape(B, K * S ** 3, 1).to(sup_flat.dtype)
+        num = torch.bmm(sup_flat, mask_flat).reshape(B, Cf)
+        den = mask_flat.sum(dim=1).clamp_min(1e-6)                        # (B,1)
+        return self.iris_tf_proj(num / den).unsqueeze(1)                  # (B,1,e)
+
+    def _iris_task_encode(self, sup_feat, context_out, fine_finest, B, K, T):
+        """Iris §4 task encoding: contextual stream (Eq 3-4) + foreground stream (Eq 2),
+        support-only, independent of the query and the main transformer. sup_feat: (B,K*N,Cf)
+        raw (pre-img_embed) encoder grid tokens. context_out: (B,K,D,H,W) support GT masks.
+        fine_finest: (B*T,Cf,S,S,S) ALL volumes' finest requested fine_decode stage -- passed
+        straight to _iris_foreground_pool. Returns T = [T_f; T_c]: (B, 1+iris_m, e)."""
         R = self.resolution
         F_s = self.img_embed(sup_feat).reshape(B * K, R, R, R, -1).permute(0, 4, 1, 2, 3)
         r, side = self.iris_r, R * self.iris_r
@@ -1043,13 +1075,15 @@ class PatchSet3D(nn.Module):
             q = q + cross(n1(q), kv, kv)[0]
             q = q + selfattn(n2(q), n2(q), n2(q))[0]
             q = q + mlp(n3(q))
-        return q
+        T_f = self._iris_foreground_pool(fine_finest, context_out, B, K, T)
+        return torch.cat([T_f, q], dim=1)
 
     def _decode_iris(self, F_q, T, fine):
         """Iris §5 mask decoding module (Eq 5-6), literal reproduction -- see
         docs/superpowers/specs/2026-09-17-patchset3d-iris-decoder-design.md. F_q: (B,N,e)
-        query's PRE-transformer image embedding. T: (B,iris_m,e) = _iris_task_encode's T_c.
-        fine: query-only unpooled encoder stage maps, self.fine_stage order."""
+        query's PRE-transformer image embedding. T: (B,1+iris_m,e) = _iris_task_encode's
+        [T_f; T_c] (agnostic to T's exact row count -- MultiheadAttention/mean(dim=1) below
+        don't care). fine: query-only unpooled encoder stage maps, self.fine_stage order."""
         t2, _ = self.iris_t2f(T, F_q, F_q)          # tokens attend image
         T2 = T + t2
         f2, _ = self.iris_f2t(F_q, T2, T2)          # image attends updated tokens
@@ -1087,7 +1121,9 @@ class PatchSet3D(nn.Module):
         query-only rows to all K+1 volumes (support + query), since _pool_tokens needs every
         volume's finest fine map to build its foreground-masked prototype row; the fine maps
         are re-sliced back down to query-only before _decode (see the `pool_token` branch
-        below and _pool_tokens)."""
+        below and _pool_tokens). arch.decoder=iris widens the same way (support rows are
+        needed for _iris_foreground_pool's T_f, §4.1) -- independent of pool_token, both can
+        be on at once without conflict since each reads its own finest stage index."""
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
@@ -1095,9 +1131,15 @@ class PatchSet3D(nn.Module):
         x = imgs.reshape(B * T, 1, D, H, W)
         fine = None
         pool_feat = None
+        iris_fine_finest = None
         if self.fine_decode:
             qidx = torch.arange(B, device=x.device) * T + K
-            if self.pool_token:
+            # arch.pool_token AND decoder=iris both need every volume's (support + query, or
+            # support-only for iris) unpooled fine map, not just the query's -- widen rows for
+            # either, re-slice back to query-only below before _decode/_decode_iris (both only
+            # ever consume the query's own fine maps).
+            need_all_rows = self.pool_token or self.decoder_kind == "iris"
+            if need_all_rows:
                 rows = torch.arange(B * T, device=x.device)   # every volume (support + query)
             else:
                 # The query volume is the last of T, so its flat rows are b*T + K; only those
@@ -1108,6 +1150,12 @@ class PatchSet3D(nn.Module):
                 finest_idx = self.fine_stage.index(self._pool_stage)
                 pool_feat = self._pool_tokens(fine[finest_idx], context_out, query_prior,
                                               B, K, T)
+            if self.decoder_kind == "iris":
+                # _iris_stage_order is sorted coarse->fine, so [-1] is the finest requested
+                # stage's index into self.fine_stage / this `fine` tuple -- ALL T rows still,
+                # not yet re-sliced to query-only.
+                iris_fine_finest = fine[self._iris_stage_order[-1]]
+            if need_all_rows:
                 fine = tuple(f[qidx] for f in fine)     # re-slice back to query-only for _decode
         else:
             feat_map = self._encode(x, spacing)                        # (B*T,Cf,R,R,R)
@@ -1123,9 +1171,10 @@ class PatchSet3D(nn.Module):
             # distribution regardless of decoder_kind (safe to call _feat_norm again here: it's
             # a pure function of its inputs, no state, no mutation of sup_feat/qry_feat).
             norm_sup, norm_qry = self._feat_norm(sup_feat, qry_feat)
-            T_c = self._iris_task_encode(norm_sup, context_out, B, K)
+            task_tokens = self._iris_task_encode(norm_sup, context_out, iris_fine_finest,
+                                                 B, K, T)
             qry_img_pre = self.img_embed(norm_qry)
-            logit = self._decode_iris(qry_img_pre, T_c, fine)
+            logit = self._decode_iris(qry_img_pre, task_tokens, fine)
         else:
             logit = self._decode(q, fine)
         return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query,
