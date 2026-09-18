@@ -529,14 +529,22 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # forward). The loop already syncs every step (loss.item()), so reading elapsed_time is
     # cheap; OFF by default (train.profile_timing) → zero overhead. patchset3d + CUDA only.
     prof = bool(cfg.train.get("profile_timing", False)) and is_patchset and DEVICE.type == "cuda"
+    # net.transformer (and therefore _attn) is never called when decoder_kind=iris and
+    # cascade_registers is off (patchset3d.py::forward's own skip -- see the "attn" 0ms this
+    # produces below as the correct, expected value, not a bug). Registering hooks on a module
+    # that never runs would leave `ea`'s events unrecorded, and elapsed_time() on an unrecorded
+    # event raises -- skip both the hooks and the later elapsed_time() call together.
+    attn_skipped = (getattr(net, "decoder_kind", None) == "iris"
+                   and not getattr(net, "cascade_registers", False))
     tsum, hooks, prof_items = {"data": 0.0, "encode": 0.0, "attn": 0.0}, [], 0
     if prof:
         ee = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        ea = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         hooks = [net.encoder.register_forward_pre_hook(lambda m, i: ee[0].record()),
-                 net.encoder.register_forward_hook(lambda m, i, o: ee[1].record()),
-                 net.transformer.register_forward_pre_hook(lambda m, i: ea[0].record()),
-                 net.transformer.register_forward_hook(lambda m, i, o: ea[1].record())]
+                 net.encoder.register_forward_hook(lambda m, i, o: ee[1].record())]
+        if not attn_skipped:
+            ea = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            hooks += [net.transformer.register_forward_pre_hook(lambda m, i: ea[0].record()),
+                     net.transformer.register_forward_hook(lambda m, i, o: ea[1].record())]
     pbar = tqdm(loader, desc=f"train e{epoch}", leave=False)
     t_prev = time.perf_counter()
     for batch in pbar:
@@ -764,7 +772,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         if prof:
             torch.cuda.synchronize()
             tsum["encode"] += ee[0].elapsed_time(ee[1])
-            tsum["attn"]   += ea[0].elapsed_time(ea[1])
+            if not attn_skipped:
+                tsum["attn"] += ea[0].elapsed_time(ea[1])
             t_prev = time.perf_counter()
     for h in hooks:
         h.remove()
