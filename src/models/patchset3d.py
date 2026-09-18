@@ -1160,9 +1160,20 @@ class PatchSet3D(nn.Module):
         else:
             feat_map = self._encode(x, spacing)                        # (B*T,Cf,R,R,R)
         sup_feat, qry_feat = self._grid_tokens(feat_map, B, T, K)
-        q, mask_support, mask_query, regs = self._attn(
-            sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing,
-            query_prior=query_prior, cascade_regs=cascade_regs, pool_feat=pool_feat)
+        # The main cross-context transformer (_tokens/thinking/RoPE/self.transformer inside
+        # _attn) is unused for arch.decoder=iris's final logit (design spec's accepted
+        # deviation) -- and its OTHER outputs are unused too whenever cascade_registers is
+        # off: mask_support/mask_query feed no loss (no SimMIM reconstruction term is wired in
+        # train.py) and regs is None regardless. Skip _attn entirely in that case rather than
+        # just leaving its (large: ~(thinking_rows+K*N+N) rows x 2 cols, l layers, dense
+        # bi-axis attention) output unused -- cascade_registers=True still needs `regs`, so
+        # only skip when nothing downstream needs any of _attn's four return values.
+        if self.decoder_kind == "iris" and not self.cascade_registers:
+            q = mask_support = mask_query = regs = None
+        else:
+            q, mask_support, mask_query, regs = self._attn(
+                sup_feat, qry_feat, self._occupancy(context_out), K, spacing=spacing,
+                query_prior=query_prior, cascade_regs=cascade_regs, pool_feat=pool_feat)
         if self.decoder_kind == "iris":
             # Eq 3-4 task encoding (support-only) + Eq 5-6 decoding: independent of `q`/the main
             # transformer above, which still runs unchanged for parity (see design spec).

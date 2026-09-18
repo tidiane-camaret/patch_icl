@@ -780,6 +780,36 @@ def test_iris_decoder_end_to_end_shape_and_backward():
     assert not missing, f"no grad reached: {missing}"
 
 
+def test_iris_decoder_skips_attn_when_no_cascade_registers():
+    """decoder=iris + cascade_registers=False (default): _attn's own transformer pass must
+    not run at all -- its outputs are unused (design spec's accepted deviation), so
+    mask_support/mask_query/regs all become None instead of being wastefully computed."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   **_IRIS_KW)
+    calls = []
+    orig_attn = m._attn
+    m._attn = lambda *a, **kw: (calls.append(1), orig_attn(*a, **kw))[1]
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert not calls, "_attn should not have been called"
+    assert out["mask_support"] is None and out["mask_query"] is None and out["registers"] is None
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+
+
+def test_iris_decoder_still_calls_attn_when_cascade_registers():
+    """decoder=iris + cascade_registers=True: _attn must still run, since `regs` (fed to the
+    NEXT cascade level) has no other source."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   cascade_registers=True, **_IRIS_KW)
+    calls = []
+    orig_attn = m._attn
+    m._attn = lambda *a, **kw: (calls.append(1), orig_attn(*a, **kw))[1]
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert calls, "_attn should have been called (cascade_registers needs its `regs`)"
+    assert out["registers"] is not None
+
+
 def test_iris_decoder_noop_when_not_selected():
     """decoder != 'iris' (existing configs): forward() takes the original branch, no iris_*
     attributes exist, output shape/behavior unchanged."""

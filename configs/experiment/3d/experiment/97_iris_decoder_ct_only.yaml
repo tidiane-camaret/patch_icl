@@ -1,0 +1,31 @@
+# @package _global_
+# 97_iris_decoder_ct_only — 96_iris_decoder_varspacing (arch.decoder=iris + T_f, varspacing,
+# gpu_realize_crop) restricted to CT-only tasks, for a clearer training/eval signal before
+# reintroducing MRI/cross-modality mixing.
+#
+# data.source stays "multisource" (needed for the TriSourceProvider/synth_gmm wiring), but
+# source_mix.regime_p=[1,0,0] means every task draws the "m0" (CT) regime with probability 1 —
+# MultiSourceProvider.assemble_task's rng.choices(..., weights=regime_p) never selects m1
+# (MRI) or "cross" when their weight is 0. Insertion order in common.py's multisource branch
+# (source_mix.sources=[totalseg, totalsegmri]) makes m0=CT, m1=MRI, matching regime_p's own
+# documented order "(all-ct, all-mri, cross)". Both train AND eval draw from the same
+# MultiSourceProvider/regime_p, so this one override covers both.
+#
+# p_synth/gmm settings are untouched: synth_gmm cohorts are tagged tgt_modality="synth" (their
+# own third axis, orthogonal to the ct/mri/cross regime split) and stay active regardless of
+# regime_p.
+#
+#   python experiments/3d/train.py experiment=97_iris_decoder_ct_only \
+#     train.checkpoint=<a 96-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 96_iris_decoder_varspacing
+  - _self_
+
+data:
+  source_mix:
+    regime_p: [1.0, 0.0, 0.0]   # (ct, mri, cross) -- CT only
+
+wandb:
+  name: 97_iris_decoder_ct_only

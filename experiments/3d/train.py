@@ -1146,10 +1146,18 @@ def main(cfg: DictConfig) -> None:
         # pair with train.drop_last=true) to get tighter kernels; eval's differing batch size
         # then triggers one extra one-time compile.
         _cdyn = bool(cfg.arch.get("compile_dynamic", True))
-        net.transformer = torch.compile(net.transformer, dynamic=_cdyn)
+        # forward() itself skips calling _attn (and therefore net.transformer) entirely when
+        # decoder_kind=iris and cascade_registers=False (patchset3d.py::forward's own skip --
+        # _attn's outputs are unused for this decoder's logit, and mask_support/mask_query/
+        # regs have no other consumer either in that case) -- compiling a graph that never
+        # runs just wastes the one-time compile cost.
+        _skip_transformer = net.decoder_kind == "iris" and not net.cascade_registers
+        if not _skip_transformer:
+            net.transformer = torch.compile(net.transformer, dynamic=_cdyn)
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
-        msg = f"Compiled net.transformer + Newton–Schulz (dynamic={_cdyn})"
+        msg = ("Skipped net.transformer compile (arch.decoder=iris, never called) + Newton–Schulz"
+              if _skip_transformer else f"Compiled net.transformer + Newton–Schulz (dynamic={_cdyn})")
         if hasattr(net, "compressor"):
             # seq_compress's Stage A/C: _compress/_expand are methods looping over an
             # nn.ModuleList (no forward of its own to compile directly) — shadow them with

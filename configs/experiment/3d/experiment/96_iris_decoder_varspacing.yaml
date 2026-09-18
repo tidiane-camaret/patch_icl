@@ -16,21 +16,9 @@
 # multisource_ct_mri's OWN group default is already train_spacing_range=[1.5,6.0]/
 # crop_spacing_mm=3/mask_downsample=soft -- only the spacing range narrows here.
 #
-# gpu_realize_crop is genuinely cascade-exclusive (common.py::_assert_cascade_supported
-# raises if gpu_realize_crop=true without cascade_spacings -- the imageless native_crop
-# payload it produces is only consumed by cascade.py's recrop loop; a non-cascade realize
-# call site doesn't exist in train.py's plain loop -- real new plumbing, out of scope here).
-# ram_cache turned out NOT to be cascade-exclusive: TotalSegProvider.load() has read it since
-# 2026-09-09 (fixed for the single-source loader_v2 branch), but the source=="multisource"
-# branch used here still ANDed it with the resolved cascade/gpu_realize flag, silently
-# dropping an explicit override -- fixed in experiments/3d/common.py alongside a second,
-# more serious bug this file's first launch surfaced: SynthGmmProvider was hardcoded
-# cascade=True regardless of the run's actual mode, crashing every non-cascade multisource +
-# p_synth>0 run with `KeyError: 'image'`. Both fixed; data.ram_cache=true below now works.
-# synth_gmm's own GMM paint still intentionally stays on cheap CPU regardless of regime
-# (docs/logs.md 2026-09-15 -- no GPU-paint branch was ever built, deemed unnecessary) -- the
-# actual "make synth_gmm crops fast" lever in THIS regime is dropping cascade's levels>0
-# re-crop entirely (this file's whole point), not a GPU-paint toggle.
+# gpu_realize_crop/ram_cache were cascade-exclusive (in two different ways) at this file's
+# first launch; both fixed and enabled below -- see the `data:` block's own comments next to
+# each key for the mechanism/history, not repeated here.
 #
 #   python experiments/3d/train.py experiment=96_iris_decoder_varspacing \
 #     train.checkpoint=<a 92-line best.pt> train.resume_weights_only=true \
