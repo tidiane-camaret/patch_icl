@@ -209,3 +209,59 @@ def test_decode_shape_and_backward():
     assert T_tok.grad is not None and F_q.grad is not None
     assert m.iris_t2f.out_proj.weight.grad is not None
     assert m.iris_f2t.out_proj.weight.grad is not None
+
+
+def test_forward_end_to_end_shape():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                   image_size=[16, 16, 16])
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 16, 16, 16)
+    assert out["registers"] is None
+
+
+def test_forward_backward():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out = m(img, context_in=cin, context_out=cout)["final_logit"]
+    out.mean().backward()
+    grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
+    assert all(grads) and len(grads) > 0
+
+
+def test_predict_and_train_forward_native_shape():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    logits = m.train_forward(img, cin, cout)
+    assert logits.shape == (2, 1, 16, 16, 16)
+    pred = m.predict(img, cin, cout)
+    assert pred.shape == (2, 16, 16, 16)
+    assert set(torch.unique(pred).tolist()) <= {0.0, 1.0}
+
+
+def test_query_prior_changes_output():
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    base = m(img, context_in=cin, context_out=cout)["final_logit"]
+    assert torch.equal(base, m(img, context_in=cin, context_out=cout)["final_logit"])
+    prior = torch.rand(2, 1, 16, 16, 16)
+    with_prior = m(img, context_in=cin, context_out=cout, query_prior=prior)["final_logit"]
+    assert with_prior.shape == base.shape
+    assert not torch.allclose(with_prior, base)
+
+
+def test_cascade_regs_end_to_end():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16],
+                   cascade_registers=True)
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out1 = m(img, context_in=cin, context_out=cout)
+    assert out1["registers"].shape == (2, m.thinking.n, 32)
+    out2 = m(img, context_in=cin, context_out=cout, cascade_regs=out1["registers"])
+    assert out2["final_logit"].shape == out1["final_logit"].shape

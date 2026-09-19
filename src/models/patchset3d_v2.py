@@ -295,3 +295,75 @@ class PatchSetV2(nn.Module):
 
         class_embed = self.class_embed(T2.mean(dim=1))
         return torch.einsum('bc,bcdhw->bdhw', class_embed, mask_features).unsqueeze(1)
+
+    def _encode(self, x: torch.Tensor, spacing, fine_rows: torch.Tensor):
+        kw = {"spacing": spacing} if self.spacing_aware else {}
+        kw.update(fine_rows=fine_rows, fine_stage=self.fine_stage)
+        return self.encoder(x, **kw)
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        """query_prior: optional (B,1,D,H,W) soft probability volume already resampled onto
+        this forward's grid frame -- feeds the target volume's own tokenize/pool step
+        (support-mean fallback when absent), always consumed (unlike PatchSet3D's iris
+        decoder path, which silently drops it -- see
+        docs/superpowers/specs/2026-09-19-patchset-v2-design.md).
+
+        cascade_regs: optional (B, thinking_rows, e), the previous cascade level's own
+        "registers" return value, fed into Stage B (requires cascade_registers=True)."""
+        B, K = context_in.shape[0], context_in.shape[1]
+        D, H, W = image.shape[-3:]
+        imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
+        T = imgs.shape[1]
+        x = imgs.reshape(B * T, 1, D, H, W)
+        rows = torch.arange(B * T, device=x.device)      # every volume needs its own fine maps
+        feat_map, fine = self._encode(x, spacing, fine_rows=rows)
+
+        occ_ctx = self._occupancy(context_out)                              # (B,K,N,p^3)
+        occ_qry = (self._prior_occupancy(query_prior) if query_prior is not None
+                  else occ_ctx.mean(dim=1, keepdim=True))                   # (B,1,N,p^3)
+        occ = torch.cat([occ_ctx, occ_qry], dim=1)                          # (B,T,N,p^3)
+
+        Cf = feat_map.shape[1]
+        feat = feat_map.reshape(B, T, Cf, self.N).transpose(2, 3)           # (B,T,N,Cf)
+        tok = self._tokens_all(feat, occ, B, T)                             # (B,T,N,2,e)
+
+        pool = self._pool_all(fine[self._finest_idx], context_out, query_prior, B, K, T)
+        compressed = self._compress_all(tok, B, T)
+        seq = self._assemble_sequence(pool, compressed, B, T)
+        seq, regs = self._stage_b(seq, B, K, T, cascade_regs=cascade_regs)
+
+        per_vol = self.compress_m + 1
+        # Thinking/cascade rows sit only at the front and context volumes only ever precede
+        # the target (imgs = cat([context_in, image]) sets this order and nothing downstream
+        # permutes it), so the target's block is always the LAST per_vol rows, regardless of
+        # how many thinking/cascade rows are prepended.
+        T_tok = seq[:, -per_vol:, 0, :]                      # target's block, img column
+
+        F_q = tok[:, K, :, 0, :]                            # target's raw, never-compressed grid
+        qidx = torch.arange(B, device=x.device) * T + K
+        fine_qry = tuple(f[qidx] for f in fine)             # re-slice to target-only
+        logit = self._decode(T_tok, F_q, fine_qry, B)
+        g = logit.shape[-1]
+        if g != D:
+            logit = F.interpolate(logit, size=(D, H, W), mode="trilinear", align_corners=False)
+        return {"final_logit": logit, "registers": regs}
+
+    def _native_logit(self, image, context_in, context_out, spacing=None, query_prior=None):
+        dev = next(self.parameters()).device
+        image = image.to(dev); context_in = context_in.to(dev); context_out = context_out.to(dev)
+        if query_prior is not None:
+            query_prior = query_prior.to(dev)
+        return self.forward(image, context_in, context_out, spacing=spacing,
+                            query_prior=query_prior)["final_logit"].float()
+
+    def train_forward(self, target_img, context_imgs, context_masks, spacing=None,
+                      query_prior=None):
+        return self._native_logit(target_img, context_imgs, context_masks, spacing=spacing,
+                                  query_prior=query_prior)
+
+    @torch.no_grad()
+    def predict(self, target_img, context_imgs, context_masks, spacing=None, query_prior=None):
+        logit = self._native_logit(target_img, context_imgs, context_masks, spacing=spacing,
+                                   query_prior=query_prior)
+        return (torch.sigmoid(logit) >= 0.5).float().squeeze(1)
