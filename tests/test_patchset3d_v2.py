@@ -207,3 +207,5 @@ def test_decode_shape_and_backward():
     assert logit.shape == (B, 1, S, S, S)          # stage-0 side == native (16) for a 16^3 input
     logit.mean().backward()
     assert T_tok.grad is not None and F_q.grad is not None
+    assert m.iris_t2f.out_proj.weight.grad is not None
+    assert m.iris_f2t.out_proj.weight.grad is not None
