@@ -22,6 +22,9 @@ arch:
   cascade_registers: false
   fine_stage: [0, 1]             # feeds both pool_v and the decode skip pyramid
   decoder_dim: 64
+  feat_norm: context             # per-channel z-score before img_embed: context | self | none
+  # img_embed_mlp is NOT set here -- pick it up from the encoder group (e.g.
+  # encoder=e4_plainconv_ts sets arch.img_embed_mlp: true) the same way PatchSet3D does.
 
 train:
   optimizer: adamw

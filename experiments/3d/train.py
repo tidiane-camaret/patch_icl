@@ -475,6 +475,8 @@ def build_model(cfg: DictConfig):
             "fine_stage": (list(a.fine_stage) if isinstance(a.get("fine_stage", [0, 1]), ListConfig)
                           else a.get("fine_stage", [0, 1])),
             "decoder_dim": a.get("decoder_dim", 64),
+            "img_embed_mlp": a.get("img_embed_mlp", False),
+            "feat_norm": a.get("feat_norm", "context"),
         }
         return PatchSetV2(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d | patchset3d_v2)")

@@ -8950,4 +8950,47 @@ in `docs/superpowers/plans/2026-09-19-patchset-v2-implementation.md`. Built task
 whole-branch final review at the end; that review's fix wave (train.py/common.py/eval.py
 `patchset3d_v2` dispatch wiring, an `_pool_all` bmm memory fix, `max_context` assert, test
 gaps, `build_encoder` comment restoration) is logged inline in the same commits, not as a
-separate entry. Not yet trained or evaluated.
+separate entry.
+
+## 2026-09-19 (cont.) — PatchSetV2 first real run: `net.grid_size` gap + a large dice deficit
+
+First real training launch (`100_patchset_v2_plainconv_doubling`, warm-started from
+`97_iris_decoder_ct_only`'s checkpoint, `arch.compress_m=128`, `train.encoder_lr_scale=1`,
+`+train.checkpoint_allow_partial=true`) crashed at first-epoch checkpoint-save time:
+`train.py`'s `is_patchset`-gated eval logging does a raw `net.grid_size` read (no `getattr`
+fallback) for a W&B metric label suffix — `PatchSetV2` never defined it (unlike `PatchSet3D`'s
+`resolution*mask_patch_decode_size` property, v2's `forward()` always resizes to the input's own
+native size, so `grid_size` is just that native side, now stored once in `__init__`). Not caught
+by any of the 8 build tasks' unit tests or the final review, since none of them exercise
+`train.py`'s actual post-eval logging path.
+
+After the fix, the real 140-epoch run completed: best val Dice **0.148**, versus `97`'s own
+**0.313** (wandb run `x1gz71wj`). Root-caused the gap by diffing `x1gz71wj`'s actual saved
+config against this run:
+
+- **Not a fair architecture comparison in the first place**: `x1gz71wj` *is* `97`, warm-started
+  from `96` with **zero dropped/mismatched keys** (identical arch, only `data.source_mix.regime_p`
+  changed) — it's the tail of a long, already-converged 92→95→96→97 lineage, not a fresh
+  140-epoch run. `PatchSetV2`'s warm start into a different class transferred only 88/171
+  parameter tensors (mostly encoder shallow stages), so most of the model started from random
+  init — 140 epochs from there is not comparable to 140 epochs continuing convergence.
+- **`mask_patch_size`**: `8` (`x1gz71wj`, 8³ occupancy detail per cell) vs `1` (this run, single
+  scalar per cell) — a real capacity cut on mask input resolution, already flagged as "a
+  plausible first suspect" in the final review's recommendations.
+- **`feat_norm`**: `self` (`x1gz71wj`) vs none at all (`PatchSetV2` had never implemented an
+  equivalent — spec Open Question 4) — fixed this session, see below.
+- **`img_embed_mlp`**: `true` (`x1gz71wj`) vs silently ignored by `PatchSetV2` (`build_model`
+  never read the key) — also fixed this session.
+- **Encoder width**: `x1gz71wj` used `96`'s original `[32,64,256,512]` (`nnunet_ts_stages=[2,3]`,
+  768ch concat); this run used the cost-conscious `[32,64,128,256]` (`nnunet_ts_stages=[3]`,
+  256ch single stage) mirrored from `99` — a deliberate choice for compute, not a v2 defect, but
+  a real width reduction.
+- `compress_m=128` vs `x1gz71wj`'s `iris_m=10` cuts the *other* way (v2 has MORE per-volume
+  token budget), so it isn't part of the explanation.
+
+Implemented the two fixable-without-a-run gaps: `PatchSetV2._feat_norm` (direct port of
+`PatchSet3D`'s `context`/`self`/`none` z-score, default `context`, applied before
+`_tokens_all`) and `arch.img_embed_mlp` (same `Linear-GELU-Linear` option `PatchSet3D` has, now
+wired through `build_model`). Neither yet validated with a real run — that's the natural next
+step, along with revisiting `mask_patch_size` (see spec's Open Question 1, whose original
+`p=1` rationale this same dice gap now makes suspect too).

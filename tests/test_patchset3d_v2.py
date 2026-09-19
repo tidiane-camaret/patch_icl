@@ -382,3 +382,86 @@ def test_compress_all_no_cross_volume_leakage():
     assert not torch.allclose(base[:, 0], perturbed[:, 0])   # volume 0 changed (expected)
     assert torch.allclose(base[:, 1], perturbed[:, 1])       # volumes 1, 2 must be UNCHANGED
     assert torch.allclose(base[:, 2], perturbed[:, 2])
+
+
+def test_img_embed_mlp_true_uses_sequential():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   img_embed_mlp=True)
+    assert isinstance(m.img_embed, torch.nn.Sequential)
+    assert len(m.img_embed) == 3
+    feat = torch.randn(2, 3, m.N, m.encoder.out_ch)
+    out = m.img_embed(feat)
+    assert out.shape == (2, 3, m.N, 32)
+
+
+def test_img_embed_mlp_false_uses_plain_linear():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
+    assert isinstance(m.img_embed, torch.nn.Linear)
+
+
+def test_feat_norm_none_is_identity():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   feat_norm="none")
+    feat = torch.randn(2, 3, m.N, 8)
+    out = m._feat_norm(feat, K=2)
+    assert torch.equal(out, feat)
+
+
+def test_feat_norm_context_matches_reference_computation():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   feat_norm="context")
+    B, T, K, Cf = 2, 3, 2, 8
+    feat = torch.randn(B, T, m.N, Cf) * 5.0 + 3.0
+    out = m._feat_norm(feat, K)
+    assert out.shape == feat.shape
+    ctx = feat[:, :K]
+    mu = ctx.mean(dim=(1, 2), keepdim=True)
+    sig = ctx.std(dim=(1, 2), keepdim=True) + 1e-8
+    expected = ((feat - mu) / sig).clamp(-10, 10)
+    assert torch.allclose(out, expected, atol=1e-5)
+
+
+def test_feat_norm_context_uses_context_stats_not_targets_own():
+    """A regression bug that accidentally normalized the target by its OWN stats (i.e.
+    behaved like "self" mode under a "context" label) would make this test's target land
+    near-zero-mean; the real "context" behavior leaves it far from zero since it's
+    normalized by the (very differently scaled) context group's stats instead."""
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   feat_norm="context")
+    B, K, Cf = 2, 2, 8
+    feat = torch.cat([
+        torch.randn(B, K, m.N, Cf),                    # context: mean~0, std~1
+        torch.randn(B, 1, m.N, Cf) + 100.0,             # target: mean~100, same scale
+    ], dim=1)
+    out = m._feat_norm(feat, K)
+    tgt_mean = out[:, K:K + 1].mean(dim=(1, 2))
+    # the target's z-score under context stats is so extreme it saturates the +/-10 clamp --
+    # itself confirms it was normalized by the (very different) context stats, not its own
+    assert (tgt_mean.abs() >= 9.9).all()
+    ctx_mean = out[:, :K].mean(dim=(1, 2, 3))
+    assert (ctx_mean.abs() < 0.5).all()
+
+
+def test_feat_norm_self_normalizes_each_volume_by_its_own_stats():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   feat_norm="self")
+    B, T, K, Cf = 2, 3, 2, 8
+    feat = torch.stack(
+        [torch.randn(B, m.N, Cf) * (t + 1) + t * 100.0 for t in range(T)], dim=1)
+    out = m._feat_norm(feat, K)
+    for t in range(T):
+        assert out[:, t].mean(dim=1).abs().max() < 1e-3
+
+
+def test_feat_norm_rejects_unknown_mode():
+    import pytest
+    with pytest.raises(AssertionError):
+        PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                  feat_norm="bogus")

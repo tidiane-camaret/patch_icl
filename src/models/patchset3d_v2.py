@@ -62,6 +62,8 @@ class PatchSetV2(nn.Module):
         encoder_precision: str = "bf16",
         fine_stage=(0, 1),
         decoder_dim: int = 64,
+        img_embed_mlp: bool = False,
+        feat_norm: str = "context",
     ):
         super().__init__()
         self.resolution = resolution
@@ -74,6 +76,16 @@ class PatchSetV2(nn.Module):
         self.max_context = int(max_context)
         self.cascade_registers = bool(cascade_registers)
         self.spacing_aware = bool(encoder_spacing_aware)
+        # Per-channel z-score of the coarse encoder grid (feat, (B,T,N,Cf)) before img_embed --
+        # PatchSet3D always applies this (_feat_norm); PatchSetV2 originally shipped without any
+        # equivalent (spec's Open Question 4, docs/superpowers/specs/2026-09-19-patchset-v2-
+        # design.md). context = context-volume stats applied to every volume (target included);
+        # self = each volume normalized by its OWN stats (target decoupled from context); none =
+        # pass-through. Scoped to the tok/Stage-A/Stage-B/decode-F_q path only -- _pool_all
+        # already does its own separate per-volume z-score internally, unaffected by this.
+        assert feat_norm in ("context", "self", "none"), (
+            f"feat_norm={feat_norm!r} — must be 'context', 'self', or 'none'")
+        self.feat_norm = feat_norm
 
         self.encoder = build_encoder(
             encoder, resolution, in_ch=1, enc_dims=enc_dims, encoder_frozen=encoder_frozen,
@@ -114,7 +126,11 @@ class PatchSetV2(nn.Module):
             [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
 
         oc = self.encoder.out_ch
-        self.img_embed = nn.Linear(oc, e)
+        # img_embed_mlp: same rationale as PatchSet3D's own knob -- when the encoder width far
+        # exceeds e (e.g. plainconv_ts's multi-scale concat), a lone Linear is a rank bottleneck;
+        # a Linear-GELU-Linear keeps the full encoder width through a nonlinearity first.
+        self.img_embed = (nn.Sequential(nn.Linear(oc, oc), nn.GELU(), nn.Linear(oc, e))
+                          if img_embed_mlp else nn.Linear(oc, e))
         assert mask_embed in ("linear", "conv"), f"mask_embed={mask_embed!r} — 'linear' or 'conv'"
         self.mask_embed = (MaskConvEmbed(self.mask_patch_size, e) if mask_embed == "conv"
                            else nn.Linear(self.mask_patch_size ** 3, e))
@@ -151,6 +167,29 @@ class PatchSetV2(nn.Module):
                 _ConvNormAct(dims[i], dims[i])))
             prev = dims[i]
         self.class_embed = nn.Linear(e, prev)
+
+    @staticmethod
+    def _zscore(x: torch.Tensor, mu: torch.Tensor, sig: torch.Tensor) -> torch.Tensor:
+        return ((x - mu) / sig).clamp(-10, 10)
+
+    def _feat_norm(self, feat: torch.Tensor, K: int) -> torch.Tensor:
+        """feat (B,T,N,Cf), context volumes 0..K-1 then target at index K -> per-channel
+        z-scored feat, same shape. context = context-volume stats (over dims T[:K] and N)
+        applied to every volume including the target; self = each volume normalized by its
+        OWN stats (target decoupled from context); none = pass-through. Mirrors
+        PatchSet3D._feat_norm's three modes, adapted to this class's single (B,T,...)
+        tensor (PatchSet3D keeps support/query as two separate tensors)."""
+        if self.feat_norm == "none":
+            return feat
+        ctx = feat[:, :K]
+        mu = ctx.mean(dim=(1, 2), keepdim=True)
+        sig = ctx.std(dim=(1, 2), keepdim=True) + 1e-8
+        if self.feat_norm == "context":
+            return self._zscore(feat, mu, sig)
+        # self: every volume normalized by its own (per-volume) stats
+        vmu = feat.mean(dim=2, keepdim=True)
+        vsig = feat.std(dim=2, keepdim=True) + 1e-8
+        return self._zscore(feat, vmu, vsig)
 
     def _tokens_all(self, feat: torch.Tensor, occ: torch.Tensor, B: int, T: int) -> torch.Tensor:
         """feat (B,T,N,Cf) raw encoder grid tokens, occ (B,T,N,p^3) mask/prior occupancy ->
@@ -333,6 +372,7 @@ class PatchSetV2(nn.Module):
 
         Cf = feat_map.shape[1]
         feat = feat_map.reshape(B, T, Cf, self.N).transpose(2, 3)           # (B,T,N,Cf)
+        feat = self._feat_norm(feat, K)
         tok = self._tokens_all(feat, occ, B, T)                             # (B,T,N,2,e)
 
         pool = self._pool_all(fine[self._finest_idx], context_out, query_prior, B, K, T)

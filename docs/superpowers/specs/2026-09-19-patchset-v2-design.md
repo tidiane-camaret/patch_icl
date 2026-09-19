@@ -187,15 +187,19 @@ etc.). New experiment/model config files under `configs/experiment/3d/` and
    support `patchset_v2` (native-grid eval, checkpoint loading, etc.) — needs a pass once the
    class exists; not expected to need changes given the same `predict()`/`train_forward()`
    contract `PatchSet3D` already satisfies, but unverified.
-4. **Feature normalization before `img_embed`** — `PatchSet3D` always calls `_feat_norm`
-   (context/self/none per-channel z-score) before its own `img_embed`; `PatchSetV2` has no
-   equivalent anywhere in the tokenize path. This was an oversight during implementation, not
-   a deliberate simplification — flagged by the final whole-branch review
-   (2026-09-19). Needs a design decision (which mode, applied where — per-volume like
-   `_pool_all`'s existing z-score, or context-relative like `PatchSet3D`'s `self`/`context`
-   modes) before a real training run, since raw frozen-encoder features (e.g. `plainconv_ts`'s
-   704-channel multi-scale concat) currently go straight into `img_embed` and then into
-   `nn.MultiheadAttention` (which has no internal input normalization) unnormalized.
+4. **Feature normalization before `img_embed`** — RESOLVED 2026-09-19. Added `PatchSetV2._feat_norm`,
+   a direct port of `PatchSet3D._feat_norm`'s `context`/`self`/`none` three-way knob (default
+   `context`, matching `PatchSet3D`'s own default), applied to the coarse `(B,T,N,Cf)` encoder
+   grid right before `_tokens_all` in `forward()` — scoped to the tok/Stage-A/Stage-B/decode-F_q
+   path only, `_pool_all`'s own separate per-volume z-score is unaffected. Unlike
+   `PatchSet3D`'s asymmetric "support-as-one-group vs query-individually" `self` mode,
+   `PatchSetV2`'s `self` mode normalizes every volume (context and target alike) by its own
+   individual stats — a more natural fit given every volume already goes through the identical
+   weight-shared per-volume pipeline elsewhere in this design (see `_feat_norm`'s docstring).
+   Also added `arch.img_embed_mlp` (identical to `PatchSet3D`'s own knob: `Linear-GELU-Linear`
+   instead of a lone `Linear` when the encoder's concat width far exceeds `e`) — previously
+   silently ignored by `PatchSetV2`, now wired through. Both driven by the first real training
+   run's dice gap vs `PatchSet3D` (`docs/logs.md` 2026-09-19).
 
 ## Non-goals for this spec
 

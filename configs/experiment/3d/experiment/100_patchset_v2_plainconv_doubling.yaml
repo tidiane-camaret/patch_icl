@@ -1,0 +1,43 @@
+# @package _global_
+# 100_patchset_v2_plainconv_doubling -- PatchSetV2 (clean Iris-style reimplementation,
+# src/models/patchset3d_v2.py) on the same CT-only multisource pipeline + plainconv doubling
+# encoder schedule as 99_iris_decoder_plainconv_doubling, swapping model=m2_patchset_decoder
+# (PatchSet3D, arch.decoder=iris) for model=m3_patchset_v2. First real training run of
+# PatchSetV2.
+#
+# encoder_lr_scale=1 (not 96/97's inherited 0.5): with the model class itself changed, most of
+# the encoder's own checkpoint weights won't transfer cleanly either (channel-width mismatch
+# vs 97's [32,64,256,512] schedule -- same reasoning that already applied when 99 warm-started
+# from 97) -- treat the encoder as effectively from-scratch here, matching
+# encoder_groups()'s own documented guidance for that case (scale~1.0, not a discriminative
+# fraction meant to protect an already-good pretrained encoder).
+#
+# Known caveats going in (see docs/superpowers/specs/2026-09-19-patchset-v2-design.md's Open
+# Questions and docs/logs.md 2026-09-19):
+#  - PatchSetV2 has no feature-normalization equivalent to PatchSet3D's _feat_norm before
+#    img_embed (open question 4 -- flagged, not fixed).
+#  - arch.img_embed_mlp (set by encoder=e4_plainconv_ts) is not read by PatchSetV2 -- img_embed
+#    is always a plain Linear, so it won't transfer from 97's checkpoint (Sequential shape) even
+#    with checkpoint_allow_partial -- falls back to random init for that submodule specifically,
+#    same as most of the rest of the architecture.
+#
+#   python experiments/3d/train.py experiment=100_patchset_v2_plainconv_doubling \
+#     arch.compress_m=128 \
+#     train.checkpoint=<a 97-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 97_iris_decoder_ct_only
+  - override /model: m3_patchset_v2
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 128, 256]
+  nnunet_ts_stages: [3]          # single stage: 256ch @ 16^3 (stride8, already == R) -- no concat
+  fine_stage: [0, 1, 2]          # feeds both pool_v and the decode skip pyramid
+
+train:
+  encoder_lr_scale: 1
+
+wandb:
+  name: 100_patchset_v2_plainconv_doubling
