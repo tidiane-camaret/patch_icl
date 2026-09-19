@@ -36,12 +36,25 @@ def build_encoder(
                              encoder_stage=encoder_stage, native_grid=encoder_native_grid,
                              spacing_aware=encoder_spacing_aware, precision=encoder_precision)
     elif name == "tap_ct":
+        # Frozen fomofo/tap-ct-b-3d ViT. Weights fixed on HF (no sidecar); it always
+        # tokenizes at the native anisotropic grid (image_size drives the token count)
+        # and is not spacing-aware — the physical cell size is set by data.crop_spacing_mm.
+        # encoder_stage early-exits the transformer blocks (like Primus). Needs image_size
+        # divisible by 8. Ignores encoder_native_grid/encoder_spacing_aware (always native).
         from src.models.tapct_encoder import TapCTEncoder
         if not image_size:
             raise ValueError("encoder='tap_ct' requires arch.image_size (from data.image_size)")
         return TapCTEncoder(resolution, image_size, frozen=encoder_frozen, device="cpu",
                             encoder_stage=encoder_stage, precision=encoder_precision)
     elif name == "nnunet_ts":
+        # Frozen TotalSegmentator nnU-Net PlainConvUNet encoder (default: Dataset297,
+        # total 3 mm). Multi-scale concat of nnunet_ts_stages resampled to R^3; input is
+        # 1-channel (image only), spacing arg ignored (conv net). nnunet_ts_weights points
+        # at the weights folder (plans.json + fold_0/checkpoint_final.pth) and is required
+        # even when nnunet_ts_random_init=True — plans.json defines the architecture and the
+        # CTNormalization stats; only the trained weights are dropped (He init instead).
+        # encoder_input_norm: None keeps each encoder's own default (nnunet_ts=reframe,
+        # so a frozen pretrained encoder still converts loader-frame -> its plans frame).
         from src.models.encoders.nnunet_ts import NnUNetTSEncoder
         if not nnunet_ts_weights:
             raise ValueError("encoder='nnunet_ts' requires arch.nnunet_ts_weights")
@@ -50,12 +63,25 @@ def build_encoder(
                                frozen=encoder_frozen, device="cpu", precision=encoder_precision,
                                random_init=nnunet_ts_random_init, **_in_norm)
     elif name == "resenc_ts":
+        # From-scratch nnU-Net ResidualEncoderUNet (the ResEnc twin of nnunet_ts). No
+        # plans.json / checkpoint: the architecture is the ResEnc M/L/XL recipe with
+        # resenc_n_stages stages (base 32, x2, cap 320; blocks 1/3/4/6/6/...), He init.
+        # Multi-scale concat of nnunet_ts_stages resampled to R^3; 1-channel image input,
+        # spacing arg ignored. encoder_input_norm defaults to passthrough (the image is
+        # already in the pipeline CT frame — see src/totalseg_dataset.CtNormSpec).
         from src.models.encoders.resenc_ts import ResEncTSEncoder
         _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
         return ResEncTSEncoder(resolution, n_stages=resenc_n_stages, stages=tuple(nnunet_ts_stages),
                                frozen=encoder_frozen, device="cpu", precision=encoder_precision,
                                **_in_norm)
     elif name == "plainconv_ts":
+        # From-scratch nnU-Net PlainConvUNet (the PlainConv twin of resenc_ts). No
+        # plans.json / checkpoint: width is plainconv_ts_features_per_stage if given,
+        # else the same base=32/x2/cap=320 formula resenc_ts uses; n_conv_per_stage=2
+        # throughout (nnU-Net's standard plain-conv schedule), He init. Multi-scale
+        # concat of nnunet_ts_stages resampled to R^3; 1-channel image input, spacing
+        # arg ignored. encoder_input_norm defaults to zscore (per-volume HU) here — this
+        # encoder carries no plans-file CTNormalization stats to reframe into.
         from src.models.encoders.plainconv_ts import PlainConvTSEncoder
         _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
         return PlainConvTSEncoder(resolution, n_stages=plainconv_ts_n_stages,
