@@ -190,3 +190,20 @@ def test_stage_b_cascade_registers_roundtrip():
         "_stage_b's returned regs does not match the correct (post-mem) thinking-row slice")
     assert not torch.allclose(regs2, wrong_slice, atol=1e-3), (
         "_stage_b's returned regs matches the WRONG (mem-block) slice -- position bug reintroduced")
+
+
+def test_decode_shape_and_backward():
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                   image_size=[16, 16, 16])
+    B = 2
+    per_vol = m.compress_m + 1
+    T_tok = torch.randn(B, per_vol, 32, requires_grad=True)
+    F_q = torch.randn(B, m.N, 32, requires_grad=True)
+    S = m.encoder.fine_stage_size(16, 0)
+    fine = (torch.randn(B, m.encoder.fine_stage_channels(0), S, S, S),)
+    logit = m._decode(T_tok, F_q, fine, B)
+    assert logit.shape == (B, 1, S, S, S)          # stage-0 side == native (16) for a 16^3 input
+    logit.mean().backward()
+    assert T_tok.grad is not None and F_q.grad is not None

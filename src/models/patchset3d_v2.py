@@ -134,6 +134,19 @@ class PatchSetV2(nn.Module):
             nn.init.normal_(self.cascade_type, std=0.02)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
 
+        self.iris_t2f = nn.MultiheadAttention(e, a, batch_first=True)
+        self.iris_f2t = nn.MultiheadAttention(e, a, batch_first=True)
+        dims = [max(decoder_dim // (2 ** i), 8) for i in range(len(self._stage_chans))]
+        self.token_proj = nn.Linear(e, decoder_dim)
+        self.decode_blocks = nn.ModuleList()
+        prev = decoder_dim
+        for i in range(len(self._stage_chans)):
+            self.decode_blocks.append(nn.Sequential(
+                _ConvNormAct(prev + self._stage_chans[i], dims[i]),
+                _ConvNormAct(dims[i], dims[i])))
+            prev = dims[i]
+        self.class_embed = nn.Linear(e, prev)
+
     def _tokens_all(self, feat: torch.Tensor, occ: torch.Tensor, B: int, T: int) -> torch.Tensor:
         """feat (B,T,N,Cf) raw encoder grid tokens, occ (B,T,N,p^3) mask/prior occupancy ->
         (B,T,N,2,e): img_embed + mask_embed + Fourier positional encoding, columns
@@ -258,3 +271,27 @@ class PatchSetV2(nn.Module):
         regs = (seq[:, n_extra:n_extra + self.thinking.n].mean(dim=2)
                 if self.cascade_registers else None)
         return seq, regs
+
+    def _decode(self, T_tok: torch.Tensor, F_q: torch.Tensor, fine, B: int) -> torch.Tensor:
+        """Iris Eq 5-6, literal reproduction. T_tok (B,compress_m+1,e): target's own
+        post-Stage-B tokens (img column), already context-aware from Stage B. F_q
+        (B,N,e): target's RAW, never-compressed per-cell grid (the same img_embed output
+        used to build `tok` before any compression). fine: target-only unpooled encoder
+        stage maps, in self.fine_stage order. Returns (B,1,S,S,S) at the finest requested
+        fine_stage's own native side."""
+        t2, _ = self.iris_t2f(T_tok, F_q, F_q)          # tokens attend image
+        T2 = T_tok + t2
+        f2, _ = self.iris_f2t(F_q, T2, T2)              # image attends updated tokens
+        Fq2 = F_q + f2
+
+        R = self.resolution
+        x = self.token_proj(Fq2).transpose(1, 2).reshape(B, -1, R, R, R)
+        for i, block in enumerate(self.decode_blocks):
+            s = self._stage_sides[i]
+            x = F.interpolate(x, size=(s, s, s), mode="trilinear", align_corners=False)
+            skip = fine[self._stage_order[i]]
+            x = block(torch.cat([x, skip], dim=1))
+        mask_features = x
+
+        class_embed = self.class_embed(T2.mean(dim=1))
+        return torch.einsum('bc,bcdhw->bdhw', class_embed, mask_features).unsqueeze(1)
