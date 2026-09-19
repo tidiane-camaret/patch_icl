@@ -91,3 +91,15 @@ def test_pool_all_native_resolution_matters():
     assert not torch.allclose(pooled_right_raw, pooled_wrong_raw, atol=1e-3), (
         "native-resolution and coarse-resolution masking orders produced the same result -- "
         "this test setup doesn't actually distinguish upsample-before-mask from mask-before-upsample")
+
+    # Now tie the REAL _pool_all output to the correct reference, and confirm it does NOT
+    # match the wrong one -- this is what actually proves _pool_all follows the correct
+    # (upsample-to-native-first) ordering, not just that the two references differ from
+    # each other.
+    right_via_proj = m.pool_proj(pooled_right_raw)
+    wrong_via_proj = m.pool_proj(pooled_wrong_raw)
+    assert torch.allclose(pool[:, 0], right_via_proj, atol=1e-4), (
+        "_pool_all's real output for the context volume does not match the correct "
+        "(upsample-to-native-first) reference computation")
+    assert not torch.allclose(pool[:, 0], wrong_via_proj, atol=1e-3), (
+        "_pool_all's real output matches the WRONG (mask-at-coarse-first) ordering")
