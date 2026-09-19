@@ -207,7 +207,8 @@ class PatchSetV2(nn.Module):
         sig = feat_native.std(dim=(-3, -2, -1), keepdim=True) + 1e-8
         feat_z = ((feat_native - mu) / sig).clamp(-10, 10)
 
-        num = (feat_z * mask).sum(dim=(-3, -2, -1))             # (B,T,Cf)
+        num = torch.bmm(feat_z.reshape(B * T, Cf, Dn * Hn * Wn),
+                        mask.to(feat_z.dtype).reshape(B * T, Dn * Hn * Wn, 1)).reshape(B, T, Cf)
         den = mask.sum(dim=(-3, -2, -1)).clamp_min(1e-6)         # (B,T,1)
         return self.pool_proj(num / den)                        # (B,T,e)
 
@@ -242,6 +243,7 @@ class PatchSetV2(nn.Module):
         without a separate mask_slots-style tag, since target vs. context identity implies
         which content type that volume's mask column holds (see
         docs/superpowers/specs/2026-09-19-patchset-v2-design.md)."""
+        assert K <= self.max_context, f"context_size {K} exceeds max_context {self.max_context}"
         ctx = self.ctx_id(torch.arange(K, device=seq.device))         # (K,e)
         tags = torch.cat([ctx, self.qry_id.unsqueeze(0)], dim=0)      # (T,e)
         tags = tags.repeat_interleave(per_vol, dim=0)                  # (T*per_vol,e)

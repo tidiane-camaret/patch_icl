@@ -344,3 +344,32 @@ def test_build_model_dispatches_patchset_v2():
     assert name == "patchset3d_v2"
     from src.models.patchset3d_v2 import PatchSetV2
     assert isinstance(model, PatchSetV2)
+    assert model.resolution == 4
+    assert model.compress_m == 3
+    assert len(model.transformer.blocks) == 2
+
+
+def test_tokens_all_img_column_matches_img_embed_plus_pos():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
+    B, T = 1, 2
+    feat = torch.randn(B, T, m.N, m.encoder.out_ch)
+    occ = torch.randn(B, T, m.N, 1)
+    tok = m._tokens_all(feat, occ, B, T)
+    ijk = m.ijk_base.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+    expected_img = m.img_embed(feat) + m.pos(ijk, m.resolution)
+    assert torch.allclose(tok[:, :, :, 0, :], expected_img, atol=1e-5)
+
+
+def test_compress_all_no_cross_volume_leakage():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
+    B, T = 1, 3
+    tok = torch.randn(B, T, m.N, 2, 32)
+    base = m._compress_all(tok, B, T)
+    tok_perturbed = tok.clone()
+    tok_perturbed[:, 0] += 5.0          # perturb only volume 0's raw cells
+    perturbed = m._compress_all(tok_perturbed, B, T)
+    assert not torch.allclose(base[:, 0], perturbed[:, 0])   # volume 0 changed (expected)
+    assert torch.allclose(base[:, 1], perturbed[:, 1])       # volumes 1, 2 must be UNCHANGED
+    assert torch.allclose(base[:, 2], perturbed[:, 2])
