@@ -103,3 +103,22 @@ def test_pool_all_native_resolution_matters():
         "(upsample-to-native-first) reference computation")
     assert not torch.allclose(pool[:, 0], wrong_via_proj, atol=1e-3), (
         "_pool_all's real output matches the WRONG (mask-at-coarse-first) ordering")
+
+
+def test_compress_and_assemble_shapes():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, compress_layers=2, fine_stage=[0],
+                   image_size=[16, 16, 16])
+    B, T = 2, 3
+    tok = torch.randn(B, T, m.N, 2, 32)
+    compressed = m._compress_all(tok, B, T)
+    assert compressed.shape == (B, T, 3, 2, 32)
+    pool = torch.randn(B, T, 32)
+    seq = m._assemble_sequence(pool, compressed, B, T)
+    assert seq.shape == (B, T * 4, 2, 32)          # per volume: 1 pool row + 3 compressed
+    # first row of each volume's block is the (broadcast) pool row
+    per_vol = 4
+    for t in range(T):
+        block = seq[:, t * per_vol:(t + 1) * per_vol]
+        assert torch.allclose(block[:, 0, 0], pool[:, t])   # img col
+        assert torch.allclose(block[:, 0, 1], pool[:, t])   # mask col (broadcast)

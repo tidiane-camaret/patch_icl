@@ -103,6 +103,11 @@ class PatchSetV2(nn.Module):
         self._finest_idx = self._stage_order[-1]      # index into `fine` for the finest stage
         self.pool_proj = nn.Linear(self._stage_chans[-1], e)
 
+        self.compress_slots = nn.Parameter(torch.empty(self.compress_m, e))
+        nn.init.normal_(self.compress_slots, std=0.02)
+        self.compressor = nn.ModuleList(
+            [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
+
         oc = self.encoder.out_ch
         self.img_embed = nn.Linear(oc, e)
         assert mask_embed in ("linear", "conv"), f"mask_embed={mask_embed!r} — 'linear' or 'conv'"
@@ -185,3 +190,26 @@ class PatchSetV2(nn.Module):
         num = (feat_z * mask).sum(dim=(-3, -2, -1))             # (B,T,Cf)
         den = mask.sum(dim=(-3, -2, -1)).clamp_min(1e-6)         # (B,T,1)
         return self.pool_proj(num / den)                        # (B,T,e)
+
+    def _compress_all(self, tok: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        """tok (B,T,N,2,e) -> (B,T,compress_m,2,e). Weight-shared per-volume compression
+        (Stage A): compress_m learnable slots cross-attend into that volume's own N raw
+        cells only (T folded into the batch dim -- no cross-volume mixing here; that's
+        Stage B's job). Identical mechanism to PatchSet3D's arch.seq_compress Stage A."""
+        e = tok.shape[-1]
+        kv = tok.reshape(B * T, self.N, 2, e)
+        q = self.compress_slots.unsqueeze(0).unsqueeze(2).expand(B * T, -1, 2, -1).contiguous()
+        for layer in self.compressor:
+            q = layer(q, kv)
+        return q.reshape(B, T, self.compress_m, 2, e)
+
+    def _assemble_sequence(self, pool: torch.Tensor, compressed: torch.Tensor,
+                           B: int, T: int) -> torch.Tensor:
+        """pool (B,T,e), compressed (B,T,compress_m,2,e) -> (B, T*(compress_m+1), 2, e),
+        volume-major: each volume's block is [pool_row ; compress_m rows], contiguous, so a
+        later slice by volume index recovers exactly that volume's tokens. pool is
+        broadcast into both img and mask columns."""
+        e = compressed.shape[-1]
+        pool_tok = pool.unsqueeze(2).unsqueeze(3).expand(B, T, 1, 2, e)
+        seq = torch.cat([pool_tok, compressed], dim=2)          # (B,T,compress_m+1,2,e)
+        return seq.reshape(B, T * (self.compress_m + 1), 2, e)
