@@ -89,6 +89,20 @@ class PatchSetV2(nn.Module):
                              f"encoder={encoder!r} has none (use conv | nnunet_ts | "
                              f"resenc_ts | plainconv_ts)")
 
+        self.fine_stage = tuple(int(st) for st in fine_stage)
+        for st in self.fine_stage:
+            if not 0 <= st < self.encoder.n_fine_stages:
+                raise ValueError(f"fine_stage {st} out of range [0, {self.encoder.n_fine_stages})")
+        if not image_size:
+            raise ValueError("PatchSetV2 needs arch.image_size (from data.image_size)")
+        stages = sorted(self.fine_stage,
+                        key=lambda st: self.encoder.fine_stage_size(int(image_size[0]), st))
+        self._stage_order = [self.fine_stage.index(st) for st in stages]   # coarse->fine, into `fine`
+        self._stage_sides = [self.encoder.fine_stage_size(int(image_size[0]), st) for st in stages]
+        self._stage_chans = [self.encoder.fine_stage_channels(st) for st in stages]
+        self._finest_idx = self._stage_order[-1]      # index into `fine` for the finest stage
+        self.pool_proj = nn.Linear(self._stage_chans[-1], e)
+
         oc = self.encoder.out_ch
         self.img_embed = nn.Linear(oc, e)
         assert mask_embed in ("linear", "conv"), f"mask_embed={mask_embed!r} — 'linear' or 'conv'"
@@ -144,3 +158,30 @@ class PatchSetV2(nn.Module):
         if p == 1:
             return _down_to(prior, self.resolution).reshape(B, 1, self.N, 1)
         return _mask_tiles_3d(prior, self.resolution, p).reshape(B, 1, self.N, p ** 3)
+
+    def _pool_all(self, fine_finest: torch.Tensor, context_out: torch.Tensor,
+                 query_prior: torch.Tensor | None, B: int, K: int, T: int) -> torch.Tensor:
+        """Iris Eq 2 foreground-masked average, generalized to every volume (not
+        support-only). fine_finest: (B*T,Cf,S,S,S), the finest requested fine_stage map for
+        ALL T volumes. Upsamples to the volume's NATIVE (D,H,W) resolution -- never R, never
+        S -- before masking: Iris's own ablation credits masking-after-upsampling with the
+        small-object Dice gain (docs/methods/iris.md sec 4.1). Returns (B,T,e)."""
+        Cf = fine_finest.shape[1]
+        Dn, Hn, Wn = context_out.shape[-3:]
+        feat_native = F.interpolate(fine_finest.float(), size=(Dn, Hn, Wn),
+                                    mode="trilinear", align_corners=False
+                                    ).reshape(B, T, Cf, Dn, Hn, Wn)
+        sup_mask = context_out.reshape(B, K, 1, Dn, Hn, Wn).float()
+        if query_prior is not None:
+            qry_mask = query_prior.reshape(B, 1, 1, Dn, Hn, Wn).float()
+        else:
+            qry_mask = sup_mask.mean(dim=1, keepdim=True)
+        mask = torch.cat([sup_mask, qry_mask], dim=1)          # (B,T,1,Dn,Hn,Wn)
+
+        mu = feat_native.mean(dim=(-3, -2, -1), keepdim=True)
+        sig = feat_native.std(dim=(-3, -2, -1), keepdim=True) + 1e-8
+        feat_z = ((feat_native - mu) / sig).clamp(-10, 10)
+
+        num = (feat_z * mask).sum(dim=(-3, -2, -1))             # (B,T,Cf)
+        den = mask.sum(dim=(-3, -2, -1)).clamp_min(1e-6)         # (B,T,1)
+        return self.pool_proj(num / den)                        # (B,T,e)
