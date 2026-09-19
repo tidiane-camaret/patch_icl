@@ -536,9 +536,16 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
     # event raises -- skip both the hooks and the later elapsed_time() call together.
     attn_skipped = (getattr(net, "decoder_kind", None) == "iris"
                    and not getattr(net, "cascade_registers", False))
-    tsum, hooks, prof_items = {"data": 0.0, "encode": 0.0, "attn": 0.0}, [], 0
+    # Diagnostic-only widening (2026-09-18): "fwd"/"bwd" bracket the WHOLE forward (incl.
+    # decode head + loss) and the WHOLE backward+opt.step, so decode_ms = fwd - encode - attn
+    # is derivable even though there's no dedicated hook on the decode head itself. Investigates
+    # why arch.decoder=iris's O(m) task-encoding tokens (vs the main transformer's O(R^3))
+    # barely moved epoch time -- see docs/logs.md.
+    tsum, hooks, prof_items = {"data": 0.0, "encode": 0.0, "attn": 0.0, "fwd": 0.0, "bwd": 0.0}, [], 0
     if prof:
         ee = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        fd = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        bd = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         hooks = [net.encoder.register_forward_pre_hook(lambda m, i: ee[0].record()),
                  net.encoder.register_forward_hook(lambda m, i, o: ee[1].record())]
         if not attn_skipped:
@@ -712,6 +719,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             _qp_sp = float(batch["spacing"][0, 0]) if "spacing" in batch else None
             qp = build_query_prior(qp_mode, lbl, perturb_cfg=qp_perturb,
                                    spacing_mm=_qp_sp, gen=_qp_gen)      # (B,1,D,H,W) or None
+        if prof:
+            fd[0].record()
         with _autocast():
             if is_patchset:
                 # Per-batch physical spacing (the batch sampler makes it constant across the
@@ -749,6 +758,9 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
                     f"Model diverged (see docs/logs.md 2026-07-29): bce_dice near the clamp "
                     f"boundary; don't resume from the collapse-edge best.pt, start from orig_weights.")
             loss = loss_fn(logits, target)
+        if prof:
+            fd[1].record()
+            bd[0].record()
         loss.backward()
         if cfg.train.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.train.grad_clip)
@@ -756,6 +768,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             opt.step()
         if step_per_batch:
             scheduler.step()
+        if prof:
+            bd[1].record()
 
         total += loss.item()
         dice_sum += _hard_dice(logits.float(), target, is_prob)
@@ -774,6 +788,8 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
             tsum["encode"] += ee[0].elapsed_time(ee[1])
             if not attn_skipped:
                 tsum["attn"] += ea[0].elapsed_time(ea[1])
+            tsum["fwd"] += fd[0].elapsed_time(fd[1])
+            tsum["bwd"] += bd[0].elapsed_time(bd[1])
             t_prev = time.perf_counter()
     for h in hooks:
         h.remove()
@@ -803,11 +819,14 @@ def train_epoch(model, loader, optimizers, scheduler, step_per_batch, loss_fn, c
         pi = max(prof_items, 1)                        # total tasks profiled (Σ batch sizes)
         bs = prof_items / n                            # avg batch size
         if tsum["encode"] > 0:                         # a non-cascade (single-forward) epoch ran
-            for k in ("data", "encode", "attn"):
+            tsum["decode"] = tsum["fwd"] - tsum["encode"] - tsum["attn"]   # derived, not hooked
+            for k in ("data", "encode", "attn", "fwd", "bwd", "decode"):
                 grid[f"time/{k}_ms"] = tsum[k] / n     # per-step (per-batch) wall time
                 grid[f"time/{k}_ms_item"] = tsum[k] / pi  # per-item (÷ batch size): B-comparable
             tqdm.write(f"  [e{epoch}] per-step: data {tsum['data']/n:5.0f}ms | "
-                       f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms"
+                       f"encode {tsum['encode']/n:5.0f}ms | attn {tsum['attn']/n:5.0f}ms | "
+                       f"decode {tsum['decode']/n:5.0f}ms | fwd {tsum['fwd']/n:5.0f}ms | "
+                       f"bwd {tsum['bwd']/n:5.0f}ms"
                        f"  ||  per-item (÷{bs:.0f}): data {tsum['data']/pi:4.0f}ms | "
                        f"encode {tsum['encode']/pi:4.0f}ms | attn {tsum['attn']/pi:4.0f}ms")
         if "recrop" in tsum:                           # cascade branch only
@@ -1112,11 +1131,25 @@ def main(cfg: DictConfig) -> None:
             # path, stale config) should hard-error via strict=True, not silently reinit part
             # of the model.
             allow_partial = bool(cfg.train.get("checkpoint_allow_partial", False))
+            if allow_partial:
+                # strict=False (below) only tolerates missing/unexpected KEYS -- PyTorch's
+                # load_state_dict still hard-errors on a SHAPE mismatch for a key present in
+                # both dicts (e.g. an encoder channel-width change), even under strict=False.
+                # Every prior use of this escape hatch only ever added/removed whole keys
+                # (mask_embed linear->conv, decoder conv->iris) so this never came up before —
+                # pre-filter shape-mismatched keys out ourselves so they fall back to
+                # missing_keys (random init) instead of crashing the load.
+                own_sd = net.state_dict()
+                shape_mismatched = [k for k, v in sd.items()
+                                    if k in own_sd and v.shape != own_sd[k].shape]
+                for k in shape_mismatched:
+                    del sd[k]
             result = net.load_state_dict(sd, strict=not allow_partial)
-            if allow_partial and (result.missing_keys or result.unexpected_keys):
+            if allow_partial and (result.missing_keys or result.unexpected_keys or shape_mismatched):
                 print(f"Partial checkpoint load (train.checkpoint_allow_partial=true): "
-                      f"{len(result.missing_keys)} key(s) left at random init "
-                      f"{result.missing_keys}; {len(result.unexpected_keys)} unused "
+                      f"{len(shape_mismatched)} key(s) dropped for a shape mismatch "
+                      f"{shape_mismatched}; {len(result.missing_keys)} key(s) left at random "
+                      f"init {result.missing_keys}; {len(result.unexpected_keys)} unused "
                       f"checkpoint key(s) dropped {result.unexpected_keys}.")
         else:
             model.load_finetuned(sd)

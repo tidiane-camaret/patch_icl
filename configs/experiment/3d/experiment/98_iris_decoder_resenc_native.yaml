@@ -1,0 +1,62 @@
+# @package _global_
+# 98_iris_decoder_resenc_native — 97_iris_decoder_ct_only with the encoder/stage/resolution
+# choices realigned to match docs/methods/iris.md literally, instead of this repo's own
+# R=16/multi-scale-concat/plainconv defaults:
+#
+#  - encoder: resenc_ts (residual blocks) instead of plainconv_ts -- Iris's backbone is
+#    explicitly "3D UNet with residual connections" (iris.md §7). resenc_ts's OWN default
+#    width formula (base 32, x2/stage, cap 320 -- resenc_ts.py:46-47) needs NO override to
+#    reproduce Iris's schedule: stage0=32@128^3, stage1=64@64^3, stage2=128@32^3,
+#    stage3=256@16^3, stage4=320@8^3(unused). Stage2 (128ch @ stride-4/32^3) is an EXACT
+#    match to iris.md:204's worked example C=128,d=h=w=32 -- no width override needed.
+#
+#  - arch.resolution: 32 (was 16) + arch.nnunet_ts_stages: [2] (was [2,3]) -- the
+#    task-encoding/decode bottleneck (F_s/F_q in _iris_task_encode/_decode_iris) now comes
+#    from stage2 ALONE at its own native size, not a multi-scale concat resampled down to a
+#    coarser R=16 grid. With iris_pixelshuffle_r=4 (unchanged default), Eq 3-4's PixelShuffle
+#    now reaches side=R*r=32*4=128 = the TRUE native volume resolution, matching Eq 3-4's own
+#    intent (fuse the mask at full resolution) exactly -- previously side=16*4=64, half native.
+#    _iris_foreground_pool (Eq 2, T_f) is unaffected (already pooled fine_stage[-1]=stage0
+#    @128^3, i.e. already-native).
+#
+#  - arch.fine_stage: [0, 1, 2] (was [0, 1]) -- stage2 is now ALSO exposed as an unpooled
+#    skip tap for _decode_iris's up-path (same tensor already computed for the coarse path,
+#    zero extra encoder cost): a same-resolution (32^3, no upsample) refinement block using
+#    stage2's raw pre-img_embed/pre-attention features, which Fq2 never sees directly
+#    (Fq2 only sees stage2 THROUGH img_embed + bidirectional cross-attention). Stage3/4 stay
+#    unused, matching Iris's own choice not to touch the true bottleneck (iris.md §7's own
+#    reasoning: the PixelShuffle divisibility constraint rules it out there anyway).
+#
+#  - arch.mask_patch_decode_size: 4 (was 8) -- grid_size = resolution * mask_patch_decode_size
+#    must stay at the native 128 output resolution; with resolution now 32 (not 16), the old
+#    *8 tiling would target grid_size=256 (beyond the volume). mask_patch_size (main
+#    transformer's mask-column tiling) is left at 8 -- irrelevant here since decoder=iris with
+#    cascade_registers=false never calls _occupancy/_attn at all (patchset3d.py forward()'s
+#    own skip), so nothing downstream reads it.
+#
+# Cost note: stage2's native size (32^3) is 8x the OLD contextual-stream KV token count
+# (K*32^3 vs K*16^3), since _iris_task_encode's cross-attention KV set is exactly this
+# resolution now. Expect the "decode" profile_timing bucket (see docs/logs.md 2026-09-18) to
+# grow accordingly -- this is the real, expected cost of Iris's own full-resolution mask
+# fusion, not a regression.
+#
+#   python experiments/3d/train.py experiment=98_iris_decoder_resenc_native \
+#     train.checkpoint=<a 97-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 97_iris_decoder_ct_only
+  - override /encoder: e3_resenc
+  - _self_
+
+arch:
+  resolution: 32
+  nnunet_ts_stages: [2]
+  fine_stage: [0, 1, 2]
+  mask_patch_decode_size: 4
+  encoder_input_norm: instance   # e3_resenc's own default is passthrough -- keep 96/97's
+                                 # modality-agnostic CT+MRI norm (harmless now CT-only, but
+                                 # matches what checkpoints from 96/97 were trained with)
+
+wandb:
+  name: 98_iris_decoder_resenc_native

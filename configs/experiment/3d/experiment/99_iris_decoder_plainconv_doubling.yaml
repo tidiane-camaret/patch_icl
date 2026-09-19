@@ -1,0 +1,38 @@
+# @package _global_
+# 99_iris_decoder_plainconv_doubling — 97_iris_decoder_ct_only with a cheaper middle ground
+# between the repo's own R=16/[32,64,256,512] defaults and 98's literal-Iris
+# resenc/R=32/stage2 reproduction: keep plainconv_ts (10x cheaper than resenc_ts) and
+# R=16 (no grid_size/mask_patch_decode_size surgery, no 8x contextual-stream KV blowup),
+# but replace the [32,64,256,512] override with Iris's own clean doubling schedule
+# [32,64,128,256] (base 32, x2/stage, no jump), and use the SINGLE 256-channel stage
+# (stage3, stride8, native 16^3 = R already -- no multi-scale concat, no resample) as the
+# task-encoding/decode bottleneck instead of the current concat(stage2,stage3)=768ch.
+#
+# Stage sizes at 128^3 (plainconv_ts.py: stage0=stride1, then x2/stage):
+#   stage0: 32ch  @ 128^3   stage1: 64ch @ 64^3   stage2: 128ch @ 32^3   stage3: 256ch @ 16^3
+#
+# fine_stage: [0,1,2] -- stage2 (128ch@32^3) is unused by nnunet_ts_stages=[3] here, but the
+# encoder still computes it every forward regardless (PlainConvUNet.return_skips returns ALL
+# stage outputs in one pass) -- exposing it as an extra decode skip tap is free (see
+# docs/logs.md 2026-09-18's "use all encoder features" discussion two turns back).
+#
+# Known tradeoff vs. 98's literal fidelity: iris_pixelshuffle_r=4 (unchanged; e=768 requires
+# e % r^3==0, and r=8 would need e divisible by 512) only reaches side=R*r=16*4=64, HALF of
+# native 128 -- Eq 3-4's mask fusion still doesn't hit true native resolution the way 98's
+# R=32 config does. Accepted here as the cost of staying at R=16/plainconv for speed.
+#
+#   python experiments/3d/train.py experiment=99_iris_decoder_plainconv_doubling \
+#     train.checkpoint=<a 97-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 97_iris_decoder_ct_only
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 128, 256]
+  nnunet_ts_stages: [3]          # single stage: 256ch @ 16^3 (stride8, already == R) -- no concat
+  fine_stage: [0, 1, 2]          # stage2 (128ch@32^3) added as a free extra decode skip tap
+
+wandb:
+  name: 99_iris_decoder_plainconv_doubling

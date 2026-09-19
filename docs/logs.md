@@ -8880,3 +8880,35 @@ tests), Hydra compose verified for all three experiment configs.
 
 Same caveat as the texture-noise work: implementation-correct and tested, but **not yet
 validated** — no eval run against 94 has happened.
+
+## 2026-09-18 — iris decoder: why skipping the O(R^3) transformer barely moved epoch time
+
+`97_iris_decoder_ct_only`'s `profile_timing` only ever hooked `net.encoder` and `net.transformer`
+(`data`/`encode`/`attn`) — `attn` correctly reads 0ms since `arch.decoder=iris` skips
+`net.transformer` entirely, but the whole rest of the forward (`_iris_task_encode`,
+`_decode_iris`, loss) and the whole backward+opt.step fell into an uninstrumented gap between
+`encode` ending and next-step `data` starting. Widened `experiments/3d/train.py::train_epoch`'s
+non-cascade profiling with two more CUDA-event brackets — `fwd` (whole `with _autocast(): ...`
+forward block) and `bwd` (backward + grad-clip + opt.step) — so `decode_ms = fwd - encode - attn`
+is derivable even without a dedicated hook on the decode head.
+
+Diagnostic run (`arch.decoder=iris` vs `arch.decoder=conv`, otherwise identical config/batch/GPU,
+15-step smoke, both compiled): conv's own `FlopCounterMode` printout shows the main bi-axis
+transformer at 2736/3891 GFLOPs (~70%) for K=1 — genuinely the majority of forward compute when
+present, so removing it is not a paper-only win. But wall-clock savings are much smaller than
+that ratio suggests because three other legs are decoder-agnostic and now set the floor:
+- `data` (CPU dataloader/aug/synth-paint) — untouched by decoder choice, often the largest term.
+- `encode` (CNN encoder fwd, ~200ms/step here) — same encoder regardless of decoder.
+- `bwd` (backward through whatever DID run forward) — for iris that's still encoder +
+  `_iris_task_encode` + `_decode_iris`, not free just because the removed op's token count (`m`)
+  is small.
+
+Iris's own modules also reintroduce non-trivial O(R^3)-scale work that isn't captured by the
+"O(m)" framing: `_iris_task_encode`'s contextual-stream cross-attention has `kv` of size
+`K*R^3` (Eq 3-4's fused support features, pre-pool), and `_decode_iris`'s bidirectional
+cross-attention (`iris_t2f`/`iris_f2t`, Eq 5) attends the *query's* `R^3` tokens against `T`
+twice per forward. Only the main transformer's dense bi-axis attention (quadratic-ish across
+`(1+K)*R^3` rows) was removed; a linear-in-`R^3` attention cost remains in the decode head
+itself. Net: the skip is a real, correct optimization (confirmed `attn_ms=0`, spy-tested), but
+it removes one leg of a multi-leg step, not the step's bottleneck — `data`+`encode`+`bwd` (none
+of which shrink with `m`) dominate.
