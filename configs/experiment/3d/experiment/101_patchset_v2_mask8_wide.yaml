@@ -1,0 +1,41 @@
+# @package _global_
+# 101_patchset_v2_mask8_wide -- iteration on 100_patchset_v2_plainconv_doubling addressing
+# two of the concrete capacity gaps the 100 vs 97 (x1gz71wj) dice-gap analysis surfaced
+# (docs/logs.md 2026-09-19 "PatchSetV2 first real run"):
+#
+#  - mask_patch_size: 8 (was 1) -- matches 97's own setting exactly (8^3 occupancy detail per
+#    cell instead of a single scalar). Bonus: since e=768 and mask_embed=linear (both already
+#    the default), mask_embed.weight's shape now matches 97's checkpoint exactly (768,512) --
+#    it should transfer cleanly via checkpoint_allow_partial this time, instead of being
+#    dropped for a shape mismatch as it was in 100's launch.
+#  - plainconv_ts_features_per_stage: [32,64,128,768] (was [32,64,128,256]) -- widens the
+#    bottleneck stage to match e=768 exactly (stage 3 is native 16^3 = R already, so
+#    nnunet_ts_stages stays [3], no concat/resample needed, same reasoning as 99/100).
+#
+# feat_norm (context, the new default) and img_embed_mlp (true, via encoder=e4_plainconv_ts)
+# are both now active for the first time in a real run too (docs/logs.md same entry).
+#
+# batch_size: 8 (was 4) -- the first real launch of this config used only 35.9/97.9 GB VRAM
+# at batch_size=4, with GPU compute already ~98% utilized but plenty of memory headroom.
+# lr scaled by sqrt(8/4) per this repo's own established batch-size scaling convention (see
+# 96_iris_decoder_varspacing.yaml's own comment: "sqrt(2)-scaled ... B=2->4").
+#
+#   python experiments/3d/train.py experiment=101_patchset_v2_mask8_wide \
+#     arch.compress_m=128 \
+#     train.checkpoint=<a 97-line best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 100_patchset_v2_plainconv_doubling
+  - _self_
+
+arch:
+  mask_patch_size: 8
+  plainconv_ts_features_per_stage: [32, 64, 128, 768]
+
+train:
+  batch_size: 8
+  lr: 2.97e-5   # 2.1e-5 * sqrt(8/4)
+
+wandb:
+  name: 101_patchset_v2_mask8_wide
