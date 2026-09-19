@@ -21,6 +21,7 @@ from src.models.patchset_pfn import FourierPositionalEncoding
 from src.models.pfn_seg_2d import (
     ThinkingRows, TransformerEncoderStack, build_register_block_mask, RowCrossAttention)
 from src.rope import build_3d_rope_freqs_from_positions
+from src.models.encoders.factory import build_encoder
 
 
 def _down_to(f: torch.Tensor, R: int) -> torch.Tensor:
@@ -290,79 +291,15 @@ class PatchSet3D(nn.Module):
         # whether callers (train loop / eval loop) thread a per-batch `spacing` through.
         self.spacing_aware = bool(encoder_spacing_aware)
 
-        if encoder == "primus":
-            if not primus_sidecar:
-                raise ValueError("encoder='primus' requires arch.primus_sidecar")
-            from src.models.primus_encoder import PrimusEncoder   # lazy: avoids import cycle
-            self.encoder = PrimusEncoder(primus_sidecar, resolution,
-                                         frozen=encoder_frozen, device="cpu",
-                                         encoder_stage=encoder_stage,
-                                         native_grid=encoder_native_grid,
-                                         spacing_aware=encoder_spacing_aware,
-                                         precision=encoder_precision)
-        elif encoder == "tap_ct":
-            # Frozen fomofo/tap-ct-b-3d ViT. Weights fixed on HF (no sidecar); it always
-            # tokenizes at the native anisotropic grid (image_size drives the token count)
-            # and is not spacing-aware — the physical cell size is set by data.crop_spacing_mm.
-            # encoder_stage early-exits the transformer blocks (like Primus). Needs image_size
-            # divisible by 8. Ignores encoder_native_grid/encoder_spacing_aware (always native).
-            from src.models.tapct_encoder import TapCTEncoder   # lazy: avoids import cycle
-            if not image_size:
-                raise ValueError("encoder='tap_ct' requires arch.image_size (from data.image_size)")
-            self.encoder = TapCTEncoder(resolution, image_size, frozen=encoder_frozen,
-                                        device="cpu", encoder_stage=encoder_stage,
-                                        precision=encoder_precision)
-        elif encoder == "nnunet_ts":
-            # Frozen TotalSegmentator nnU-Net PlainConvUNet encoder (default: Dataset297,
-            # total 3 mm). Multi-scale concat of nnunet_ts_stages resampled to R^3; input is
-            # 1-channel (image only), spacing arg ignored (conv net). nnunet_ts_weights points
-            # at the weights folder (plans.json + fold_0/checkpoint_final.pth) and is required
-            # even when nnunet_ts_random_init=True — plans.json defines the architecture and the
-            # CTNormalization stats; only the trained weights are dropped (He init instead).
-            from src.models.encoders.nnunet_ts import NnUNetTSEncoder   # lazy: avoids import cycle
-            if not nnunet_ts_weights:
-                raise ValueError("encoder='nnunet_ts' requires arch.nnunet_ts_weights")
-            # encoder_input_norm: None keeps each encoder's own default (nnunet_ts=reframe,
-            # so a frozen pretrained encoder still converts loader-frame -> its plans frame).
-            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
-            self.encoder = NnUNetTSEncoder(nnunet_ts_weights, resolution,
-                                           stages=tuple(nnunet_ts_stages),
-                                           frozen=encoder_frozen, device="cpu",
-                                           precision=encoder_precision,
-                                           random_init=nnunet_ts_random_init, **_in_norm)
-        elif encoder == "resenc_ts":
-            # From-scratch nnU-Net ResidualEncoderUNet (the ResEnc twin of nnunet_ts). No
-            # plans.json / checkpoint: the architecture is the ResEnc M/L/XL recipe with
-            # resenc_n_stages stages (base 32, x2, cap 320; blocks 1/3/4/6/6/...), He init.
-            # Multi-scale concat of nnunet_ts_stages resampled to R^3; 1-channel image input,
-            # spacing arg ignored. encoder_input_norm defaults to passthrough (the image is
-            # already in the pipeline CT frame — see src/totalseg_dataset.CtNormSpec).
-            from src.models.encoders.resenc_ts import ResEncTSEncoder   # lazy: avoids import cycle
-            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
-            self.encoder = ResEncTSEncoder(resolution, n_stages=resenc_n_stages,
-                                           stages=tuple(nnunet_ts_stages),
-                                           frozen=encoder_frozen, device="cpu",
-                                           precision=encoder_precision, **_in_norm)
-        elif encoder == "plainconv_ts":
-            # From-scratch nnU-Net PlainConvUNet (the PlainConv twin of resenc_ts). No
-            # plans.json / checkpoint: width is plainconv_ts_features_per_stage if given,
-            # else the same base=32/x2/cap=320 formula resenc_ts uses; n_conv_per_stage=2
-            # throughout (nnU-Net's standard plain-conv schedule), He init. Multi-scale
-            # concat of nnunet_ts_stages resampled to R^3; 1-channel image input, spacing
-            # arg ignored. encoder_input_norm defaults to zscore (per-volume HU) here — this
-            # encoder carries no plans-file CTNormalization stats to reframe into.
-            from src.models.encoders.plainconv_ts import PlainConvTSEncoder   # lazy: avoids import cycle
-            _in_norm = {"input_norm": encoder_input_norm} if encoder_input_norm else {}
-            self.encoder = PlainConvTSEncoder(resolution, n_stages=plainconv_ts_n_stages,
-                                              stages=tuple(nnunet_ts_stages),
-                                              features_per_stage=plainconv_ts_features_per_stage,
-                                              frozen=encoder_frozen, device="cpu",
-                                              precision=encoder_precision, **_in_norm)
-        elif encoder == "conv":
-            self.encoder = ConvEncoder3D(1, tuple(enc_dims), resolution)
-        else:
-            raise ValueError(f"unknown arch.encoder {encoder!r} "
-                             f"(conv | primus | tap_ct | nnunet_ts | resenc_ts | plainconv_ts)")
+        self.encoder = build_encoder(
+            encoder, resolution, in_ch=1, enc_dims=enc_dims, encoder_frozen=encoder_frozen,
+            primus_sidecar=primus_sidecar, nnunet_ts_weights=nnunet_ts_weights,
+            nnunet_ts_stages=nnunet_ts_stages, nnunet_ts_random_init=nnunet_ts_random_init,
+            resenc_n_stages=resenc_n_stages, plainconv_ts_n_stages=plainconv_ts_n_stages,
+            plainconv_ts_features_per_stage=plainconv_ts_features_per_stage,
+            encoder_input_norm=encoder_input_norm, image_size=image_size,
+            encoder_stage=encoder_stage, encoder_native_grid=encoder_native_grid,
+            encoder_spacing_aware=encoder_spacing_aware, encoder_precision=encoder_precision)
         # Encoder feature -> token width e. Default: a single Linear. When the encoder
         # width far exceeds e (e.g. frozen primus out_ch=864 -> e=256), that lone Linear
         # is a rank bottleneck; img_embed_mlp=True instead keeps the full encoder width
