@@ -121,7 +121,7 @@ dispatches to). `PatchSet3D`'s own behavior/checkpoints are unaffected.
 | Dropped | Why |
 |---|---|
 | `register_routed`/`register_flex`/`build_register_block_mask` | Explicit requirement this round. Also structurally moot: per-cell tokens are pure KV for Stage A only, never self-attend to each other beyond their own volume's compression. |
-| `mask_slots` / content-type tagging | Target/context asymmetry is structural (which volume you are), not a config flag. |
+| `mask_slots` (content-type tag, distinct from `mask_embed` — see Kept) | In `PatchSet3D`, an additive Fourier tag marking a mask column "gt" vs "pred" since support/target rows are otherwise embedded identically. Redundant once `context_id_embed` is kept: it already assigns the target row its own identity distinct from every context row, which tells the network which volume — and therefore whether that volume's mask column is GT or prediction — as a byproduct of a strictly more general signal. |
 | `decode_source` | Always the target's own Stage-B slice / img-embed pair, mirroring Iris exactly. |
 | `fine_decode` / `decoder` mode switch, `fine_filter`, `conv` decoders | v2 has exactly one decoder (Iris-style). |
 | `pool_token` flag | Pooling is unconditionally part of every volume's sequence, not an optional prefix-row mechanism. |
@@ -137,6 +137,11 @@ dispatches to). `PatchSet3D`'s own behavior/checkpoints are unaffected.
 - Fourier positional encoding and mask embedding (`mask_embed`: linear or conv) — explicit
   requirement this round.
 - `compress_m` / `compress_layers` (renamed from `seq_compress`'s knobs — always active in v2).
+- `context_id_embed` — kept, for two reasons: (1) forward-looking support for K>1 context
+  items needing individually distinguishable identity, not just joint pooling; (2) it now also
+  carries the job `mask_slots` used to do (see Dropped table) — the target row's `qry_id` vs.
+  each context row's own `ctx_id[k]` already tells the network which volume, and therefore
+  whether that volume's mask column holds GT or prediction, without a separate tag.
 - `fine_stage` (which encoder stages are exposed unpooled — feeds both `pool_v` and the decode
   skip pyramid).
 - Encoder choice and its own sub-knobs (`encoder`, `nnunet_ts_stages`,
@@ -172,15 +177,13 @@ etc.). New experiment/model config files under `configs/experiment/3d/` and
 
 ## Open questions for the implementation plan
 
-1. **`context_id_embed`** — keep, drop, or defer? Doesn't conflict with anything decided so
-   far; not load-bearing to any decision made this round.
-2. **`mask_patch_size`** (occupancy tiling granularity, `p>1`) — does v2 need it, or is `p=1`
+1. **`mask_patch_size`** (occupancy tiling granularity, `p>1`) — does v2 need it, or is `p=1`
    (single-voxel occupancy per cell) sufficient now that `pool_v` separately handles
    high-resolution mask detail via native-resolution masked pooling?
-3. **`forward()` return signature** — today's `mask_support`/`mask_query` outputs exist for a
+2. **`forward()` return signature** — today's `mask_support`/`mask_query` outputs exist for a
    SimMIM reconstruction loss that's dropped in v2 (see Dropped table). v2's `forward()` should
    return just `final_logit` + `registers` (for cascade use) unless a future loss needs more.
-4. Whether `cascade.py`/`evaluate.py` need any changes beyond the `build_model` dispatch to
+3. Whether `cascade.py`/`evaluate.py` need any changes beyond the `build_model` dispatch to
    support `patchset_v2` (native-grid eval, checkpoint loading, etc.) — needs a pass once the
    class exists; not expected to need changes given the same `predict()`/`train_forward()`
    contract `PatchSet3D` already satisfies, but unverified.
