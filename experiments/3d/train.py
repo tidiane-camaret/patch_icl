@@ -917,7 +917,7 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # patchset3d: predict == threshold(train_forward), so reuse the logits (one forward, no
     # separate predict pass) and run eval under bf16 (matches training, avoids recompiling the
     # compiled encoder/transformer between dtypes). Off for medverse to keep its val byte-identical.
-    fast_eval = cfg.get("model", "medverse") == "patchset3d"
+    fast_eval = cfg.get("model", "medverse") in ("patchset3d", "patchset3d_v2")
     # eval_autocast: bf16 autocast around the val forward(s). Defaults to fast_eval — on for
     # patchset3d (its val also reuses the bf16 train_forward logits), off for medverse so its
     # val/dice stays fp32-stable across epochs and vs the released benchmark. Set
@@ -1094,7 +1094,7 @@ def main(cfg: DictConfig) -> None:
             f"{val_split!r} split (or no subjects for val_classes). Set "
             f"train.val_split to an existing split (e.g. test).")
     model, model_name = build_model(cfg)
-    is_patchset = model_name == "patchset3d"
+    is_patchset = model_name in ("patchset3d", "patchset3d_v2")
     net = getattr(model, "model", model)
     if is_patchset:
         net.to(DEVICE)
