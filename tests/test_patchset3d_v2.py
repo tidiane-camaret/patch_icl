@@ -221,6 +221,15 @@ def test_forward_end_to_end_shape():
     assert out["registers"] is None
 
 
+def test_grid_size_matches_native_image_size():
+    """train.py's is_patchset-gated logging reads net.grid_size directly (no getattr
+    fallback) for val metric label suffixes -- must exist and reflect the native side."""
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                   image_size=[16, 16, 16])
+    assert m.grid_size == 16
+
+
 def test_forward_backward():
     m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
                    compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])

@@ -95,6 +95,11 @@ class PatchSetV2(nn.Module):
                 raise ValueError(f"fine_stage {st} out of range [0, {self.encoder.n_fine_stages})")
         if not image_size:
             raise ValueError("PatchSetV2 needs arch.image_size (from data.image_size)")
+        # forward() always resizes final_logit to the input volume's own native (D,H,W) (no
+        # fixed decode-grid formula the way PatchSet3D's resolution*mask_patch_decode_size is),
+        # so this is just the native side train.py's is_patchset-gated logging reads it for
+        # (val/dice_ds@{grid_size} metric labels) -- not used anywhere in this class's own math.
+        self.grid_size = int(image_size[0])
         stages = sorted(self.fine_stage,
                         key=lambda st: self.encoder.fine_stage_size(int(image_size[0]), st))
         self._stage_order = [self.fine_stage.index(st) for st in stages]   # coarse->fine, into `fine`
