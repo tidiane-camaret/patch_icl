@@ -157,11 +157,18 @@ def build_register_block_mask(n_t: int, N: int, T: int, device):
 
 
 class LowerPrecisionRMSNorm(nn.RMSNorm):
-    """RMSNorm that upcasts to fp32 when the input is bf16/fp16."""
+    """RMSNorm that upcasts to fp32 when the input is bf16/fp16.
+
+    autocast(enabled=False) alone does NOT upcast an already-bf16 tensor -- it only stops
+    the outer autocast context from casting further inside the block. Without an explicit
+    x.float(), self.weight (fp32, never cast) and x (still bf16) mismatch, so PyTorch's
+    fused RMSNorm kernel declines and falls back to an unfused path (numerically correct,
+    just slower -- "Cannot dispatch to fused implementation" UserWarning). x.float() makes
+    the upcast genuine; .to(x.dtype) restores the caller's expected dtype on the way out."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype in (torch.float16, torch.bfloat16):
             with torch.amp.autocast("cuda", enabled=False):
-                return super().forward(x)
+                return super().forward(x.float()).to(x.dtype)
         return super().forward(x)
 
 

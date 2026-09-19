@@ -1,5 +1,33 @@
+import warnings
+
 import torch
-from src.models.pfn_seg_2d import RowCrossAttention
+from src.models.pfn_seg_2d import LowerPrecisionRMSNorm, RowCrossAttention
+
+
+def test_lower_precision_rmsnorm_bf16_matches_fp32_reference_and_returns_bf16():
+    """x.float() must genuinely upcast (not just disable autocast on an already-bf16
+    tensor) -- verified by comparing against RMSNorm computed directly in fp32, and the
+    output must be cast back to bf16 for the caller."""
+    torch.manual_seed(0)
+    m = LowerPrecisionRMSNorm(8)
+    x_fp32 = torch.randn(4, 8)
+    x_bf16 = x_fp32.to(torch.bfloat16)
+
+    out = m(x_bf16)
+    assert out.dtype == torch.bfloat16
+
+    expected_fp32 = torch.nn.functional.rms_norm(x_fp32, (8,), m.weight, m.eps)
+    # bf16 has ~3 decimal digits of precision -- the input itself already lost precision
+    # converting to bf16, so compare in bf16-appropriate tolerance, not fp32-tight
+    assert torch.allclose(out.float(), expected_fp32, atol=2e-2, rtol=2e-2)
+
+
+def test_lower_precision_rmsnorm_no_fused_dispatch_warning():
+    m = LowerPrecisionRMSNorm(8)
+    x_bf16 = torch.randn(4, 8).to(torch.bfloat16)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        m(x_bf16)   # raises if the "Cannot dispatch to fused implementation" warning fires
 
 
 def test_row_cross_attention_shape_with_mismatched_row_counts():
