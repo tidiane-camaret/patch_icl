@@ -260,8 +260,62 @@ def test_cascade_regs_end_to_end():
     m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
                    compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16],
                    cascade_registers=True)
+    m.eval()
     img, cin, cout = _dummy_batch(S=16, K=2)
     out1 = m(img, context_in=cin, context_out=cout)
     assert out1["registers"].shape == (2, m.thinking.n, 32)
     out2 = m(img, context_in=cin, context_out=cout, cascade_regs=out1["registers"])
     assert out2["final_logit"].shape == out1["final_logit"].shape
+    assert not torch.allclose(out2["final_logit"], out1["final_logit"]), (
+        "cascade_regs should influence the output -- if this passes trivially, cascade_regs "
+        "may not be getting threaded through to _stage_b")
+
+
+def test_query_prior_occupancy_path_alone_changes_output():
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    base = m(img, context_in=cin, context_out=cout)["final_logit"]
+    prior = torch.rand(2, 1, 16, 16, 16)
+
+    orig_pool_all = m._pool_all
+    m._pool_all = lambda fine_finest, context_out, query_prior, B, K, T: orig_pool_all(
+        fine_finest, context_out, None, B, K, T)
+    try:
+        occ_only = m(img, context_in=cin, context_out=cout, query_prior=prior)["final_logit"]
+    finally:
+        m._pool_all = orig_pool_all
+    assert not torch.allclose(occ_only, base), (
+        "query_prior's occupancy/mask-embed path alone should move the output even when "
+        "_pool_all is forced to ignore query_prior")
+
+
+def test_query_prior_pool_path_alone_changes_output():
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[0], decoder_dim=16, image_size=[16, 16, 16])
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    base = m(img, context_in=cin, context_out=cout)["final_logit"]
+    prior = torch.rand(2, 1, 16, 16, 16)
+
+    fallback_occ = m._occupancy(cout).mean(dim=1, keepdim=True)
+    orig_prior_occ = m._prior_occupancy
+    m._prior_occupancy = lambda prior_: fallback_occ
+    try:
+        pool_only = m(img, context_in=cin, context_out=cout, query_prior=prior)["final_logit"]
+    finally:
+        m._prior_occupancy = orig_prior_occ
+    assert not torch.allclose(pool_only, base), (
+        "query_prior's _pool_all path alone should move the output even when the "
+        "occupancy/mask-embed path is forced to ignore query_prior")
+
+
+def test_forward_native_resize_when_decode_grid_not_native():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   compress_m=3, fine_stage=[1], decoder_dim=16, image_size=[16, 16, 16])
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out = m(img, context_in=cin, context_out=cout)
+    assert out["final_logit"].shape == (2, 1, 16, 16, 16)
