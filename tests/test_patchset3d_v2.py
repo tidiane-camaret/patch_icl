@@ -19,6 +19,25 @@ def _dummy_batch(B=2, K=2, S=16):
     return image, context_in, context_out
 
 
+def _replicate_stage_b_internals(m, seq_in, B, K, T, cascade_regs):
+    """Reproduces _stage_b's steps up through the transformer call, so a test can inspect
+    the intermediate sequence _stage_b itself doesn't return -- used to verify `regs` reads
+    the correct row offset, not just that it differs from its input."""
+    per_vol = m.compress_m + 1
+    seq = seq_in
+    if m.context_id_embed:
+        seq = m._apply_context_tags(seq, B, K, T, per_vol)
+    seq, _ = m.thinking(seq, seq.shape[1])
+    n_extra = 0
+    if cascade_regs is not None:
+        mem = m.cascade_proj(cascade_regs) + m.cascade_type
+        mem = mem.unsqueeze(2).expand(-1, -1, seq.shape[2], -1)
+        seq = torch.cat([mem, seq], dim=1)
+        n_extra = mem.shape[1]
+    seq = m.transformer(seq, 0, full_attn=True)
+    return seq, n_extra
+
+
 def test_tokens_all_shape():
     m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
                    fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
@@ -157,8 +176,17 @@ def test_stage_b_cascade_registers_roundtrip():
     seq_out, regs = m._stage_b(seq, B, K, T)
     assert regs.shape == (2, m.thinking.n, 32)
     seq_out2, regs2 = m._stage_b(seq, B, K, T, cascade_regs=regs)
-    assert seq_out2.shape[1] == seq_out.shape[1] + m.thinking.n   # cascade rows prepended
-    assert regs2.shape == (2, m.thinking.n, 32)
-    assert not torch.allclose(regs2, regs), (
-        "regs2 should reflect genuine NEW post-attention state for this level, not a "
-        "stale pass-through of the mem block fed in via cascade_regs")
+    assert seq_out2.shape[1] == seq_out.shape[1] + m.thinking.n
+
+    # Position-sensitive check: reproduce the internal sequence _stage_b computed for the
+    # SECOND call, then verify regs2 matches the correct (post-mem) thinking-row slice of
+    # that tensor and does NOT match the wrong (mem-block) slice -- catches a regression to
+    # the pre-fix `seq[:, :thinking.n]` bug, which "differs from regs" would not catch (both
+    # slices differ from the raw input regs post-attention regardless of which is read).
+    seq_internal, n_extra = _replicate_stage_b_internals(m, seq, B, K, T, regs)
+    right_slice = seq_internal[:, n_extra:n_extra + m.thinking.n].mean(dim=2)
+    wrong_slice = seq_internal[:, :m.thinking.n].mean(dim=2)
+    assert torch.allclose(regs2, right_slice, atol=1e-5), (
+        "_stage_b's returned regs does not match the correct (post-mem) thinking-row slice")
+    assert not torch.allclose(regs2, wrong_slice, atol=1e-3), (
+        "_stage_b's returned regs matches the WRONG (mem-block) slice -- position bug reintroduced")
