@@ -127,6 +127,13 @@ class PatchSetV2(nn.Module):
             nn.init.normal_(self.ctx_id.weight, std=0.1)
             nn.init.normal_(self.qry_id, std=0.1)
 
+        self.thinking = ThinkingRows(thinking_rows, e)
+        if self.cascade_registers:
+            self.cascade_proj = nn.Linear(e, e)
+            self.cascade_type = nn.Parameter(torch.zeros(e))
+            nn.init.normal_(self.cascade_type, std=0.02)
+        self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
+
     def _tokens_all(self, feat: torch.Tensor, occ: torch.Tensor, B: int, T: int) -> torch.Tensor:
         """feat (B,T,N,Cf) raw encoder grid tokens, occ (B,T,N,p^3) mask/prior occupancy ->
         (B,T,N,2,e): img_embed + mask_embed + Fourier positional encoding, columns
@@ -213,3 +220,40 @@ class PatchSetV2(nn.Module):
         pool_tok = pool.unsqueeze(2).unsqueeze(3).expand(B, T, 1, 2, e)
         seq = torch.cat([pool_tok, compressed], dim=2)          # (B,T,compress_m+1,2,e)
         return seq.reshape(B, T * (self.compress_m + 1), 2, e)
+
+    def _apply_context_tags(self, seq: torch.Tensor, B: int, K: int, T: int,
+                            per_vol: int) -> torch.Tensor:
+        """seq (B, T*per_vol, 2, e). Adds ctx_id[k] to each context volume's block, qry_id
+        to the target's block -- lets Stage B's self-attention tell context rows from the
+        target row. This also distinguishes GT-content rows from prediction-content rows
+        without a separate mask_slots-style tag, since target vs. context identity implies
+        which content type that volume's mask column holds (see
+        docs/superpowers/specs/2026-09-19-patchset-v2-design.md)."""
+        ctx = self.ctx_id(torch.arange(K, device=seq.device))         # (K,e)
+        tags = torch.cat([ctx, self.qry_id.unsqueeze(0)], dim=0)      # (T,e)
+        tags = tags.repeat_interleave(per_vol, dim=0)                  # (T*per_vol,e)
+        return seq + tags.to(seq.dtype).view(1, -1, 1, seq.shape[-1])
+
+    def _stage_b(self, seq: torch.Tensor, B: int, K: int, T: int,
+                cascade_regs: torch.Tensor | None = None):
+        """seq (B, T*per_vol, 2, e) -> (post-transformer sequence, registers). Full
+        self-attention across every volume's tokens (no register_routed, no full_attn
+        toggle -- this is the only mode) plus thinking rows and, if enabled, the previous
+        cascade level's carried memory rows -- unchanged mechanism from
+        PatchSet3D._attn."""
+        per_vol = self.compress_m + 1
+        if self.context_id_embed:
+            seq = self._apply_context_tags(seq, B, K, T, per_vol)
+        seq, _ = self.thinking(seq, seq.shape[1])
+        n_extra = 0
+        if cascade_regs is not None:
+            assert self.cascade_registers, "cascade_regs given but cascade_registers=False"
+            mem = self.cascade_proj(cascade_regs) + self.cascade_type
+            mem = mem.unsqueeze(2).expand(-1, -1, seq.shape[2], -1)
+            seq = torch.cat([mem, seq], dim=1)
+            n_extra = mem.shape[1]
+        # `sep` is unused downstream when full_attn=True (see TransformerEncoderLayer) --
+        # passed as 0 for clarity that it has no effect here.
+        seq = self.transformer(seq, 0, full_attn=True)
+        regs = seq[:, :self.thinking.n].mean(dim=2) if self.cascade_registers else None
+        return seq, regs

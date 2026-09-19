@@ -122,3 +122,39 @@ def test_compress_and_assemble_shapes():
         block = seq[:, t * per_vol:(t + 1) * per_vol]
         assert torch.allclose(block[:, 0, 0], pool[:, t])   # img col
         assert torch.allclose(block[:, 0, 1], pool[:, t])   # mask col (broadcast)
+
+
+def test_stage_b_shape_and_cross_volume_mixing():
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, compress_layers=1, fine_stage=[0],
+                   context_id_embed=True, image_size=[16, 16, 16])
+    B, K, T = 2, 2, 3
+    per_vol = m.compress_m + 1
+    seq = torch.randn(B, T * per_vol, 2, 32)
+    seq_out, regs = m._stage_b(seq, B, K, T)
+    n_think = m.thinking.n
+    assert seq_out.shape == (B, n_think + T * per_vol, 2, 32)
+    assert regs is None                          # cascade_registers=False by default
+
+    start = n_think + K * per_vol
+    target_block_a = seq_out[:, start:start + per_vol]
+
+    seq_perturbed = seq.clone()
+    seq_perturbed[:, :per_vol] += 5.0             # perturb context volume 0 only
+    seq_out_b, _ = m._stage_b(seq_perturbed, B, K, T)
+    target_block_b = seq_out_b[:, start:start + per_vol]
+    assert not torch.allclose(target_block_a, target_block_b)
+
+
+def test_stage_b_cascade_registers_roundtrip():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], cascade_registers=True,
+                   image_size=[16, 16, 16])
+    B, K, T = 2, 2, 3
+    per_vol = m.compress_m + 1
+    seq = torch.randn(B, T * per_vol, 2, 32)
+    seq_out, regs = m._stage_b(seq, B, K, T)
+    assert regs.shape == (2, m.thinking.n, 32)
+    seq_out2, regs2 = m._stage_b(seq, B, K, T, cascade_regs=regs)
+    assert seq_out2.shape[1] == seq_out.shape[1] + m.thinking.n   # cascade rows prepended
