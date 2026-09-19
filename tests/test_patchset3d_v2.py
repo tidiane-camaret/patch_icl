@@ -40,19 +40,54 @@ def test_occupancy_shapes():
     assert pocc.shape == (2, 1, m.N, 1)
 
 
-def test_pool_all_native_resolution_and_value():
+def test_pool_all_native_resolution_matters():
     m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
-                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
+                   fourier_bands=4, compress_m=3, fine_stage=[1], image_size=[16, 16, 16])
     B, K, T = 1, 1, 2
-    S = m.encoder.fine_stage_size(16, 0)          # stage-0 native side for a 16^3 input
-    Cf = m.encoder.fine_stage_channels(0)
-    fine_finest = torch.full((B * T, Cf, S, S, S), 3.0)   # constant feature map
+    S = m.encoder.fine_stage_size(16, 1)          # stage-1 side: coarser than native 16
+    assert S < 16
+    Cf = m.encoder.fine_stage_channels(1)
+
+    # Feature map with real spatial structure: two halves along the D axis at different values.
+    fine_finest = torch.ones(B * T, Cf, S, S, S)
+    fine_finest[:, :, S // 2:] = 5.0
+
+    # A tiny, native-resolution foreground region sitting entirely in the LOW-value half, near
+    # the region boundary -- small enough that coarse (S-resolution) downsampling of the mask
+    # would blur it across the boundary into the HIGH-value half, while upsampling the FEATURE
+    # to native first (this task's implementation) keeps the mask exact.
     context_out = torch.zeros(B, K, 16, 16, 16)
-    context_out[:, :, :2, :2, :2] = 1.0            # a small 2^3 foreground corner
+    context_out[:, :, 6:7, :2, :2] = 1.0           # native slice just before the D-axis midpoint
+
     pool = m._pool_all(fine_finest, context_out, None, B, K, T)
     assert pool.shape == (B, T, 32)
-    # constant input -> after per-volume z-score the whole map is 0 everywhere (std=0 branch
-    # uses the 1e-8 floor), so the pooled *projection* is deterministic and identical for
-    # every volume regardless of mask shape/size -- this is what we can assert without
-    # depending on pool_proj's random init producing any particular non-zero value.
-    assert torch.allclose(pool[:, 0], pool[:, 1])
+
+    # Replicate the WRONG (coarse-mask-first) ordering this task must NOT match: downsample the
+    # mask to S first, then mask the still-coarse feature map, then reduce.
+    mask_coarse = torch.nn.functional.interpolate(
+        context_out.reshape(B * K, 1, 16, 16, 16).float(), size=(S, S, S),
+        mode="trilinear", align_corners=False).reshape(B, K, 1, S, S, S)
+    feat_for_wrong = fine_finest.reshape(B, T, Cf, S, S, S)[:, :K]
+    mu = feat_for_wrong.mean(dim=(-3, -2, -1), keepdim=True)
+    sig = feat_for_wrong.std(dim=(-3, -2, -1), keepdim=True) + 1e-8
+    feat_z = ((feat_for_wrong - mu) / sig).clamp(-10, 10)
+    num_wrong = (feat_z * mask_coarse).sum(dim=(-3, -2, -1))
+    den_wrong = mask_coarse.sum(dim=(-3, -2, -1)).clamp_min(1e-6)
+    pooled_wrong_raw = (num_wrong / den_wrong).squeeze(1)          # (B,Cf), pre-projection
+
+    # The CORRECT (native-upsample-first) raw pooled vector, computed the same way _pool_all
+    # does internally, for a like-for-like comparison before pool_proj's learned weights:
+    feat_native = torch.nn.functional.interpolate(
+        fine_finest.float(), size=(16, 16, 16), mode="trilinear", align_corners=False
+        ).reshape(B, T, Cf, 16, 16, 16)[:, :K]
+    mu2 = feat_native.mean(dim=(-3, -2, -1), keepdim=True)
+    sig2 = feat_native.std(dim=(-3, -2, -1), keepdim=True) + 1e-8
+    feat_z2 = ((feat_native - mu2) / sig2).clamp(-10, 10)
+    mask_native = context_out.reshape(B, K, 1, 16, 16, 16).float()
+    num_right = (feat_z2 * mask_native).sum(dim=(-3, -2, -1))
+    den_right = mask_native.sum(dim=(-3, -2, -1)).clamp_min(1e-6)
+    pooled_right_raw = (num_right / den_right).squeeze(1)
+
+    assert not torch.allclose(pooled_right_raw, pooled_wrong_raw, atol=1e-3), (
+        "native-resolution and coarse-resolution masking orders produced the same result -- "
+        "this test setup doesn't actually distinguish upsample-before-mask from mask-before-upsample")
