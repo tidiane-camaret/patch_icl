@@ -440,7 +440,44 @@ def build_model(cfg: DictConfig):
             "iris_ctx_layers": a.get("iris_ctx_layers", 2),
         }
         return PatchSet3D(**arch), name
-    raise ValueError(f"unknown model {name!r} (medverse | patchset3d)")
+    if name == "patchset3d_v2":
+        from src.models.patchset3d_v2 import PatchSetV2
+        a = cfg.arch
+        arch = {
+            "resolution": a.resolution, "enc_dims": list(a.enc_dims),
+            "e": a.e, "h": a.h, "l": a.l, "a": a.a,
+            "thinking_rows": a.thinking_rows, "residual_decay": a.residual_decay,
+            "fourier_bands": a.get("fourier_bands", 8),
+            "mask_patch_size": a.get("mask_patch_size", 1),
+            "mask_embed": a.get("mask_embed", "linear"),
+            "compress_m": a.get("compress_m", 32),
+            "compress_layers": a.get("compress_layers", 1),
+            "context_id_embed": a.get("context_id_embed", True),
+            "max_context": a.get("max_context", 16),
+            "cascade_registers": a.get("cascade_registers", False),
+            "image_size": list(cfg.data.image_size),
+            "encoder": a.get("encoder", "conv"),
+            "encoder_frozen": a.get("encoder_frozen", True),
+            "primus_sidecar": a.get("primus_sidecar", None),
+            "nnunet_ts_weights": a.get("nnunet_ts_weights", None),
+            "nnunet_ts_stages": a.get("nnunet_ts_stages", (2, 3, 4)),
+            "nnunet_ts_random_init": a.get("nnunet_ts_random_init", False),
+            "resenc_n_stages": a.get("resenc_n_stages", 5),
+            "plainconv_ts_n_stages": a.get("plainconv_ts_n_stages", 5),
+            "plainconv_ts_features_per_stage": (
+                list(a.plainconv_ts_features_per_stage)
+                if a.get("plainconv_ts_features_per_stage") is not None else None),
+            "encoder_input_norm": a.get("encoder_input_norm", None),
+            "encoder_stage": a.get("encoder_stage", None),
+            "encoder_native_grid": a.get("encoder_native_grid", False),
+            "encoder_spacing_aware": a.get("encoder_spacing_aware", False),
+            "encoder_precision": a.get("encoder_precision", "bf16"),
+            "fine_stage": (list(a.fine_stage) if isinstance(a.get("fine_stage", [0, 1]), ListConfig)
+                          else a.get("fine_stage", [0, 1])),
+            "decoder_dim": a.get("decoder_dim", 64),
+        }
+        return PatchSetV2(**arch), name
+    raise ValueError(f"unknown model {name!r} (medverse | patchset3d | patchset3d_v2)")
 
 
 class EncoderDrift:
@@ -919,7 +956,7 @@ def validate_mean(model, cfg, classes, loader=None, loss_fn=None):
     # patchset3d: predict == threshold(train_forward), so reuse the logits (one forward, no
     # separate predict pass) and run eval under bf16 (matches training, avoids recompiling the
     # compiled encoder/transformer between dtypes). Off for medverse to keep its val byte-identical.
-    fast_eval = cfg.get("model", "medverse") == "patchset3d"
+    fast_eval = cfg.get("model", "medverse") in ("patchset3d", "patchset3d_v2")
     # eval_autocast: bf16 autocast around the val forward(s). Defaults to fast_eval — on for
     # patchset3d (its val also reuses the bf16 train_forward logits), off for medverse so its
     # val/dice stays fp32-stable across epochs and vs the released benchmark. Set
@@ -1096,7 +1133,7 @@ def main(cfg: DictConfig) -> None:
             f"{val_split!r} split (or no subjects for val_classes). Set "
             f"train.val_split to an existing split (e.g. test).")
     model, model_name = build_model(cfg)
-    is_patchset = model_name == "patchset3d"
+    is_patchset = model_name in ("patchset3d", "patchset3d_v2")
     net = getattr(model, "model", model)
     if is_patchset:
         net.to(DEVICE)

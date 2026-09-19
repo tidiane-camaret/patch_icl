@@ -8912,3 +8912,42 @@ twice per forward. Only the main transformer's dense bi-axis attention (quadrati
 itself. Net: the skip is a real, correct optimization (confirmed `attn_ms=0`, spy-tested), but
 it removes one leg of a multi-leg step, not the step's bottleneck — `data`+`encode`+`bwd` (none
 of which shrink with `m`) dominate.
+
+## 2026-09-19 — PatchSetV2: clean Iris-style reimplementation (`src/models/patchset3d_v2.py`)
+
+Added `PatchSetV2`, a from-scratch Iris-style in-context 3D segmentation model, alongside
+(not replacing) `PatchSet3D`. `PatchSet3D`'s knob surface (`mask_slots`, `seq_compress`,
+`pool_token`, `iris_pixelshuffle_r`, `arch.decoder=iris`, ...) accreted incrementally as each
+Iris-paper idea was bolted on as an opt-in flag; `PatchSetV2` instead writes the resulting
+design as one minimal class with no legacy toggles, reusing `RowCrossAttention`/
+`TransformerEncoderStack`/`ThinkingRows` and the encoders as building blocks. `PatchSet3D`
+itself is unmodified except for one pure refactor: its encoder-selection `if`/`elif` was
+extracted into `build_encoder` (`src/models/encoders/factory.py`), shared by both classes so
+the ~70-line dispatch isn't duplicated.
+
+**Key architectural departure from the Iris paper**: Iris keeps task-representation
+construction (context-only) and query decoding as separate stages — the target volume never
+sits inside the same self-attention as the context set. `PatchSetV2` instead puts the target's
+own per-volume tokens through the identical shared self-attention as every context volume
+("Stage B") before decoding; the target isn't just a read-out query against a context-built
+task representation, it's a first-class participant in the same attention op. This was a
+deliberate simplification carried over from `PatchSet3D`'s existing design, not an oversight —
+see `docs/superpowers/specs/2026-09-19-patchset-v2-design.md` for the rationale.
+
+**Native-resolution foreground pooling (`pool_v`)**: per Iris's own ablation (Eq 2:
+`T_f = Pool(Upsample(F_s) ⊙ y_s)`), masking must happen AFTER upsampling features to full
+resolution, not before — this is the property credited for Iris's small-object Dice gain, not
+an incidental detail. `_pool_all` upsamples the finest requested fine-stage feature map to
+each volume's actual NATIVE `(D,H,W)` (never `R`, never the coarser fine-stage side `S`) before
+masking, for every volume (support and query alike), matching that ablation exactly. This is a
+real correctness fix relative to `PatchSet3D`: its `_iris_foreground_pool`'s docstring makes
+the same "mask after upsampling to full resolution" claim, but its actual code upsamples the
+support masks DOWN to the feature map's coarse `S` side and masks at that resolution — the
+opposite of what the docstring and the Iris ablation call for.
+
+Full design in `docs/superpowers/specs/2026-09-19-patchset-v2-design.md`, implementation plan
+in `docs/superpowers/plans/2026-09-19-patchset-v2-implementation.md`. Built task-by-task with a
+whole-branch final review at the end; that review's fix wave (train.py/common.py/eval.py
+`patchset3d_v2` dispatch wiring, an `_pool_all` bmm memory fix, `max_context` assert, test
+gaps, `build_encoder` comment restoration) is logged inline in the same commits, not as a
+separate entry. Not yet trained or evaluated.

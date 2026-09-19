@@ -258,8 +258,9 @@ def _assert_cascade_supported(cfg) -> None:
                 "consumer outside the cascade train loop, and would ship NativeCrop "
                 "dataclasses into the default stacking collate.")
         return
-    if cfg.get("model") not in ("patchset3d", "medverse"):
-        raise ValueError("data.cascade_spacings requires model=patchset3d or model=medverse.")
+    if cfg.get("model") not in ("patchset3d", "patchset3d_v2", "medverse"):
+        raise ValueError(
+            "data.cascade_spacings requires model=patchset3d, model=patchset3d_v2, or model=medverse.")
     if not d.get("loader_v2", False):
         raise ValueError("data.cascade_spacings requires data.loader_v2=true (v2 pipeline).")
     # nasalseg/flare22 (NativeGridProvider) are duck-type compatible with the cascade re-crop

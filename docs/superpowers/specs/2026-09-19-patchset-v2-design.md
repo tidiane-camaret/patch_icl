@@ -187,6 +187,15 @@ etc.). New experiment/model config files under `configs/experiment/3d/` and
    support `patchset_v2` (native-grid eval, checkpoint loading, etc.) — needs a pass once the
    class exists; not expected to need changes given the same `predict()`/`train_forward()`
    contract `PatchSet3D` already satisfies, but unverified.
+4. **Feature normalization before `img_embed`** — `PatchSet3D` always calls `_feat_norm`
+   (context/self/none per-channel z-score) before its own `img_embed`; `PatchSetV2` has no
+   equivalent anywhere in the tokenize path. This was an oversight during implementation, not
+   a deliberate simplification — flagged by the final whole-branch review
+   (2026-09-19). Needs a design decision (which mode, applied where — per-volume like
+   `_pool_all`'s existing z-score, or context-relative like `PatchSet3D`'s `self`/`context`
+   modes) before a real training run, since raw frozen-encoder features (e.g. `plainconv_ts`'s
+   704-channel multi-scale concat) currently go straight into `img_embed` and then into
+   `nn.MultiheadAttention` (which has no internal input normalization) unnormalized.
 
 ## Non-goals for this spec
 

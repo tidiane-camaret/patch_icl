@@ -192,28 +192,29 @@ def _build_model(cfg: DictConfig):
             model.compile_net()
             print("  Compiled Medverse net (eval.compile=true)")
         return model
-    if name == "patchset3d":
-        # PatchSet3D is used directly as the eval model (it provides .predict, the only
-        # method the shared eval loop needs). The architecture is rebuilt from the
+    if name in ("patchset3d", "patchset3d_v2"):
+        # PatchSet3D/PatchSetV2 are used directly as the eval model (they provide .predict,
+        # the only method the shared eval loop needs). The architecture is rebuilt from the
         # checkpoint's stored `arch` when present (new checkpoints), else from cfg.arch
-        # (re-supply the same model=patchset3d arch.* overrides used at training).
+        # (re-supply the same model=patchset3d[_v2] arch.* overrides used at training).
         from train import build_model
         if not cfg.eval.get("checkpoint"):
-            raise ValueError("eval.checkpoint is required for patchset3d")
+            raise ValueError(f"eval.checkpoint is required for {name}")
         ckpt = torch.load(cfg.eval.checkpoint, map_location=DEVICE, weights_only=False)
         arch = ckpt.get("arch")
         from omegaconf import open_dict
         with open_dict(cfg):
             # build_model dispatches on top-level cfg.model, which is unset unless the
-            # user passed +model=patchset3d — pin it so the arch-from-checkpoint path
-            # (eval.model=patchset3d only) still builds a PatchSet3D, not medverse.
-            cfg.model = "patchset3d"
+            # user passed +model=patchset3d[_v2] — pin it so the arch-from-checkpoint path
+            # (eval.model=patchset3d/patchset3d_v2 only) still builds the matching class,
+            # not medverse.
+            cfg.model = name
             if arch is not None:
                 cfg.arch = OmegaConf.create(arch)   # rebuild from the stored arch
             elif "arch" not in cfg:
                 raise ValueError(
                     "checkpoint has no stored arch (older run); re-supply the training "
-                    "arch, e.g. +model=patchset3d arch.l=2")
+                    f"arch, e.g. +model={name} arch.l=2")
             # feat_norm is weight-free -> allow an eval-time override on top of the stored
             # arch so one checkpoint sweeps context|self|none (older archs lack the key).
             fn = cfg.eval.get("feat_norm")
@@ -230,7 +231,7 @@ def _build_model(cfg: DictConfig):
         sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
         model.load_state_dict(sd)
         model.eval()
-        print(f"  Loaded PatchSet3D from {cfg.eval.checkpoint} (arch l={cfg.arch.l})")
+        print(f"  Loaded {name} from {cfg.eval.checkpoint} (arch l={cfg.arch.l})")
         return model
     if name == "totalsegmentator":
         # Context-free nnU-Net TotalSegmentator organ reference (Route B). No checkpoint: the
@@ -431,9 +432,9 @@ def main(cfg: DictConfig) -> None:
         # which is intentionally left untouched.
         from cascade import evaluate_cascade
         from train import model_output_is_prob
-        if model_name not in ("patchset3d", "medverse"):
-            raise ValueError(f"data.cascade_spacings eval requires eval.model=patchset3d "
-                             f"or medverse (got {model_name!r}).")
+        if model_name not in ("patchset3d", "patchset3d_v2", "medverse"):
+            raise ValueError(f"data.cascade_spacings eval requires eval.model=patchset3d, "
+                             f"patchset3d_v2, or medverse (got {model_name!r}).")
         if sweep or locator or cascade:
             raise ValueError("data.cascade_spacings (v2 cascade eval) is mutually exclusive "
                              "with eval.spacing_sweep / spacing_locator / spacing_cascade.")
