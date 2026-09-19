@@ -319,3 +319,28 @@ def test_forward_native_resize_when_decode_grid_not_native():
     img, cin, cout = _dummy_batch(S=16, K=2)
     out = m(img, context_in=cin, context_out=cout)
     assert out["final_logit"].shape == (2, 1, 16, 16, 16)
+
+
+def test_build_model_dispatches_patchset_v2():
+    import importlib.util
+    from omegaconf import OmegaConf
+
+    spec = importlib.util.spec_from_file_location(
+        "experiments_3d_train", "experiments/3d/train.py")
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+
+    cfg = OmegaConf.create({
+        "model": "patchset3d_v2",
+        "arch": {
+            "resolution": 4, "enc_dims": [8, 8, 8], "e": 32, "h": 64, "l": 2, "a": 2,
+            "thinking_rows": 2, "residual_decay": 0.95, "fourier_bands": 4,
+            "compress_m": 3, "compress_layers": 1, "fine_stage": [0], "decoder_dim": 16,
+            "encoder": "conv",
+        },
+        "data": {"image_size": [16, 16, 16]},
+    })
+    model, name = train_mod.build_model(cfg)
+    assert name == "patchset3d_v2"
+    from src.models.patchset3d_v2 import PatchSetV2
+    assert isinstance(model, PatchSetV2)

@@ -1,0 +1,35 @@
+# @package _global_
+# m3_patchset_v2 — PatchSetV2, the clean Iris-style reimplementation. Selected as a Hydra
+# group: `model=m3_patchset_v2`. See docs/superpowers/specs/2026-09-19-patchset-v2-design.md.
+# Encoder-forward keys are NOT here -- pick an `encoder` group (e.g. encoder=e4_plainconv_ts).
+model: patchset3d_v2
+
+arch:
+  l: 4                          # Stage B transformer layers
+  e: 768
+  h: 3072
+  a: 12
+  thinking_rows: 8
+  residual_decay: 0.95
+  fourier_bands: 8
+  mask_patch_size: 1             # single-voxel occupancy per cell -- pool_v handles
+                                  # high-resolution mask detail separately (native-res pooling)
+  mask_embed: linear
+  compress_m: 32                 # Stage A tokens per volume
+  compress_layers: 1
+  context_id_embed: true         # kept for future multi-context (K>1) support
+  max_context: 16
+  cascade_registers: false
+  fine_stage: [0, 1]             # feeds both pool_v and the decode skip pyramid
+  decoder_dim: 64
+
+train:
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 5
+  loss: bce_dice
+  dice_weight: 1.0
+  checkpoint: null
+  resume_weights_only: false
