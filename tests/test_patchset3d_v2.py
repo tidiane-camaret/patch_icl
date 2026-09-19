@@ -158,3 +158,7 @@ def test_stage_b_cascade_registers_roundtrip():
     assert regs.shape == (2, m.thinking.n, 32)
     seq_out2, regs2 = m._stage_b(seq, B, K, T, cascade_regs=regs)
     assert seq_out2.shape[1] == seq_out.shape[1] + m.thinking.n   # cascade rows prepended
+    assert regs2.shape == (2, m.thinking.n, 32)
+    assert not torch.allclose(regs2, regs), (
+        "regs2 should reflect genuine NEW post-attention state for this level, not a "
+        "stale pass-through of the mem block fed in via cascade_regs")

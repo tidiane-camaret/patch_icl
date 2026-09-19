@@ -255,5 +255,6 @@ class PatchSetV2(nn.Module):
         # `sep` is unused downstream when full_attn=True (see TransformerEncoderLayer) --
         # passed as 0 for clarity that it has no effect here.
         seq = self.transformer(seq, 0, full_attn=True)
-        regs = seq[:, :self.thinking.n].mean(dim=2) if self.cascade_registers else None
+        regs = (seq[:, n_extra:n_extra + self.thinking.n].mean(dim=2)
+                if self.cascade_registers else None)
         return seq, regs
