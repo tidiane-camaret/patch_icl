@@ -22,13 +22,18 @@ artificially-equalized one:
   real training run of both classes in this repo, and `evaluate.py::_eval_autocast`'s own
   bf16-CUDA-autocast convention.
 
-Forcing all three into one precision was considered and dropped: `PatchSet3D`/`PatchSetV2`'s
-encoder classes (`plainconv_ts.py`) apply their own **internal** bf16 autocast unconditionally
-at construction time (`encoder_precision=bf16`), independent of any outer autocast context — so
-externally disabling autocast to force fp32 doesn't actually make them fp32; it just creates a
-dtype mismatch between the (still-bf16) encoder output and the (now fp32) downstream layers.
-A genuine iso-precision comparison would need separate `encoder_precision=fp32` model instances,
-which is out of scope for this benchmark.
+Forcing all three into one precision was considered and mostly dropped: `PatchSet3D`/
+`PatchSetV2`'s encoder classes (`plainconv_ts.py`) apply their own **internal** bf16 autocast
+unconditionally at construction time (`encoder_precision=bf16`), independent of any outer
+autocast context — so externally disabling autocast to force fp32 doesn't actually make them
+fp32; it just creates a dtype mismatch between the (still-bf16) encoder output and the (now
+fp32) downstream layers. A genuine fp32 comparison for these two would need separate
+`encoder_precision=fp32` model instances, out of scope here.
+
+`MedverseModel` has no such internal autocast, so the reverse direction — externally wrapping
+it in bf16 even though it was never trained/validated there — works cleanly with no dtype
+conflicts. Added as a supplementary data point (not the headline "fair" number) below, purely
+to show medverse's own bf16 speed potential; its *accuracy* under bf16 was not checked.
 
 ## Architectures benchmarked (each model's actual real-run configuration)
 
@@ -40,11 +45,14 @@ which is out of scope for this benchmark.
 
 ## Results
 
-| model | params | GFLOPs (predict) | inference (native precision) | peak memory |
-|---|---:|---:|---:|---:|
-| medverse | 71.1M | 2362.6 | 68.9 ms (fp32) | 3.30 GB |
-| patchset3d (97/99, decoder=iris) | 71.9M | not measurable* | 36.4 ms (bf16) | 3.36 GB |
-| patchset3d_v2 (101, mask8_wide) | 67.9M | 1190.5 [encoder 804.5, transformer 36.9, other 349.1] | 36.6 ms (bf16) | 2.63 GB |
+| model | params | GFLOPs (predict) | inference (native precision) | peak memory (native) | bf16 (supplementary)† |
+|---|---:|---:|---:|---:|---:|
+| medverse | 71.1M | 2362.6 | 68.3 ms (fp32) | 3.30 GB | 44.1 ms, 2.32 GB |
+| patchset3d (97/99, decoder=iris) | 71.9M | not measurable* | 36.4 ms (bf16) | 3.36 GB | — (already native) |
+| patchset3d_v2 (101, mask8_wide) | 67.9M | 1190.5 [encoder 804.5, transformer 36.9, other 349.1] | 36.6 ms (bf16) | 2.63 GB | — (already native) |
+
+† medverse's bf16 column is an external `torch.autocast` wrap, not its trained precision —
+speed/memory data point only, accuracy under bf16 not checked. See "What 'fair' means here".
 
 \* `FlopCounterMode` raises `AssertionError: Expected gradient function to be set` for this
 specific architecture — root-caused (not a benchmark bug, see below). Given `patchset3d`'s
@@ -74,8 +82,12 @@ not something introduced by this benchmark — fixing it (if wanted) would mean 
 ## Reading the numbers
 
 - **Inference time**: `patchset3d` and `patchset3d_v2` are effectively tied (36.4 vs 36.6 ms) and
-  both ~1.9x faster than medverse (68.9 ms) at their respective native precisions — expected,
-  since medverse runs fp32 while both patchset variants run bf16.
+  both ~1.9x faster than medverse (68.3 ms) at their respective native precisions — expected,
+  since medverse runs fp32 while both patchset variants run bf16. Under the supplementary bf16
+  wrap, medverse drops to 44.1 ms (peak memory 3.30→2.32 GB too) — a real ~1.55x speedup from
+  precision alone (68.3/44.1), narrowing the remaining gap to the patchset variants' own bf16
+  numbers to ~1.2x (44.1/36.5) — most of medverse's native-precision speed disadvantage here
+  traces to the fp32 vs bf16 choice, not the architecture itself.
 - **Peak memory**: `patchset3d_v2` is the lightest of the three (2.63 GB vs 3.30-3.36 GB) despite
   having a wider bottleneck encoder stage (768ch) than `patchset3d`'s multi-scale concat
   (256+512=768ch too, same total) — consistent with `patchset3d_v2`'s architecture avoiding the

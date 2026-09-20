@@ -127,7 +127,12 @@ def time_predict(model, img, ctx_in, ctx_out, autocast: bool):
     return ms, peak, tuple(out.shape)
 
 
-def bench_model(name, build_fn, native_autocast: bool):
+def bench_model(name, build_fn, native_autocast: bool, extra_bf16: bool = False):
+    """extra_bf16: also time an externally-bf16-autocast-wrapped pass, IN ADDITION to the
+    native-precision one. Only meaningful for models with no internal autocast of their own
+    (medverse) -- patchset3d/v2's encoders apply their own bf16 autocast unconditionally at
+    construction time, so external wrapping there is already a no-op (they're bf16 natively)
+    and forcing fp32 externally instead crashes (see module docstring)."""
     print(f"\n{'='*70}\n{name}\n{'='*70}")
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -151,12 +156,19 @@ def bench_model(name, build_fn, native_autocast: bool):
     print(f"Inference [{prec_native}]: {ms_native:7.1f} ms   peak {peak_native:5.2f} GB   "
           f"out {out_shape}")
 
+    ms_bf16 = peak_bf16 = None
+    if extra_bf16:
+        ms_bf16, peak_bf16, _ = time_predict(model, img, ctx_in, ctx_out, autocast=True)
+        print(f"Inference [bf16 (extra, not the trained precision)]: {ms_bf16:7.1f} ms   "
+              f"peak {peak_bf16:5.2f} GB")
+
     del model, net
     torch.cuda.empty_cache()
     return dict(name=name, params_total=total, params_trainable=trainable,
                gflops=flops["total"], gflops_encoder=flops["encoder"],
                gflops_transformer=flops["transformer"], gflops_other=flops["other"],
                ms_native=ms_native, peak_native_gb=peak_native, native_precision=prec_native,
+               ms_bf16_extra=ms_bf16, peak_bf16_extra_gb=peak_bf16,
                out_shape=list(out_shape))
 
 
@@ -165,17 +177,18 @@ def main():
     print(f"Conditions: B=1, K={K}, image_size={IMAGE_SIZE}, {REPS} reps ({WARMUP} warmup)")
 
     results = [
-        bench_model("medverse", build_medverse, native_autocast=False),
+        bench_model("medverse", build_medverse, native_autocast=False, extra_bf16=True),
         bench_model("patchset3d (97/99, decoder=iris)", build_patchset3d, native_autocast=True),
         bench_model("patchset3d_v2 (101, mask8_wide)", build_patchset_v2, native_autocast=True),
     ]
 
     print(f"\n{'='*90}\nSUMMARY (B=1, K={K}, {IMAGE_SIZE[0]}^3)\n{'='*90}")
-    hdr = f"{'model':<34}{'params':>9}{'GFLOPs':>10}{'native ms':>12}{'peak GB':>9}"
+    hdr = f"{'model':<34}{'params':>9}{'GFLOPs':>10}{'native ms':>12}{'peak GB':>9}{'bf16 ms':>10}"
     print(hdr)
     for r in results:
+        bf16 = f"{r['ms_bf16_extra']:.1f}" if r["ms_bf16_extra"] is not None else "-"
         print(f"{r['name']:<34}{human(r['params_total']):>9}{r['gflops']:>10.1f}"
-              f"{r['ms_native']:>12.1f}{r['peak_native_gb']:>9.2f}")
+              f"{r['ms_native']:>12.1f}{r['peak_native_gb']:>9.2f}{bf16:>10}")
 
     out_dir = Path(__file__).resolve().parent
     with open(out_dir / "results.json", "w") as f:
