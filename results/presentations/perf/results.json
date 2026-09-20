@@ -1,0 +1,71 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "torch": "2.12.1+cu130",
+  "conditions": {
+    "B": 1,
+    "K": 1,
+    "image_size": [
+      128,
+      128,
+      128
+    ],
+    "reps": 20,
+    "warmup": 5
+  },
+  "results": [
+    {
+      "name": "medverse",
+      "params_total": 71054793,
+      "params_trainable": 71050569,
+      "gflops": 2362.564820992,
+      "gflops_encoder": null,
+      "gflops_transformer": null,
+      "gflops_other": null,
+      "ms_native": 68.8507203492918,
+      "peak_native_gb": 3.3040384,
+      "native_precision": "fp32 (native)",
+      "out_shape": [
+        1,
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "name": "patchset3d (97/99, decoder=iris)",
+      "params_total": 71913192,
+      "params_trainable": 71913192,
+      "gflops": 0.0,
+      "gflops_encoder": null,
+      "gflops_transformer": null,
+      "gflops_other": null,
+      "ms_native": 36.42219510074938,
+      "peak_native_gb": 3.359925248,
+      "native_precision": "bf16 (native)",
+      "out_shape": [
+        1,
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "name": "patchset3d_v2 (101, mask8_wide)",
+      "params_total": 67943312,
+      "params_trainable": 67943312,
+      "gflops": 1190.463463424,
+      "gflops_encoder": 804.501061632,
+      "gflops_transformer": 36.896047104,
+      "gflops_other": 349.06635468800016,
+      "ms_native": 36.562555500131566,
+      "peak_native_gb": 2.6258432,
+      "native_precision": "bf16 (native)",
+      "out_shape": [
+        1,
+        128,
+        128,
+        128
+      ]
+    }
+  ]
+}
