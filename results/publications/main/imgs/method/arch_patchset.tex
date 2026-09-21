@@ -1,0 +1,71 @@
+\documentclass[tikz,border=4pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  % title
+  \node[anchor=west,font=\Large] at (0,7.6) {Ours \textnormal{: bi-axial image/label attention}};
+
+  % Three parallel lanes, all token grids at the same x (6.05) so the
+  % three token streams read as aligned right before attention:
+  %   target (image only)      y:  4.00-6.50, center 5.25
+  %   context image ($I^C$)    y:  1.30-2.50, center 1.90
+  %   context mask ($M^C$)     y: -0.60-0.60, center 0.00
+
+  % ---- lane 1: target image ----
+  \archvolcube{0}{4}{1.6}{2.5}{archTargetGreen}{ct}{$I^T$}
+  \archarrow{(1.7,5.25)}{(2.35,5.25)}{archArrowPale}
+  \archfunnel{2.45}{4}{2.5}{1.1}{0.6}{1}{archEncGray}{Encoder}
+  \archarrow{(3.6,5.25)}{(4.15,5.25)}{archArrowPale}
+  \archfeatcube{4.25}{4.4}{1.0}{1.7}{archTargetGreen}{$F^T$}
+  \archarrow{(5.35,5.25)}{(5.95,5.25)}{archArrowPale}
+  \archtokengrid{6.05}{4.5}{3}{2}{0.5}{archTargetGreen}
+
+  % ---- lane 3: context mask -- own block, patch-embedded separately,
+  % and fed to attention as its own token stream (no feature-volume
+  % stage: patch embedding is a single projection, not a deep
+  % encoder). Kept 0.7 below lane 2 (not just the 0.1 baseline gap):
+  % the $I^C$ label below lane 2 is plain black text, and anything
+  % closer overlapped this cube's solid-black mask content, making the
+  % label unreadable regardless of draw order. ----
+  \archvolcube{0}{-0.60}{1.6}{1.20}{archMaskGold}{predmask}{$M^C$}
+  \archarrow{(1.7,0.00)}{(2.35,0.00)}{archArrowPale}
+  \archfunnel{2.45}{-0.60}{1.20}{0.7}{0.5}{1}{archMaskGold}{Embed}
+  \archarrow{(3.25,0.00)}{(5.95,0.00)}{archArrowPale}
+  \archtokengrid{6.05}{-0.75}{3}{2}{0.5}{archMaskGold}
+
+  % ---- lane 2: context image (mask no longer overlaid on it) ----
+  \archvolcube{0}{1.30}{1.6}{1.20}{archContextPink}{ct}{$I^C$}
+  \archarrow{(1.7,1.90)}{(2.35,1.90)}{archArrowPale}
+  \archfunnel{2.45}{1.30}{1.20}{1.1}{0.6}{1}{archEncGray}{Encoder}
+  \archarrow{(3.6,1.90)}{(4.15,1.90)}{archArrowPale}
+  \archfeatcube{4.25}{1.55}{1.0}{0.70}{archContextPink}{$F^C$}
+  \archarrow{(5.35,1.90)}{(5.95,1.90)}{archArrowPale}
+  \archtokengrid{6.05}{1.15}{3}{2}{0.5}{archContextPink}
+
+  % shared image-encoder weights (target and context images use the
+  % same encoder; the mask path above does not share these weights)
+  \draw[black!55,thin,dashed] (2.45,2.5) -- (2.45,4);
+  \node[align=center,font=\scriptsize,black!55] at (2.0,3.25) {shared\\weights};
+
+  % ---- bi-axial attention block: all three token lanes converge here ----
+  \archarrow{(7.15,5.25)}{(7.50,5.25)}{archArrowPale}
+  \archarrow{(7.15,1.90)}{(7.50,1.90)}{archArrowPale}
+  \archarrow{(7.15,0.00)}{(7.50,0.00)}{archArrowPale}
+  \draw[archAttnBlue!70!black,thin,dashed] (7.50,-0.15) rectangle ++(1.80,5.55);
+  \archtokengrid{7.65}{0.25}{10}{3}{0.5}{archAttnBlue}
+  \node[align=center] at (8.40,5.70) {bi-axial\\attention};
+
+  % ---- output (target stream only) ----
+  \archarrow{(9.40,5.25)}{(9.95,5.25)}{archArrowPale}
+  \archtokengrid{10.05}{4.5}{3}{2}{0.5}{archTargetGreen}
+  \archarrow{(11.15,5.25)}{(11.75,5.25)}{archArrowPale}
+  \archfunnel{11.85}{4}{2.5}{1.1}{0.6}{-1}{archEncGray}{Decoder}
+  \archarrow{(13.05,5.25)}{(13.55,5.25)}{archArrowPale}
+  \archvolcube{13.65}{4}{1.6}{2.5}{archTargetGreen}{predmask}{$M^T_{\mathrm{pred}}$}
+
+\end{tikzpicture}
+\end{document}
