@@ -25,6 +25,10 @@ arch:
   feat_norm: context             # per-channel z-score before img_embed: context | self | none
   # img_embed_mlp is NOT set here -- pick it up from the encoder group (e.g.
   # encoder=e4_plainconv_ts sets arch.img_embed_mlp: true) the same way PatchSet3D does.
+  # Rounds of bidirectional cross-attention between T_tok (m-scale) and F_q (N-scale) in
+  # _decode (DecodeCrossBlock, pfn_seg_2d.py) -- 1 reproduces the original single-round Eq5.
+  # See docs/logs.md 2026-09-20 "scale the Fq<->T_tok cross-attention".
+  decode_layers: 1
 
 train:
   optimizer: adamw

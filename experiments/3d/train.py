@@ -477,6 +477,7 @@ def build_model(cfg: DictConfig):
             "decoder_dim": a.get("decoder_dim", 64),
             "img_embed_mlp": a.get("img_embed_mlp", False),
             "feat_norm": a.get("feat_norm", "context"),
+            "decode_layers": a.get("decode_layers", 1),
         }
         return PatchSetV2(**arch), name
     raise ValueError(f"unknown model {name!r} (medverse | patchset3d | patchset3d_v2)")

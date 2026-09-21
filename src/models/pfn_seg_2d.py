@@ -172,6 +172,54 @@ class LowerPrecisionRMSNorm(nn.RMSNorm):
         return super().forward(x)
 
 
+class MaskConvEmbedV2(nn.Module):
+    """p³ occupancy tile -> e via strided Conv3d local feature extraction, WITHOUT the global
+    average-pool `MaskConvEmbed` (patchset3d.py) uses before its final projection.
+
+    That pool is provably lossy: AdaptiveAvgPool3d(1) computes sum/N over the final s³ spatial
+    cells, which is permutation-invariant BY CONSTRUCTION -- two feature maps that differ only
+    in WHICH of the final s³ cells holds a given value produce IDENTICAL pooled output,
+    regardless of the conv weights (confirmed empirically, docs/logs.md 2026-09-20 "mask_embed
+    expressiveness"). That's exactly the kind of within-cell positional detail
+    arch.mask_patch_size>1 exists to preserve.
+
+    This variant keeps the same strided-conv front end (same translation-equivariant local
+    pattern detection / parameter sharing PatchSet3D's MaskConvEmbed has) but flattens the
+    final s×s×s×co feature grid and feeds the FULL vector to the projection instead of
+    pooling it first -- the read-out weight matrix can assign an independent weight to every
+    remaining spatial position, the same guarantee nn.Linear(p³,e) has over the raw input.
+    Not a hard guarantee of "exactly as expressive as Linear" for adversarial inputs (the
+    strided convs still do a real, learned p³->s³·co dimensionality reduction upstream), but
+    it removes the one structurally-guaranteed loss -- and for p=8 the flattened width (256)
+    is actually smaller than the raw p³ (512), so the final Linear ends up CHEAPER than the
+    plain-Linear(p³,e) path, not more expensive.
+
+    v2-only: PatchSet3D's own MaskConvEmbed is left untouched (no v1 checkpoint depends on
+    this class); only PatchSetV2's arch.mask_embed="conv" uses this."""
+
+    def __init__(self, p: int, e: int, base_ch: int = 16, groups: int = 4):
+        super().__init__()
+        self.p = p
+        convs, ci, co, s = [], 1, base_ch, p
+        while s > 2:
+            convs.append(nn.Sequential(
+                nn.Conv3d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(min(groups, co), co),
+                nn.LeakyReLU(0.1, inplace=True),
+            ))
+            ci, co, s = co, co * 2, (s + 1) // 2
+        self.convs = nn.Sequential(*convs)
+        self.final_ch = ci if convs else 1
+        self.final_s = s
+        self.proj = nn.Linear(self.final_ch * self.final_s ** 3, e)
+
+    def forward(self, occ: torch.Tensor) -> torch.Tensor:
+        *lead, _ = occ.shape                              # (..., p³) -> (..., e)
+        x = self.convs(occ.reshape(-1, 1, self.p, self.p, self.p))
+        x = x.flatten(1)
+        return self.proj(x).reshape(*lead, -1)
+
+
 class ThinkingRows(nn.Module):
     """Prepend n learnable row embeddings broadcast across all patch positions."""
     def __init__(self, n: int, e: int):
@@ -324,6 +372,36 @@ class RowCrossAttention(nn.Module):
 
         # -- MLP --
         return q_in + self.mlp(self.norm_mlp(q_in))
+
+
+class DecodeCrossBlock(nn.Module):
+    """One round of bidirectional cross-attention between a small task-token set T (m-scale,
+    e.g. PatchSetV2's compress_m+1 rows) and a large per-cell grid F (N=R^3 rows): T reads F,
+    then F reads the UPDATED T (sequential, not simultaneous -- see docs/methods/iris.md's
+    Eq 5 and the fidelity discussion in docs/logs.md 2026-09-20), then each side gets its own
+    MLP. Stacking L of these (PatchSetV2's arch.decode_layers) lets F accumulate context over
+    several hops before the conv decoder -- mirroring PatchSet3D's fine_filter decode getting
+    its query tokens from _attn's l dense self-attention layers, but staying m-scale per hop
+    (O(N*m), never O(N*N) -- see the R^3-vs-m benchmark, docs/logs.md 2026-09-20)."""
+
+    def __init__(self, e: int, a: int, h: int):
+        super().__init__()
+        self.t2f = nn.MultiheadAttention(e, a, batch_first=True)
+        self.f2t = nn.MultiheadAttention(e, a, batch_first=True)
+        self.mlp_t = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
+        self.mlp_f = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
+        self.norm_t1 = LowerPrecisionRMSNorm(e)
+        self.norm_f1 = LowerPrecisionRMSNorm(e)
+        self.norm_t2 = LowerPrecisionRMSNorm(e)
+        self.norm_f2 = LowerPrecisionRMSNorm(e)
+
+    def forward(self, T: torch.Tensor, F: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """T (B,r_t,e), F (B,r_f,e) -> updated (T,F), same shapes."""
+        T = T + self.t2f(self.norm_t1(T), F, F)[0]
+        F = F + self.f2t(self.norm_f1(F), T, T)[0]
+        T = T + self.mlp_t(self.norm_t2(T))
+        F = F + self.mlp_f(self.norm_f2(F))
+        return T, F
 
 
 class TransformerEncoderStack(nn.Module):

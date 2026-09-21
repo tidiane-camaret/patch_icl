@@ -1,0 +1,36 @@
+# @package _global_
+# 102_patchset_v2_decode_cross — 101_patchset_v2_mask8_wide + arch.decode_layers=3.
+#
+# Context walkthrough this session (docs/logs.md 2026-09-20) traced how little of Stage B's
+# rich, multi-layer context attention actually reaches _decode's conv up-path input `x`:
+# F_q (the target's raw N=R^3 grid) never goes through Stage B's dense self-attention at all
+# -- it's reintroduced only via a SINGLE cross-attention hop into the (already m-scale
+# compressed) T_tok at decode time. Contrast with PatchSet3D's default (non-iris)
+# fine_filter decode, whose query tokens come straight out of l=4 layers of dense
+# full-resolution self-attention (m1.yaml) -- much richer context exposure before the
+# decoder's own input is built.
+#
+# Fix: arch.decode_layers=3 stacks DecodeCrossBlock (pfn_seg_2d.py) three deep -- T_tok and
+# F_q now exchange 3 rounds of bidirectional cross-attention (+ per-side MLP each round)
+# before `x = token_proj(F_q)...` starts the conv up-path, instead of 1. Stays m-scale per
+# round (O(N*m), not O(N*N) -- the R^3-vs-m benchmark, same doc entry, is why this is cheap:
+# self.transformer's own m-scale Stage B costs ~0.7ms vs. patchset3d's real R^3 self-attention
+# at ~13.4ms for ONE pass).
+#
+# This restructures iris_t2f/iris_f2t into decode_cross.* in the state dict -- warm-starting
+# from 101's checkpoint needs +train.checkpoint_allow_partial=true (drops only that piece).
+#
+#   python experiments/3d/train.py experiment=102_patchset_v2_decode_cross \
+#     arch.compress_m=128 \
+#     train.checkpoint=<a 101 best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - 101_patchset_v2_mask8_wide
+  - _self_
+
+arch:
+  decode_layers: 3
+
+wandb:
+  name: 102_patchset_v2_decode_cross

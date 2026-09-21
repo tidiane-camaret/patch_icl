@@ -207,8 +207,8 @@ def test_decode_shape_and_backward():
     assert logit.shape == (B, 1, S, S, S)          # stage-0 side == native (16) for a 16^3 input
     logit.mean().backward()
     assert T_tok.grad is not None and F_q.grad is not None
-    assert m.iris_t2f.out_proj.weight.grad is not None
-    assert m.iris_f2t.out_proj.weight.grad is not None
+    assert m.decode_cross[0].t2f.out_proj.weight.grad is not None
+    assert m.decode_cross[0].f2t.out_proj.weight.grad is not None
 
 
 def test_forward_end_to_end_shape():
@@ -465,3 +465,113 @@ def test_feat_norm_rejects_unknown_mode():
         PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
                   feat_norm="bogus")
+
+
+def test_decode_layers_default_is_one_block():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16])
+    assert len(m.decode_cross) == 1
+
+
+def test_decode_layers_stacks_requested_depth():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   decode_layers=3)
+    assert len(m.decode_cross) == 3
+
+
+def test_decode_layers_rejects_zero():
+    import pytest
+    with pytest.raises(AssertionError):
+        PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                  decode_layers=0)
+
+
+def test_decode_layers_all_blocks_receive_gradient():
+    """A bug that only wired up the first/last block into the forward pass (e.g. a loop that
+    accidentally re-ran block[0] L times, or dropped blocks after the first) would still pass
+    a shape check but leave later blocks' params without gradient -- catch it directly."""
+    torch.manual_seed(0)
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                   image_size=[16, 16, 16], decode_layers=3)
+    B = 2
+    per_vol = m.compress_m + 1
+    T_tok = torch.randn(B, per_vol, 32, requires_grad=True)
+    F_q = torch.randn(B, m.N, 32, requires_grad=True)
+    S = m.encoder.fine_stage_size(16, 0)
+    fine = (torch.randn(B, m.encoder.fine_stage_channels(0), S, S, S),)
+    logit = m._decode(T_tok, F_q, fine, B)
+    logit.mean().backward()
+    for i, block in enumerate(m.decode_cross):
+        assert block.t2f.out_proj.weight.grad is not None, f"decode_cross[{i}].t2f ungraded"
+        assert block.f2t.out_proj.weight.grad is not None, f"decode_cross[{i}].f2t ungraded"
+        assert block.mlp_t[0].weight.grad is not None, f"decode_cross[{i}].mlp_t ungraded"
+        assert block.mlp_f[0].weight.grad is not None, f"decode_cross[{i}].mlp_f ungraded"
+
+
+def test_decode_layers_changes_output_vs_single_layer():
+    torch.manual_seed(0)
+    common = dict(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                 fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                 image_size=[16, 16, 16])
+    m1 = PatchSetV2(decode_layers=1, **common)
+    m1.eval()
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out1 = m1(img, context_in=cin, context_out=cout)["final_logit"]
+
+    torch.manual_seed(0)
+    m3 = PatchSetV2(decode_layers=3, **common)
+    m3.eval()
+    out3 = m3(img, context_in=cin, context_out=cout)["final_logit"]
+    assert out1.shape == out3.shape
+    assert not torch.allclose(out1, out3)
+
+
+def test_mask_embed_conv_uses_mask_conv_embed_v2():
+    from src.models.pfn_seg_2d import MaskConvEmbedV2
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   mask_patch_size=8, mask_embed="conv")
+    assert isinstance(m.mask_embed, MaskConvEmbedV2)
+
+
+def test_mask_embed_linear_uses_plain_linear():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], image_size=[16, 16, 16],
+                   mask_patch_size=8, mask_embed="linear")
+    assert isinstance(m.mask_embed, torch.nn.Linear)
+
+
+def test_mask_embed_conv_end_to_end_forward():
+    m = PatchSetV2(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fourier_bands=4, compress_m=3, fine_stage=[0], decoder_dim=16,
+                   image_size=[16, 16, 16], mask_patch_size=8, mask_embed="conv")
+    img, cin, cout = _dummy_batch(S=16, K=2)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 16, 16, 16)
+
+
+def test_build_model_dispatches_patchset_v2_decode_layers():
+    import importlib.util
+    from omegaconf import OmegaConf
+
+    spec = importlib.util.spec_from_file_location(
+        "experiments_3d_train", "experiments/3d/train.py")
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+
+    cfg = OmegaConf.create({
+        "model": "patchset3d_v2",
+        "arch": {
+            "resolution": 4, "enc_dims": [8, 8, 8], "e": 32, "h": 64, "l": 2, "a": 2,
+            "thinking_rows": 2, "residual_decay": 0.95, "fourier_bands": 4,
+            "compress_m": 3, "compress_layers": 1, "fine_stage": [0], "decoder_dim": 16,
+            "encoder": "conv", "decode_layers": 3,
+        },
+        "data": {"image_size": [16, 16, 16]},
+    })
+    model, name = train_mod.build_model(cfg)
+    assert name == "patchset3d_v2"
+    assert len(model.decode_cross) == 3

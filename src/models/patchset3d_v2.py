@@ -1,19 +1,20 @@
 """PatchSetV2: clean Iris-style in-context 3D segmentation.
 
 See docs/superpowers/specs/2026-09-19-patchset-v2-design.md for the full design. Reuses
-RowCrossAttention / TransformerEncoderStack / ThinkingRows from pfn_seg_2d.py and the
-encoder classes via build_encoder, but is a fresh, minimal class -- not another branch on
-PatchSet3D's own accreted knob surface.
+RowCrossAttention / DecodeCrossBlock / TransformerEncoderStack / ThinkingRows from
+pfn_seg_2d.py and the encoder classes via build_encoder, but is a fresh, minimal class --
+not another branch on PatchSet3D's own accreted knob surface.
 
 Per forward call: target volume (image + prior/prediction mask) + K context volumes
 (image + real GT mask), T = K+1 total. Every volume is tokenized, foreground-pooled at
 native resolution, and compressed to `compress_m` tokens (Stage A, weight-shared across
 volumes) via the same RowCrossAttention arch.seq_compress already uses in PatchSet3D. All
 volumes' compressed sequences run through one shared self-attention stack (Stage B). The
-target's own post-Stage-B tokens are Iris's task tokens T; they cross-attend (Eq 5) against
-the target's raw, never-compressed per-cell grid, and a conv up-path with encoder-pyramid
-skips (Eq 6) produces the final logits. No decompression step exists -- the target's raw
-grid was never discarded in the first place.
+target's own post-Stage-B tokens are Iris's task tokens T; they cross-attend (Eq 5,
+`arch.decode_layers` rounds via DecodeCrossBlock) against the target's raw,
+never-compressed per-cell grid, and a conv up-path with encoder-pyramid skips (Eq 6)
+produces the final logits. No decompression step exists -- the target's raw grid was
+never discarded in the first place.
 """
 
 import torch
@@ -21,9 +22,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.encoders.factory import build_encoder
-from src.models.patchset3d import MaskConvEmbed, _ConvNormAct, _down_to, _mask_tiles_3d
+from src.models.patchset3d import _ConvNormAct, _down_to, _mask_tiles_3d
 from src.models.patchset_pfn import FourierPositionalEncoding
-from src.models.pfn_seg_2d import RowCrossAttention, ThinkingRows, TransformerEncoderStack
+from src.models.pfn_seg_2d import (DecodeCrossBlock, MaskConvEmbedV2, RowCrossAttention,
+                                   ThinkingRows, TransformerEncoderStack)
 
 
 class PatchSetV2(nn.Module):
@@ -64,6 +66,7 @@ class PatchSetV2(nn.Module):
         decoder_dim: int = 64,
         img_embed_mlp: bool = False,
         feat_norm: str = "context",
+        decode_layers: int = 1,
     ):
         super().__init__()
         self.resolution = resolution
@@ -132,7 +135,10 @@ class PatchSetV2(nn.Module):
         self.img_embed = (nn.Sequential(nn.Linear(oc, oc), nn.GELU(), nn.Linear(oc, e))
                           if img_embed_mlp else nn.Linear(oc, e))
         assert mask_embed in ("linear", "conv"), f"mask_embed={mask_embed!r} — 'linear' or 'conv'"
-        self.mask_embed = (MaskConvEmbed(self.mask_patch_size, e) if mask_embed == "conv"
+        # "conv" uses MaskConvEmbedV2 (flatten read-out), not PatchSet3D's own MaskConvEmbed
+        # (pooled read-out, provably discards within-cell position -- see MaskConvEmbedV2's
+        # docstring and docs/logs.md 2026-09-20 "mask_embed expressiveness").
+        self.mask_embed = (MaskConvEmbedV2(self.mask_patch_size, e) if mask_embed == "conv"
                            else nn.Linear(self.mask_patch_size ** 3, e))
         self.pos = FourierPositionalEncoding(e, fourier_bands, n_axes=3)
 
@@ -155,8 +161,12 @@ class PatchSetV2(nn.Module):
             nn.init.normal_(self.cascade_type, std=0.02)
         self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
 
-        self.iris_t2f = nn.MultiheadAttention(e, a, batch_first=True)
-        self.iris_f2t = nn.MultiheadAttention(e, a, batch_first=True)
+        assert decode_layers >= 1, "arch.decode_layers must be >= 1"
+        # Bidirectional cross-attention between T_tok (m-scale, compress_m+1 rows) and F_q
+        # (N=R^3 rows), stacked decode_layers deep -- see docs/logs.md 2026-09-20 "scale the
+        # Fq<->T_tok cross-attention" for why this replaced a single iris_t2f/iris_f2t pair.
+        self.decode_cross = nn.ModuleList(
+            [DecodeCrossBlock(e, a, h) for _ in range(decode_layers)])
         dims = [max(decoder_dim // (2 ** i), 8) for i in range(len(self._stage_chans))]
         self.token_proj = nn.Linear(e, decoder_dim)
         self.decode_blocks = nn.ModuleList()
@@ -319,16 +329,17 @@ class PatchSetV2(nn.Module):
         return seq, regs
 
     def _decode(self, T_tok: torch.Tensor, F_q: torch.Tensor, fine, B: int) -> torch.Tensor:
-        """Iris Eq 5-6, literal reproduction. T_tok (B,compress_m+1,e): target's own
-        post-Stage-B tokens (img column), already context-aware from Stage B. F_q
-        (B,N,e): target's RAW, never-compressed per-cell grid (the same img_embed output
+        """Iris Eq 5-6, generalized to arch.decode_layers rounds of bidirectional
+        cross-attention (see DecodeCrossBlock) instead of a single pair -- decode_layers=1
+        reproduces the original literal single-round shape. T_tok (B,compress_m+1,e):
+        target's own post-Stage-B tokens (img column), already context-aware from Stage B.
+        F_q (B,N,e): target's RAW, never-compressed per-cell grid (the same img_embed output
         used to build `tok` before any compression). fine: target-only unpooled encoder
         stage maps, in self.fine_stage order. Returns (B,1,S,S,S) at the finest requested
         fine_stage's own native side."""
-        t2, _ = self.iris_t2f(T_tok, F_q, F_q)          # tokens attend image
-        T2 = T_tok + t2
-        f2, _ = self.iris_f2t(F_q, T2, T2)              # image attends updated tokens
-        Fq2 = F_q + f2
+        for block in self.decode_cross:
+            T_tok, F_q = block(T_tok, F_q)
+        T2, Fq2 = T_tok, F_q
 
         R = self.resolution
         x = self.token_proj(Fq2).transpose(1, 2).reshape(B, -1, R, R, R)

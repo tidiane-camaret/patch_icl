@@ -73,15 +73,24 @@ No pixel-shuffle/unshuffle step (see Motivation).
 - No RoPE (compressed rows have no single cell position — same reasoning `seq_compress`
   already applies today). Fourier PE is baked in per-cell before compression (step 2 above).
 
-### Decode (Iris Eq 5-6, unchanged mechanism)
+### Decode (Iris Eq 5-6, generalized to `arch.decode_layers` rounds — 2026-09-20)
 
 - Take the target volume's own post-Stage-B `(compress_m+1, 2, e)` slice as `T`. This is
   already context-aware — Stage B let it exchange information with every context volume —
   richer than plain Iris's support-only `T`.
-- Bidirectional cross-attention (`iris_t2f`/`iris_f2t`-equivalent, unchanged) between `T` and
-  the target's **raw, never-compressed** per-cell grid `F_q` (the same `img_embed` output from
-  step 2 above, before any compression) — both sides update, cardinality unchanged on either
-  side.
+- Bidirectional cross-attention between `T` and the target's **raw, never-compressed** per-cell
+  grid `F_q` (the same `img_embed` output from step 2 above, before any compression) — both
+  sides update, cardinality unchanged on either side. Originally a single `iris_t2f`/`iris_f2t`
+  pair (literal Eq 5); as of 2026-09-20 this is `arch.decode_layers` rounds of
+  `DecodeCrossBlock` (`pfn_seg_2d.py`), each round adding a per-side MLP too — motivated by how
+  little of Stage B's attention reached `x` (the conv up-path's actual input) through a single
+  round: `F_q` never goes through Stage B's dense self-attention itself, only ever the
+  compressed `T`, so one cross-attention hop was a much narrower channel than `PatchSet3D`'s
+  default `fine_filter` decode gets from `_attn`'s `l` dense full-resolution self-attention
+  layers. `decode_layers=1` is the new default (matches the original single-round shape, though
+  not byte-identical — the MLPs are new regardless of depth). See docs/logs.md 2026-09-20
+  "scale the Fq<->T_tok cross-attention" and `102_patchset_v2_decode_cross.yaml`
+  (`decode_layers=3`).
 - Conv up-path (`iris_blocks`/`_ConvNormAct`-equivalent, unchanged) with skip connections from
   the target's multiscale pyramid `F_q_all`, recovering full native resolution.
 - Class embedding from refined `T'` dotted against the resulting per-voxel mask-feature map →
@@ -101,9 +110,16 @@ never discarded, so there's nothing to re-expand.
 ## Reused verbatim (imported, not reimplemented)
 
 - `RowCrossAttention`, `TransformerEncoderStack`, `ThinkingRows`, `FourierPositionalEncoding`,
-  RoPE helpers — from `pfn_seg_2d.py` / `patchset_pfn.py` / `rope.py`.
-- `MaskConvEmbed`, `_ConvNormAct` — from `patchset3d.py`.
+  `DecodeCrossBlock`, RoPE helpers — from `pfn_seg_2d.py` / `patchset_pfn.py` / `rope.py`.
+- `_ConvNormAct` — from `patchset3d.py`.
 - `_down_to`, `_mask_tiles_3d` — from `patchset3d.py` (module-level free functions).
+
+**Not reused**: `arch.mask_embed="conv"` uses `MaskConvEmbedV2` (`pfn_seg_2d.py`), not
+`PatchSet3D`'s own `MaskConvEmbed` — the latter's final `AdaptiveAvgPool3d(1)` is provably
+permutation-invariant over the final `s³` spatial cells (discards exactly the within-cell
+positional detail `mask_patch_size>1` exists to preserve, confirmed empirically), so v2 gets
+its own flatten-read-out variant instead. See docs/logs.md 2026-09-20 "mask_embed
+expressiveness".
 - Encoder classes: `ConvEncoder3D`, `PlainConvTSEncoder`, `ResEncTSEncoder`, `NnUNetTSEncoder`,
   `PrimusEncoder`, `TapCTEncoder` — unchanged.
 
