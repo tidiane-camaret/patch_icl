@@ -1,50 +1,118 @@
 # Experiments (draft)
 
+See `PERFORMANCE_ANALYSIS.md` for the full evidence synthesis behind every
+claim below (file citations, contradictions, and what's still missing).
+Numbers here are preliminary/internal — not yet verified as
+publication-ready (see gaps flagged inline).
+
 ## Setup
 
 - **Dataset:** TotalSegmentator CT. **TODO:** state the train/held-out
   anatomical class split — following the same held-in/held-out protocol
   used in the 2D paper to test in-context generalization to unseen
-  classes, not just unseen subjects.
-- **Baselines:** Medverse, Iris. **TODO:** state whether baselines are
-  retrained on the same data/split or evaluated with released weights, and
-  the number of context pairs K used at inference.
+  classes, not just unseen subjects. (Training curves already show a real
+  seen/unseen gap, e.g. dice_seen 0.68 vs dice_unseen 0.51 on an early
+  cascade checkpoint — the split exists operationally, just needs stating.)
+- **Baselines:** Medverse, Iris. **TODO/blocker:** no Iris baseline exists
+  anywhere in the repo yet (`PERFORMANCE_ANALYSIS.md` gap G5) — every
+  number we have is vs. Medverse only. Also unresolved: our OOD numbers use
+  a finetuned-on-TotalSeg-CT checkpoint vs. Medverse's released,
+  multi-modal, zero-shot weights (gap G8) — must be stated explicitly or
+  fixed before any head-to-head framing.
+- **Scope decision (gap G1):** "Ours" currently means the
+  `exp92_multisource_synth` cascade line (bi-axial attention + query prior +
+  region restriction, register-carry gated off). The newer PatchSetV2 line
+  is not yet converged and is not the source of any number below.
 - **Metrics:** Dice, normalized surface distance (NSD) for accuracy;
-  wall-clock time, FLOPs, peak VRAM for compute.
+  wall-clock time, FLOPs, peak VRAM for compute. **Caveat:** VRAM is not
+  currently measured anywhere in the eval pipeline (`evaluate.py`/`cascade.py`
+  has no memory instrumentation) — only in a separate B=1/K=1 inference
+  benchmark. Accuracy and compute numbers currently come from disjoint
+  scripts/checkpoints; needs one unified benchmark before the joint table
+  below can be filled in cleanly.
 
 ## Fixed spacing
 
-- Datasets: TotalSegmentator CT, 3mm spacing crops.
-- Report accuracy (Dice, NSD) and compute (time, FLOPs, VRAM) against
-  Medverse and Iris, isolating the image-label interaction design
-  (bi-axial vs. concat vs. pixel-shuffle) from the cascade, which is
-  evaluated separately below.
-- Show strengths — expect an advantage on small/thin structures, similar
-  to the pattern observed for patch-based selection in the 2D work.
+- Datasets: TotalSegmentator CT, whole-body `use_crop=false` protocol
+  (117 classes, 3897 samples) — see `PERFORMANCE_ANALYSIS.md` §1 for why
+  this protocol is canonical and a conflicting notebook (`nb 36`) is not.
+- **Preliminary result:** Medverse wins macro Dice overall (0.078 vs 0.048)
+  and wins more individual classes, but we run at **17% of its FLOPs**
+  (398 vs 2363 GFLOPs) at comparable wall-clock. The overall macro-Dice gap
+  is *not* uniform: splitting by object thickness, we're near parity on
+  thin structures (Δ≈−0.005) and lose specifically on thick tubes/blobs
+  (Δ up to −0.18) — replicated independently in the 2D paper and in a
+  separate 3D geometric-driver study. **This is the strength claim: small/thin
+  structures at a large compute discount, not an overall win.**
+- **Compute, current architecture:** the "much smaller model" framing is
+  stale — the current architecture (77–110M params) is comparable to or
+  larger than Medverse (71.1M). What holds up at matched (bf16) precision is
+  a modest 1.05–1.3× latency edge and a FLOPs reduction specific to the
+  iris-style compressed decoder path (1230 vs 2363 GFLOPs), not a
+  param-count story.
 
-**TODO:** table with per-method Dice/NSD/time/FLOPs/VRAM; break down by
-anatomical category (organs, bones, vessels, muscles) once numbers land.
+**TODO:** per-anatomical-category breakdown (organs, bones, vessels,
+muscles) beyond the thickness-family split we already have; an Iris row;
+one benchmark that reports accuracy+VRAM+FLOPs together for a single
+checkpoint/setting (see gaps G2–G5).
 
 ## Coarse-to-fine
 
 - Datasets: TotalSegmentator CT.
-- Show the effect of the query prior and of cross-level (register)
-  training, ablated independently against: (a) blank label-token init
-  instead of the query prior, (b) full-volume sliding window instead of
-  region-restricted, (c) independently-supervised levels instead of
-  register-carried training.
-- Show the accuracy/compute trade-off as the sliding window restriction is
-  relaxed (full volume → tight crop around the previous prediction),
-  analogous to the resolution/FLOPs Pareto plot in the 2D paper.
+- **Preliminary result — cascade helps in-distribution, replicated twice:**
+  macro Dice **0.361 → 0.538** (+0.177) from 4mm coarse to 1.5mm fine
+  (`37_patchset_spacing_locator.py`), and a matching monotonic
+  r1.5/r3/r6 = 0.572/0.509/0.389 on the full multisource eval (wandb
+  `92_multisource_synth`). Locator containment (0.92 mean) does *not*
+  predict fine-level Dice — once the coarse level roughly localizes the
+  structure, remaining failures are segmentation quality, not localization,
+  matching the `more_labels` failure-mode study.
+- **TODO/blocker:** the actual ablation this section promises (full model
+  vs −query prior vs −region restriction vs −register carry) has not been
+  run as a controlled experiment (gap G6). What exists instead is indirect
+  evidence: feeding a model's own imperfect prediction forward as the
+  query prior hurts Medverse's own cascade universally (7/7 OOD sources,
+  sometimes catastrophically) — suggestive that compounding error is a
+  generic cascade risk, not proof of our specific design's ablated
+  components.
+- Register-carry status: still training (epoch 36/140 at last check),
+  mixed early signal — helps single-level Dice on 3/7 OOD sources but
+  regresses the cascade result on the one source where it's been fully
+  measured (HU_LWK1, 0.1287→0.0935); one OOD cell (GNC_705 cascade) has
+  never completed a run (suspected `torch.compile` hang, not a scoring
+  issue). Don't cite a register-carry number until training finishes and
+  that cell is resolved or explicitly excluded.
 
-**TODO:** ablation table (Dice, time, FLOPs per configuration); Pareto
-plot of Dice vs. compute as the region-restriction margin is swept.
+**TODO:** ablation table (Dice, time, FLOPs per configuration) once G6 is
+run; Pareto plot of Dice vs. compute as the region-restriction margin is
+swept (not yet run at all — gap G7); full multi-level cascade compute
+(time/FLOPs/VRAM end-to-end, including re-crop overhead) has never been
+benchmarked (gap G3).
 
 ## Generalization
 
-- **Other CT datasets:** **TODO** — list held-out CT cohorts and results.
-- **Other modalities:** **TODO** — MRI (e.g. TotalSegmentator MRI)
-  evaluated with models trained only on CT.
-- **Far OOD tasks:** **TODO** — non-anatomical or pathology-driven
-  segmentation tasks, probing whether the region-restricted cascade still
-  localizes correctly when the coarse level's prior is unreliable.
+- **Preliminary result — cascade helps only when the coarse level is
+  already roughly right:** across 7 native-grid OOD sources
+  (`docs/datasets/eval_expansion_status.md`), cascade *helps* only on
+  HU_LWK1 (CT, single-level Dice 0.116 → cascade 0.129) — the one
+  same-modality-as-training source with a non-trivial single-level Dice —
+  and *hurts* on GNC_705 and ISLES22 (both MRI, both already failing at
+  single-level, Dice 0.05–0.06). This mirrors the Medverse query-prior
+  finding above: coarse-to-fine cascades compound error when the coarse
+  prior is unreliable. Frame as a general cascade limitation (motivates a
+  confidence-gated fallback as future work), not a design flaw unique to
+  us.
+- **Other modalities:** Shifts-MS (FLAIR, 0.063), MSD Hippocampus (T1,
+  0.481 — best OOD-MRI result), MSD Prostate (T2/ADC, 0.295), ATLAS v2.0
+  (T1, 0.028 — ⚠️ possible label-corruption confound, don't treat as clean
+  evidence of failure).
+- **TODO/blocker:** best-of-Medverse (released, zero-shot) beats our
+  single-level result on 4/7 of these sources, loses on 3 (HU_LWK1,
+  ISLES22, GNC_705) — but this comparison is confounded (gap G8: released
+  multi-modal Medverse vs. our CT-only-finetuned checkpoint) and needs
+  either a matched-training rerun or an explicit caveat before it goes in
+  the paper as "generalizes better/worse."
+- **Far OOD / pathology tasks:** GNC_705 (kidney lesion) and ISLES22
+  (stroke lesion) already serve this role; both show the cascade-hurts
+  pattern above. No additional far-OOD source planned beyond these unless
+  a gap is found in review.
