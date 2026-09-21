@@ -8994,3 +8994,313 @@ Implemented the two fixable-without-a-run gaps: `PatchSetV2._feat_norm` (direct 
 wired through `build_model`). Neither yet validated with a real run — that's the natural next
 step, along with revisiting `mask_patch_size` (see spec's Open Question 1, whose original
 `p=1` rationale this same dice gap now makes suspect too).
+
+## 2026-09-20 — Why v1/v2 inference times are nearly tied despite v1's "R³ token" main transformer
+
+Follow-up on the `results/presentations/perf/` benchmark: patchset3d (v1) and patchset3d_v2
+(v2) measured 36.4 vs 36.6 ms — surprising given v1's main cross-context transformer (`_attn`,
+`self.N = resolution³ = 4096` raw per-cell tokens, this arch's `seq_compress=False`,
+`full_attn=True` → dense self-attention over all `(K+1)*N` tokens) is nominally O(R⁶)-scale,
+vs v2's `compress_m=128`-token design.
+
+Root cause: that transformer never runs in v1's benchmarked config. `patchset3d.py:1108`
+explicitly skips `_attn` whenever `decoder_kind=="iris"` and `cascade_registers=False` (both
+true for `97`/`99`/`x1gz71wj` and this benchmark) — confirmed empirically with a forward-hook
+stage-timer (`results/presentations/perf/profile_stage_split.py`): `self.transformer` fires
+**0 times** per `predict()` call for v1, vs. ~1.3 calls/call (~1-3% of wall-clock) for v2, whose
+architecture always routes through it.
+
+`decoder=iris`'s actual decode path (`_iris_task_encode`/`_decode_iris`) is *already* an m-scale
+design in the same family as v2's `compress_m`: `iris_ctx_query` has only `iris_m=10` rows, and
+every cross-attention in that path pairs a tiny token set against the full `R³=4096` grid on
+only *one* side (`M × R³` cost, linear in the big side — never `R³ × R³`). v2's `_compress_all`
+is structurally the same operation with `compress_m=128` query rows instead of 10 — ~12.8× more
+query rows, still cheap for the same reason. So "v1 uses R³ tokens, v2 uses m" is true only of a
+dead code branch in this config, not of either model's real decode-time cost — which is why the
+wall-clock numbers land so close. Full writeup in RESULTS.md's "Follow-up" section.
+
+## 2026-09-20 (cont.) — Measuring the R³-token transformer for real: patchset3d decoder=conv
+
+Follow-up to the above: added a third benchmark variant using `92_multisource_synth`'s actual
+arch (Hydra-resolved: `92 → 89_multisource_cascade → 88_cascade`, which selects
+`model=m2_patchset_decoder` → `decoder=conv`) — the genuine non-iris path that does **not** hit
+the `patchset3d.py:1108` skip, so `_attn`'s dense R³=4096-token self-attention actually runs.
+Stopped the live `patchsetv2` 400-epoch training run first (clean `C-c`/`KeyboardInterrupt`,
+wandb closed, resumable from its last checkpoint — `resume_weights_only=true` as before) so the
+benchmark wasn't GPU-contended; an earlier contended run had inflated every number by ~1.7-2x
+(medverse fp32 145.8 ms vs. the clean 69.5 ms) and was discarded.
+
+Confirmed with the same forward-hook stage-timer: `self.transformer` now fires (unlike
+`decoder=iris`'s 0 calls) and costs 13.4 ms — ~19x `patchset3d_v2`'s compressed-transformer cost
+(0.7 ms) and 70% of `decoder=conv`'s total FLOPs (2736.3/3891.1 GFLOPs). But total wall-clock
+only rises ~18% over the iris/v2 variants (43.4 vs ~36.7 ms) — bf16 attention matmuls run much
+closer to this GPU's peak throughput than the conv-heavy encoder/fine-decode stages that
+dominate wall-clock in every variant, so a real ~19x sub-stage cost multiplier barely moves the
+total. Also notable: `decoder=conv` has fewer params (48.0M vs iris's 71.9M) and *lower* peak
+memory (2.50 vs 3.36 GB) than `decoder=iris`, despite doing the extra R³-attention — the iris
+decoder's own extra machinery (pixel-shuffle upsampling blocks, class-embedding path) costs more
+than the real R³-token transformer does. Full numbers/table in RESULTS.md.
+
+## 2026-09-20 (cont.) — PatchSetV2 `arch.decode_layers`: scale the Fq<->T_tok cross-attention
+
+Follow-up on a walkthrough of `PatchSetV2._decode` (docs/methods/iris.md comparison, this
+session): traced how little of Stage B's context attention actually reaches `_decode`'s conv
+up-path input `x`. `F_q` (the target's raw `N=R³` grid) never goes through Stage B's dense
+self-attention at all — it's reintroduced only via a **single** cross-attention hop into the
+already-compressed `T_tok` (`compress_m+1` rows) at decode time. Contrast with `PatchSet3D`'s
+default (non-iris) `fine_filter` decode (`m1.yaml`), whose per-cell query tokens come straight
+out of `l=4` layers of dense full-resolution self-attention (`_attn`) — much richer context
+exposure before the decoder's own input is even built, and critically at **no** m-scale
+compression bottleneck (every cell keeps its own individually context-attended token all the
+way to `filter_head`).
+
+Fix: new `DecodeCrossBlock` (`src/models/pfn_seg_2d.py`) — one round of bidirectional
+cross-attention (`T` reads `F`, then `F` reads the updated `T`, sequential per the existing
+convention) plus a per-side MLP, pre-norm residual, matching `RowCrossAttention`'s shape.
+`PatchSetV2._decode` now stacks `arch.decode_layers` of these (new constructor param, default
+`1` — reproduces the original single-round Eq5 shape, though not byte-identical since the MLPs
+are new either way) instead of the old single `iris_t2f`/`iris_f2t` pair. Stays m-scale per
+round (`O(N×m)`, never `O(N×N)`) — the R³-vs-m benchmark above is exactly why this is cheap:
+Stage B's own m-scale `self.transformer` cost ~0.7ms vs. `patchset3d (conv)`'s real `R³`
+self-attention at ~13.4ms for a single pass.
+
+`m3_patchset_v2.yaml` documents the new default (`decode_layers: 1`). New experiment
+`102_patchset_v2_decode_cross.yaml` (inherits `101_patchset_v2_mask8_wide`) sets
+`decode_layers: 3`, matching Iris's own `iris_ctx_layers=2`-style precedent (v1's task
+-encoding contextual stream). This restructures `iris_t2f`/`iris_f2t` into `decode_cross.*` in
+the state dict — confirmed via the actual `101` checkpoint that this is a clean rename/add
+(8 old keys become unexpected, all `decode_cross.*` keys become missing — no shape collisions),
+so `train.checkpoint_allow_partial=true` warm-starts cleanly. 15 new tests (`DecodeCrossBlock`
+shape/backward/cross-dependency in `test_pfn_seg_2d.py`; `decode_layers` default/depth/gradient
+-reaches-all-blocks/output-changes/`build_model` wiring in `test_patchset3d_v2.py`); full
+suite (103 tests across `test_patchset3d.py`/`test_pfn_seg_2d.py`/`test_patchset3d_v2.py`)
+passes. `patchset3d.py`'s iris decoder (same `t2f`/`f2t` pattern) intentionally left untouched
+— that lineage is converged, not what's being iterated on.
+
+## 2026-09-20 (cont.) — new experiment `103_patchset_v2_cascade` + `mask_embed` expressiveness
+
+Built `configs/experiment/3d/experiment/103_patchset_v2_cascade.yaml`: `PatchSetV2` in
+cascade mode, built to sit close to `88_cascade` (same dataset/augmentation/cascade-data/train
+recipe) for a v1-vs-v2 cascade comparison. Standalone construction (no experiment-chain
+inheritance, matching `88_cascade`'s own style) since v2's arch surface doesn't share most of
+v1's knobs (`mask_slots`/`decode_source` don't exist on `PatchSetV2` at all). Verified
+`cascade.py`/`train.py`'s cascade path is fully model-agnostic (duck-typed
+`getattr(model,"spacing_aware",False)`, generic `forward(**kw)`/`out.get("registers")`,
+cascade mode gated only by `data.cascade_spacings`) — no code changes needed to run v2 in
+cascade mode. Requested arch overrides applied (`encoder_spacing_aware=true`,
+`encoder_input_norm=zscore`, `compile_dynamic=false`,
+`plainconv_ts_features_per_stage=[32,64,256,768]`); resolved `nnunet_ts_stages=[3]` (single
+deepest stage, `768ch==e`, no concat — the user's explicit choice over the initial `[2,3]`
+draft, which would've concatenated to `1024ch`). Carried forward `compress_m=128`/
+`mask_patch_size=8` from `101`/`102`'s validated settings rather than v2's raw group defaults.
+Confirmed via `build_model` + a real 128³ forward pass (`encoder.out_ch=768`, correct output
+shape) before considering it launch-ready.
+
+**`mask_embed=conv` expressiveness check** (requested before adopting it): inspected
+`PatchSet3D`'s existing `MaskConvEmbed` (`patchset3d.py`) — strided-conv front end,
+`AdaptiveAvgPool3d(1)`, then a narrow `Linear(ci,e)`. Proved empirically that the pool step is
+lossy independent of weights: took a real post-conv feature map, swapped two of its final
+`s³=8` spatial cells' values (a genuine positional difference — `not torch.equal`), and the
+pooled output differed by `~6e-8` (float noise only — mathematically identical), while the
+exact same feature map through `flatten+Linear` differed by `0.89`. `sum/N` is
+permutation-invariant by construction; `AdaptiveAvgPool3d(1)` throws away exactly the
+within-cell positional detail `arch.mask_patch_size>1` exists to preserve, regardless of
+training.
+
+Fix: new `MaskConvEmbedV2` (`pfn_seg_2d.py`) — same strided-conv front end, but flattens the
+final `s×s×s×co` feature grid into the projection instead of pooling it first. Not a hard
+guarantee of "exactly as expressive as `Linear`" (the strided convs still do a real, learned
+`p³→s³·co` reduction upstream — for `p=8`: `512→256`), but it removes the one
+structurally-guaranteed loss, and the smaller flattened width (`256` vs `512`) means the final
+projection ends up **cheaper** than plain `Linear(512,768)` (`196.6k` vs `393.2k` params), not
+more expensive. Scoped v2-only: `PatchSet3D`'s own `MaskConvEmbed`/`mask_embed=conv` option
+(`patchset3d.py`) is untouched — no v1 checkpoint has ever used it, and no v2 run had used
+`mask_embed=conv` before this, so there was no backward-compatibility cost either way.
+`PatchSetV2.mask_embed="conv"` now builds `MaskConvEmbedV2` instead. 7 new tests (shape/p=1
+edge case/permutation-distinguishing/backward in `test_pfn_seg_2d.py`; wiring/end-to-end in
+`test_patchset3d_v2.py`); full suite (110 tests) passes. `103_patchset_v2_cascade.yaml` sets
+`arch.mask_embed=conv`; verified end-to-end via a real 128³ forward pass.
+
+## 2026-09-20 (cont.) — 103 benchmarked; decode_layers refactor moved 101's own numbers too
+
+Set `103_patchset_v2_cascade.yaml`'s `arch.decode_layers=3`, then benchmarked it single-level
+(K=1, no cascade re-crop — `run_cascade` just calls the same forward per level) alongside the
+existing `results/presentations/perf/bench_inference_compare.py` roster. Results: 109.6M
+params, 1993.4 GFLOPs (encoder 1050.9, transformer 36.9 — identical to 101's, `decode_layers`
+doesn't touch Stage B — other 905.5), 42.6ms/3.78GB. +62% GFLOPs vs 101 but only +19%
+wall-clock (35.9→42.6ms) — same "conv/MLP FLOPs cost less wall-clock than the FLOPs count
+suggests on this GPU" pattern as the R³-transformer finding, just via `decode_layers`'s extra
+cross-attention/MLP rounds + `MaskConvEmbedV2`'s conv front end instead of raw self-attention.
+
+Noticed and reported transparently: `patchset3d_v2 (101)`'s OWN numbers shifted in this same
+benchmark run (67.9M→77.4M params, 1190.5→1230.3 GFLOPs, memory 2.63→2.67GB) — not measurement
+noise, a real consequence of the `DecodeCrossBlock` refactor: `decode_layers=1` (101's setting,
+unchanged) is not byte-identical to the old single `iris_t2f`/`iris_f2t` pair it replaced —
+`DecodeCrossBlock` adds a per-side MLP even at depth 1. `RESULTS.md` updated with both the new
+row and this explanation so the table doesn't read as internally inconsistent against the
+previous version.
+
+## 2026-09-20 (cont.) — evaluate_cascade stitching: N+1 redundant native-GT loads -> 1
+
+Launched `103_patchset_v2_cascade` (warm-started from `101`'s epoch-50 checkpoint via
+`train.checkpoint_allow_partial=true`; 22 keys dropped — `iris_t2f`/`iris_f2t` renamed to
+`decode_cross.*` plus the expected `mask_embed`/encoder shape mismatches from `mask_embed=conv`
+and the widened `plainconv_ts_features_per_stage`/`nnunet_ts_stages=[3]` vs. the 101 source —
+confirmed clean and training stably). Then inspected `evaluate_cascade`'s stitching step
+(cascade.py) for optimization, as requested.
+
+Found: for an N-level cascade, `evaluate_cascade`'s per-case scoring called into
+`evaluate._stitched_native_metrics_multi`/`_stitched_native_dice_multi` **N+1 times per case**
+— once for the full coarse->fine composite, once more per level for the `dice_r{s}` breakdown.
+Each call independently does `np.load(root/subj/"label.npy", mmap_mode="r") == idx` (or
+`gt_loader(subj, cls)`), materializing the full native-resolution GT volume from the NFS mount
+— for 103's N=3, that's 4x redundant GT loads/thresholds per case, times every (subj,class) in
+the val set, every `eval_every=5` epochs. Each level's crop->native upsample (`F.interpolate`
+inside the old `_write_native`) was also duplicated: once for the composite write, once more
+for the solo per-level write.
+
+Fix (evaluate.py, Bounded per brainstorming — presented in chat, approved before implementing):
+split `_write_native` into `_place_patch` (crop->native upsample, run once per (level,key)) +
+`_paste` (bounds-clip array write, reusable), then added `_stitched_native_metrics_and_levels`
+— one combined pass that loads GT once per key and pastes each level's patch into both a
+running composite (for the full stitched dice/nsd) and that level's own solo array (for
+`dice_r{s}`) from the same upsample. `_stitched_native_metrics_multi`/`_stitched_native_dice_
+multi` are untouched (other callers, e.g. `_stitched_native_dice`, still use them standalone);
+only `evaluate_cascade`'s call site swapped to the combined function. Verified byte-identical
+output against the two old functions (6 new tests, `experiments/3d/tests/test_stitched_
+native.py`: full-dice/nsd match, per-level match, a key-missing-from-one-level edge case
+matches each function's own presence rule, and a counting `gt_loader` confirms exactly one
+load per key instead of N+1). Full `experiments/3d/tests/test_cascade.py` suite (73 tests)
+still passes.
+
+## 2026-09-20 (cont.) — cascade train step: level-1 recrop was CPU-bound and serial
+
+User reported 103's 2-level cascade epoch (~320-360s) running ~3x a non-cascade single-level
+epoch (~100s) and asked to investigate the "non-model time". Stopped the run (`tmux send-keys
+C-c`, verified process count 0) and profiled instead of guessing.
+
+`nvidia-smi` sampled during training alternated 100%<->0% util every step (not steady-state
+busy) -- confirmed a real CPU-bound gap, not GPU contention (only one compute process on the
+GPU; `top`/`free -h` showed 96.6% CPU idle, 894GB RAM available, no swap -- ruled out memory
+pressure). Root-caused with an isolated benchmark (`_recrop_level` called directly against the
+warm-RAM-cache provider, no model): level-1's re-crop (target re-centred + K=1 context reload,
+needed mid-step since the crop center depends on level-0's OWN prediction, so — unlike level
+0's recrop, which happens inside prefetching DataLoader workers and is hidden — it can't be
+backgrounded the same way) ran fully serially (`data.cascade_recrop_workers: 1`, a value
+carried over from a LOKI-node finding that doesn't transfer to this node, nora-odin, 44 cores).
+Sub-profiled one task: `provider.load_native_crop`'s `build_native_crop` costs ~61ms, of which
+~33ms is `avg_pool3d` decimating the full native-resolution crop toward the target grid — real
+CPU compute (RAM cache confirmed hit every call — not NFS I/O). With 8 such tasks/level
+(`B=4 x (K+1)=2`) run serially, that's the ~400-500ms/item observed.
+
+Threaded it: `_recrop_level` at `recrop_workers=1/2/4/8/16` -> `424.4/240.7/156.5/97.5/105.8`
+ms/item — `workers=8` (== tasks/level here) is the sweet spot, a 4.35x win on that component,
+with no oversubscription on this core count (the earlier LOKI-derived `workers=1` default was
+just wrong for this box). Set `data.cascade_recrop_workers: 8` in
+`103_patchset_v2_cascade.yaml` (comment updated to explain the retune and note it should scale
+with `batch_size*(context_size+1)` if those change).
+
+Relaunched (full checkpoint resume attempted, but `train.resume_weights_only: true` is a
+config-level default here — matches 88_cascade's warm-start convention — so it re-warmed
+optimizer/schedule from epoch 0 regardless; weights themselves resumed correctly from the
+epoch-10 checkpoint, val_dice 0.0365). Confirmed live: `cascade_ms` 808.5-855.1 -> 515.0ms/step
+(`cascade_ms_item` ~202-214 -> 128.7ms/item), epoch 320-360s -> 277.5s (~20-25% faster
+end-to-end; less than the isolated recrop win since `cascade_ms` also includes the two
+model forward passes, which don't shrink). Did not pursue the bigger, riskier follow-up lever
+(moving the CPU decimation onto the otherwise-idle-during-recrop GPU) — flagged as a possible
+next step if more headroom is wanted.
+
+## 2026-09-20 (cont.) — 104: train the prior-consumption skill single-level, before cascade
+
+Even after the recrop retune, 103's 2-level cascade epoch stayed ~2.8x a single-level epoch
+(structural: level-1's recrop depends on level-0's own prediction, so it can't be hidden in
+DataLoader prefetch the way level-0's crop can — no further easy win there). Rather than keep
+paying that cost while the model is ALSO still learning to consume a prior mask at all, split
+the two concerns: `104_patchset_v2_varspacing_hard_tgt_prior.yaml` trains PatchSetV2
+single-level on the cheap [1.5,6]mm varspacing path (dataset=d2_varspacing_15_6, no
+cascade_spacings) with the SAME non-cascade perturbed-GT query-prior injection v1's
+`80_varspacing_hard_tgt_prior` established (`data.query_prior={modes:[gt,none], p:[0.3,0.7]}`
++ its hard `prior_perturb` floors) — so the prior-consumption skill trains on the cheap path,
+and the later cascade finetune (103, resumed from this run's checkpoint) only has to learn the
+recrop/re-attend mechanics on top of a model that already knows what to do with a prior.
+
+Built standalone (NOT chained off 101 — 101's own lineage is the multisource CT+MRI
+synth_gmm regime, unrelated to 103's plain single-source totalseg cascade target; chaining
+would drag all of that in). Composed `dataset=d2_varspacing_15_6` (70/80's own plain-totalseg
+varspacing group) with 103's exact resolved `arch:` block verbatim (including
+`cascade_registers=true`, unused this run — kept only so a later 103 relaunch's checkpoint
+load is a full shape match, not partial) — same reasoning as 103's own construction. `lr` set
+to 103's `2e-5 @ B=4` scaled by `sqrt(8/4)` (this repo's established batch-scaling convention)
+for `batch_size=8`, `encoder_lr_scale=1` (from-scratch, matching 100's stated reasoning —
+nothing meaningfully warm-starts across the mask_embed/decode_layers/encoder-width changes
+since 97 anyway). Flagged as an unverified assumption (no B=8 VRAM check done for this arch
+yet, unlike 101's own explicit check). Verified end-to-end before proposing: Hydra compose
+(`cascade_spacings=None`, `query_prior` mixture, arch matches 103), a real `train_loader`
+batch (B=8, varspacing `spacing` per-batch), and a real forward pass both with and without an
+injected `query_prior` tensor.
+
+## 2026-09-20 (cont.) — 104 revised: multisource (CT+MRI+synth) with non-CT regime restored
+
+Requested follow-up: switch 104's `dataset=d2_varspacing_15_6` (plain single-source totalseg)
+for 101's own `data.source=multisource` recipe, but with the non-CT regime probability
+restored to nonzero (101 itself trains CT-only, `source_mix.regime_p=[1.0, 0.0, 0.0]`, 97's
+explicit simplification off 96_iris_decoder_varspacing's original `[0.4, 0.4, 0.2]`). Switched
+`override /dataset: multisource_ct_mri` (96/101's own group) and copied 101's full resolved
+data overrides verbatim (`train_spacing_range=[3,6]`, `crop_spacing_mm=4.24`,
+`gpu_realize_crop`/`ram_cache=true`, `p_synth=0.3` + its `gmm`/`cohort` blocks,
+`source_mix.per_source_train_classes=[balanced,balanced]`, `eval_epoch_length=800`) — except
+`regime_p`, reverted to 96's original `[0.4, 0.4, 0.2]` so MRI and cross-modality tasks are
+genuinely trained on again. `arch:` deliberately left untouched (kept as 103's exact block,
+not 101/96's own — mask_embed=linear/decode_layers=1/cascade_registers=false there — so this
+run's checkpoint stays shape-identical to 103's cascade model for a later full resume); pulling
+in 101's data recipe doesn't require its arch too. Re-verified end-to-end: Hydra compose
+(`source=multisource`, `regime_p=[0.4,0.4,0.2]`, `p_synth=0.3`), a real `train_loader` batch
+through the cohort/synth_gmm path (`SynthGmmMaisiDataset` initializes, 3832 masks/125
+classes), and a real `PatchSetV2` forward pass with an injected `query_prior`.
+
+## 2026-09-20 (cont.) — 104 reverted to CT-only regime_p, launched, resource-checked
+
+Reverted `source_mix.regime_p` back to `[1.0, 0.0, 0.0]` (CT-only, matching 101) per follow-up
+request — `dataset=multisource_ct_mri` stays (for its p_synth/cohort/gmm machinery) even
+though every task is CT. Stopped 103's still-running cascade job, confirmed its latest
+checkpoint (epoch 0 of the recrop-fixed relaunch, val_dice 0.0816, arch byte-identical to
+104's own), and launched 104 resuming WEIGHTS ONLY from it (`train.resume_weights_only=true`
+— different regime, so fresh optimizer/schedule, matching train.py's own stated convention).
+Weights transferred cleanly (arches match exactly, no partial-load needed), stepped
+immediately at dice=0.177 (vs random init), confirmed healthy.
+
+Live resource check (~4.5h into the run, epoch 122/400): GPU steady 100% util across repeated
+samples (no idle bubbles — unlike 103's cascade 0%/100% alternation), 78.7/97.9GB VRAM (80%,
+headroom). CPU load 64-66 on 44 cores with up to 12 `pt_data*` workers near 100% each
+(train.workers=12, doing real per-item work incl. the 30% synth_gmm CPU paint) — legitimate
+parallel throughput, not thrashing (no swap, 836GB RAM still available). Per-step
+profile_timing: `fwd 231.9ms (encode 81.6 + attn 2.2 + decode 148.1) + bwd 522.7ms +
+data 189.9ms`, data fully hidden behind GPU compute via the 12-worker prefetch (never drops
+GPU below 100%). Conclusion: GPU-compute-bound as intended, nothing wasted; the only lever
+left is compute efficiency, not more data-pipeline parallelism.
+
+## 2026-09-20 (cont.) — torch.compile was v1-only; fixed for PatchSetV2, enabled on 104
+
+`arch.compile=true` for a `patchset3d_v2` model crashed: train.py's compile block (added for
+`PatchSet3D`/v1 only) referenced `net.decoder_kind` (v2 has no such attribute at all —
+AttributeError) and gated its seq_compress Stage A/C compile on `hasattr(net, "compressor")`
+(the nn.ModuleList — v2 also has one, `PatchSetV2.compressor`, but no `_compress`/`_expand`
+METHODS to compile, since v2's own Stage A method is `_compress_all` — same AttributeError
+class). Fixed both (`experiments/3d/train.py`, `main()`'s compile block, ~line 1224): the
+decoder_kind check now goes through `getattr(net, "decoder_kind", None)` (v2 -> None -> never
+"iris" -> its Stage B transformer, which v2 always calls unconditionally, always gets
+compiled); the seq_compress branch is now gated on `hasattr(net, "_compress")` (the method,
+v1-only) with a new `elif hasattr(net, "_compress_all")` branch compiling v2's own Stage A
+method. v1's own path is provably unchanged (same attributes exist -> same branch taken), so
+no regression risk there — not covered by an automated test (GPU-only, ~50s one-time compile
+cost per run, no existing harness for this block on either model), verified instead by direct
+execution: built a real 104 model, applied the exact compile-block logic, ran 4 real
+forward+backward+opt.step iterations on real (random) tensors incl. an injected query_prior —
+no crash, step 0 paid the ~49.4s one-time compile, steps 1-3 settled at ~632ms/step vs the
+eager baseline's `fwd 231.9 + bwd 522.7 = 754.6ms` (~16-19% faster compute).
+
+Baked `arch.compile/compile_encoder/compile_decoder=true` into
+`104_patchset_v2_varspacing_hard_tgt_prior.yaml`. Stopped the running 104 job (epoch 120,
+val_dice 0.232) to prepare this relaunch (planned: resume FULL state — optimizer/scheduler/
+epoch, same config/regime as before, only adding compile, so unlike the earlier CT-only-regime
+relaunch this one wouldn't need resume_weights_only) — launch itself held pending user signal.
