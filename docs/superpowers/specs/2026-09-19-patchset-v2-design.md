@@ -177,8 +177,9 @@ Stage B's self-attention operates over `T·(compress_m+1)` rows, replacing both 
 per-cell dual-axis transformer (`T·N` rows) and the iris-decoder path's separate
 `iris_t2f`/`iris_f2t` reciprocal attention (which put the query's full `R³` grid on both sides
 of an attention op). Expected to be substantially cheaper on the `attn`/`decode` timing
-buckets `profile_timing` already tracks (see `docs/logs.md` 2026-09-18). No formal FLOPs or
-wall-clock comparison has been run yet — recommend a `profile_timing` pass against the
+buckets `profile_timing` already tracks (see `docs/logs.md` 2026-09-18). Confirmed 2026-09-20:
+`results/presentations/perf/RESULTS.md` measured v1's real (non-iris, `decoder=conv`) `R³`
+self-attention at ~13.4ms/pass vs. v2's m-scale Stage B at ~0.7ms — recommend a `profile_timing` pass against the
 `99_iris_decoder_plainconv_doubling` baseline once implemented.
 
 ## Config / integration point
