@@ -1,0 +1,68 @@
+\begin{thebibliography}{10}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Butoi et~al.(2023)Butoi, Ortiz, Ma, Sabuncu, Guttag, and
+  Dalca]{butoiUniverSegUniversalMedical2023}
+Victor~Ion Butoi, Jose Javier~Gonzalez Ortiz, Tianyu Ma, Mert~R. Sabuncu, John
+  Guttag, and Adrian~V. Dalca.
+\newblock Universeg: Universal medical image segmentation.
+\newblock \emph{arXiv preprint arXiv:2304.06131}, 2023.
+
+\bibitem[D'Antonoli et~al.(2025)]{dantonoliTotalSegmentatorMRIRobust2025}
+Tommaso~A. D'Antonoli et~al.
+\newblock {TotalSegmentator MRI}: Robust segmentation of anatomic structures in
+  {MRI}.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Gao et~al.(2025)]{gaoShowSegmentUniversal2025}
+Yunhe Gao et~al.
+\newblock Show and segment: Universal medical image segmentation via in-context
+  learning.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Hu(2025)]{huMedverseUniversalModel2025a}
+others Hu.
+\newblock Medverse: A universal model for medical image segmentation.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Kool et~al.(2019)Kool, van Hoof, and
+  Welling]{kool2019stochasticbeamsthemgumbeltopk}
+Wouter Kool, Herke van Hoof, and Max Welling.
+\newblock Stochastic beams and where to find them: The gumbel-top-k trick for
+  sampling sequences without replacement, 2019.
+
+\bibitem[Kus et~al.(2024)]{kusMedSegBenchComprehensiveBenchmark2024}
+Zeki Kus et~al.
+\newblock {MedSegBench}: A comprehensive benchmark for medical image
+  segmentation.
+\newblock \emph{arXiv preprint}, 2024.
+
+\bibitem[Rakic et~al.(2025)]{rakicTycheStochasticInContext2025}
+Marianne Rakic et~al.
+\newblock Tyche: Stochastic in-context learning for medical image segmentation.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Reisert et~al.(2022)]{reisertDeepNeuralPatchworks2022a}
+Marco Reisert et~al.
+\newblock Deep neural patchworks: Coping with large segmentation tasks.
+\newblock In \emph{Medical Image Computing and Computer Assisted Intervention},
+  2022.
+
+\bibitem[Wasserthal
+  et~al.(2023)]{wasserthalTotalSegmentatorRobustSegmentation2023}
+Jakob Wasserthal et~al.
+\newblock {TotalSegmentator}: Robust segmentation of 104 anatomic structures in
+  {CT} images.
+\newblock \emph{Radiology: Artificial Intelligence}, 2023.
+
+\bibitem[Xie(2026)]{xieEICSegUniversalMedical2026}
+others Xie.
+\newblock {EICSeg}: Universal medical image segmentation via efficient
+  in-context learning.
+\newblock \emph{arXiv preprint}, 2026.
+
+\end{thebibliography}
