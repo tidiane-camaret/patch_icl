@@ -59,3 +59,17 @@ results/synth_task_gen/*.png
 results/synth_task_gen/*.npz
 results/synth_task_gen/totalseg_intensity_loadings.png
 results/3d/gnc_kidney/*.json
+
+# LaTeX build artifacts (results/publications)
+# Note: PDFs are intentionally not ignored here — reference papers and
+# compiled figures under this dir are tracked on purpose.
+results/publications/**/*.aux
+results/publications/**/*.bbl
+results/publications/**/*.blg
+results/publications/**/*.brf
+results/publications/**/*.log
+results/publications/**/*.out
+results/publications/**/*.synctex.gz
+results/publications/**/*.fdb_latexmk
+results/publications/**/*.fls
+results/publications/**/*.toc

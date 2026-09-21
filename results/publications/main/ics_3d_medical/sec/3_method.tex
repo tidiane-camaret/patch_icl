@@ -1,0 +1,114 @@
+\section{Method}
+\label{sec:method}
+
+\noindent\textbf{Input.} A target volume $I^t \in \mathbb{R}^{D\times H\times W}$
+and a context set $\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image/mask pairs for
+the same anatomical class as the (unknown) target mask.
+
+\noindent\textbf{Output.} A predicted target mask $\hat{L}^t$, produced
+by a coarse-to-fine cascade over $M$ resolution levels
+$\{r_1, \dots, r_M\}$.
+
+\subsection{Backbone}
+\label{sec:backbone}
+
+Each volume (target or context) is tokenized by a shared encoder --
+either the nnU-Net residual-encoder stages
+(\texttt{ResEncInContext3D})~\cite{isensee2021nnu} or a 3D patch
+embedding (\texttt{ViTInContext3D}) -- into a grid of spatial tokens
+with 3D axial rotary position embeddings (RoPE), following the
+architecture already implemented in our codebase. At the bottleneck, a
+two-stage attention block first lets tokens attend within their own
+volume (target and each context volume independently, sharing weights),
+then lets the target cross-attend, read-only, into all $K$ context
+bottlenecks. \TODO{restate/adjust to match final architecture diagram.}
+
+\subsection{Bi-Axial Image--Label Attention}
+\label{sec:biaxial}
+
+Rather than folding the label into the image as a second input channel
+before encoding (concatenation, as in Medverse) or fusing image and
+label features once via a pixel shuffle-unshuffle step (Iris), we keep
+image tokens $\mathbf{z}^{\text{img}}$ and label tokens
+$\mathbf{z}^{\text{lbl}}$ as separate streams and attend over two axes:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
+  \item \textbf{Patch axis}: standard spatial self-/cross-attention
+    among tokens at the same image/label identity, as described in
+    \cref{sec:backbone}.
+  \item \textbf{Image/label axis}: at each spatial location, the image
+    and label tokens attend to each other, letting label evidence
+    sharpen the corresponding image features and vice versa.
+\end{itemize}
+
+The target's label stream starts from a query prior (\cref{sec:cascade})
+rather than a zero/blank mask, so this axis is informative for the
+target as well as for the contexts. \TODO{formalize with an equation once
+the exact factorization (interleaved vs.\ parallel bi-axial layers) is
+finalized; specify how many layers alternate between the two axes.}
+
+\subsection{Coarse-to-Fine Cascade}
+\label{sec:cascade}
+
+PatchICL-3D processes the target through $M$ increasingly fine
+resolution levels $\{r_1 < \dots < r_M\}$ (e.g. a coarse full-volume pass
+followed by finer crops). Two mechanisms connect consecutive levels.
+
+\vspace{0.3em}\noindent\textbf{Query image prior.}
+At level $\ell > 1$, the target's label tokens are initialized from the
+upsampled prediction of level $\ell - 1$,
+\begin{equation}
+  \mathbf{z}^{\text{lbl}}_{\ell,0} = \operatorname{Embed}\bigl(\operatorname{Upsample}(\hat{L}^t_{\ell-1})\bigr),
+  \label{eq:query-prior}
+\end{equation}
+instead of entering the network through a separate autoregressive branch
+(Medverse) or not being used at all (Iris). This makes the previous
+level's belief part of the same token stream that attends bi-axially
+with the image, rather than a side channel fused later.
+
+\vspace{0.3em}\noindent\textbf{Region-restricted fine processing.}
+Given level $\ell-1$'s prediction, we take its predicted foreground
+region (thresholded and padded by a margin) and restrict the sliding
+window at level $\ell$ to that region, rather than re-scanning the full
+volume as in Medverse's autoregressive steps. This lets compute at fine
+levels scale with the size of the structure of interest rather than the
+size of the input volume, at the cost of depending on the coarse level's
+localization being approximately correct. \TODO{specify margin/threshold
+values and failure-mode handling (e.g. what happens when the coarse
+level misses the structure entirely).}
+
+\subsection{Cross-Level Training via Register Tokens}
+\label{sec:registers}
+
+To connect the cascade with a gradient path that crosses resolution
+levels -- rather than levels being independently supervised and only
+chained via the rendered prediction in \cref{eq:query-prior} -- we add a
+small set of learned register tokens $\mathbf{r}_\ell \in \mathbb{R}^{N_r \times d}$
+at each level. Registers participate in the bi-axial attention at level
+$\ell$ alongside image and label tokens, and their updated state is
+carried forward, via a learned projection and a level-type embedding,
+into level $\ell+1$'s register initialization:
+\begin{equation}
+  \mathbf{r}_{\ell+1,0} = W_r\, \mathbf{r}_{\ell,\text{final}} + \mathbf{e}_{\ell+1}.
+  \label{eq:register-carry}
+\end{equation}
+This allows the model to propagate information that is useful for
+finer-level processing but not fully captured by the rendered
+segmentation mask alone (e.g. uncertainty or contextual cues about
+neighboring structures). \cref{sec:cross-level-ablation} ablates this
+mechanism against training levels independently with the query prior as
+the only cross-level connection.
+
+\subsection{Training Objective}
+\label{sec:objective}
+
+Each level is supervised at its own resolution with a combined
+binary cross-entropy and soft Dice loss,
+\begin{equation}
+  \mathcal{L}_\ell = \mathcal{L}_{\text{BCE}}^\ell + \mathcal{L}_{\text{Dice}}^\ell,
+\end{equation}
+and the total loss sums over levels, \TODO{state whether uniform or
+level-weighted, matching the final training config}:
+\begin{equation}
+  \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell\, \mathcal{L}_\ell.
+\end{equation}

@@ -1,0 +1,19 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented PatchICL-3D, an in-context 3D medical segmentation model
+that (1) attends jointly over space and image/label identity through a
+bi-axial attention mechanism, and (2) trains a coarse-to-fine cascade
+end-to-end by carrying hidden state across resolution levels with
+register tokens, while restricting fine-level computation to the region
+localized by coarser levels. \TODO{summarize headline results once
+finalized: accuracy vs.\ Medverse/Iris at fixed spacing, the individual
+contribution of each cascade component, and generalization findings.}
+Limitations and future work: \TODO{discuss dependence of
+region-restricted processing on coarse-level localization accuracy,
+scaling to more than \{$M$\} levels, and extending register-carried
+training to other volumetric ICL backbones.}
+
+\section*{Acknowledgments}
+\TODO{funding statement, matching our prior paper's DFG acknowledgment
+if applicable.}

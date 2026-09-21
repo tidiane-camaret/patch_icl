@@ -1,0 +1,76 @@
+\section{Introduction}
+\label{sec:intro}
+
+In-context learning (ICL) recasts medical image segmentation as a
+few-shot matching problem: given a target scan and a small set of
+(image, mask) context pairs illustrating the structure of interest, the
+model predicts a mask for the target without any task-specific
+fine-tuning. This removes the need to retrain or fine-tune a model for
+every new anatomical class, which is especially valuable for structures
+that are rare, newly defined, or only annotated by a handful of clinical
+sites.
+
+Most ICL segmentation models were designed and validated in
+2D~\cite{butoiUniverSegUniversalMedical2023,gaoShowSegmentUniversal2025,huMedverseUniversalModel2025a}.
+Moving to native 3D volumes is attractive -- CT and MRI are inherently
+volumetric, and slice-wise processing discards through-plane context
+that is often necessary to resolve thin or elongated structures -- but
+it sharpens an already difficult resolution--compute trade-off. Dense
+cross-attention between a target volume and $K$ context volumes scales
+with the cube of the side length, so a design that is affordable at
+$64^3$ becomes impractical at $256^3$. Existing 3D-capable approaches
+each make a different concession: Medverse~\cite{huMedverseUniversalModel2025a}
+processes the whole volume through a sliding window at every resolution
+step of its autoregressive cascade, re-visiting the entire volume even
+once coarse levels have already localized the target; Iris~\cite{gaoShowSegmentUniversal2025}
+fuses context information into the target through a single-shot
+pixel-shuffle/unshuffle operation with no iterative refinement across
+scales. Our own concurrent 2D work on hierarchical patch selection~\cite{camaretPatchICL2026}
+showed that supervising
+which regions to process, rather than relying on attention alone to
+discover them, yields a favorable accuracy/compute trade-off in 2D; here
+we ask whether the same principle extends to full 3D volumes, and how
+the image--label interaction itself should be designed once both axes
+(space and image/label identity) matter jointly.
+
+We propose \textbf{PatchICL-3D}, an in-context 3D segmentation model
+with two components that address these gaps directly.
+
+\vspace{0.3em}\noindent\textbf{Bi-axial image--label attention.}
+Instead of concatenating image and mask channels before a shared
+encoder (Medverse) or fusing them once via pixel shuffle-unshuffle
+(Iris), we let target and context tokens attend jointly along two axes:
+a spatial-patch axis (as in standard within-volume/cross-context
+attention) and an image/label axis that lets label information at a
+given location refine, and be refined by, the corresponding image
+features. This keeps the image and label streams distinct for longer
+while still allowing early, repeated exchange between them.
+
+\vspace{0.3em}\noindent\textbf{Register-carried coarse-to-fine cascade.}
+PatchICL-3D processes a volume through a small number of resolution
+levels. Two design choices connect the levels: (1) a \emph{query image
+prior} -- the previous level's upsampled prediction initializes the
+target's label tokens at the next level, rather than entering the
+network as a separate perturbed-GT branch (Medverse) or not at all
+(Iris); and (2) \emph{region-restricted fine processing} -- once a
+coarse level localizes the structure, the sliding window at finer levels
+is restricted to the predicted zone instead of re-scanning the full
+volume. To let the cascade be trained as a single model rather than a
+chain of independently-supervised stages, we introduce a small number of
+learned \emph{register tokens} that carry hidden state from one level's
+processing into the next, giving the optimizer a gradient path that
+crosses resolution levels.
+
+\vspace{0.3em}\noindent\textbf{Contributions.} (1) A bi-axial
+image--label attention mechanism for in-context 3D segmentation that
+attends jointly over space and image/label identity, contrasted directly
+against early-concatenation and one-shot fusion baselines. (2) A
+coarse-to-fine cascade in which the query prior and the region
+restriction at fine levels are ablated independently, quantifying their
+individual contribution to the accuracy/compute trade-off. (3)
+Register-token cross-level training that lets gradients flow across the
+cascade, evaluated against per-level-only supervision. (4) An evaluation
+on TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
+at fixed spacing against Medverse and Iris on accuracy (Dice, NSD) and
+compute (time, FLOPs, VRAM), together with generalization experiments on
+\TODO{other CT datasets, other modalities, and far-OOD tasks}.

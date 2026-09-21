@@ -1,0 +1,31 @@
+\begin{abstract}
+In-context learning (ICL) allows a segmentation model to adapt to a new
+anatomical structure at inference time from a handful of (image, mask)
+context pairs, without any gradient update. Extending ICL segmentation to
+full 3D volumes is attractive for clinical CT/MRI workflows but exposes a
+resolution--compute trade-off that is more severe than in 2D: dense
+cross-attention between a target volume and its contexts scales cubically
+with side length, forcing prior work to either downsample the volume,
+fall back to per-slice processing, or tile the volume with independent,
+context-blind sliding windows. We propose \textbf{PatchICL-3D}, an
+in-context 3D segmentation model built around two components. First, a
+\emph{bi-axial} image--label attention mechanism lets target and context
+tokens exchange information jointly along the spatial-patch axis and the
+image/label axis, in contrast to early feature concatenation
+(Medverse~\cite{huMedverseUniversalModel2025a}) or one-shot
+pixel-shuffle fusion (Iris~\cite{gaoShowSegmentUniversal2025}). Second, a
+coarse-to-fine cascade initializes each finer level's label tokens from
+the previous level's upsampled prediction and restricts its sliding
+window to the previously predicted foreground region, while a small set
+of learned register tokens carries hidden state across levels so the
+whole cascade can be trained end-to-end with gradients flowing between
+resolutions. We evaluate on TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
+CT at a fixed 3\,mm spacing, reporting Dice, normalized surface distance,
+and compute (wall-clock, FLOPs, peak VRAM) against Medverse and Iris
+baselines, and ablate the query prior, the region-restricted fine level,
+and cross-level register training. \TODO{fill in headline numbers once
+experiments are final: e.g., X\% Dice at Y\% of the compute of the
+strongest baseline, and standout categories such as small/thin
+structures.} We further test generalization to \TODO{other CT cohorts,
+MRI, and far-OOD tasks}, and release code and checkpoints.
+\end{abstract}

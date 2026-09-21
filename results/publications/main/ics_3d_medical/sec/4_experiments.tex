@@ -1,0 +1,106 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+
+\noindent\textbf{Dataset.} We use
+TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
+CT, \TODO{state the train/held-out anatomical class split, following the
+same held-in/held-out protocol used in our 2D work to test in-context
+generalization to unseen classes, not just unseen subjects}.
+
+\noindent\textbf{Baselines.} Medverse~\cite{huMedverseUniversalModel2025a}
+and Iris~\cite{gaoShowSegmentUniversal2025}, \TODO{state whether
+baselines are retrained on the same data/split or evaluated with
+released weights, and the number of context pairs $K$ used at
+inference}.
+
+\noindent\textbf{Metrics.} Segmentation accuracy is reported as Dice and
+normalized surface distance (NSD); compute is reported as wall-clock
+inference time, FLOPs, and peak VRAM.
+
+\subsection{Fixed-Spacing Comparison}
+\label{sec:fixed-spacing}
+
+We first compare all methods at a fixed 3\,mm isotropic spacing on
+TotalSegmentator CT crops, isolating architectural differences in
+image--label interaction (\cref{sec:biaxial}) from the coarse-to-fine
+cascade evaluated separately in \cref{sec:c2f-ablation}.
+
+\begin{table}[t]
+\centering
+\caption{Dice, NSD, and compute at fixed 3\,mm spacing on
+TotalSegmentator CT held-out classes. \TODO{fill in.}}
+\label{tab:fixed-spacing}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method & Dice & NSD & Time (s) & VRAM (GB) \\
+\midrule
+Iris & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+Medverse & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+PatchICL-3D (ours) & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\TODO{Discuss overall numbers, then break down by anatomical category
+(organs, bones, vessels, muscles) to identify where bi-axial attention
+helps most -- we expect an advantage on small/thin structures, similar
+to the pattern observed for patch-based selection in our 2D work.}
+
+\subsection{Coarse-to-Fine Ablations}
+\label{sec:c2f-ablation}
+
+We ablate the three cascade mechanisms of \cref{sec:cascade,sec:registers}
+independently: (i) the query image prior
+(\cref{eq:query-prior}) vs.\ a blank label-token initialization at every
+level; (ii) region-restricted fine processing (sliding window over the
+previous level's predicted zone) vs.\ a full-volume sliding window at
+every level; and (iii) register-carried cross-level training
+(\cref{eq:register-carry}) vs.\ independently-supervised levels
+connected only through the rendered query prior.
+
+\label{sec:cross-level-ablation}
+\begin{table}[t]
+\centering
+\caption{Effect of each cascade component on Dice and compute.
+\TODO{fill in; one row per ablation, cumulative or leave-one-out.}}
+\label{tab:c2f-ablation}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Configuration & Dice & Time (s) & FLOPs \\
+\midrule
+Full model & \TODO{} & \TODO{} & \TODO{} \\
+$-$ query prior & \TODO{} & \TODO{} & \TODO{} \\
+$-$ region restriction & \TODO{} & \TODO{} & \TODO{} \\
+$-$ register carry & \TODO{} & \TODO{} & \TODO{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\TODO{Report the accuracy/compute Pareto trade-off as sliding-window
+restriction is relaxed (full volume $\rightarrow$ tight crop around the
+previous prediction), analogous to the resolution/FLOPs Pareto plot in
+our 2D paper~\cite{camaretPatchICL2026}.}
+
+\subsection{Generalization}
+\label{sec:generalization}
+
+To test how well PatchICL-3D's accuracy/compute trade-off transfers
+beyond the training distribution, we evaluate on three settings of
+increasing distribution shift.
+
+\noindent\textbf{Other CT datasets.} \TODO{list held-out CT cohorts and
+results.}
+
+\noindent\textbf{Other modalities.} \TODO{MRI (e.g.\ TotalSegmentator
+MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025}) evaluated with models
+trained only on CT.}
+
+\noindent\textbf{Far out-of-distribution tasks.} \TODO{non-anatomical or
+pathology-driven segmentation tasks probing whether the region-restricted
+cascade still localizes correctly when the coarse level's prior is
+unreliable.}

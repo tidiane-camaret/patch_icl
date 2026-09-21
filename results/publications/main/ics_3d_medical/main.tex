@@ -1,0 +1,47 @@
+% Template for the 3D in-context medical segmentation paper.
+% Style follows the CVPR author kit, consistent with our prior 2D paper
+% (results/publications/references/scaling_ics_hierachical).
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[pagenumbers]{cvpr} % arXiv / draft numbering; switch to plain \usepackage{cvpr} for camera-ready
+
+% Import additional packages in the preamble file, before hyperref
+\input{preamble}
+
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\paperID{****}
+\def\confName{CVPR}
+\def\confYear{2027}
+
+%%%%%%%%% TITLE - PLEASE UPDATE
+\title{PatchICL-3D: Bi-Axial Attention and Register-Carried Cascades for In-Context 3D Medical Segmentation}
+
+%%%%%%%%% AUTHORS - PLEASE UPDATE
+\author{Tidiane Camaret Ndir \qquad Marco Reisert \qquad Robin T. Schirrmeister\\
+Division of Medical Physics, Department of Radiology,\\
+Medical Center -- University of Freiburg\\
+Freiburg, Germany\\
+{\tt\small \{tidiane.camaret.ndir, marco.reisert, robin.schirrmeister\}@uniklinik-freiburg.de}
+}
+
+\begin{document}
+\maketitle
+
+\input{sec/0_abstract}
+\input{sec/1_intro}
+\input{sec/2_related_work}
+\input{sec/3_method}
+\input{sec/4_experiments}
+\input{sec/5_conclusion}
+
+{
+    \small
+    \bibliographystyle{ieeenat_fullname}
+    \bibliography{references}
+}
+
+% \input{sec/X_suppl}
+
+\end{document}
