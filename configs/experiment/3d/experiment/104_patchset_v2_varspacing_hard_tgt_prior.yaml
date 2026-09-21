@@ -1,0 +1,197 @@
+# @package _global_
+# 104_patchset_v2_varspacing_hard_tgt_prior — PatchSetV2, single-forward variable-spacing
+# training (NO cascade), but with the same perturbed-GT query-prior injection as
+# 80_varspacing_hard_tgt_prior (v1) so the model learns to consume a rough prior mask BEFORE
+# ever paying the cascade recrop cost. Rationale (2026-09-20): 103's 2-level cascade epoch
+# stayed ~2.8x a single-level epoch even after retuning cascade_recrop_workers (docs/logs.md
+# same date) — level-1's re-crop is structurally serial-in-critical-path (its centre depends
+# on level-0's own prediction, so it can't be hidden in DataLoader prefetch the way level-0's
+# crop can). Training the "consume a prior" skill on the CHEAP single-level path first, then
+# warm-starting 103's actual cascade finetune from this run's checkpoint, spends the expensive
+# cascade-recrop wall-clock only on what genuinely needs a real upstream level-0 prediction
+# (i.e. the recrop/re-attend mechanics), not on re-deriving the prior-consumption skill itself.
+#
+#   python experiments/3d/train.py experiment=104_patchset_v2_varspacing_hard_tgt_prior
+#
+# CONSTRUCTION — standalone (composed directly from Hydra groups, not chained off 101, to
+# keep arch independent of it — see below), but data.source=multisource now DOES mirror 101's
+# full recipe (2026-09-20 update, requested): dataset=multisource_ct_mri (96/101's own group:
+# CT totalseg + MRI totalsegmri, v2 cohort path) with 101's exact resolved overrides —
+# train_spacing_range=[3,6] (96/101's own choice: the coarser two of cascade's [6,3,1.5]
+# levels; finest 1.5mm deferred to the later cascade finetune, same "prep, don't fully
+# replicate cascade" logic this whole config already follows), crop_spacing_mm=4.24 (eval,
+# geometric midpoint sqrt(3*6)), p_synth=0.3 + the gmm/cohort blocks (supervoxel-synth
+# regime), source_mix.per_source_train_classes=[balanced,balanced], eval_epoch_length=800 —
+# source_mix.regime_p: kept at 101's own CT-only [1.0, 0.0, 0.0] (2026-09-20 — briefly tried
+# reverting to 96's original mixed [0.4, 0.4, 0.2] so MRI/cross-modality would train too, but
+# reverted back to CT-only per explicit request). dataset=multisource_ct_mri is still used (not
+# d2_varspacing_15_6) for its p_synth/cohort/gmm machinery, even though every task is CT.
+#
+# arch stays independent of 101/96's own arch (which differs — mask_embed=linear,
+# decode_layers=1, cascade_registers=false, narrower features_per_stage, encoder_input_norm=
+# instance): kept as 103's exact block (below) so this run's checkpoint stays shape-identical
+# to 103's cascade model for a full (non-partial) later resume — pulling in 101's DATA recipe
+# doesn't require pulling in its arch too.
+#
+# arch: verbatim copy of 103_patchset_v2_cascade's resolved arch (compress_m=128,
+# mask_patch_size=8, mask_embed=conv [MaskConvEmbedV2 — see docs/logs.md 2026-09-20 "mask_embed
+# expressiveness"], decode_layers=3 [DecodeCrossBlock — docs/logs.md 2026-09-20 "scale the
+# Fq<->T_tok cross-attention"], plainconv_ts_features_per_stage=[32,64,256,768],
+# nnunet_ts_stages=[3], encoder_input_norm=zscore, encoder_spacing_aware=true). ALSO carries
+# cascade_registers=true even though this run never calls with cascade_regs (no cascade here,
+# so cascade_proj/cascade_type stay randomly-initialized/untrained dead weight) — purely so
+# the LATER 103 relaunch's checkpoint load is a full shape match, not a partial one.
+#
+# data.query_prior / prior_perturb: 80's exact "hard" mixture — modes=[gt,none] p=[0.3,0.7]
+# (not exp70's always-on `gt`) so training also sees the prior-free condition eval and
+# cascade's own level-0 (which never gets a prior) both run under; prior_perturb floors past
+# the measured Dice-vs-magnitude knees (see 80's own header for the citations) so the injected
+# prior looks like a real upstream prediction, not a clean copy of the answer — the same
+# degradation a real level-0 prediction (or cascade's own perturbed prior_perturb path) would
+# have. augmentations: copied from 103 (not 70/80's plainer block) — same goal_mask-inclusive
+# regime the eventual cascade finetune trains under.
+#
+# ASSUMPTIONS (not explicitly requested — override if wrong):
+#   - train.batch_size=8 / lr=2.83e-5: 103's own batch_size=4/lr=2e-5, scaled by sqrt(8/4) per
+#     this repo's established batch-size-scaling convention (101's own header cites the same
+#     rule). No VRAM check done yet for THIS arch at B=8 non-cascade (103's single-level
+#     benchmark was 3.78GB/sample @ inference-only; training/backward will use more, and B=8
+#     has not been measured) — the 98GB card has a lot of headroom over 101's own
+#     already-validated B=8, so this is a reasonable starting point, not a verified one.
+#   - encoder_lr_scale=1 (100's own stated reasoning: mask_embed/decode_layers/encoder-width
+#     changes since 97 mean nothing meaningfully warm-starts here either — training genuinely
+#     from scratch, not protecting a pretrained encoder).
+#   - warmup_epochs left at m3_patchset_v2's own default (5), not overridden.
+#   - train.checkpoint left unset (null) — from scratch, matching 70/80/100's own convention
+#     for a first-of-its-kind run.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m3_patchset_v2
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 768]
+  nnunet_ts_stages: [3]              # single deepest stage (768ch == e), no concat
+  encoder_input_norm: zscore
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  compress_m: 128
+  mask_patch_size: 8
+  mask_embed: conv                   # MaskConvEmbedV2 — see docs/logs.md 2026-09-20
+  decode_layers: 3                   # DecodeCrossBlock — see docs/logs.md 2026-09-20
+  cascade_registers: true            # unused this run (no cascade_regs) — kept for checkpoint
+                                      # shape-compat with a later 103 relaunch
+  # 2026-09-20 bottleneck-audit follow-up (docs/logs.md same date):
+  decoder_dim: 128                   # was 64 -- token_proj's e->decoder_dim cut was a 12x
+                                      # channel bottleneck at the decode conv stack's entry.
+                                      # 768 OOM'd (confirmed, not GPU contention): the decode
+                                      # conv path reaches native T=128 resolution at its finest
+                                      # stage, and decoder_dim sets the channel width THERE --
+                                      # 768ch @ 128^3 tried to allocate 48GB for one
+                                      # interpolate call at B=8. 128 (2x the old width) is a
+                                      # conservative bump instead.
+  feat_norm: self                    # was context -- target no longer z-scored using the
+                                      # context volume's own stats
+  compress_layers: 3                 # was 1 -- Stage A's single-shot 4096->128 read becomes
+                                      # 3 rounds of iterative refinement (kv reused, q updates)
+  # NOTE: decoder_dim/compress_layers changes checkpoint param shapes (token_proj,
+  # decode_blocks, class_embed, compressor.1/.2) -- this run's checkpoint is NO LONGER
+  # shape-identical to 103_patchset_v2_cascade's arch (that property, deliberately engineered
+  # above for a full-resume warm-start, is broken by this change unless 103 is updated to
+  # match). Relaunching from THIS run's own prior checkpoint needs
+  # +train.checkpoint_allow_partial=true + train.resume_weights_only=true (fresh optimizer;
+  # token_proj/decode_blocks/class_embed/compressor.1-2 are randomly re-initialized).
+  # torch.compile (2026-09-20): train.py's compile block was v1-only (net.decoder_kind /
+  # net._compress don't exist on PatchSetV2 -> AttributeError) -- fixed to be v2-safe
+  # (getattr/hasattr guards + a _compress_all branch, see docs/logs.md same date). Verified
+  # against a real build+forward+backward: ~632ms/step compiled vs eager's fwd 231.9 +
+  # bwd 522.7 = 754.6ms (~16-19% faster), first step pays a ~49s one-time compile.
+  compile: true
+  compile_encoder: true              # plainconv_ts is opt-in-only for compile (see
+                                      # _compile_encoder's docstring)
+  compile_decoder: true              # compiles PatchSetV2._decode (DecodeCrossBlock stack)
+
+data:
+  # 101's own recipe (see CONSTRUCTION above), regime_p reverted to 96's original mixed value.
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture: {}
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]   # (ct, mri, cross) -- CT-only, matching 101
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 2.83e-5   # 2e-5 * sqrt(8/4), matching 103's own lr scaled for B=8 (see ASSUMPTIONS)
+  encoder_lr_scale: 1
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 104_patchset_v2_varspacing_hard_tgt_prior

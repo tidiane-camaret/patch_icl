@@ -1,0 +1,144 @@
+# @package _global_
+# 103_patchset_v2_cascade — PatchSetV2 in cascade mode, built to sit close to 88_cascade
+# (same dataset/augmentation/cascade-data/train recipe) for a direct v1-vs-v2 cascade
+# comparison, swapping model=m2_patchset_decoder -> model=m3_patchset_v2. Standalone (no
+# experiment-chain inheritance), matching 88_cascade's own construction style, since v2's arch
+# surface doesn't share most of v1's knobs. Verified cascade.py/train.py's cascade path is
+# fully model-agnostic (duck-typed getattr(model,"spacing_aware",False), generic
+# forward(**kw)/out.get("registers"), cascade mode gated only by data.cascade_spacings) --
+# no code changes needed for this run.
+#
+# Requested arch overrides (literal copies/near-copies of 88's own arch block):
+#   encoder_spacing_aware=true, encoder_input_norm=zscore, compile_dynamic=false,
+#   plainconv_ts_features_per_stage=[32,64,256,768] (88's own [32,64,256,512], deepest stage
+#   widened 512->768), nnunet_ts_stages=[3] (single deepest stage, 768ch == e exactly, no
+#   concat -- confirmed, not 88's own [2,3])
+#
+# arch.mask_embed=conv (MaskConvEmbedV2, pfn_seg_2d.py): inspected PatchSet3D's own
+# MaskConvEmbed (the "conv" option's original implementation) and found its final
+# AdaptiveAvgPool3d(1) is provably lossy -- permutation-invariant over the final s^3 spatial
+# cells regardless of learned weights, confirmed empirically (docs/logs.md 2026-09-20). v2's
+# mask_embed=conv uses a new v2-only class instead: same strided-conv front end, flatten
+# read-out instead of pool+narrow-Linear -- removes that specific loss and, for p=8, is
+# actually cheaper than plain Linear (196.6k vs 393.2k params for the final projection).
+#
+# ASSUMPTIONS (not explicitly requested -- override if wrong):
+#   - compress_m: 128, mask_patch_size: 8 -- v2's model-group defaults are 32/1; carrying
+#     forward the values 101/102 actually validated instead (docs/logs.md 2026-09-19/20), not
+#     v2's raw un-iterated defaults.
+#   - arch.decode_layers left at the model-group default (1) -- the decode_layers=3
+#     experiment (102) is a separate track, not bundled in here unless wanted.
+#   - data/augmentations/train/eval blocks copied verbatim from 88_cascade (same batch_size=2
+#     /lr=1e-5/epochs=100 loki-sized recipe) -- no GPU-sizing rescale applied yet (101's own
+#     batch_size=8 bump came from an explicit VRAM check after the fact, not up front).
+#   - arch.cascade_registers=true, data.cascade_center_mode={mode: random_fg, eval_mode: com}
+#     -- explicit overrides (not carried from 88, which leaves both at their defaults).
+#
+#   python experiments/3d/train.py experiment=103_patchset_v2_cascade \
+#     train.checkpoint=<a v2 best.pt> train.resume_weights_only=true \
+#     +train.checkpoint_allow_partial=true
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: d1
+  - override /model: m3_patchset_v2
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 768]
+  nnunet_ts_stages: [3]              # single deepest stage (768ch == e), no concat
+  encoder_input_norm: zscore
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  compress_m: 128
+  mask_patch_size: 8
+  # MaskConvEmbedV2 (flatten read-out, not the pooled MaskConvEmbed) -- see docs/logs.md
+  # 2026-09-20 "mask_embed expressiveness" for why the pooled version was rejected.
+  mask_embed: conv
+  # 3 rounds of Fq<->T_tok cross-attention in _decode (DecodeCrossBlock) -- see docs/logs.md
+  # 2026-09-20 "scale the Fq<->T_tok cross-attention" / 102_patchset_v2_decode_cross.yaml.
+  decode_layers: 3
+  cascade_registers: true            # carry level i-1's thinking-row state into level i
+
+data:
+  context_size: 1
+  train_classes: balanced
+  val_classes: all
+  crop_spacing_mm: 6                 # == cascade_spacings[0] (required by _assert_cascade_supported)
+  train_spacing_range: null          # fixed-pitch crops; cascade guard requires this null
+  mask_downsample: soft              # smooth downsample target (train); eval maps back to occupancy
+
+  cascade_spacings: [6, 3, 1.5]      # coarse -> fine
+  cascade_crop_jitter: null          # level>0 re-crop jitter: null -> T//4; 0 -> exact predicted COM
+  # Threaded re-crop loads. The old value (1, serial) was a LOKI-node finding that doesn't
+  # transfer here (nora-odin, 44 cores, ~97% idle during recrop): profiled per-task cost is
+  # real CPU compute (build_native_crop's avg_pool3d native->target decimation, ~33ms/task
+  # of a ~61ms task), not NFS I/O (RAM cache confirmed hit every call), so it threads well.
+  # Measured on this node/config (B=4, K=1 -> 8 tasks/level): workers=1 424ms/item ->
+  # workers=8 97.5ms/item (4.35x; peaks at task count, workers=16 is mildly worse -- no more
+  # tasks to parallelize). Retune (roughly = batch_size*(context_size+1), capped near the
+  # core count) if batch_size/context_size change. docs/logs.md 2026-09-20.
+  cascade_recrop_workers: 8
+  cascade_center_mode:                # train re-crop centre = random_fg (donut/large-ROI safe);
+    mode: random_fg                   # eval stays on the deterministic prob-weighted centroid
+    eval_mode: com                    # so val Dice stays comparable across epochs
+  ram_cache: true                    # fork-shared RAM cache of ct_raw.npy + label.npy (>= 96 GB node)
+  gpu_realize_crop: true             # GPU resample / normalize / place for every cascade crop
+
+  cascade_query_prior:
+    modes: [pred, none, gt]
+    p:     [0.8, 0.1, 0.1]
+    eval_mode: pred
+  cascade_query_prior_hard: false
+
+  cascade_train:
+    levels: 2
+    spacing_range: [1.5, 6]
+
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 4                      # loki 48 GB; larger GPU -> scale batch_size/lr like 101 did
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 2.0e-5
+  encoder_lr_scale: 1
+  cascade_loss_weights: [1, 1, 1]
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 103_patchset_v2_cascade
