@@ -1232,23 +1232,36 @@ def main(cfg: DictConfig) -> None:
         # decoder_kind=iris and cascade_registers=False (patchset3d.py::forward's own skip --
         # _attn's outputs are unused for this decoder's logit, and mask_support/mask_query/
         # regs have no other consumer either in that case) -- compiling a graph that never
-        # runs just wastes the one-time compile cost.
-        _skip_transformer = net.decoder_kind == "iris" and not net.cascade_registers
+        # runs just wastes the one-time compile cost. PatchSetV2 has no decoder_kind at all
+        # (getattr -> None -> never "iris") -- its Stage B transformer is unconditionally
+        # called every forward, so it's always compiled there.
+        _skip_transformer = (getattr(net, "decoder_kind", None) == "iris"
+                             and not net.cascade_registers)
         if not _skip_transformer:
             net.transformer = torch.compile(net.transformer, dynamic=_cdyn)
         import pfn_train
         pfn_train._newtonschulz5_batched = torch.compile(pfn_train._newtonschulz5_batched)
         msg = ("Skipped net.transformer compile (arch.decoder=iris, never called) + Newton–Schulz"
               if _skip_transformer else f"Compiled net.transformer + Newton–Schulz (dynamic={_cdyn})")
-        if hasattr(net, "compressor"):
-            # seq_compress's Stage A/C: _compress/_expand are methods looping over an
-            # nn.ModuleList (no forward of its own to compile directly) — shadow them with
+        if hasattr(net, "_compress"):
+            # PatchSet3D's seq_compress Stage A/C: _compress/_expand are methods looping over
+            # an nn.ModuleList (no forward of its own to compile directly) — shadow them with
             # compiled callables the same way compile_decoder shadows _decode below. No
             # separate flag: automatic whenever arch.compile and arch.seq_compress are both
             # true. Likely NOT bit-exact vs eager either, same caveat as compile_decoder.
+            # Gated on hasattr(net, "_compress") (the METHOD), not hasattr(net, "compressor")
+            # (the nn.ModuleList) -- PatchSetV2 also has a `.compressor` ModuleList (its own
+            # Stage A) but no `_compress`/`_expand` methods (it uses `_compress_all` instead,
+            # compiled separately below), so the old `hasattr(net, "compressor")` guard would
+            # have raised AttributeError on a v2 model.
             net._compress = torch.compile(net._compress, dynamic=_cdyn)
             net._expand = torch.compile(net._expand, dynamic=_cdyn)
             msg += " + seq_compress stages"
+        elif hasattr(net, "_compress_all"):
+            # PatchSetV2's own Stage A per-volume compression (compress_m tokens from the
+            # R^3 encoder grid) -- the v2 analogue of the block above.
+            net._compress_all = torch.compile(net._compress_all, dynamic=_cdyn)
+            msg += " + Stage A compress_all"
         msg += _compile_encoder(net, cfg)
         if cfg.arch.get("compile_decoder", False):
             # _decode is a method, so this shadows it with a compiled callable on the instance —
