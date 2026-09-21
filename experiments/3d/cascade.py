@@ -730,7 +730,7 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     from collections import defaultdict
     import numpy as np
     from common import _source_root                     # NOTE: _source_root lives in common.py
-    from evaluate import _stitched_native_dice_multi, _stitched_native_metrics_multi, _save_cascade_pair
+    from evaluate import _stitched_native_metrics_and_levels, _save_cascade_pair
 
     # NSD tolerance (mm), same convention as evaluate.evaluate_classes: absent eval config (e.g.
     # train.py's cascade val step, whose cfg may have no `eval.nsd_tolerance_mm`) -> skipped.
@@ -865,14 +865,16 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     for m in mods_seen:
         r = roots.get(m, root)
         pgm = [{(k[1], k[2]): v for k, v in lvl.items() if k[0] == m} for lvl in pg_levels]
-        for (sj, cl), (d, nsd) in _stitched_native_metrics_multi(
-                pgm, r, tol_mm=nsd_tol, class_idx=cls_idx, gt_loader=gt_loader).items():
+        # One combined pass: full stitch + all N per-level solo dices, one native-GT load
+        # per case instead of N+1 (see evaluate._stitched_native_metrics_and_levels).
+        full, per_level = _stitched_native_metrics_and_levels(
+            pgm, r, tol_mm=nsd_tol, class_idx=cls_idx, gt_loader=gt_loader)
+        for (sj, cl), (d, nsd) in full.items():
             stitched[(m, sj, cl)] = d
             if nsd is not None:
                 nsd_scores[(m, sj, cl)] = nsd
         for li in range(N):
-            for (sj, cl), d in _stitched_native_dice_multi(
-                    [pgm[li]], r, class_idx=cls_idx, gt_loader=gt_loader).items():
+            for (sj, cl), d in per_level[li].items():
                 per_res_by_level[li][(m, sj, cl)] = d
 
     mean_ms = round(t_cascade / n_seen, 1) if n_seen else float("nan")

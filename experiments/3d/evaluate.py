@@ -881,23 +881,42 @@ def _refit_into_box(pred_fine, center, side, T):
     return out
 
 
+def _place_patch(pred, geom):
+    """Crop-grid prediction (T,T,T) + its geom -> (d0,h0,w0,small): `small` is the pred's
+    occupied pad-box upsampled (nearest) to native crop_sizes; (d0,h0,w0) its native-volume
+    placement origin. None when the pad-box is empty.
+
+    Split out of _write_native so a caller needing the SAME level's patch pasted into more
+    than one target array (a running composite AND that level's own solo-dice array, see
+    _stitched_native_metrics_and_levels) upsamples it once instead of once per paste."""
+    starts, crop, out, pad = (geom[r].astype(int) for r in range(4))
+    sub = pred[pad[0]:pad[0] + out[0], pad[1]:pad[1] + out[1], pad[2]:pad[2] + out[2]]
+    if sub.size == 0:
+        return None
+    t = torch.from_numpy(np.ascontiguousarray(sub, dtype=np.float32))[None, None]
+    small = F.interpolate(t, size=(int(crop[0]), int(crop[1]), int(crop[2])),
+                          mode="nearest")[0, 0].numpy() > 0.5
+    return int(starts[0]), int(starts[1]), int(starts[2]), small
+
+
+def _paste(native, d0, h0, w0, small):
+    """Write a _place_patch patch into `native` at native-volume origin (d0,h0,w0), clipped
+    to native's bounds."""
+    D, H, W = native.shape
+    de, he, we = min(d0 + small.shape[0], D), min(h0 + small.shape[1], H), min(w0 + small.shape[2], W)
+    native[d0:de, h0:he, w0:we] = small[:de - d0, :he - h0, :we - w0]
+
+
 def _write_native(native, pred, geom):
     """Composite a crop-grid prediction into the native volume at its crop location.
 
     Inverse of the crop: the grid region [pad_lo, pad_lo+out_sizes) resamples from native
     [starts, starts+crop_sizes), so extract the object sub-block, upsample it to crop_sizes
-    (nearest), and write it in. Later (finer) writes overwrite earlier (coarser) ones."""
-    starts, crop, out, pad = (geom[r].astype(int) for r in range(4))
-    sub = pred[pad[0]:pad[0] + out[0], pad[1]:pad[1] + out[1], pad[2]:pad[2] + out[2]]
-    if sub.size == 0:
-        return
-    t = torch.from_numpy(np.ascontiguousarray(sub, dtype=np.float32))[None, None]
-    small = F.interpolate(t, size=(int(crop[0]), int(crop[1]), int(crop[2])),
-                          mode="nearest")[0, 0].numpy() > 0.5
-    D, H, W = native.shape
-    d0, h0, w0 = int(starts[0]), int(starts[1]), int(starts[2])
-    de, he, we = min(d0 + small.shape[0], D), min(h0 + small.shape[1], H), min(w0 + small.shape[2], W)
-    native[d0:de, h0:he, w0:we] = small[:de - d0, :he - h0, :we - w0]
+    (nearest), and write it in. Later (finer) writes overwrite earlier (coarser) ones.
+    Thin wrapper over _place_patch + _paste."""
+    placed = _place_patch(pred, geom)
+    if placed is not None:
+        _paste(native, *placed)
 
 
 def _unpack_pred(entry):
@@ -992,6 +1011,76 @@ def _stitched_native_dice_multi(pg_levels, root, class_idx=None, gt_loader=None)
     return {k: d for k, (d, _) in
             _stitched_native_metrics_multi(pg_levels, root, class_idx=class_idx,
                                            gt_loader=gt_loader).items()}
+
+
+def _stitched_native_metrics_and_levels(pg_levels, root, tol_mm: float | None = None,
+                                        class_idx=None, gt_loader=None):
+    """Combined (full composite, per-level solo) dice/nsd, one native-GT load per case.
+
+    evaluate_cascade needs both the full coarse->fine composite (`_stitched_native_metrics_
+    multi`) AND each level's own solo dice (`_stitched_native_dice_multi([pg_levels[li]],
+    ...)` per level, for the dice_r{s} breakdown) — calling them separately reloads/
+    rethresholds the same native GT volume (`np.load(...)==idx` or `gt_loader(...)`) N+1
+    times per case, and re-upsamples (`F.interpolate`) each level's crop twice. This loads
+    GT once per case and computes each level's crop->native patch once (`_place_patch`),
+    pasting it into both a running composite and that level's own solo array.
+
+    Returns (full, per_level):
+      full: {(subj,cls): (dice, nsd_or_None)} — byte-identical to
+        _stitched_native_metrics_multi(pg_levels, root, tol_mm, class_idx, gt_loader).
+      per_level: list of len(pg_levels), each {(subj,cls): dice} — per_level[i] is
+        byte-identical to _stitched_native_dice_multi([pg_levels[i]], root, class_idx,
+        gt_loader) (computed independently per level: a key need only be present in that
+        one level's dict, unlike `full` which requires presence in every level)."""
+    if gt_loader is None and class_idx is None:
+        from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+        class_idx = _ALL_CLASSES_IDX
+    n = len(pg_levels)
+    full, per_level = {}, [dict() for _ in range(n)]
+    if n == 0:
+        return full, per_level
+    spacings = _load_native_spacings(root) if tol_mm is not None else {}
+    all_keys = set()
+    for lvl in pg_levels:
+        all_keys.update(lvl.keys())
+    for key in all_keys:
+        subj, cls = key
+        present = [li for li in range(n) if key in pg_levels[li]]
+        want_full = len(present) == n
+        if gt_loader is not None:
+            gt = gt_loader(subj, cls)
+            if gt is None:
+                continue
+            gt = np.asarray(gt)
+        else:
+            idx = class_idx.get(cls)
+            if idx is None:
+                continue
+            gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
+        composite = np.zeros(gt.shape, dtype=bool) if want_full else None
+        for li in present:
+            p, geom = _unpack_pred(pg_levels[li][key])
+            placed = _place_patch(p, geom)
+            solo = np.zeros(gt.shape, dtype=bool)
+            if placed is not None:
+                if want_full:
+                    _paste(composite, *placed)
+                _paste(solo, *placed)
+            inter = 2.0 * np.logical_and(solo, gt).sum()
+            denom = int(solo.sum()) + int(gt.sum())
+            per_level[li][key] = inter / denom if denom > 0 else 1.0
+        if want_full:
+            inter = 2.0 * np.logical_and(composite, gt).sum()
+            denom = int(composite.sum()) + int(gt.sum())
+            dice = inter / denom if denom > 0 else 1.0
+            nsd = None
+            if tol_mm is not None:
+                sp = spacings.get(subj, (1.0, 1.0, 1.0))
+                nsd_t = nsd_batch(torch.from_numpy(composite)[None], torch.from_numpy(gt)[None],
+                                  sp, tol_mm)
+                nsd = float(nsd_t[0])
+            full[key] = (dice, nsd)
+    return full, per_level
 
 
 def _stitched_native_dice(base_pg, over_pg, root):
