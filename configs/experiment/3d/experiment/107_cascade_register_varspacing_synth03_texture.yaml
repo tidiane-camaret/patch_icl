@@ -1,0 +1,137 @@
+# @package _global_
+# 107_cascade_register_varspacing_synth03_texture — the +TextureSpec twin of 106
+# (106_cascade_register_varspacing_synth03), completing a clean 3-arm ablation chain
+# (105: p_synth=0 / 106: p_synth=0.3 flat noise / 107: p_synth=0.3 + multi-octave correlated
+# noise) sharing one starting checkpoint, arch, and recipe.
+#
+#   python experiments/3d/train.py experiment=107_cascade_register_varspacing_synth03_texture
+#
+# WHY (2026-09-22): literature research (fork, this session) on synthetic-data /
+# domain-randomization methods for OOD generalization converged on texture/appearance
+# randomization as the single highest-leverage knob, ahead of shape randomization:
+#   - SynthSeg (Billot et al., PMC10154424 / arXiv:2107.09559): ablation shows removing
+#     spatial deformation + bias-field (smooth intensity inhomogeneity) hurts Dice on EVERY
+#     eval set -- flat per-label GMM intensity sampling alone is not what drives their
+#     generalization.
+#   - Domain-randomization CV literature (arXiv:2303.11546 "Texture Learning Domain
+#     Randomization" + related): texture/appearance randomization has the largest single
+#     effect on sim-to-real transfer, larger than shape/geometry alone -- AND flags that
+#     low-order/flat noise underperforms richer multi-octave/multi-scale noise specifically.
+#   - GIN/IPA (arXiv:2411.05223): pure appearance randomization (no synthetic shape at all)
+#     achieves strong single-source domain generalization -- appearance alone captures a large
+#     share of the OOD-robustness benefit.
+#   - SyntheticTumors/DiffTumor shape-realism ablations show a real but FAST-SATURATING effect
+#     (DiffTumor needed just one annotated tumor exemplar) -- a secondary, not primary, lever.
+# `data.gmm.texture` (`TextureSpec`, `src/providers/synth_gmm.py`) implements exactly the
+# "richer multi-octave noise" the CV literature calls for, but per `[[project_synth_gmm_texture_
+# noise]]` memory it was implemented+unit-tested 2026-09-16 and NEVER trained/eval'd — 106
+# leaves it at `n_octaves=1` (pure passthrough, byte-identical to flat i.i.d. noise). This run
+# turns it on to test the literature's top prediction directly.
+#
+# ONLY delta vs 106: `data.gmm.texture: {n_octaves: 4}` (persistence/base_scale_mm left at
+# TextureSpec's own defaults: 0.5 / 15.0mm). Same checkpoint resume, same p_synth=0.3, same
+# gmm.shape/heterogeneity/cohort/source_mix, same train recipe, same epoch-51 cap.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4        # ONLY delta vs 106 -- see WHY above
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints/2026-09-14_92_multisource_synth_cascade_register/best.pt
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 107_cascade_register_varspacing_synth03_texture

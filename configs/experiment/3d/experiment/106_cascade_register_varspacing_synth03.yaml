@@ -1,0 +1,134 @@
+# @package _global_
+# 106_cascade_register_varspacing_synth03 — the p_synth=0.3 twin of
+# 105_cascade_register_varspacing_hard_tgt_prior, for a controlled p_synth ablation on
+# val/dice. Identical arch, data, augmentations, and train recipe to 105 (same checkpoint
+# resume, same lr/batch_size/warmup) — the ONLY difference is `data.p_synth: 0 -> 0.3` (which
+# activates the gmm/cohort blocks 105 leaves declared-but-inert) and
+# `data.gpu_realize_max_native: 128`, 92_multisource_synth's own perf cap for this exact
+# p_synth>0 + gpu_realize_crop=true combo (docs/logs.md 2026-09-14 "synth_gmm cascade path:
+# cap the native crop before painting" — without it, p_synth=0.3 was measured at ~3.3x a
+# p_synth=0 epoch; the cap brings that down to ~2.5x, still not free).
+#
+#   python experiments/3d/train.py experiment=106_cascade_register_varspacing_synth03
+#
+# WHY (2026-09-22): user wants to directly test whether p_synth helps generalization. Per
+# docs/logs.md + eval_expansion_status.md, every existing synth-vs-real comparison in this
+# project is confounded (92 vs 89 differs in BOTH p_synth AND intensity-aug strength) or
+# untested (89 was never run through the OOD eval sweep, and that sweep hit an unrelated
+# DataLoader forkserver bug — `TypeError: cannot pickle 'module' object` — on eval.py,
+# unresolved, out of scope here). This run instead isolates p_synth cleanly against 105 itself:
+# same starting weights, same everything else, only p_synth differs. Comparison metric is
+# `val/dice` on TotalSeg val (the in-training validation, logged every eval_every=10 epochs —
+# no separate eval.py sweep needed), read directly off both runs' wandb curves /
+# `  [e{epoch}] ... val_dice=...` log lines at matching epochs (0,10,20,30,40,50).
+#
+# BUDGET: capped at epoch 50 (train.epochs=51 -- resume_weights_only=true always starts
+# epoch counting at 0, so this yields exactly epochs 0..50, matching 105's own stop point) via
+# a config-level cap rather than a runtime SIGINT/tmux watcher (the tmux-based auto-stop used
+# for 105 needed 2x SIGINT + an escalation to SIGTERM, and the whole session was separately
+# interrupted mid-run by an unrelated restart -- a hardcoded epoch budget is more robust).
+# At ~2.5-3x epoch time this is a real multi-hour commitment (105 was ~107s/epoch * 50 =~90
+# min; expect roughly 4-5.5 hours here) on the single shared GPU.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3                # ONLY delta vs 105 (plus the perf cap below)
+  gpu_realize_max_native: 128  # 92's own cap for p_synth>0 + gpu_realize_crop (see header)
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture: {}
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51    # capped -- see BUDGET above
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints/2026-09-14_92_multisource_synth_cascade_register/best.pt
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 106_cascade_register_varspacing_synth03

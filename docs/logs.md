@@ -9304,3 +9304,188 @@ Baked `arch.compile/compile_encoder/compile_decoder=true` into
 val_dice 0.232) to prepare this relaunch (planned: resume FULL state — optimizer/scheduler/
 epoch, same config/regime as before, only adding compile, so unlike the earlier CT-only-regime
 relaunch this one wouldn't need resume_weights_only) — launch itself held pending user signal.
+
+## 2026-09-22 — patchset3d cascade_registers checkpoint: cheap prior-consumption pretrain, then a controlled p_synth ablation
+
+Resumed `2026-09-14_92_multisource_synth_cascade_register/best.pt` (the still-training,
+epoch-36/140, `arch.cascade_registers=true` checkpoint on the 88->89->92 line) weights-only
+into 104's cheap single-forward variable-spacing + hard target-prior recipe (no cascade),
+matching the "train the prior-consumption skill cheaply before paying the cascade re-crop
+cost" logic 104 itself used for PatchSetV2 — new config
+`105_cascade_register_varspacing_hard_tgt_prior.yaml` (same 88_cascade arch: `mask_slots=1`/
+`decode_source=img`/`mask_embed=linear`, NOT 70/80's `mask_slots=2`/`decode_source=mask`;
+`p_synth=0` real-data-only; `lr=1e-4`/`batch_size=8`, m2_patchset_decoder's own stated B=8
+base; `warmup_epochs=1` matching 89's own warm-start precedent). Ran in a detached tmux
+session (`train_105`) so it survives independently of the Claude Code session — learned this
+the hard way after first launching it as a plain nohup'd background process, invisible to the
+user's own tmux. Capped at epoch 50 via a runtime SIGINT/SIGTERM watcher (grep for the
+`[e50] loss=...` eval line, `tmux send-keys C-c` x2 then escalate to `pkill -TERM`) — reached
+it cleanly: `val_dice=0.4868`, best checkpoint along the way `0.4922`, seen=0.5737/unseen=0.3886.
+
+**User then asked to study `p_synth`'s effect on generalization.** Research (fork) found every
+existing synth-vs-real comparison in this project is either confounded (92 vs 89 differs in
+BOTH `p_synth` AND 92's added intensity-aug set) or untested (89_multisource_cascade,
+epoch-50 real-only checkpoint from 2026-09-10, has zero eval.json entries anywhere despite
+being the architectural sibling of exp92_orig). Queued a 10-source external-cohort eval sweep
+of the 89 checkpoint to get a free real-vs-synth read using existing artifacts (no new
+training) — but `eval.py`'s DataLoader hit a real bug on `totalseg` (multiprocessing forkserver
+`TypeError: cannot pickle 'module' object`; `flare22`'s eval succeeded right after, so it's not
+uniformly fatal — not root-caused, out of scope for now). Also lost the sweep once to an
+unrelated session/tmux-server restart mid-run (harness-level interruption, not caused by this
+work) before even hitting the pickle bug — a reminder that ALL multi-hour work in this session
+needs to live in tmux, not in a Claude-Code-owned background process, to survive session
+hiccups.
+
+**Redirected**: drop the external-cohort sweep entirely for now; run a CLEAN controlled
+`p_synth` ablation against 105 itself instead (same starting checkpoint, arch, data, aug,
+train recipe — only `data.p_synth: 0 -> 0.3` differs, plus `data.gpu_realize_max_native=128`,
+92's own perf cap for `p_synth>0` + `gpu_realize_crop=true`) — new config
+`106_cascade_register_varspacing_synth03.yaml`, `train.epochs=51` hardcoded (not a runtime
+watcher this time — more robust) so it self-terminates at the same epoch-50 stop point as 105.
+Measured epoch-0 cost: 220.4s vs 105's ~107s (~2.1x, driven almost entirely by
+`data_ms=874.6` vs 105's ~79ms/step — the synth paint path, not compute) — better than the
+~2.5-3x pessimistic estimate from the September cascade-path perf investigation, ~50 epochs
+should land around ~3.1h. Comparison metric: `val/dice` (+ seen/unseen macro split) on
+TotalSeg val at matching epochs (0/10/20/30/40/50), read off both runs' wandb curves — no
+external eval needed for this first pass.
+
+**Plan for the unattended window (user away ~6h)**: (1) let 106 run to its epoch-50 cap: (2) in
+parallel, literature research (fork) on synthetic-data / domain-randomization methods for OOD
+generalization (SynthSeg, SyntheticTumors/DiffTumor/FreeTumor, MAISI, GIN/IPA appearance
+randomization, general domain-randomization dose-response findings) to prioritize which
+`synth_gmm` knob (plain GMM paint dose, `p_shape` procedural shapes, `p_heterogeneity`
+core/rim lesion blobs, `texture` multi-octave noise, `var_max` GMM spread) to ablate next; (3)
+once 106 completes, log the 105-vs-106 val_dice comparison here; (4) time-box a quick attempt
+at the `eval.py` forkserver bug (`eval.workers=0` is the documented workaround for a related
+fork-after-CUDA-init crash, see `project_eval_cuda_fork_crash` memory) on 1-2 sources only, to
+get genuine OOD signal on 105 vs 106 if it's a quick fix; (5) launch one more targeted ablation
+arm sized to whatever GPU budget remains, informed by (2)-(4). All long-running work stays in
+tmux (`train_105` gone/cleaned up, `train_106` running) so it survives any further session
+interruptions.
+
+## 2026-09-22 (cont.) — literature research: texture/appearance randomization ranks above shape for OOD generalization
+
+Literature survey (SynthSeg PMC10154424/arXiv:2107.09559, SyntheticTumors/DiffTumor
+arXiv:2402.19470, domain-randomization CV arXiv:2303.11546, GIN/IPA arXiv:2411.05223, dose-
+response arXiv:2510.14831) to prioritize which `synth_gmm` knob to ablate after 106. Key
+findings: SynthSeg's own ablation shows spatial deformation + bias-field (smooth intensity
+inhomogeneity) drive its generalization, not flat per-label GMM intensity alone; general
+domain-randomization literature ranks texture/appearance randomization above shape/geometry
+randomization for sim-to-real transfer, and specifically flags that low-order/flat noise
+underperforms richer multi-octave/correlated noise; GIN/IPA gets strong single-source domain
+generalization from appearance randomization alone, no synthetic shape at all; shape-realism
+ablations (SyntheticTumors/DiffTumor) show a real but fast-saturating effect (one exemplar
+tumor sufficed). `p_synth` dose literature (arXiv:2510.14831) reports a 25-100% synthetic-
+fraction sweet spot, so the current 0.3 arm is reasonable but 0.5-0.6 is also worth trying
+later. Net: `data.gmm.texture` (`TextureSpec`, multi-octave correlated noise,
+[[project_synth_gmm_texture_noise]]) is the literature's top pick — implemented+unit-tested
+2026-09-16 but never trained/eval'd, currently inert (`n_octaves=1`) in both 105 and 106.
+
+New config `107_cascade_register_varspacing_synth03_texture.yaml` — identical to 106 except
+`data.gmm.texture.n_octaves: 1 -> 4` — queued to launch once 106 frees the GPU, completing a
+clean 3-arm chain (105 real-only / 106 flat-noise synth / 107 multi-octave-texture synth) off
+one shared starting checkpoint.
+
+## 2026-09-22 (cont.) — 105 vs 106 val_dice comparison: p_synth=0.3 trends better on unseen classes
+
+Full val curves (TotalSeg val, `val/dice_seen` / `val/dice_unseen` macro split by
+train-class membership):
+
+| epoch | 105 (p_synth=0) val_dice | seen | unseen | 106 (p_synth=0.3) val_dice | seen | unseen |
+|---|---|---|---|---|---|---|
+| 0  | 0.4803 | 0.5634 | 0.3865 | 0.4540 | 0.5393 | 0.3576 |
+| 10 | 0.4922 | 0.5739 | 0.4000 | 0.4871 | 0.5626 | 0.4018 |
+| 20 | 0.4824 | 0.5599 | 0.3949 | 0.4776 | 0.5513 | 0.3943 |
+| 30 | 0.4814 | 0.5621 | 0.3903 | 0.4762 | 0.5525 | 0.3899 |
+| 40 | 0.4872 | 0.5691 | 0.3947 | 0.4854 | 0.5623 | 0.3987 |
+| 50 | 0.4868 | 0.5737 | 0.3886 | 0.4899 | 0.5676 | 0.4022 |
+
+Both curves wobble the same way (peak ~e10, dip e20-30, partial recovery e40-50) — same
+underlying data/schedule noise, expected since they share a starting checkpoint and differ
+only in `p_synth`. Two real differences: (1) **105 plateaus after its e10 peak (0.4922) and
+never re-exceeds it through e50 (0.4868, -0.0054 off peak)**; **106 is still climbing at e50
+and sets a new own-curve peak there (0.4899)**, ~0.003 above 105's matched e50 point and
+closing on 105's overall peak — consistent with p_synth=0.3 diluting the real-anatomy
+gradient signal per epoch (only 70% of batches are real) so it converges slower but hasn't
+plateaued yet, unlike 105. (2) **unseen-class Dice**: 106 ends at 0.4022 (its own peak,
+exceeding 105's peak-ever 0.4000 at e10 and 105's own e50 value 0.3886 by +0.0136) while 105's
+unseen trend is flat/noisy with no late improvement. seen-class Dice is consistently ~0.006-
+0.013 LOWER for 106 at every epoch (expected: real-only training directly matches the seen-
+class eval distribution; synth dilutes that).
+
+Read: a real, if modest and not-yet-fully-converged, signal that `p_synth=0.3` trades a small
+amount of seen-class Dice for better unseen-class generalization, and the effect looks like it
+was still growing at the epoch-50 cutoff rather than saturated — both runs likely need more
+epochs for a confident verdict, and this in-distribution "unseen TotalSeg class" split is a
+weaker generalization probe than true external-cohort OOD Dice (still blocked on the
+unresolved `eval.py` forkserver bug). Launching `107_cascade_register_varspacing_synth03_
+texture.yaml` (same recipe + `gmm.texture.n_octaves=4`) next to test whether the literature-
+prioritized multi-octave texture knob adds to this on top of flat-noise `p_synth=0.3`.
+
+## 2026-09-22 (cont.) — eval.py forkserver crash root cause: `dataset=totalseg` defaults to p_synth=1 (OLD supervoxel synth, not synth_gmm)
+
+Investigated the `TypeError: cannot pickle 'module' object` crash from the earlier 89-checkpoint
+sweep (only hit on `totalseg`, not `flare22`) without spending GPU time (107 was training).
+`configs/experiment/3d/dataset/totalseg.yaml:18` sets `data.p_synth: 1` as this dataset group's
+own default — but this `p_synth`/`synth_method: seeds3d` pair is the OLDER supervoxel-merge
+synth-label path (`label_synth_{method}.npy`, `scripts/synth_labels/generate.py --method slic`,
+`src/totalseg_dataloader_incontext.py`), a COMPLETELY DIFFERENT mechanism from
+`SynthGmmProvider`/`synth_gmm` (the GMM-paint system this session's whole p_synth ablation is
+about) — same config key name, unrelated implementation, easy to conflate. Net effect: any
+`eval.py ... dataset=totalseg` invocation that doesn't explicitly override `data.p_synth=0`
+evaluates on 100% OLD-style supervoxel-synthetic labels, not real TotalSeg anatomy — a real
+correctness gotcha, not just a crash cause (the crash itself may or may not trace to this old
+path specifically; not fully root-caused, and out of scope to chase further right now).
+
+**Not yet verified**: whether any of the EXISTING master-table `eval.json` entries tagged as
+"totalseg"/in-distribution (exp92_orig etc., `results/presentations/val/per_dataset_
+analysis.py`) were run without an explicit `data.p_synth=0` override and are therefore silently
+scored against old-synth labels instead of real anatomy — `eval.json`'s own `config` dict only
+records `eval.*` keys, not the resolved `data.*` state, so this isn't auditable from the saved
+JSON alone. Flagging, not chasing — out of scope for the current p_synth/texture ablation
+series (which never touches `eval.py`/`dataset=totalseg`, only the in-training `val/dice` on
+the multisource cohort loader, unaffected by this). Any FUTURE `eval.py ... dataset=totalseg`
+call MUST pass `data.p_synth=0` explicitly to get real-anatomy Dice.
+
+## 2026-09-22 (cont.) — 107 result + eval.py forkserver fix: multi-octave texture wins on every axis
+
+`107_cascade_register_varspacing_synth03_texture` (p_synth=0.3 + `gmm.texture.n_octaves=4`)
+completed its epoch-50 cap. Full 3-arm comparison (TotalSeg val, same starting checkpoint,
+same recipe otherwise):
+
+| epoch | 105 real-only<br>dice/seen/unseen | 106 p_synth=0.3 flat-noise<br>dice/seen/unseen | 107 p_synth=0.3 +texture(n_oct=4)<br>dice/seen/unseen |
+|---|---|---|---|
+| 0  | 0.4803/0.5634/0.3865 | 0.4540/0.5393/0.3576 | 0.4575/0.5385/0.3659 |
+| 10 | 0.4922/0.5739/0.4000 | 0.4871/0.5626/0.4018 | 0.4910/0.5656/0.4067 |
+| 20 | 0.4824/0.5599/0.3949 | 0.4776/0.5513/0.3943 | 0.4755/0.5500/0.3913 |
+| 30 | 0.4814/0.5621/0.3903 | 0.4762/0.5525/0.3899 | 0.4815/0.5554/0.3981 |
+| 40 | 0.4872/0.5691/0.3947 | 0.4854/0.5623/0.3987 | 0.4910/0.5667/0.4054 |
+| 50 | 0.4868/0.5737/0.3886 | 0.4899/0.5676/0.4022 | **0.4955/0.5748/0.4059** |
+
+107 wins on ALL THREE metrics at e50: highest overall val_dice (0.4955), highest seen-class
+Dice (0.5748, even edging out 105's real-only 0.5737 — texture erases the seen-class cost 106
+paid for going synthetic), and unseen-class Dice essentially tied with its own e10 peak
+(0.4059 vs 0.4067) and clearly ahead of 105 throughout. Both 106 and 107 were STILL RISING at
+e50 (their own-curve peak is the final epoch) while 105 plateaued after e10 — none of these are
+fully converged; a longer run could sharpen or narrow the gap. This is the first real
+train+eval evidence for `TextureSpec` (implemented+unit-tested 2026-09-16, memory
+[[project_synth_gmm_texture_noise]], never previously trained) and it directly confirms
+tonight's literature synthesis: texture/appearance randomization adds real value on top of
+flat-noise synth, without the seen-class Dice cost flat synth alone incurs.
+
+**Also fixed** (bounded, ~5 min, no training GPU-time lost — done while 107 had already
+finished and GPU was idle): the `eval.py` `dataset=totalseg` forkserver crash from earlier
+tonight. `data.p_synth=0` alone did NOT fix it (separate issue from the old-synth-default
+gotcha logged above) — `eval.workers=0` does. Verified: real eval run against the 107
+checkpoint completed cleanly, Mean Dice 0.4792 (n=5/class, TotalSeg test split), consistent
+with the in-training val_dice range. External-cohort OOD sweeps are viable again with this
+workaround (serial data loading, not parallel) — see [[project_eval_totalseg_psynth_gotcha]]
+for the full writeup. Not attempted tonight (6-hour window closed) but unblocked for next time.
+
+**Status at end of window**: 3-arm chain complete (105/106/107), clean literature-motivated
+result favoring `p_synth=0.3` + multi-octave texture. Natural next steps for a future session:
+(a) extend 107 (or a fresh run) past epoch 50 since it hadn't converged, (b) run the
+now-unblocked external-cohort OOD sweep on all three checkpoints for a genuine (not just
+seen/unseen-split) generalization read, (c) try `HeterogeneitySpec`/`p_heterogeneity` (the
+literature's secondary pick) or a higher `p_synth` dose (0.5-0.6, per arXiv:2510.14831) as the
+next ablation arm.

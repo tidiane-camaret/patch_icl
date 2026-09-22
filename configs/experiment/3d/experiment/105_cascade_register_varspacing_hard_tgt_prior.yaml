@@ -1,0 +1,163 @@
+# @package _global_
+# 105_cascade_register_varspacing_hard_tgt_prior — resume-finetunes the 88->89->92
+# cascade_registers checkpoint (PatchSet3D / m2_patchset_decoder, `arch.cascade_registers=
+# true`) on 104's PatchSetV2 run recipe: single-forward variable-spacing, hard target-prior
+# mixture, NO cascade, real data only (p_synth=0) — so the existing cascade_registers weights
+# pick up the "consume a rough prior mask cheaply" skill on real anatomy before ever paying
+# the cascade re-crop cost again, then a later cascade finetune can warm-start from here.
+#
+#   python experiments/3d/train.py experiment=105_cascade_register_varspacing_hard_tgt_prior
+#
+# WHY (2026-09-21): `2026-09-14_92_multisource_synth_cascade_register/best.pt` (the
+# `arch.cascade_registers=true` variant of 92_multisource_synth, itself 89_multisource_cascade
+# + 88_cascade) was itself a resume-finetune of an already-cascade-trained checkpoint
+# (`2026-09-12_90_multisource_random_cascade_center/best.pt`) at lr=1e-5 / encoder_lr_scale=0.3
+# / batch_size=2 — a gentle nudge on top of existing cascade weights. That checkpoint still
+# regressed hu_lwk1's cascade (0.1287 -> 0.0935, see docs/logs.md 2026-09-14 sweep) while
+# improving single-level on 3/7 sources — still training (epoch 36/140) when evaluated, so not
+# a final verdict either way. This run resumes THAT checkpoint's weights (train.checkpoint=
+# <path>, resume_weights_only=true — fresh optimizer/scheduler/epoch) directly into 104's
+# cheap single-level varspacing recipe on real data, rather than training from scratch (104's
+# own choice for PatchSetV2) or restarting the gentle cascade finetune (92's own choice) —
+# `arch.cascade_registers=true` stays declared (dead weight this run — no cascade, so
+# `cascade_proj`/`cascade_type` see no real prev-level input, but their already-trained values
+# load and simply go unused) purely so a later 88/89/92-style cascade finetune's checkpoint
+# load off THIS run's output is a full shape match, not a partial one.
+#
+# ARCH — the exact 88_cascade / 89_multisource_cascade arch (matches the checkpoint being
+# resumed, so the weight load is strict/full), NOT PatchSetV2: `model=m2_patchset_decoder`
+# (e=768, thinking_rows=8, conv fine-decoder), `encoder=e4_plainconv_ts` widths
+# [32,64,256,512] / nnunet_ts_stages=[2,3] (exp68's choice), `encoder_input_norm=instance`
+# (89's CT+MRI-agnostic stem), `encoder_spacing_aware=true`. `mask_slots=1` /
+# `decode_source=img` / `mask_embed=linear` restated verbatim from 88_cascade — that combo is
+# the fix for the 0.61->0.44 macro-Dice regression 88's header documents (decode_source=mask/
+# mask_slots=2/mask_embed=conv), so it must NOT silently drift back to 70/80's mask_slots=2/
+# decode_source=mask choice just because this run's DATA recipe borrows from the 100-104
+# (PatchSetV2) line.
+#
+# DATA/TRAIN — 104's recipe, with p_synth forced to 0 (real data only — the gmm/cohort/shape
+# blocks below are left declared but inert, not deleted, so synth can be toggled back on
+# without re-typing them): train_spacing_range=[3,6], crop_spacing_mm=4.24 (geometric
+# midpoint), query_prior modes=[gt,none] p=[0.3,0.7] + the same prior_perturb floors as
+# 80/88/92/104 (identical across the whole line already), source_mix.regime_p=[1,0,0]
+# (CT-only, matching 104), per_source_train_classes=[balanced,balanced], eval_epoch_length=
+# 800. augmentations block copied from 104 (task/per_image/goal_mask; no 92-style extra
+# intensity-aug overrides — 104 didn't carry those either).
+#
+# ASSUMPTIONS (not explicitly requested — override if wrong):
+#   - train.batch_size=8 / lr=1.0e-4: m2_patchset_decoder's own default lr=7.0e-5 is ALREADY
+#     documented in that group file as "1e-4 / sqrt(2): sqrt(B) rule for B=4 vs the B=8 base"
+#     — i.e. 7e-5 is the B=4-scaled value and 1e-4 is this model's own stated B=8 base, so B=8
+#     here uses that base lr directly. encoder_lr_scale=1 (not 88/92's protective 0.3) — kept
+#     as-is per direct confirmation.
+#   - train.warmup_epochs=1 (not the model default of 5): matches 89_multisource_cascade's own
+#     precedent for the identical situation ("warm-start from a CT-only cascade checkpoint; no
+#     from-scratch peak") — this run resumes real cascade_registers weights, not training from
+#     scratch, so a short warmup instead of a 5-epoch ramp.
+#   - No VRAM check done yet for this arch at B=8 non-cascade single-level (88/92's own
+#     measurements are all cascade + B=2); start conservative and watch the first few steps.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  # --- pinned to 88_cascade's post-regression-fix values (see header) ---
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  # unused this run (no cascade) — kept for checkpoint shape-compat with a later
+  # 88/89/92-style cascade finetune, same reasoning 104 uses for PatchSetV2.
+  cascade_registers: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0                 # off this run (real data only) — gmm/cohort blocks below are inert
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture: {}
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]   # (ct, mri, cross) -- CT-only, matching 104
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4    # m2_patchset_decoder's own stated B=8 base (see ASSUMPTIONS)
+  encoder_lr_scale: 1
+  warmup_epochs: 1    # warm-starting real weights, not from scratch — see ASSUMPTIONS
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints/2026-09-14_92_multisource_synth_cascade_register/best.pt
+  resume_weights_only: true    # warm-start weights only — fresh optimizer/scheduler/epoch
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 105_cascade_register_varspacing_hard_tgt_prior

@@ -1,0 +1,136 @@
+# @package _global_
+# 108_cascade_register_varspacing_synth03_texture_pool — the +pool_token twin of 107
+# (107_cascade_register_varspacing_synth03_texture, wandb `gdap5nuo`), continuing that run's
+# checkpoint with `arch.pool_token=true` added on top. Extends the ablation chain:
+# 105 (real-only) / 106 (p_synth=0.3 flat noise) / 107 (+texture n_octaves=4) / 108 (+pool_token).
+#
+#   python experiments/3d/train.py experiment=108_cascade_register_varspacing_synth03_texture_pool
+#
+# WHY (2026-09-22): user asked to "continue run gdap5nuo" (107) with `arch.pool_token` added.
+# `pool_token` (`src/models/patchset3d.py`, spec docs/superpowers/specs/2026-09-14-patchset3d-
+# pool-token-design.md) is an IRIS-style foreground-masked pooling token per volume (K support +
+# 1 query = K+1 extra prefix rows, inserted the same way cascade_registers' carried memory is)
+# — pools `fine_decode`'s finest requested stage into one extra token per volume, giving the
+# bi-axial attention a compact "what does this volume's fine-resolution foreground look like"
+# summary alongside the per-cell tokens. Requires `fine_decode=true` (already on via
+# `model=m2_patchset_decoder`) and is incompatible with `register_routed` (already false).
+# Defaults to `false` everywhere (byte-identical to today) — 105/106/107 never exercised it.
+#
+# CHECKPOINT: resumes 107's own `best.pt` (NOT the original 92-line checkpoint 105/106/107 all
+# started from) — continuing that specific line, texture noise included. Adds two NEW params
+# not in 107's checkpoint (`pool_proj`: Linear fine_stage_channels->e, `pool_type`: learned
+# e-dim vector) -> needs `train.checkpoint_allow_partial=true` (the established escape hatch,
+# same one `arch.cascade_registers` needed when it was first turned on: missing keys fall back
+# to random init, everything else transfers strict). `resume_weights_only=true` stays on for
+# the same reason -- optimizer moments don't survive an architecture change either.
+#
+# BUDGET: epochs=51 (0..50) again, matching 105/106/107's own cutoff, so 108 is directly
+# comparable to 107 at the same epoch with only `pool_token` differing. Note 106/107 were BOTH
+# still rising at their own epoch-50 cutoff (not converged) -- if the goal shifts from "isolate
+# pool_token's effect" to "reach convergence", bump train.epochs on a rerun.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true    # ONLY delta vs 107 -- see WHY above
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_107_cascade_register_varspacing_synth03_texture/best.pt
+  checkpoint_allow_partial: true   # pool_proj/pool_type are new params -- see WHY above
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 108_cascade_register_varspacing_synth03_texture_pool
