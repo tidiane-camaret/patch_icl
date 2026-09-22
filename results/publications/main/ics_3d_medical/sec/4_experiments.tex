@@ -8,25 +8,34 @@
 TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
 CT, \TODO{state the train/held-out anatomical class split, following the
 same held-in/held-out protocol used in our 2D work to test in-context
-generalization to unseen classes, not just unseen subjects}.
+generalization to unseen classes, not just unseen subjects}. Experiments
+below are organized into two settings: (1) fixed 3\,mm-spacing crops
+(\cref{sec:fixed-spacing}), isolating architectural differences in
+image--label interaction from the coarse-to-fine cascade; and (2)
+full-resolution coarse-to-fine evaluation (\cref{sec:c2f-ablation}),
+exercising the cascade end to end.
 
 \noindent\textbf{Baselines.} Medverse~\cite{huMedverseUniversalModel2025a}
 and Iris~\cite{gaoShowSegmentUniversal2025}, \TODO{state whether
 baselines are retrained on the same data/split or evaluated with
 released weights, and the number of context pairs $K$ used at
-inference}.
+inference; blocker: no Iris baseline is implemented/run yet, so all
+current numbers are vs.\ Medverse only}.
 
 \noindent\textbf{Metrics.} Segmentation accuracy is reported as Dice and
 normalized surface distance (NSD); compute is reported as wall-clock
 inference time, FLOPs, and peak VRAM.
 
-\subsection{Fixed-Spacing Comparison}
+\subsection{Fixed-Spacing Comparison (Setting 1: 3\,mm crops)}
 \label{sec:fixed-spacing}
 
 We first compare all methods at a fixed 3\,mm isotropic spacing on
 TotalSegmentator CT crops, isolating architectural differences in
 image--label interaction (\cref{sec:biaxial}) from the coarse-to-fine
-cascade evaluated separately in \cref{sec:c2f-ablation}.
+cascade evaluated separately under full-resolution processing in
+\cref{sec:c2f-ablation}. \TODO{this replaces the earlier
+\texttt{use\_crop=false} whole-body protocol (notebook 20), which is
+stale under the current experiment organization.}
 
 \begin{table}[t]
 \centering
@@ -34,13 +43,13 @@ cascade evaluated separately in \cref{sec:c2f-ablation}.
 TotalSegmentator CT held-out classes. \TODO{fill in.}}
 \label{tab:fixed-spacing}
 \small
-\begin{tabular}{@{}lcccc@{}}
+\begin{tabular}{@{}lccccc@{}}
 \toprule
-Method & Dice & NSD & Time (s) & VRAM (GB) \\
+Method & Dice & NSD & Time (s) & FLOPs (G) & VRAM (GB) \\
 \midrule
-Iris & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
-Medverse & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
-PatchICL-3D (ours) & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+Iris & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+Medverse & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+Ours & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -50,11 +59,15 @@ PatchICL-3D (ours) & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
 helps most -- we expect an advantage on small/thin structures, similar
 to the pattern observed for patch-based selection in our 2D work.}
 
-\subsection{Coarse-to-Fine Ablations}
+\subsection{Coarse-to-Fine Ablations (Setting 2: full resolution)}
 \label{sec:c2f-ablation}
 
-We ablate the three cascade mechanisms of \cref{sec:cascade,sec:registers}
-independently: (i) the query image prior
+Unlike \cref{sec:fixed-spacing}, this setting runs the full cascade at
+native/full resolution end to end, from a coarse full-volume level down
+to the finest region-restricted level, so that the effect of each cascade
+mechanism on the accuracy/compute trade-off can be measured where it
+actually matters. We ablate the three cascade mechanisms of
+\cref{sec:cascade,sec:registers} independently: (i) the query image prior
 (\cref{eq:query-prior}) vs.\ a blank label-token initialization at every
 level; (ii) region-restricted fine processing (sliding window over the
 previous level's predicted zone) vs.\ a full-volume sliding window at
@@ -86,10 +99,23 @@ restriction is relaxed (full volume $\rightarrow$ tight crop around the
 previous prediction), analogous to the resolution/FLOPs Pareto plot in
 our 2D paper~\cite{camaretPatchICL2026}.}
 
+\subsection{Synthetic Data Ablation}
+\label{sec:synth-ablation}
+
+To isolate the effect of the GMM-based synthetic supervision described in
+\cref{sec:synth}, we compare three otherwise-identical training runs
+(single-level, non-cascade regime) that share a starting checkpoint and
+recipe and vary only the synthetic-data knob: real-only
+($p_{\text{synth}}=0$), synthetic with i.i.d.\ paint noise
+($p_{\text{synth}}=0.3$), and synthetic with the multi-octave texture
+noise of \cref{sec:synth}. \TODO{report TotalSegmentator validation Dice
+(seen/unseen class macro split) at a shared training cutoff for all three
+arms, plus qualitative prediction figures per arm.}
+
 \subsection{Generalization}
 \label{sec:generalization}
 
-To test how well PatchICL-3D's accuracy/compute trade-off transfers
+To test how well our model's accuracy/compute trade-off transfers
 beyond the training distribution, we evaluate on three settings of
 increasing distribution shift.
 

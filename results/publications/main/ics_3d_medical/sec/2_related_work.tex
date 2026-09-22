@@ -25,7 +25,7 @@ performs a full sliding-window pass over the entire volume; only the
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} similarly
 stacks levels of increasing resolution but targets single-model
 supervised segmentation rather than in-context, few-shot prediction. In
-contrast, PatchICL-3D restricts the sliding window itself to the region
+contrast, our cascade restricts the sliding window itself to the region
 already localized by the previous level, so compute at fine levels
 scales with the size of the structure rather than the size of the
 volume, and connects levels with register tokens rather than by feeding

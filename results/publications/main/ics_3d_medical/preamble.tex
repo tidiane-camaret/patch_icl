@@ -15,6 +15,7 @@
 \usepackage{amssymb}
 \usepackage{amsfonts}
 \usepackage{graphicx}
+\usepackage{subcaption}
 \usepackage{multirow}
 \usepackage{makecell}
 \usepackage{array}
@@ -23,6 +24,13 @@
 \usepackage[accsupp]{axessibility}
 
 \usepackage[pagebackref,breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+
+% Draft figures live as editable standalone TikZ sources under ../imgs/method/
+% (arch-macros.tex holds shared macros). Each *.tex there compiles on its own
+% (documentclass=standalone) to a same-named .pdf; \includegraphics below
+% picks up that compiled .pdf, so edit the .tex, recompile just that file,
+% then rebuild main.tex to refresh the figure here.
+\graphicspath{{../imgs/method/}}
 
 \usepackage[capitalize]{cleveref}
 \crefname{section}{Sec.}{Secs.}

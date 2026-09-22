@@ -7,8 +7,8 @@ resolution--compute trade-off that is more severe than in 2D: dense
 cross-attention between a target volume and its contexts scales cubically
 with side length, forcing prior work to either downsample the volume,
 fall back to per-slice processing, or tile the volume with independent,
-context-blind sliding windows. We propose \textbf{PatchICL-3D}, an
-in-context 3D segmentation model built around two components. First, a
+context-blind sliding windows. We propose a 3D in-context segmentation
+model built around two components. First, a
 \emph{bi-axial} image--label attention mechanism lets target and context
 tokens exchange information jointly along the spatial-patch axis and the
 image/label axis, in contrast to early feature concatenation

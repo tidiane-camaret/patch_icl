@@ -33,8 +33,8 @@ we ask whether the same principle extends to full 3D volumes, and how
 the image--label interaction itself should be designed once both axes
 (space and image/label identity) matter jointly.
 
-We propose \textbf{PatchICL-3D}, an in-context 3D segmentation model
-with two components that address these gaps directly.
+We propose a 3D in-context segmentation model with two components that
+address these gaps directly.
 
 \vspace{0.3em}\noindent\textbf{Bi-axial image--label attention.}
 Instead of concatenating image and mask channels before a shared
@@ -47,7 +47,7 @@ features. This keeps the image and label streams distinct for longer
 while still allowing early, repeated exchange between them.
 
 \vspace{0.3em}\noindent\textbf{Register-carried coarse-to-fine cascade.}
-PatchICL-3D processes a volume through a small number of resolution
+The model processes a volume through a small number of resolution
 levels. Two design choices connect the levels: (1) a \emph{query image
 prior} -- the previous level's upsampled prediction initializes the
 target's label tokens at the next level, rather than entering the

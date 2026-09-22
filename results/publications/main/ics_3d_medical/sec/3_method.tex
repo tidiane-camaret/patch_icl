@@ -7,7 +7,29 @@ the same anatomical class as the (unknown) target mask.
 
 \noindent\textbf{Output.} A predicted target mask $\hat{L}^t$, produced
 by a coarse-to-fine cascade over $M$ resolution levels
-$\{r_1, \dots, r_M\}$.
+$\{r_1, \dots, r_M\}$. \cref{fig:overview} contrasts our architecture
+with Medverse's.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{arch_medverse.pdf}
+    \caption{Medverse: early concatenation + dual U-Net.}
+    \label{fig:overview-medverse}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{arch_patchset.pdf}
+    \caption{Ours: separate image/label streams + bi-axial attention.}
+    \label{fig:overview-ours}
+  \end{subfigure}
+  \caption{Architecture overview, contrasted against Medverse's
+  early-concatenation fusion. \TODO{draft diagram; finalize labels/scale
+  once the architecture is settled.}}
+  \label{fig:overview}
+\end{figure*}
 
 \subsection{Backbone}
 \label{sec:backbone}
@@ -41,16 +63,37 @@ $\mathbf{z}^{\text{lbl}}$ as separate streams and attend over two axes:
     sharpen the corresponding image features and vice versa.
 \end{itemize}
 
+\cref{fig:biaxial} illustrates both axes within a single layer.
+
 The target's label stream starts from a query prior (\cref{sec:cascade})
 rather than a zero/blank mask, so this axis is informative for the
 target as well as for the contexts. \TODO{formalize with an equation once
 the exact factorization (interleaved vs.\ parallel bi-axial layers) is
 finalized; specify how many layers alternate between the two axes.}
 
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.9\linewidth]{arch_biaxial.pdf}
+  \caption{Bi-axial attention within one transformer layer, shown for a
+  single context volume ($K{=}1$ here for clarity; in general $K$
+  context volumes are each processed this way) and 3 of its $N$ spatial
+  tokens per stream. Left: the \emph{image/label axis} -- image and
+  label tokens attend to each other within the same cell. Right: the
+  \emph{patch axis} -- tokens attend across cells and, for the target,
+  across contexts (edges stand in for full attention among all $N$
+  tokens of both volumes). Gray edges are context-only; green edges
+  touch the target row, which is architecturally distinct -- it
+  cross-attends read-only into context, and its label-stream input is
+  the predicted query prior (\cref{sec:cascade}) rather than ground
+  truth. \TODO{draft diagram; finalize once the layer factorization
+  above is settled.}}
+  \label{fig:biaxial}
+\end{figure}
+
 \subsection{Coarse-to-Fine Cascade}
 \label{sec:cascade}
 
-PatchICL-3D processes the target through $M$ increasingly fine
+Our model processes the target through $M$ increasingly fine
 resolution levels $\{r_1 < \dots < r_M\}$ (e.g. a coarse full-volume pass
 followed by finer crops). Two mechanisms connect consecutive levels.
 
@@ -64,7 +107,20 @@ upsampled prediction of level $\ell - 1$,
 instead of entering the network through a separate autoregressive branch
 (Medverse) or not being used at all (Iris). This makes the previous
 level's belief part of the same token stream that attends bi-axially
-with the image, rather than a side channel fused later.
+with the image, rather than a side channel fused later. \cref{fig:query-prior}
+shows this flow across two levels.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{arch_query_prior.pdf}
+  \caption{Query image prior across two cascade levels, with the full
+  model input/output flow. At level 1 the target has no real prior yet
+  (dashed support-mean placeholder); at level 2 the target's second lane
+  is a real crop of level 1's own prediction $\hat{L}^t_1$ -- the same
+  lane the context mask always occupies. \TODO{draft diagram; finalize
+  once the number of levels $M$ is settled.}}
+  \label{fig:query-prior}
+\end{figure*}
 
 \vspace{0.3em}\noindent\textbf{Region-restricted fine processing.}
 Given level $\ell-1$'s prediction, we take its predicted foreground
@@ -112,3 +168,19 @@ level-weighted, matching the final training config}:
 \begin{equation}
   \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell\, \mathcal{L}_\ell.
 \end{equation}
+
+\subsection{Synthetic Supervision}
+\label{sec:synth}
+
+A fraction $p_{\text{synth}}$ of training tasks are drawn from a
+GMM-based synthetic generator instead of real (image, mask) pairs: a
+real-anatomy supervoxel cohort is repainted with per-class Gaussian
+intensities, giving a label-perfect (image, mask) pair with a novel
+appearance. Paint noise is i.i.d.\ per voxel by default; an optional
+multi-octave correlated variant (coarse-to-fine random fields, summed)
+better matches the spatial autocorrelation of real tissue (measured
+$\approx 0.6$ in real CT/MRI vs.\ $\approx 0.0$ for i.i.d.\ paint at
+native resolution) without changing the per-class intensity variance.
+\TODO{figure of a synth\_gmm training pair (i.i.d.\ vs.\ multi-octave
+texture noise) next to a real (image, mask) pair; equation for the paint
+model once finalized.}
