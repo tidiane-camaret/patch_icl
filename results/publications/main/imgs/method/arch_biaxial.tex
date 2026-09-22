@@ -1,0 +1,103 @@
+\documentclass[tikz,border=4pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% ---------------------------------------------------------------------------
+% Bi-axial attention, one transformer layer (arch.md §3). Style follows
+% TabPFN's Fig. 1 (Hollmann et al., Nature 2024): two side-by-side panels,
+% each a small token grid, connected by simple curved double-arrows rather
+% than full cell/token-block renderings. Their "special test row" device
+% (edges touching it get a distinct color) maps onto our target row, which
+% really is architecturally special: it cross-attends read-only into
+% context, and its label-stream input is a predicted prior, not ground
+% truth like context's. Each image/label volume is patchified into N
+% spatial tokens; each cell below shows 3 of them as a representative
+% sample (not literally N=3).
+% ---------------------------------------------------------------------------
+
+% \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
+\newcommand{\tpsq}[4]{
+  \fill[#3] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+  \draw[#4,line width=0.8pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpcluster{x}{y}{fill}{ring} -- 3 stacked tokens standing in for N.
+\newcommand{\tpcluster}[4]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsq{#1}{#2+\doff}{#3}{#4}
+  }
+}
+% \dblarrow{p1}{p2}{color} -- curved double-headed attention edge.
+\newcommand{\dblarrow}[3]{
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,#3] #1 to[bend left=12] #2;
+}
+
+\def\tsz{0.16}
+\def\toff{0.22}
+\def\colpitch{0.95}
+\def\rowpitch{1.0}
+\def\panelgap{1.5}
+\def\clusterhalf{\toff+\tsz/2}
+
+\def\xlab{-0.15}
+\def\ximgA{0.35}
+\def\xlblA{\ximgA+\colpitch}
+\def\ximgB{\xlblA+\panelgap}
+\def\xlblB{\ximgB+\colpitch}
+
+\def\yCtx{1.0}  % context (single support volume)
+\def\yTgt{0.0}  % target
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  \node[anchor=west,font=\Large] at (\xlab,2.7) {Bi-Axial Attention \textnormal{(one layer)}};
+
+  % ---- panel frames + titles ----
+  \draw[black!25,rounded corners=3pt]
+    (\ximgA-0.45,\yTgt-\clusterhalf-0.15) rectangle (\xlblA+0.45,\yCtx+\clusterhalf+0.15);
+  \draw[black!25,rounded corners=3pt]
+    (\ximgB-0.45,\yTgt-\clusterhalf-0.15) rectangle (\xlblB+0.45,\yCtx+\clusterhalf+0.15);
+  \node[anchor=south,font=\bfseries\small] at ({(\ximgA+\xlblA)/2},\yCtx+\clusterhalf+0.25) {Image/label axis};
+  \node[anchor=south,font=\bfseries\small] at ({(\ximgB+\xlblB)/2},\yCtx+\clusterhalf+0.25) {Patch axis};
+
+  % ---- shared row labels ----
+  \node[anchor=east,font=\scriptsize] at (\xlab,\yCtx) {context ($N$)};
+  \node[anchor=east,font=\scriptsize] at (\xlab,\yTgt) {target ($N$)};
+  \node[anchor=south,font=\scriptsize] at (\ximgA,\yCtx+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at (\xlblA,\yCtx+\clusterhalf+0.05) {lbl};
+  \node[anchor=south,font=\scriptsize] at (\ximgB,\yCtx+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at (\xlblB,\yCtx+\clusterhalf+0.05) {lbl};
+
+  % ---- token clusters (both panels) + role rings ----
+  \foreach \y/\ring in {\yCtx/archContextPink!70!black, \yTgt/archTargetLine} {
+    \tpcluster{\ximgA}{\y}{archAttnBlue}{\ring}
+    \tpcluster{\xlblA}{\y}{archMaskGold}{\ring}
+    \tpcluster{\ximgB}{\y}{archAttnBlue}{\ring}
+    \tpcluster{\xlblB}{\y}{archMaskGold}{\ring}
+  }
+
+  % ---- Panel A: image/label axis -- per-token edge, same spatial cell ----
+  \foreach \doff in {-\toff,0,\toff} {
+    \dblarrow{(\ximgA+\tsz/2,\yCtx+\doff)}{(\xlblA-\tsz/2,\yCtx+\doff)}{black!55}
+    \dblarrow{(\ximgA+\tsz/2,\yTgt+\doff)}{(\xlblA-\tsz/2,\yTgt+\doff)}{archTargetLine}
+  }
+
+  % ---- Panel B: patch axis -- one representative edge per stream between
+  % the context and target token clusters (stands in for full attention
+  % among all N tokens of both volumes) ----
+  \dblarrow{(\ximgB,\yCtx-\clusterhalf)}{(\ximgB,\yTgt+\clusterhalf)}{archTargetLine}
+  \dblarrow{(\xlblB,\yCtx-\clusterhalf)}{(\xlblB,\yTgt+\clusterhalf)}{archTargetLine}
+
+  % ---- caption note ----
+  \node[anchor=north,align=center,font=\scriptsize,black!55] at ({(\ximgB+\xlblB)/2},\yTgt-\clusterhalf-0.25)
+    {edge stands in for full attention\\among all $N$ tokens, both volumes};
+
+  % ---- legend ----
+  \node[anchor=west,font=\scriptsize] at (\ximgA-0.45,\yTgt-\clusterhalf-1.15)
+    {\textcolor{black!55}{\textbf{---}}\ context-only edge \quad
+     \textcolor{archTargetLine}{\textbf{---}}\ touches target row};
+
+\end{tikzpicture}
+\end{document}
