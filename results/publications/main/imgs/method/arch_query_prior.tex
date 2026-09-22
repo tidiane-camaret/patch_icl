@@ -1,0 +1,111 @@
+\documentclass[tikz,border=4pt]{standalone}
+\usepackage{ifthen}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% ---------------------------------------------------------------------------
+% Query prior across 2 cascade levels, WITH the model's own input/output flow
+% (arch.md §5) -- each level is a compact version of arch_patchset.tex's
+% pipeline (image -> Encoder -> feature -> tokens -> attention -> Decoder ->
+% predicted mask), stacked as lanes: target-image, target-PRIOR, context
+% -image, context-mask. Level 1's prior lane is an empty/dashed placeholder
+% (support-mean, no real input yet); level 2's is a real cube, produced by
+% CROPPING level 1's own prediction around its centroid. That side-by-side
+% contrast IS the figure's point -- the target "catches up" to having a
+% second (mask-like) lane, exactly like context always had.
+% ---------------------------------------------------------------------------
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  \node[anchor=west,font=\Large] at (0,7.9)
+    {Query Prior \textnormal{(arch.md \S5) -- 2 cascade levels, model input/output flow}};
+
+  % Shared per-level geometry (both scopes below use these local coords)
+  %   lane0 target-image   y=5.1  h=1.3   top=6.4
+  %   lane1 target-prior   y=3.3  h=1.3   top=4.6   (empty @ level 1, real @ level 2)
+  %   lane2 context-image  y=1.5  h=1.3   top=2.8
+  %   lane3 context-mask   y=0.0  h=1.0   top=1.0
+  %   col0 input cube | col1 Encoder | col2 feature | col3 tokens
+  %   col4 attention grid | col5 Decoder | col6 output cube  (target-image lane only)
+
+  \foreach \L/\xs/\rname in {1/0/{Level 1 -- coarse ($r_1=6$mm)},
+                              2/11.3/{Level 2 -- fine ($r_2=3$mm)}} {
+    \begin{scope}[xshift=\xs cm]
+      \node[anchor=west,font=\bfseries] at (0,7.3) {\rname};
+
+      % ---- lane 0: target image (always real) ----
+      % (lane labels sit in the LEFT margin, not below the cubes -- 4 stacked
+      % lanes leave too little vertical clearance for archvolcube's own
+      % below-cube label to clear the next lane's isometric top face)
+      \node[anchor=east,font=\small] at (-0.15,5.75) {$I^T$};
+      \archvolcube{0}{5.1}{1.15}{1.3}{archTargetGreen}{ct}{}
+      \archarrow{(1.25,5.75)}{(1.65,5.75)}{archArrowPale}
+      \archfunnel{1.7}{5.1}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
+      \archarrow{(2.45,5.75)}{(2.75,5.75)}{archArrowPale}
+      \archfeatcube{2.8}{5.2}{0.7}{1.1}{archTargetGreen}{$F^T$}
+      \archarrow{(3.5,5.75)}{(3.9,5.75)}{archArrowPale}
+      \archtokengrid{3.95}{5.25}{3}{2}{0.4}{archTargetGreen}
+
+      % ---- lane 1: target PRIOR -- content differs by level, see below ----
+      \ifthenelse{\equal{\L}{1}}{
+        % Level 1: no prior yet -- dashed placeholder, faint token column
+        \draw[black!40,thin,dashed] (0,3.3) rectangle ++(1.15,1.3);
+        \node[align=center,font=\scriptsize,black!45] at (0.575,3.95) {support\\-mean};
+        \archarrow{(1.25,3.95)}{(3.9,3.95)}{black!15}
+        \foreach \r in {0,1,2}{\foreach \c in {0,1}{
+          \draw[black!20,thin] ({3.95+\c*0.4},{3.5+\r*0.4}) rectangle ++(0.33,0.33);
+        }}
+      }{
+        % Level 2: REAL prior, cropped from level 1's own prediction (arrow drawn after the loop)
+        \node[anchor=east,font=\small] at (-0.15,3.95) {$P^T$};
+        \archvolcube{0}{3.3}{1.15}{1.3}{archMaskGold}{predmask}{}
+        \archarrow{(1.25,3.95)}{(3.9,3.95)}{archArrowPale}
+        \archtokengrid{3.95}{3.45}{3}{2}{0.4}{archMaskGold}
+      }
+
+      % ---- lane 2: context image (always real) ----
+      \node[anchor=east,font=\small] at (-0.15,2.15) {$I^C$};
+      \archvolcube{0}{1.5}{1.15}{1.3}{archContextPink}{ct}{}
+      \archarrow{(1.25,2.15)}{(1.65,2.15)}{archArrowPale}
+      \archfunnel{1.7}{1.5}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
+      \archarrow{(2.45,2.15)}{(2.75,2.15)}{archArrowPale}
+      \archfeatcube{2.8}{1.6}{0.7}{1.1}{archContextPink}{$F^C$}
+      \archarrow{(3.5,2.15)}{(3.9,2.15)}{archArrowPale}
+      \archtokengrid{3.95}{1.65}{3}{2}{0.4}{archContextPink}
+
+      % ---- lane 3: context mask (always real, ground truth) ----
+      \node[anchor=east,font=\small] at (-0.15,0.5) {$M^C$};
+      \archvolcube{0}{0}{1.15}{1.0}{archMaskGold}{predmask}{}
+      \archarrow{(1.25,0.5)}{(3.9,0.5)}{archArrowPale}
+      \archtokengrid{3.95}{0.1}{2}{2}{0.4}{archMaskGold}
+
+      % ---- attention (spans all 4 lanes) -> Decoder -> output (target lane) ----
+      \draw[archAttnBlue!70!black,thin,dashed] (4.65,-0.15) rectangle ++(1.3,6.7);
+      \archtokengrid{4.8}{0.0}{16}{3}{0.4}{archAttnBlue}
+      \node[align=center,font=\small] at (5.3,6.75) {attention};
+      \archarrow{(6.1,5.75)}{(6.45,5.75)}{archArrowPale}
+      \archfunnel{6.5}{5.1}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
+      \archarrow{(7.25,5.75)}{(7.6,5.75)}{archArrowPale}
+      \archvolcube{7.65}{5.1}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
+      \def\cxOut{7.65+0.51*1.15}\def\cyOut{5.1+0.5*1.3}
+      \draw[archCtxYellow,line width=1pt] (\cxOut-0.14,\cyOut) -- (\cxOut+0.14,\cyOut);
+      \draw[archCtxYellow,line width=1pt] (\cxOut,\cyOut-0.14) -- (\cxOut,\cyOut+0.14);
+      \ifthenelse{\equal{\L}{1}}{
+        \node[anchor=north,font=\tiny,archCtxYellow] at (\cxOut,\cyOut-0.2) {centroid};
+      }{}
+    \end{scope}
+  }
+
+  % ---- the crop connector: level 1's OWN prediction becomes level 2's P^T input ----
+  \draw[-{Latex[length=2.8mm,width=2.3mm]},line width=1.8pt,black!65]
+    (9.15,5.75) to[bend left=8] (11.3,3.95);
+  \node[align=center,font=\bfseries] at (9.6,6.55) {crop};
+
+  \node[align=center,font=\small] at (10.3,-1.0)
+    {level 1: target's 2nd lane = \emph{support-mean} (no real input) $\quad\longrightarrow\quad$
+     level 2: target's 2nd lane = $P^T$, a REAL cube (crop of $\hat L^t_1$) -- same lane the context mask always occupied};
+
+\end{tikzpicture}
+\end{document}
