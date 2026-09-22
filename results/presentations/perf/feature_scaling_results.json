@@ -1,0 +1,491 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "torch": "2.12.1+cu130",
+  "conditions": {
+    "B": 1,
+    "K": 1,
+    "image_size": [
+      128,
+      128,
+      128
+    ],
+    "reps": 10,
+    "warmup": 3
+  },
+  "sweeps": [
+    {
+      "sweep": "resolution",
+      "variant": "v1_dense",
+      "param": "resolution",
+      "fixed": {
+        "e": 768,
+        "h": 3072
+      },
+      "rows": [
+        {
+          "params": 48004066,
+          "gflops_total": 1147.475460096,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 18.429640704,
+          "gflops_other": 252.06718464000005,
+          "ms_total": 30.90158289996907,
+          "ms_encoder": 15.767020893096923,
+          "ms_transformer": 0.6888895988464355,
+          "ms_other": 14.445672408025713,
+          "peak_gb": 2.86253312,
+          "resolution": 4
+        },
+        {
+          "params": 48004066,
+          "gflops_total": 1294.481620992,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 162.57318912,
+          "gflops_other": 254.92979712000005,
+          "ms_total": 31.583282392239198,
+          "ms_encoder": 15.781600189208984,
+          "ms_transformer": 1.6524703860282899,
+          "ms_other": 14.149211817001925,
+          "peak_gb": 2.869343232,
+          "resolution": 8
+        },
+        {
+          "params": 48004066,
+          "gflops_total": 3891.091341312,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 2736.2820096,
+          "gflops_other": 277.8306969600003,
+          "ms_total": 44.419063202803954,
+          "ms_encoder": 15.620246410369873,
+          "ms_transformer": 13.800790214538575,
+          "ms_other": 14.998026577895507,
+          "peak_gb": 2.93640704,
+          "resolution": 16
+        },
+        {
+          "params": 48004066,
+          "gflops_total": 115579.8368256,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 114241.820295168,
+          "gflops_other": 461.03789567999775,
+          "ms_total": 391.73267409787513,
+          "ms_encoder": 16.031638622283936,
+          "ms_transformer": 355.8771636962891,
+          "ms_other": 19.823871779302124,
+          "peak_gb": 9.10323968,
+          "resolution": 32
+        }
+      ]
+    },
+    {
+      "sweep": "resolution",
+      "variant": "v2_compressed",
+      "param": "resolution",
+      "fixed": {
+        "e": 768,
+        "h": 3072,
+        "compress_m": 128
+      },
+      "rows": [
+        {
+          "params": 77391248,
+          "gflops_total": 1099.313242112,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 257.91613337599995,
+          "ms_total": 31.988795701181516,
+          "ms_encoder": 15.288889598846435,
+          "ms_transformer": 0.6670656025409698,
+          "ms_other": 16.032840499794112,
+          "peak_gb": 2.54924288,
+          "resolution": 4
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1113.87127808,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 272.47416934399996,
+          "ms_total": 32.57954670698382,
+          "ms_encoder": 15.38383674621582,
+          "ms_transformer": 0.6713888049125671,
+          "ms_other": 16.524321155855432,
+          "peak_gb": 2.557574656,
+          "resolution": 8
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1153.385947136,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 311.98883839999996,
+          "ms_total": 33.39052049559541,
+          "ms_encoder": 15.434982395172119,
+          "ms_transformer": 0.6685600042343139,
+          "ms_other": 17.286978096188975,
+          "peak_gb": 2.599366656,
+          "resolution": 12
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1230.335565824,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 388.93845708800006,
+          "ms_total": 35.07025869330391,
+          "ms_encoder": 15.310175895690918,
+          "ms_transformer": 0.6690688133239746,
+          "ms_other": 19.09101398428902,
+          "peak_gb": 2.68335872,
+          "resolution": 16
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1357.198450688,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 515.8013419520001,
+          "ms_total": 39.14954380597919,
+          "ms_encoder": 15.886115169525146,
+          "ms_transformer": 0.6752448081970215,
+          "ms_other": 22.588183828257023,
+          "peak_gb": 2.823764992,
+          "resolution": 20
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1546.452918272,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 705.0558095360001,
+          "ms_total": 45.0661865004804,
+          "ms_encoder": 16.008598423004152,
+          "ms_transformer": 0.6673375964164734,
+          "ms_other": 28.390250481059773,
+          "peak_gb": 3.033570816,
+          "resolution": 24
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1810.57728512,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 969.180176384,
+          "ms_total": 53.554817801341414,
+          "ms_encoder": 16.228659057617186,
+          "ms_transformer": 0.6693279922008515,
+          "ms_other": 36.65683075152338,
+          "peak_gb": 3.325319168,
+          "resolution": 28
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 2162.049867776,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 1320.65275904,
+          "ms_total": 64.51891458127648,
+          "ms_encoder": 16.297462272644044,
+          "ms_transformer": 0.6673919975757598,
+          "ms_other": 47.55406031105667,
+          "peak_gb": 3.711651328,
+          "resolution": 32
+        }
+      ]
+    },
+    {
+      "sweep": "width",
+      "variant": "v1_dense",
+      "param": "e",
+      "fixed": {
+        "resolution": 16,
+        "h": 3072
+      },
+      "rows": [
+        {
+          "params": 16604866,
+          "gflops_total": 1431.615553536,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 291.2514048,
+          "gflops_other": 263.38551398400017,
+          "ms_total": 34.287857508752495,
+          "ms_encoder": 15.33454065322876,
+          "ms_transformer": 4.818870401382446,
+          "ms_other": 14.134446454141289,
+          "peak_gb": 2.7667328,
+          "e": 96
+        },
+        {
+          "params": 19763362,
+          "gflops_total": 1739.440226304,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 597.01248,
+          "gflops_other": 265.449111552,
+          "ms_total": 34.7266165073961,
+          "ms_encoder": 15.33218240737915,
+          "ms_transformer": 5.434816026687622,
+          "ms_other": 13.95961807332933,
+          "peak_gb": 2.785665536,
+          "e": 192
+        },
+        {
+          "params": 27407458,
+          "gflops_total": 2398.61858304,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 1252.0636416,
+          "gflops_other": 269.57630668800016,
+          "ms_total": 36.404647992458194,
+          "ms_encoder": 15.227071857452392,
+          "ms_transformer": 6.907843208312988,
+          "ms_other": 14.269732926692813,
+          "peak_gb": 2.828830208,
+          "e": 384
+        },
+        {
+          "params": 48004066,
+          "gflops_total": 3891.091341312,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 2736.2820096,
+          "gflops_other": 277.8306969600003,
+          "ms_total": 42.93754388927482,
+          "ms_encoder": 15.157231903076172,
+          "ms_transformer": 13.218518447875976,
+          "ms_other": 14.561793538322672,
+          "peak_gb": 2.93640704,
+          "e": 768
+        },
+        {
+          "params": 110430946,
+          "gflops_total": 7572.501037056,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 6401.1829248,
+          "gflops_other": 294.33947750399966,
+          "ms_total": 61.2671991053503,
+          "ms_encoder": 15.339833545684815,
+          "ms_transformer": 31.31007671356201,
+          "ms_other": 14.617288846103477,
+          "peak_gb": 3.240689664,
+          "e": 1536
+        },
+        {
+          "params": 320219362,
+          "gflops_total": 17721.177145344,
+          "gflops_encoder": 876.978634752,
+          "gflops_transformer": 16516.841472,
+          "gflops_other": 327.35703859200294,
+          "ms_total": 103.30065300222486,
+          "ms_encoder": 15.207199954986573,
+          "ms_transformer": 72.69373092651367,
+          "ms_other": 15.399722120724618,
+          "peak_gb": 4.479716864,
+          "e": 3072
+        }
+      ]
+    },
+    {
+      "sweep": "width",
+      "variant": "v2_compressed",
+      "param": "e",
+      "fixed": {
+        "resolution": 16,
+        "h": 3072,
+        "compress_m": 128
+      },
+      "rows": [
+        {
+          "params": 25309904,
+          "gflops_total": 1073.780489216,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 2.964627456,
+          "gflops_other": 266.314800128,
+          "ms_total": 31.794340896885842,
+          "ms_encoder": 15.481836795806885,
+          "ms_transformer": 0.36412799954414365,
+          "ms_other": 15.948376101534814,
+          "peak_gb": 2.416653824,
+          "e": 96
+        },
+        {
+          "params": 30648848,
+          "gflops_total": 1089.014085632,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 6.399934464,
+          "gflops_other": 278.11308953599996,
+          "ms_total": 32.222847297089174,
+          "ms_encoder": 15.349075222015381,
+          "ms_transformer": 0.40188799500465394,
+          "ms_other": 16.47188408006914,
+          "peak_gb": 2.446327808,
+          "e": 192
+        },
+        {
+          "params": 43427984,
+          "gflops_total": 1126.612692992,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 14.682587136,
+          "gflops_other": 307.42904422399994,
+          "ms_total": 32.64972809702158,
+          "ms_encoder": 15.406934452056884,
+          "ms_transformer": 0.47241919934749604,
+          "ms_other": 16.7703744456172,
+          "peak_gb": 2.514178048,
+          "e": 384
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1230.335565824,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 388.93845708800006,
+          "ms_total": 35.10124059394002,
+          "ms_encoder": 15.329516696929932,
+          "ms_transformer": 0.670473599433899,
+          "ms_other": 19.10125029757619,
+          "peak_gb": 2.68335872,
+          "e": 768
+        },
+        {
+          "params": 178937744,
+          "gflops_total": 1551.883943936,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 103.915585536,
+          "gflops_other": 643.467296768,
+          "ms_total": 42.477468599099666,
+          "ms_encoder": 15.32659845352173,
+          "ms_transformer": 1.2005823850631714,
+          "ms_other": 25.950287760514765,
+          "peak_gb": 3.290640384,
+          "e": 1536
+        },
+        {
+          "params": 516510608,
+          "gflops_total": 2651.391229952,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 328.325136384,
+          "gflops_other": 1518.5650319359997,
+          "ms_total": 89.34627890121192,
+          "ms_encoder": 15.32903985977173,
+          "ms_transformer": 2.9186016082763673,
+          "ms_other": 71.09863743316383,
+          "peak_gb": 5.291164672,
+          "e": 3072
+        }
+      ]
+    },
+    {
+      "sweep": "compress_m",
+      "variant": "v2_compressed",
+      "param": "compress_m",
+      "fixed": {
+        "resolution": 16,
+        "e": 768,
+        "h": 3072
+      },
+      "rows": [
+        {
+          "params": 77299088,
+          "gflops_total": 1179.336433664,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 3.453026304,
+          "gflops_other": 371.382345728,
+          "ms_total": 34.93793879169971,
+          "ms_encoder": 15.357513809204102,
+          "ms_transformer": 0.4695903956890106,
+          "ms_other": 19.110834586806597,
+          "peak_gb": 2.67967232,
+          "compress_m": 8
+        },
+        {
+          "params": 77305232,
+          "gflops_total": 1182.648295424,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 5.59448064,
+          "gflops_other": 372.5527531520001,
+          "ms_total": 34.934464702382684,
+          "ms_encoder": 15.342950439453125,
+          "ms_transformer": 0.4743232011795044,
+          "ms_other": 19.117191061750052,
+          "peak_gb": 2.67991808,
+          "compress_m": 16
+        },
+        {
+          "params": 77317520,
+          "gflops_total": 1189.30976768,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 9.915138048,
+          "gflops_other": 374.8935680000001,
+          "ms_total": 35.00618350808509,
+          "ms_encoder": 15.354371261596679,
+          "ms_transformer": 0.5015680074691773,
+          "ms_other": 19.15024423901923,
+          "peak_gb": 2.6804096,
+          "compress_m": 32
+        },
+        {
+          "params": 77342096,
+          "gflops_total": 1202.783707136,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 18.707447808,
+          "gflops_other": 379.57519769600003,
+          "ms_total": 35.04488019971177,
+          "ms_encoder": 15.315737628936768,
+          "ms_transformer": 0.5587456047534942,
+          "ms_other": 19.17039696602151,
+          "peak_gb": 2.68139264,
+          "compress_m": 64
+        },
+        {
+          "params": 77391248,
+          "gflops_total": 1230.335565824,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 36.896047104,
+          "gflops_other": 388.93845708800006,
+          "ms_total": 35.02040160819888,
+          "ms_encoder": 15.279219245910644,
+          "ms_transformer": 0.671065604686737,
+          "ms_other": 19.070116757601497,
+          "peak_gb": 2.68335872,
+          "compress_m": 128
+        },
+        {
+          "params": 77489552,
+          "gflops_total": 1287.855202304,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 75.6891648,
+          "gflops_other": 407.66497587199996,
+          "ms_total": 35.64924899255857,
+          "ms_encoder": 15.378767967224121,
+          "ms_transformer": 0.8987648069858551,
+          "ms_other": 19.371716218348592,
+          "peak_gb": 2.68729088,
+          "compress_m": 256
+        },
+        {
+          "params": 77686160,
+          "gflops_total": 1412.55815168,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 162.939076608,
+          "gflops_other": 445.1180134400001,
+          "ms_total": 36.77328459452838,
+          "ms_encoder": 15.3618558883667,
+          "ms_transformer": 1.3676287889480592,
+          "ms_other": 20.04379991721362,
+          "peak_gb": 2.695679488,
+          "compress_m": 512
+        },
+        {
+          "params": 78079376,
+          "gflops_total": 1700.618756096,
+          "gflops_encoder": 804.501061632,
+          "gflops_transformer": 376.093605888,
+          "gflops_other": 520.0240885759999,
+          "ms_total": 39.90651990752667,
+          "ms_encoder": 15.34830083847046,
+          "ms_transformer": 2.4886815786361693,
+          "ms_other": 22.069537490420046,
+          "peak_gb": 2.711929344,
+          "compress_m": 1024
+        }
+      ]
+    }
+  ]
+}
