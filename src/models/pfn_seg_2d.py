@@ -236,21 +236,29 @@ class ThinkingRows(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
     """
-    Dual-axis transformer block.
+    Dual-axis transformer block (or single-axis, dual_axis=False).
 
     Feature-axis (col-axis): full self-attention across N patches within each image row.
     Sample-axis  (row-axis): cross-image attention per patch position.
       Both context rows and query row attend only to the train set
       (thinking rows + context images); query cannot attend to itself.
+
+    dual_axis=False drops the feature-axis block entirely (qkv_col/norm1 not even
+    allocated) -- for callers whose columns are already fused into one BEFORE the
+    transformer (e.g. PatchSet3D's arch.dual_axis=False pixel-shuffle token fusion) and
+    want zero further per-layer column-mixing capacity, not just a vacuous c=1
+    self-attention that would still cost params without being able to mix anything.
     """
-    def __init__(self, a: int, e: int, h: int):
+    def __init__(self, a: int, e: int, h: int, dual_axis: bool = True):
         super().__init__()
         assert e % a == 0
         self.a = a
         self.d = e // a
-        self.qkv_col = nn.Linear(e, 3 * e)
+        self.dual_axis = dual_axis
+        if self.dual_axis:
+            self.qkv_col = nn.Linear(e, 3 * e)
+            self.norm1 = LowerPrecisionRMSNorm(e)
         self.qkv_row = nn.Linear(e, 3 * e)
-        self.norm1 = LowerPrecisionRMSNorm(e)
         self.norm2 = LowerPrecisionRMSNorm(e)
         self.norm3 = LowerPrecisionRMSNorm(e)
         self.mlp = nn.Sequential(nn.Linear(e, h), nn.GELU(), nn.Linear(h, e))
@@ -262,21 +270,23 @@ class TransformerEncoderLayer(nn.Module):
         b, r, c, e = src.shape
         a, d = self.a, self.d
 
-        # ── Feature-axis: spatial attention within each image ──────────────────
-        # batched_sdpa (not plain SDPA) so the b*r grid stays under the gridDim.y cap
-        # when r is large (e.g. set-of-patches layouts where rows = all patches).
-        x = src.reshape(b * r, c, e)
-        res = x
-        x = self.norm1(x)
-        qkv = self.qkv_col(x).reshape(b * r, c, 3, a, d).permute(2, 0, 3, 1, 4)
-        # c is tiny in the set-of-patches layout (2 img/mask cols) → manual attention beats
-        # the fused kernel's per-problem overhead; ImagePFN's large c falls back to SDPA.
-        if c <= _SMALL_SEQ_ATTN:
-            x = _small_seq_attn(qkv[0], qkv[1], qkv[2])
-        else:
-            x = batched_sdpa(qkv[0], qkv[1], qkv[2])
-        x = x.transpose(1, 2).reshape(b * r, c, e)
-        src = (res + x).reshape(b, r, c, e)
+        if self.dual_axis:
+            # ── Feature-axis: spatial attention within each image ───────────────
+            # batched_sdpa (not plain SDPA) so the b*r grid stays under the gridDim.y cap
+            # when r is large (e.g. set-of-patches layouts where rows = all patches).
+            x = src.reshape(b * r, c, e)
+            res = x
+            x = self.norm1(x)
+            qkv = self.qkv_col(x).reshape(b * r, c, 3, a, d).permute(2, 0, 3, 1, 4)
+            # c is tiny in the set-of-patches layout (2 img/mask cols) → manual attention
+            # beats the fused kernel's per-problem overhead; ImagePFN's large c falls back
+            # to SDPA.
+            if c <= _SMALL_SEQ_ATTN:
+                x = _small_seq_attn(qkv[0], qkv[1], qkv[2])
+            else:
+                x = batched_sdpa(qkv[0], qkv[1], qkv[2])
+            x = x.transpose(1, 2).reshape(b * r, c, e)
+            src = (res + x).reshape(b, r, c, e)
 
         # ── Sample-axis: cross-image attention per patch position ───────────────
         # Default: every row (context + query) attends only to the train set
@@ -405,10 +415,12 @@ class DecodeCrossBlock(nn.Module):
 
 
 class TransformerEncoderStack(nn.Module):
-    def __init__(self, l: int, a: int, e: int, h: int, residual_decay: float):
+    def __init__(self, l: int, a: int, e: int, h: int, residual_decay: float,
+                 dual_axis: bool = True):
         super().__init__()
         self.residual_decay = residual_decay
-        self.blocks = nn.ModuleList([TransformerEncoderLayer(a, e, h) for _ in range(l)])
+        self.blocks = nn.ModuleList(
+            [TransformerEncoderLayer(a, e, h, dual_axis=dual_axis) for _ in range(l)])
 
     def forward(self, x: torch.Tensor, sep: int, attn_mask: torch.Tensor | None = None,
                 full_attn: bool = False,

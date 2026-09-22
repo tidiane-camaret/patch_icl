@@ -567,6 +567,21 @@ def test_pool_token_forward_shape_and_backward():
     assert not missing, f"no grad reached: {missing}"
 
 
+def test_pool_token_fine_pools_all_requested_stages():
+    """pool_source='fine' with fine_stage=(0,1) (matching m2_patchset_decoder's own default)
+    must pool BOTH stages, not just the finest -- pool_proj.in_features is the SUM of both
+    stages' channels, and a real forward/backward still works end to end."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, image_size=(16, 16, 16), fine_decode=True, fine_stage=(0, 1))
+    assert m.pool_proj.in_features == 8 + 8      # enc_dims[0] + enc_dims[1], not just one
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
 def test_pool_token_changes_output_vs_off():
     """Sanity: with the same seed, pool_token=True must produce different logits than
     pool_token=False."""
@@ -664,6 +679,213 @@ def test_pool_token_with_seq_compress():
                    image_size=(16, 16, 16), fine_decode=True, fine_stage=1)
     img, cin, cout = _dummy_batch(B=2, K=2, S=16)
     out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+# --- arch.pool_source="coarse": pool_token variant sourcing the SAME R^3 grid features that
+# feed the transformer, instead of a separate fine_decode extraction -- no fine_decode
+# requirement, no fine-row widening, no K-scaling cost. ---
+
+def test_pool_token_coarse_rejects_bad_pool_source():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  pool_token=True, pool_source="bogus")
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "pool_source" in str(exc)
+
+
+def test_pool_token_coarse_needs_no_fine_decode():
+    """Unlike pool_source='fine', 'coarse' must NOT require fine_decode=True."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse")   # fine_decode left at its default False
+    assert m.pool_proj.in_features == m.encoder.out_ch      # == 24 for enc_dims=(8,8,8)
+
+
+def test_pool_token_coarse_forward_shape_and_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse")
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_pool_token_coarse_changes_output_vs_off():
+    torch.manual_seed(0)
+    kw = dict(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    m_off = PatchSet3D(pool_token=False, **kw)
+    torch.manual_seed(0)
+    m_on = PatchSet3D(pool_token=True, pool_source="coarse", **kw)
+    m_off.eval(); m_on.eval()
+    torch.manual_seed(1)
+    img, cin, cout = _dummy_batch(S=16)
+    out_off = m_off(img, context_in=cin, context_out=cout)["final_logit"]
+    out_on = m_on(img, context_in=cin, context_out=cout)["final_logit"]
+    assert out_off.shape == out_on.shape
+    assert not torch.allclose(out_off, out_on)
+
+
+def test_pool_token_coarse_rejects_register_routed():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  pool_token=True, pool_source="coarse", register_routed=True)
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "register_routed" in str(exc)
+
+
+def test_pool_token_coarse_does_not_widen_fine_rows():
+    """pool_source='coarse' + fine_decode=True together (an allowed combination) must NOT
+    trigger the fine-row widening 'fine' mode needs -- _decode should still see query-only
+    (B,Cf,S,S,S) fine maps, not (B*T,...)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse",
+                   image_size=(16, 16, 16), fine_decode=True, fine_stage=1)
+    captured = {}
+    orig_decode = m._decode
+
+    def spy(q, fine=None):
+        captured["fine_shapes"] = [f.shape for f in fine]
+        return orig_decode(q, fine)
+    m._decode = spy
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    m(img, context_in=cin, context_out=cout, mode="train")
+    assert captured["fine_shapes"] == [(2, 8, 8, 8, 8)]   # (B, Cf, S, S, S), B=2 not B*T
+
+
+def test_pool_token_coarse_all_background_support_mask_no_nan():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse")
+    img, cin, _ = _dummy_batch(B=2, K=2, S=16)
+    cout = torch.zeros(2, 2, 16, 16, 16, dtype=torch.long)     # all background
+    out = m(img, context_in=cin, context_out=cout, mode="train")["final_logit"]
+    assert torch.isfinite(out).all()
+
+
+def test_pool_token_coarse_with_query_prior():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse")
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    query_prior = torch.rand(2, 1, 16, 16, 16)
+    out = m(img, context_in=cin, context_out=cout, query_prior=query_prior,
+           mode="train")["final_logit"]
+    assert torch.isfinite(out).all()
+
+
+def test_pool_token_coarse_with_context_id_embed_and_cascade_registers_and_mask_slots():
+    """Combined smoke test, mirroring the 'fine' mode's own: context_id_embed/
+    cascade_registers/mask_slots tagging all apply correctly to coarse pool rows alongside
+    real content rows, and everything still trains."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   pool_token=True, pool_source="coarse", context_id_embed=True,
+                   cascade_registers=True, mask_slots=2)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    out = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+# --- arch.dual_axis=False: single-axis transformer, img+mask fused into one column
+# BEFORE the transformer via Iris Eq 3-4's PixelShuffle trick, instead of attended
+# together every layer via the (dropped) column-axis block. ---
+
+def test_dual_axis_rejects_bad_e():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  mask_patch_size=2, dual_axis=False, axis_fuse_r=3)   # 3^3=27 doesn't divide 32
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "axis_fuse_r" in str(exc)
+
+
+def test_dual_axis_rejects_bad_mask_patch_size():
+    try:
+        PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                  mask_patch_size=3, dual_axis=False, axis_fuse_r=2)   # 3 not divisible by 2
+        assert False, "should have raised"
+    except AssertionError as exc:
+        assert "mask_patch_size" in str(exc)
+
+
+def test_dual_axis_false_drops_col_attn_params():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=2, dual_axis=False, axis_fuse_r=2)
+    for block in m.transformer.blocks:
+        assert not hasattr(block, "qkv_col")
+        assert not hasattr(block, "norm1")
+    assert m.fuse_conv.in_channels == 32 // 8 + 1     # e/r^3 + 1 mask channel
+    assert m.fuse_conv.out_channels == 32 // 8
+
+
+def test_dual_axis_false_forward_shape_and_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=2, dual_axis=False, axis_fuse_r=2)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached (dual_axis=False must still route grad to " \
+                        f"mask_embed/mask_token via the zero-contribution trick): {missing}"
+
+
+def test_dual_axis_false_changes_output_vs_bi_axial():
+    torch.manual_seed(0)
+    kw = dict(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+              mask_patch_size=2)
+    m_bi = PatchSet3D(dual_axis=True, **kw)
+    torch.manual_seed(0)
+    m_single = PatchSet3D(dual_axis=False, axis_fuse_r=2, **kw)
+    m_bi.eval(); m_single.eval()
+    torch.manual_seed(1)
+    img, cin, cout = _dummy_batch(S=16)
+    out_bi = m_bi(img, context_in=cin, context_out=cout)["final_logit"]
+    out_single = m_single(img, context_in=cin, context_out=cout)["final_logit"]
+    assert out_bi.shape == out_single.shape
+    assert not torch.allclose(out_bi, out_single)
+
+
+def test_dual_axis_false_mask_patch_size_coarser_than_r_avg_pools():
+    """axis_fuse_r < mask_patch_size: occ's tile must be avg-pooled down, not just
+    truncated/reshaped -- exercised via mask_patch_size=4, axis_fuse_r=2 (4 % 2 == 0)."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=4, dual_axis=False, axis_fuse_r=2)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")["final_logit"]
+    assert torch.isfinite(out).all()
+
+
+def test_dual_axis_false_with_pool_token_fine_two_stage():
+    """Combined smoke test matching the actual 120 experiment recipe: dual_axis=False +
+    pool_token=True + fine_stage=(0,1) (2-stage fine pooling) together."""
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=2, dual_axis=False, axis_fuse_r=2,
+                   pool_token=True, image_size=(16, 16, 16), fine_decode=True,
+                   fine_stage=(0, 1))
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    out = m(img, context_in=cin, context_out=cout, mode="train")
+    assert out["final_logit"].shape == (2, 1, 4, 4, 4)
+    out["final_logit"].mean().backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no grad reached: {missing}"
+
+
+def test_dual_axis_false_rejects_bad_content_type_still_works_with_mask_slots():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   mask_patch_size=2, dual_axis=False, axis_fuse_r=2,
+                   context_id_embed=True, cascade_registers=True, mask_slots=2)
+    img, cin, cout = _dummy_batch(B=2, K=2, S=16)
+    prev_regs = torch.randn(2, 2, 32)
+    out = m(img, context_in=cin, context_out=cout, cascade_regs=prev_regs)
     assert out["final_logit"].shape == (2, 1, 4, 4, 4)
     out["final_logit"].mean().backward()
     missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]

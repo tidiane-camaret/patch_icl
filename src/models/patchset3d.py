@@ -251,6 +251,9 @@ class PatchSet3D(nn.Module):
         iris_m: int = 10,
         iris_ctx_layers: int = 2,
         pool_token: bool = False,
+        pool_source: str = "fine",
+        dual_axis: bool = True,
+        axis_fuse_r: int = 4,
     ):
         super().__init__()
         self.resolution = resolution
@@ -284,6 +287,23 @@ class PatchSet3D(nn.Module):
             f"arch.decode_source={decode_source!r} not in this config's slot_layout "
             f"{self.slot_layout}")
         self._decode_col = self.slot_index[self.decode_source]
+        # dual_axis=False: img and mask are fused into ONE column before the transformer
+        # (see _tokens_fused) instead of attended together per-layer via the feature-axis
+        # block -- isolates row-axis-only (cross-context) attention. The img-vs-mask
+        # decode_source distinction no longer applies once there's a single fused column,
+        # so slot_layout/_decode_col are overridden here regardless of decode_source.
+        self.dual_axis = bool(dual_axis)
+        self.axis_fuse_r = int(axis_fuse_r)
+        if not self.dual_axis:
+            assert e % (self.axis_fuse_r ** 3) == 0, (
+                f"arch.dual_axis=False needs e ({e}) divisible by axis_fuse_r^3 "
+                f"({self.axis_fuse_r} ** 3 = {self.axis_fuse_r ** 3})")
+            assert mask_patch_size % self.axis_fuse_r == 0, (
+                f"arch.dual_axis=False needs arch.mask_patch_size ({mask_patch_size}) "
+                f"divisible by arch.axis_fuse_r ({self.axis_fuse_r})")
+            self.slot_layout = ("fused",)
+            self.slot_index = {"fused": 0}
+            self._decode_col = 0
         self._mask_content_index = {name: i for i, name in enumerate(self._MASK_CONTENT_TYPES)}
         self.full_attn = full_attn
         self.query_self_attn = query_self_attn
@@ -368,6 +388,20 @@ class PatchSet3D(nn.Module):
         # identity tag along with the content, see _tokens) — shape independent of mask_slots.
         self.mask_token = nn.Parameter(torch.zeros(2, e))
         nn.init.normal_(self.mask_token, std=0.02)
+        if not self.dual_axis:
+            # Iris Eq 3-4's PixelShuffle mask-fusion trick (docs/methods/iris.md), applied
+            # PER CELL instead of per volume: img's e-dim embedding is channel-to-space
+            # shuffled into an axis_fuse_r^3 fake-spatial grid, concatenated with the REAL
+            # fine-grained occupancy tile (avg-pooled from mask_patch_size down to
+            # axis_fuse_r if coarser) at every one of those positions, mixed by a shared
+            # pointwise conv, then unshuffled back to one e-vector -- see _tokens_fused.
+            # r=4 (not mask_patch_size=8) because e must be divisible by r^3 (768/4^3=12;
+            # 768/8^3 is not integer) -- same constraint arch.iris_pixelshuffle_r already
+            # satisfies for the (structurally separate) IRIS decoder path.
+            c_shuf = e // (self.axis_fuse_r ** 3)
+            self.fuse_conv = nn.Conv3d(c_shuf + 1, c_shuf, 1)
+            self.fuse_mask_token = nn.Parameter(torch.zeros(e))
+            nn.init.normal_(self.fuse_mask_token, std=0.02)
         self.head_dim = e // a
         self.rope_train_mm = float(getattr(self.encoder, "train_spacing_mm", 2.0))
         self.pos = None if self.transformer_rope else FourierPositionalEncoding(e, fourier_bands, n_axes=3)
@@ -417,7 +451,8 @@ class PatchSet3D(nn.Module):
                 [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
             self.expander = nn.ModuleList(
                 [RowCrossAttention(a, e, h) for _ in range(compress_layers)])
-        self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay)
+        self.transformer = TransformerEncoderStack(l, a, e, h, residual_decay,
+                                                   dual_axis=self.dual_axis)
         # Decode head. Default (fine_decode=False): a per-token MLP emitting d^3 CONSTANTS per
         # cell. fine_decode=True picks between two heads via `decoder`:
         #   "fine_filter" — each token emits a dynamic FILTER dotted against the query volume's
@@ -485,22 +520,58 @@ class PatchSet3D(nn.Module):
                                          int(iris_ctx_layers))
             else:
                 raise ValueError(f"arch.decoder {self.decoder_kind!r} (fine_filter | conv | iris)")
-        # pool_token (IRIS-style T_f): foreground-masked average of fine-resolution image
-        # features, one extra prefix row per volume (K support + 1 query) -- inserted the same
-        # way arch.cascade_registers' carried memory is (see _attn), not as an extra per-cell
+        # pool_token (IRIS-style T_f): foreground-masked average of a per-volume feature map,
+        # one extra prefix row per volume (K support + 1 query) -- inserted the same way
+        # arch.cascade_registers' carried memory is (see _attn), not as an extra per-cell
         # token, so register_routed/_rope/_grid_tokens/context_id_embed's N-cells-per-volume
         # invariant is untouched. See docs/superpowers/specs/2026-09-14-patchset3d-pool-token-
         # design.md.
+        #
+        # pool_source picks WHICH feature map gets pooled:
+        #   "fine"   (default) -- EVERY fine_decode requested stage (near-native resolution,
+        #            e.g. S=128 at fine_stage=0; each stage masked-averaged independently at
+        #            its own resolution then concatenated, see _pool_tokens), matching IRIS's
+        #            own ablation finding that masking AFTER upsampling to full res (not
+        #            before) is what lifts small-object Dice. Requires fine_decode=True and
+        #            extending fine-map extraction from query-only to all K+1 volumes -- a
+        #            real K-scaling cost (paid once per requested stage).
+        #   "coarse" -- the SAME R^3 grid features already feeding the transformer's per-cell
+        #            tokens (self.encoder.out_ch channels), pooled against a properly
+        #            antialiased occupancy weight derived from the tiled mask already computed
+        #            for _tokens (sup_occ/qry_occ mean-reduced over their p^3 tile axis --
+        #            mathematically identical to avg-pooling the native mask to R^3, not a
+        #            cruder representation, see _pool_tokens_coarse). Costs nothing extra:
+        #            sup_feat/qry_feat and sup_occ/qry_occ already exist in _attn for every
+        #            volume regardless of pool_token, so no fine_decode requirement, no extra
+        #            encoder pass, no K-scaling. The tradeoff is resolution, not mask
+        #            precision: at R^3 cells the FEATURE itself already blended small
+        #            structures with neighboring content before any pooling happens (a
+        #            stride-8-ish receptive field per cell under e.g. nnunet_ts_stages=[2,3])
+        #            -- the same failure mode IRIS's own ablation found for masking before
+        #            upsampling, just relocated from "mask precision" to "feature precision".
+        #            A cheap counterfactual for that finding, not assumed to lose to "fine".
         self.pool_token = bool(pool_token)
-        assert not (self.pool_token and not self.fine_decode), (
-            "arch.pool_token=True requires arch.fine_decode=True (needs unpooled per-stage maps)")
+        self.pool_source = str(pool_source)
+        assert self.pool_source in ("fine", "coarse"), (
+            f"arch.pool_source must be 'fine' or 'coarse', got {pool_source!r}")
+        assert not (self.pool_token and self.pool_source == "fine" and not self.fine_decode), (
+            "arch.pool_token=True with pool_source='fine' requires arch.fine_decode=True "
+            "(needs unpooled per-stage maps) -- pool_source='coarse' has no such requirement")
         assert not (self.pool_token and self.register_routed), (
             "arch.pool_token=True adds K+1 extra prefix rows -- arch.register_routed's "
             "block-mask partitioning assumes no prefix rows besides thinking rows (same reason "
             "cascade_registers is incompatible)")
         if self.pool_token:
-            self._pool_stage = min(self.fine_stage)
-            self.pool_proj = nn.Linear(self.encoder.fine_stage_channels(self._pool_stage), e)
+            if self.pool_source == "fine":
+                # Pool EVERY requested fine_decode stage (not just the finest), each masked-
+                # averaged independently at its own native resolution then concatenated --
+                # mirrors _decode's fine_filter path, which also reads all of self.fine_stage
+                # (there: projected + summed at the finest grid; here: concatenated, since
+                # _pool_tokens produces one vector per volume, not a spatial map).
+                pool_in = sum(self.encoder.fine_stage_channels(st) for st in self.fine_stage)
+            else:
+                pool_in = self.encoder.out_ch
+            self.pool_proj = nn.Linear(pool_in, e)
             self.pool_type = nn.Parameter(torch.zeros(e))
             nn.init.normal_(self.pool_type, std=0.02)
         # (i,j,k) lattice, row-major over R³ (cell index n = i*R² + j*R + k)
@@ -628,6 +699,8 @@ class PatchSet3D(nn.Module):
         the SAME column/QKV space for cross-context attention (unlike a separate column per
         type, which only one side would ever populate — see _MASK_CONTENT_TYPES)."""
         img = self.img_embed(feat)
+        if not self.dual_axis:
+            return self._tokens_fused(img, occ, ijk, mask=mask, content_type=content_type)
         msk = self.mask_embed(occ)
         if content_type is not None:
             idx = self._mask_content_index[content_type]
@@ -648,6 +721,41 @@ class PatchSet3D(nn.Module):
             img = img + pos                                 # masked token keeps its position
             msk = msk + pos
         return torch.stack([img, msk], dim=2)               # (B,M,2,e)
+
+    def _tokens_fused(self, img, occ, ijk, mask=None, content_type: str | None = None):
+        """arch.dual_axis=False: fuse img+mask into ONE column via Iris Eq 3-4's
+        PixelShuffle trick (docs/methods/iris.md), per cell instead of per volume. occ's
+        own p³ tile IS the real fine-grained mask (avg-pooled to axis_fuse_r if coarser,
+        never flattened through a Linear the way mask_embed would) -- concatenating it at
+        the shuffled sub-cell grid, not after collapsing to a single vector, is what keeps
+        small-object mask precision alive without any column-axis attention. img:
+        (B,M,e) (already img_embed'd by the caller). occ: (B,M,mask_patch_size³). Returns
+        (B,M,1,e) -- single fused column, so downstream `x.shape[2]`-generic code
+        (thinking rows, cascade_regs, pool_feat) works unchanged at c=1."""
+        B, M, e = img.shape
+        r, p = self.axis_fuse_r, self.mask_patch_size
+        mask_r = occ.reshape(B * M, 1, p, p, p)
+        if p != r:
+            mask_r = F.avg_pool3d(mask_r, p // r)
+        mask_r = mask_r.reshape(B * M, 1, r, r, r).to(img.dtype)
+        img_grid = _pixel_shuffle_3d(img.reshape(B * M, e, 1, 1, 1), r)   # (B*M,e/r³,r,r,r)
+        fused = self.fuse_conv(torch.cat([img_grid, mask_r], dim=1))
+        fused = _pixel_unshuffle_3d(fused, r).reshape(B, M, e)
+        # mask_embed/mask_token are unused on this path -- keep them in the compute graph
+        # (zero contribution) so they still receive a gradient, same reasoning as the
+        # SimMIM else-branch below (some optimizer state assumes every param is touched).
+        fused = fused + self.mask_embed(occ).sum() * 0.0 + self.mask_token.sum() * 0.0
+        if content_type is not None:
+            idx = self._mask_content_index[content_type]
+            fused = fused + self._slot_pos_vec(idx, occ.device, fused.dtype)
+        if mask is not None:                                 # SimMIM in-place [MASK] replacement
+            m = mask.unsqueeze(-1)
+            fused = torch.where(m, self.fuse_mask_token.to(fused.dtype), fused)
+        else:
+            fused = fused + self.fuse_mask_token.sum() * 0.0
+        if self.pos is not None:                              # additive Fourier PE (non-RoPE mode)
+            fused = fused + self.pos(ijk, self.resolution)
+        return fused.unsqueeze(2)                             # (B,M,1,e)
 
     def _slot_pos_vec(self, idx: int, device, dtype):
         """(e,) additive Fourier feature for canonical mask-content-type index `idx`
@@ -739,27 +847,18 @@ class PatchSet3D(nn.Module):
             q = layer(q, kv)
         return q
 
-    def _pool_tokens(self, fine_finest, context_out, query_prior, B, K, T):
-        """fine_finest: (B*T, Cf, S, S, S) -- ALL volumes' finest requested-stage map (forward's
-        `fine` indexed at self._pool_stage, before it's re-sliced back to query-only). Returns
-        (B, K+1, Cf): support-major (index 0..K-1) then query (index K), raw foreground-masked
-        -average feature vectors -- NOT yet projected to e (projection + tagging happens in
-        _attn, mirroring how cascade_regs is projected there via cascade_proj). See
-        docs/superpowers/specs/2026-09-14-patchset3d-pool-token-design.md."""
-        S = fine_finest.shape[-1]
-        Cf = fine_finest.shape[1]
-        feat = fine_finest.reshape(B, T, Cf, S, S, S)
-        sup_feat, qry_feat = feat[:, :K], feat[:, K:K + 1]      # (B,K,Cf,...), (B,1,Cf,...)
-
-        sup_mask = F.interpolate(
-            context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
-            size=(S, S, S), mode="trilinear", align_corners=False).reshape(B, K, S, S, S)
-        if query_prior is not None:
-            qry_mask = F.interpolate(query_prior.float(), size=(S, S, S), mode="trilinear",
-                                     align_corners=False)                   # (B,1,S,S,S)
-        else:
-            qry_mask = sup_mask.mean(dim=1, keepdim=True)                  # (B,1,S,S,S)
-
+    def _pool_tokens(self, fine_maps, context_out, query_prior, B, K, T):
+        """fine_maps: tuple of (B*T, Cf_st, S_st, S_st, S_st), ALL volumes' unpooled map for
+        EVERY stage in self.fine_stage (forward's `fine`, in self.fine_stage order, before
+        it's re-sliced back to query-only) -- not just the finest. Each stage is
+        masked-averaged independently at its OWN native resolution (own mask, own z-score),
+        then concatenated along the channel dim -- mirrors _decode's fine_filter path, which
+        also reads every self.fine_stage entry (there: projected + summed at the finest grid;
+        here: concatenated, since this produces one vector per volume, not a spatial map).
+        Returns (B, K+1, sum(Cf_st)): support-major (index 0..K-1) then query (index K), raw
+        foreground-masked-average feature vectors -- NOT yet projected to e (projection +
+        tagging happens in _attn, mirroring how cascade_regs is projected there via
+        cascade_proj). See docs/superpowers/specs/2026-09-14-patchset3d-pool-token-design.md."""
         def masked_avg(f, m):
             # Per-volume z-score before the masked reduction -- mirrors _decode's fine_filter
             # normalization (mu/sig over each volume's OWN spatial extent), so support and
@@ -778,8 +877,53 @@ class PatchSet3D(nn.Module):
             den = m.sum(dim=(-3, -2, -1)).clamp_min(1e-6).unsqueeze(-1)   # (B,n,1)
             return num / den                                   # (B,n,Cf)
 
-        return torch.cat([masked_avg(sup_feat, sup_mask), masked_avg(qry_feat, qry_mask)],
-                         dim=1)
+        stage_vecs = []
+        for fine_st in fine_maps:
+            S = fine_st.shape[-1]
+            Cf = fine_st.shape[1]
+            feat = fine_st.reshape(B, T, Cf, S, S, S)
+            sup_feat, qry_feat = feat[:, :K], feat[:, K:K + 1]      # (B,K,Cf,...), (B,1,Cf,...)
+
+            sup_mask = F.interpolate(
+                context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
+                size=(S, S, S), mode="trilinear", align_corners=False).reshape(B, K, S, S, S)
+            if query_prior is not None:
+                qry_mask = F.interpolate(query_prior.float(), size=(S, S, S), mode="trilinear",
+                                         align_corners=False)               # (B,1,S,S,S)
+            else:
+                qry_mask = sup_mask.mean(dim=1, keepdim=True)              # (B,1,S,S,S)
+
+            stage_vecs.append(torch.cat(
+                [masked_avg(sup_feat, sup_mask), masked_avg(qry_feat, qry_mask)], dim=1))
+        return torch.cat(stage_vecs, dim=-1)      # (B, K+1, sum(Cf_st))
+
+    def _pool_tokens_coarse(self, sup_feat, qry_feat, sup_occ, qry_occ):
+        """arch.pool_source='coarse' variant of _pool_tokens: pools the SAME R^3-grid per-cell
+        features _attn already builds sup_tok/qry_tok from (sup_feat:(B,K*N,Cf) qry_feat:
+        (B,N,Cf), raw -- called BEFORE _feat_norm overwrites them), weighted by the SAME tiled
+        mask content _tokens consumes (sup_occ:(B,K*N,p^3) qry_occ:(B,N,p^3)), mean-reduced
+        over the p^3 tile axis to a per-cell occupancy fraction -- an exact antialiased
+        avg-pool of the native mask to R^3 (see pool_source docstring in __init__), NOT a
+        cruder representation than _pool_tokens' own upsample-then-interpolate mask. Returns
+        (B,K+1,Cf), support-major then query, NOT yet projected to e (mirrors _pool_tokens)."""
+        B, Cf, N = sup_feat.shape[0], sup_feat.shape[-1], self.N
+
+        def masked_avg(f, w):                                   # f:(B,n*N,Cf)  w:(B,n*N)
+            f = f.reshape(B, -1, N, Cf)
+            w = w.reshape(B, -1, N, 1)
+            # Per-volume z-score before the masked reduction, over the N-cell axis -- mirrors
+            # _pool_tokens' own per-volume normalization (never across the n/K dim, which
+            # would NaN at K=1).
+            mu = f.mean(dim=2, keepdim=True)
+            sig = f.std(dim=2, keepdim=True) + 1e-8
+            f = self._zscore(f, mu, sig)
+            num = (f * w).sum(dim=2)
+            den = w.sum(dim=2).clamp_min(1e-6)
+            return num / den                                     # (B,n,Cf)
+
+        sup_w = sup_occ.mean(dim=-1)                              # (B,K*N)
+        qry_w = qry_occ.mean(dim=-1)                              # (B,N)
+        return torch.cat([masked_avg(sup_feat, sup_w), masked_avg(qry_feat, qry_w)], dim=1)
 
     def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None,
              cascade_regs=None, pool_feat=None):
@@ -793,6 +937,15 @@ class PatchSet3D(nn.Module):
             qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)
         qry_ijk = self.ijk_base.unsqueeze(0).expand(B, N, 3)
+
+        # arch.pool_source='coarse': unlike 'fine' (computed in forward(), threaded in as the
+        # `pool_feat` argument -- needs the widened fine-row extraction only forward() controls),
+        # 'coarse' needs nothing forward() doesn't already hand this method, so it's computed
+        # here instead, from the RAW (pre-_feat_norm) sup_feat/qry_feat/sup_occ/qry_occ already
+        # in scope. Guarded on `pool_feat is None` so an explicitly-passed (fine-mode) pool_feat
+        # is never overwritten.
+        if self.pool_token and self.pool_source == "coarse" and pool_feat is None:
+            pool_feat = self._pool_tokens_coarse(sup_feat, qry_feat, sup_occ, qry_occ)
 
         sup_feat, qry_feat = self._feat_norm(sup_feat, qry_feat)
 
@@ -1054,13 +1207,17 @@ class PatchSet3D(nn.Module):
         input rows (arch.cascade_registers=True required; see _attn).
 
         arch.pool_token (constructor flag, not a forward argument) changes this method's own
-        internal behavior: when set, the unpooled fine-map extraction below widens from
-        query-only rows to all K+1 volumes (support + query), since _pool_tokens needs every
-        volume's finest fine map to build its foreground-masked prototype row; the fine maps
-        are re-sliced back down to query-only before _decode (see the `pool_token` branch
-        below and _pool_tokens). arch.decoder=iris widens the same way (support rows are
-        needed for _iris_foreground_pool's T_f, §4.1) -- independent of pool_token, both can
-        be on at once without conflict since each reads its own finest stage index."""
+        internal behavior when arch.pool_source='fine' (the default): the unpooled fine-map
+        extraction below widens from query-only rows to all K+1 volumes (support + query),
+        since _pool_tokens needs every volume's map at EVERY requested fine_decode stage to
+        build its foreground-masked prototype row; the fine maps are re-sliced back down to
+        query-only before _decode (see the `pool_token` branch below and _pool_tokens).
+        arch.decoder=iris widens the same way (support rows are needed for
+        _iris_foreground_pool's T_f, §4.1) -- independent of pool_token, both can be on at once
+        without conflict since each reads its own stage index/indices.
+        arch.pool_source='coarse' touches NONE of this -- it's computed entirely
+        inside _attn from tensors already built there (see _pool_tokens_coarse); this method
+        doesn't even need arch.fine_decode=True for that mode."""
         B, K = context_in.shape[0], context_in.shape[1]
         D, H, W = image.shape[-3:]
         imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
@@ -1071,11 +1228,13 @@ class PatchSet3D(nn.Module):
         iris_fine_finest = None
         if self.fine_decode:
             qidx = torch.arange(B, device=x.device) * T + K
-            # arch.pool_token AND decoder=iris both need every volume's (support + query, or
-            # support-only for iris) unpooled fine map, not just the query's -- widen rows for
-            # either, re-slice back to query-only below before _decode/_decode_iris (both only
-            # ever consume the query's own fine maps).
-            need_all_rows = self.pool_token or self.decoder_kind == "iris"
+            # arch.pool_token (pool_source='fine' only) AND decoder=iris both need every
+            # volume's (support + query, or support-only for iris) unpooled fine map, not just
+            # the query's -- widen rows for either, re-slice back to query-only below before
+            # _decode/_decode_iris (both only ever consume the query's own fine maps).
+            # pool_source='coarse' needs none of this -- see _attn/_pool_tokens_coarse.
+            pool_fine = self.pool_token and self.pool_source == "fine"
+            need_all_rows = pool_fine or self.decoder_kind == "iris"
             if need_all_rows:
                 rows = torch.arange(B * T, device=x.device)   # every volume (support + query)
             else:
@@ -1083,10 +1242,9 @@ class PatchSet3D(nn.Module):
                 # keep an unpooled map (one encoder pass, the rest freed with the stage list).
                 rows = qidx
             feat_map, fine = self._encode(x, spacing, fine_rows=rows)
-            if self.pool_token:
-                finest_idx = self.fine_stage.index(self._pool_stage)
-                pool_feat = self._pool_tokens(fine[finest_idx], context_out, query_prior,
-                                              B, K, T)
+            if pool_fine:
+                # ALL of self.fine_stage, not just the finest -- see _pool_tokens.
+                pool_feat = self._pool_tokens(fine, context_out, query_prior, B, K, T)
             if self.decoder_kind == "iris":
                 # _iris_stage_order is sorted coarse->fine, so [-1] is the finest requested
                 # stage's index into self.fine_stage / this `fine` tuple -- ALL T rows still,

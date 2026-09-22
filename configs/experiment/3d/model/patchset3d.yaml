@@ -67,17 +67,42 @@ arch:
   compress_layers: 1           # depth of the Stage A/Stage C RowCrossAttention stacks, each
                                # (independent, not weight-shared)
   pool_token: false            # IRIS-style foreground-masked pooling token per volume (K+1
-                               # extra prefix rows, one per support + query). Pools
-                               # arch.fine_decode's finest requested stage -- requires
-                               # arch.fine_decode=true. Extends fine-map extraction to all K+1
-                               # volumes (memory cost scales with K, vs. query-only otherwise).
-                               # Incompatible with arch.register_routed (same reason
-                               # cascade_registers is). NOTE: this base patchset3d.yaml has no
-                               # fine_decode: true model config, so exercising arch.pool_token=
-                               # true today means using model=m2_patchset_decoder (the one
-                               # existing fine_decode: true model config) with
-                               # +arch.pool_token=true, or any future config that sets
-                               # fine_decode: true.
+                               # extra prefix rows, one per support + query). Incompatible with
+                               # arch.register_routed (same reason cascade_registers is).
+  pool_source: fine            # WHICH feature map arch.pool_token pools, when pool_token=true:
+                               #   fine   -- arch.fine_decode's finest requested stage (near-
+                               #             native resolution). Requires arch.fine_decode=true;
+                               #             extends fine-map extraction to all K+1 volumes
+                               #             (memory cost scales with K, vs. query-only
+                               #             otherwise). NOTE: this base patchset3d.yaml has no
+                               #             fine_decode: true model config, so exercising this
+                               #             mode today means using model=m2_patchset_decoder
+                               #             (the one existing fine_decode: true model config)
+                               #             with +arch.pool_token=true, or any future config
+                               #             that sets fine_decode: true.
+                               #   coarse -- the same R^3 grid features already feeding the
+                               #             transformer's per-cell tokens. No fine_decode
+                               #             requirement, no extra encoder pass, no K-scaling
+                               #             cost -- but pools an already spatially-blended
+                               #             (stride-8-ish) feature, trading resolution for
+                               #             being ~free. See src/models/patchset3d.py's
+                               #             pool_source docstring for the full tradeoff.
+  dual_axis: true              # bi-axial (default) vs single-axis transformer. true = every
+                               # layer attends img<->mask (column axis) AND cross-context
+                               # (row axis), the two independent axes the "bi-axial attention"
+                               # design refers to. false = img+mask are fused into ONE column
+                               # BEFORE the transformer via Iris Eq 3-4's PixelShuffle trick
+                               # (per cell, not per volume -- see
+                               # src/models/patchset3d.py::_tokens_fused), and every layer's
+                               # column-axis attention block is not even allocated (row-axis
+                               # cross-context attention only) -- isolates whether per-layer
+                               # attention-based img/mask mixing matters vs a one-time fusion.
+  axis_fuse_r: 4                # PixelShuffle factor for the dual_axis=false fusion; e % r^3
+                               # must == 0 (e=768 -> r=4, not mask_patch_size=8: 8^3=512
+                               # doesn't divide 768). Same constraint/reasoning as the
+                               # structurally separate arch.iris_pixelshuffle_r (IRIS decoder
+                               # path); mask_patch_size must be divisible by r (avg-pooled
+                               # down when coarser).
   compile: true               # torch.compile the transformer (encoder stays eager); slow first batch
 
 train:
