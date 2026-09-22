@@ -46,7 +46,7 @@
       \archarrow{(2.45,5.75)}{(2.75,5.75)}{archArrowPale}
       \archfeatcube{2.8}{5.2}{0.7}{1.1}{archTargetGreen}{$F^T$}
       \archarrow{(3.5,5.75)}{(3.9,5.75)}{archArrowPale}
-      \archtokengrid{3.95}{5.25}{3}{2}{0.4}{archTargetGreen}
+      \archtokengrid{4.35}{5.25}{3}{1}{0.4}{archTargetGreen}
 
       % ---- lane 1: target PRIOR -- content differs by level, see below ----
       \ifthenelse{\equal{\L}{1}}{
@@ -54,15 +54,15 @@
         \draw[black!40,thin,dashed] (0,3.3) rectangle ++(1.15,1.3);
         \node[align=center,font=\scriptsize,black!45] at (0.575,3.95) {support\\-mean};
         \archarrow{(1.25,3.95)}{(3.9,3.95)}{black!15}
-        \foreach \r in {0,1,2}{\foreach \c in {0,1}{
-          \draw[black!20,thin] ({3.95+\c*0.4},{3.5+\r*0.4}) rectangle ++(0.33,0.33);
-        }}
+        \foreach \r in {0,1,2}{
+          \draw[black!20,thin] (4.35,{3.5+\r*0.4}) rectangle ++(0.33,0.33);
+        }
       }{
         % Level 2: REAL prior, cropped from level 1's own prediction (arrow drawn after the loop)
         \node[anchor=east,font=\small] at (-0.15,3.95) {$P^T$};
-        \archvolcube{0}{3.3}{1.15}{1.3}{archMaskGold}{predmask}{}
+        \archvolcube{0}{3.3}{1.15}{1.3}{archTargetAccent}{predmask}{}
         \archarrow{(1.25,3.95)}{(3.9,3.95)}{archArrowPale}
-        \archtokengrid{3.95}{3.45}{3}{2}{0.4}{archMaskGold}
+        \archtokengrid{4.35}{3.45}{3}{1}{0.4}{archTargetAccent}
       }
 
       % ---- lane 2: context image (always real) ----
@@ -73,13 +73,13 @@
       \archarrow{(2.45,2.15)}{(2.75,2.15)}{archArrowPale}
       \archfeatcube{2.8}{1.6}{0.7}{1.1}{archContextPink}{$F^C$}
       \archarrow{(3.5,2.15)}{(3.9,2.15)}{archArrowPale}
-      \archtokengrid{3.95}{1.65}{3}{2}{0.4}{archContextPink}
+      \archtokengrid{4.35}{1.65}{3}{1}{0.4}{archContextPink}
 
       % ---- lane 3: context mask (always real, ground truth) ----
       \node[anchor=east,font=\small] at (-0.15,0.5) {$M^C$};
-      \archvolcube{0}{0}{1.15}{1.0}{archMaskGold}{predmask}{}
+      \archvolcube{0}{0}{1.15}{1.0}{archContextAccent}{predmask}{}
       \archarrow{(1.25,0.5)}{(3.9,0.5)}{archArrowPale}
-      \archtokengrid{3.95}{0.1}{2}{2}{0.4}{archMaskGold}
+      \archtokengrid{4.35}{0.1}{3}{1}{0.4}{archContextAccent}
 
       % ---- attention (spans all 4 lanes) -> Decoder -> output (target lane) ----
       \draw[archAttnBlue!70!black,thin,dashed] (4.65,-0.15) rectangle ++(1.3,6.7);

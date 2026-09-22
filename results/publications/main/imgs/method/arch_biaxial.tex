@@ -36,7 +36,10 @@
 \def\tsz{0.16}
 \def\toff{0.22}
 \def\colpitch{0.95}
-\def\rowpitch{1.0}
+\def\rowpitch{0.66} % 3*\toff -- target/context sit at the SAME pitch as the
+                     % 3 tokens within a cluster, so all 6 read as one
+                     % continuous column; only the ring/fill color marks the
+                     % boundary between the two volumes
 \def\panelgap{1.5}
 \def\clusterhalf{\toff+\tsz/2}
 
@@ -46,8 +49,8 @@
 \def\ximgB{\xlblA+\panelgap}
 \def\xlblB{\ximgB+\colpitch}
 
-\def\yCtx{1.0}  % context (single support volume)
-\def\yTgt{0.0}  % target
+\def\yTgt{\rowpitch}  % target (top)
+\def\yCtx{0}          % context (bottom, single support volume)
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
@@ -56,48 +59,59 @@
 
   % ---- panel frames + titles ----
   \draw[black!25,rounded corners=3pt]
-    (\ximgA-0.45,\yTgt-\clusterhalf-0.15) rectangle (\xlblA+0.45,\yCtx+\clusterhalf+0.15);
+    (\ximgA-0.45,\yCtx-\clusterhalf-0.15) rectangle (\xlblA+0.45,\yTgt+\clusterhalf+0.15);
   \draw[black!25,rounded corners=3pt]
-    (\ximgB-0.45,\yTgt-\clusterhalf-0.15) rectangle (\xlblB+0.45,\yCtx+\clusterhalf+0.15);
-  \node[anchor=south,font=\bfseries\small] at ({(\ximgA+\xlblA)/2},\yCtx+\clusterhalf+0.25) {Image/label axis};
-  \node[anchor=south,font=\bfseries\small] at ({(\ximgB+\xlblB)/2},\yCtx+\clusterhalf+0.25) {Patch axis};
+    (\ximgB-0.45,\yCtx-\clusterhalf-0.15) rectangle (\xlblB+0.45,\yTgt+\clusterhalf+0.15);
+  \node[anchor=south,font=\bfseries\small] at ({(\ximgA+\xlblA)/2},\yTgt+\clusterhalf+0.25) {Image/label axis};
+  \node[anchor=south,font=\bfseries\small] at ({(\ximgB+\xlblB)/2},\yTgt+\clusterhalf+0.25) {Patch axis};
 
   % ---- shared row labels ----
-  \node[anchor=east,font=\scriptsize] at (\xlab,\yCtx) {context ($N$)};
   \node[anchor=east,font=\scriptsize] at (\xlab,\yTgt) {target ($N$)};
-  \node[anchor=south,font=\scriptsize] at (\ximgA,\yCtx+\clusterhalf+0.05) {img};
-  \node[anchor=south,font=\scriptsize] at (\xlblA,\yCtx+\clusterhalf+0.05) {lbl};
-  \node[anchor=south,font=\scriptsize] at (\ximgB,\yCtx+\clusterhalf+0.05) {img};
-  \node[anchor=south,font=\scriptsize] at (\xlblB,\yCtx+\clusterhalf+0.05) {lbl};
+  \node[anchor=east,font=\scriptsize] at (\xlab,\yCtx) {context ($N$)};
+  \node[anchor=south,font=\scriptsize] at (\ximgA,\yTgt+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at (\xlblA,\yTgt+\clusterhalf+0.05) {lbl};
+  \node[anchor=south,font=\scriptsize] at (\ximgB,\yTgt+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at (\xlblB,\yTgt+\clusterhalf+0.05) {lbl};
 
-  % ---- token clusters (both panels) + role rings ----
-  \foreach \y/\ring in {\yCtx/archContextPink!70!black, \yTgt/archTargetLine} {
-    \tpcluster{\ximgA}{\y}{archAttnBlue}{\ring}
-    \tpcluster{\xlblA}{\y}{archMaskGold}{\ring}
-    \tpcluster{\ximgB}{\y}{archAttnBlue}{\ring}
-    \tpcluster{\xlblB}{\y}{archMaskGold}{\ring}
+  % ---- token clusters (both panels). img fill is neutral (blue) with a
+  % role-colored ring; lbl fill IS the role color (context=red, target=
+  % green), so its ring is plain black instead of a same-color/invisible
+  % colored ring. ----
+  \foreach \y/\imgring/\lblfill in {\yTgt/archTargetAccent/archTargetAccent,
+                                     \yCtx/archContextPink!70!black/archContextAccent} {
+    \tpcluster{\ximgA}{\y}{archAttnBlue}{\imgring}
+    \tpcluster{\xlblA}{\y}{\lblfill}{black!70}
+    \tpcluster{\ximgB}{\y}{archAttnBlue}{\imgring}
+    \tpcluster{\xlblB}{\y}{\lblfill}{black!70}
   }
 
   % ---- Panel A: image/label axis -- per-token edge, same spatial cell ----
   \foreach \doff in {-\toff,0,\toff} {
     \dblarrow{(\ximgA+\tsz/2,\yCtx+\doff)}{(\xlblA-\tsz/2,\yCtx+\doff)}{black!55}
-    \dblarrow{(\ximgA+\tsz/2,\yTgt+\doff)}{(\xlblA-\tsz/2,\yTgt+\doff)}{archTargetLine}
+    \dblarrow{(\ximgA+\tsz/2,\yTgt+\doff)}{(\xlblA-\tsz/2,\yTgt+\doff)}{archTargetAccent}
   }
 
   % ---- Panel B: patch axis -- one representative edge per stream between
   % the context and target token clusters (stands in for full attention
-  % among all N tokens of both volumes) ----
-  \dblarrow{(\ximgB,\yCtx-\clusterhalf)}{(\ximgB,\yTgt+\clusterhalf)}{archTargetLine}
-  \dblarrow{(\xlblB,\yCtx-\clusterhalf)}{(\xlblB,\yTgt+\clusterhalf)}{archTargetLine}
+  % among all N tokens of both volumes). Context/target tokens are adjacent
+  % (no gap), so a bend-shorthand arc (radius scales with the now-tiny
+  % endpoint distance) would be imperceptible -- explicit Bezier control
+  % points give a loop of fixed, visible size regardless. ----
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,archTargetAccent]
+    (\ximgB-\tsz/2,\yCtx+\toff) .. controls +(-0.28,0.05) and +(-0.28,-0.05) .. (\ximgB-\tsz/2,\yTgt-\toff);
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,archTargetAccent]
+    (\xlblB+\tsz/2,\yCtx+\toff) .. controls +(0.28,0.05) and +(0.28,-0.05) .. (\xlblB+\tsz/2,\yTgt-\toff);
 
   % ---- caption note ----
-  \node[anchor=north,align=center,font=\scriptsize,black!55] at ({(\ximgB+\xlblB)/2},\yTgt-\clusterhalf-0.25)
+  \node[anchor=north,align=center,font=\scriptsize,black!55] at ({(\ximgB+\xlblB)/2},\yCtx-\clusterhalf-0.25)
     {edge stands in for full attention\\among all $N$ tokens, both volumes};
 
   % ---- legend ----
-  \node[anchor=west,font=\scriptsize] at (\ximgA-0.45,\yTgt-\clusterhalf-1.15)
+  \node[anchor=west,font=\scriptsize] at (\ximgA-0.45,\yCtx-\clusterhalf-1.15)
     {\textcolor{black!55}{\textbf{---}}\ context-only edge \quad
-     \textcolor{archTargetLine}{\textbf{---}}\ touches target row};
+     \textcolor{archTargetAccent}{\textbf{---}}\ touches target row};
 
 \end{tikzpicture}
 \end{document}

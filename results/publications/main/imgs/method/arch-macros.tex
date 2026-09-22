@@ -4,19 +4,21 @@
 % prefixed `arch` to avoid clashing with pgf/tikz internals.
 
 % ---- palette (approximating the PowerPoint drafts) ----
-\definecolor{archTargetGreen}{HTML}{A9D3B0}
-\definecolor{archContextPink}{HTML}{F0C4CB}
+\definecolor{archTargetGreen}{HTML}{9BC7AC}
+\definecolor{archContextPink}{HTML}{E8B8B0}
 \definecolor{archAttnBlue}{HTML}{BBD6EC}
 \definecolor{archEncGray}{HTML}{E4E4E4}
 \definecolor{archArrowPale}{HTML}{CFE6D6}
 \definecolor{archCtBg}{HTML}{2B2B2B}
 \definecolor{archCtBlob}{HTML}{8C8C8C}
 \definecolor{archCtxYellow}{HTML}{E8D24C}
-\definecolor{archMaskGold}{HTML}{E8C468}
-% saturated version of archTargetGreen for line strokes (arrows, braces) --
-% pastel fills read poorly as 1pt strokes, so use this wherever the query/
-% target row's color needs to be legible as a line rather than a fill.
-\definecolor{archTargetLine}{HTML}{4C8C5C}
+% darker, more saturated siblings of archTargetGreen/archContextPink --
+% pastel fills read poorly as 1pt strokes, and mask/label content needs to
+% read as "which volume owns this" at a glance, so masks/labels and any
+% line (arrow, brace) touching that volume's row use these instead of the
+% pastel role color or the old flat archMaskGold.
+\definecolor{archTargetAccent}{HTML}{2F6B4A}  % target: darker green
+\definecolor{archContextAccent}{HTML}{A8453E} % context: darker red
 
 % fake-isometric depth skew shared by every cube
 \newcommand{\archdx}{0.30}
