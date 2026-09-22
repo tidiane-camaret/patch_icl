@@ -116,3 +116,31 @@ benchmarked (gap G3).
   (stroke lesion) already serve this role; both show the cascade-hurts
   pattern above. No additional far-OOD source planned beyond these unless
   a gap is found in review.
+
+## Synthetic data ablation (synth_gmm)
+
+- **Setup:** three runs sharing one starting checkpoint and recipe
+  (single-level, non-cascade training regime — not the fixed-spacing/
+  cascade eval protocol used elsewhere in this doc), varying only the
+  synthetic-data knob: real-only ($p_{\text{synth}}{=}0$), synthetic with
+  i.i.d. paint noise ($p_{\text{synth}}{=}0.3$), and synthetic with
+  multi-octave texture noise (same $p_{\text{synth}}$). Metric: TotalSeg
+  val Dice, seen/unseen class macro split, at a shared epoch-50 cutoff.
+- **Preliminary result — texture noise beats both alternatives on every
+  axis:** val Dice 0.496 (texture) vs. 0.490 (i.i.d. noise) vs. 0.487
+  (real-only); seen-class 0.575 vs. 0.568 vs. 0.574; unseen-class 0.406
+  vs. 0.402 vs. 0.389. Plain synthetic data alone trades seen-class
+  accuracy for unseen-class generalization; multi-octave texture noise
+  recovers the seen-class cost while keeping the unseen-class gain.
+  Runs (curves not yet converged — both synthetic arms were still rising
+  at the cutoff):
+  [real-only](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/y3kcv5w1) ·
+  [i.i.d.-noise synth](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/pg7veapf) ·
+  [texture-noise synth](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/gdap5nuo)
+- **TODO/blocker:** prediction figures per arm (pull from the wandb runs
+  above once ready); extend all three past epoch 50 to convergence;
+  external-cohort OOD numbers for these checkpoints (the `eval.py`
+  DataLoader bug blocking this is now fixed, not yet re-run here); this
+  ablation uses a different training regime than "Ours" elsewhere in this
+  section (gap G1-adjacent) — state that explicitly if/when merged into
+  a single results table.

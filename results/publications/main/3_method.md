@@ -99,3 +99,19 @@ $$\mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell \, (\mathcal{L}_{\text{BCE}}^\ell
 
 **TODO:** state whether level weights $\lambda_\ell$ are uniform or
 scheduled, matching the final training config.
+
+## Synthetic supervision
+
+A fraction $p_{\text{synth}}$ of training tasks are drawn from a GMM-based
+synthetic generator instead of real (image, mask) pairs: a real-anatomy
+supervoxel cohort is repainted with per-class Gaussian intensities, giving
+a label-perfect (image, mask) pair with a novel appearance. Paint noise is
+i.i.d. per voxel by default; an optional multi-octave correlated variant
+(coarse-to-fine random fields, summed) better matches the spatial
+autocorrelation of real tissue (measured ≈0.6 in real CT/MRI vs. ≈0.0 for
+i.i.d. paint at native resolution) without changing the per-class
+intensity variance.
+
+**TODO:** figure of a synth_gmm training pair (i.i.d. vs. multi-octave
+texture noise) next to a real (image, mask) pair; equation for the paint
+model once finalized.
