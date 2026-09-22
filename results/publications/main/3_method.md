@@ -115,3 +115,20 @@ intensity variance.
 **TODO:** figure of a synth_gmm training pair (i.i.d. vs. multi-octave
 texture noise) next to a real (image, mask) pair; equation for the paint
 model once finalized.
+
+## Pooling token
+
+Alongside the per-cell tokens (§Backbone), an optional extra "prototype"
+row per volume — support and query alike — summarizes that volume's
+foreground appearance as a single token: a masked average of a per-volume
+feature map, projected to the token width and inserted as an extra prefix
+row (same mechanism the register tokens above use). Two variants differ in
+*which* feature map is pooled: a near-native-resolution stage (masking
+after upsampling, following Iris's finding that this — not masking a
+coarser feature — is what preserves small-structure signal), or the same
+coarse grid features the backbone's per-cell tokens are already built
+from (no extra encoder cost, at the price of pooling an already
+spatially-blended feature).
+
+**TODO:** equation/diagram once one variant is picked as default; cite
+Iris's masked-pooling ablation directly.

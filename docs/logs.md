@@ -9489,3 +9489,78 @@ now-unblocked external-cohort OOD sweep on all three checkpoints for a genuine (
 seen/unseen-split) generalization read, (c) try `HeterogeneitySpec`/`p_heterogeneity` (the
 literature's secondary pick) or a higher `p_synth` dose (0.5-0.6, per arXiv:2510.14831) as the
 next ablation arm.
+
+## 2026-09-22 (cont.) — arch.pool_source: cheap "coarse" alternative to pool_token's fine-map pooling
+
+User proposed pooling the R^3 grid features already feeding the transformer (instead of
+`pool_token`'s separate `fine_decode`-stage extraction) using a properly antialiased mask
+derived from the existing tiled mask content -- checked whether that mask would actually be
+"high-res" or a cruder representation before implementing: confirmed `sup_occ`/`qry_occ`
+(`_mask_tiles_3d`) already does an EXACT reshape of the native mask into `p^3` tiles (no
+interpolation fires for our configs, `R*p` divides the native size exactly) -- `.mean(-1)` over
+that axis is mathematically identical to `avg_pool3d(mask, kernel=p)`, i.e. already a proper
+antialiased downsample, not degraded. So the only real difference from `pool_token`'s current
+("fine") mode is which FEATURE gets pooled, not mask precision.
+
+Implemented `arch.pool_source: "fine" | "coarse"` (`src/models/patchset3d.py`):
+- `"fine"` (default, byte-identical to pre-existing `pool_token` behavior) -- unchanged.
+- `"coarse"` -- new `_pool_tokens_coarse` pools `sup_feat`/`qry_feat` (the SAME `self.encoder.
+  out_ch`-channel R^3 features `_tokens` already builds from, raw/pre-`_feat_norm`) weighted by
+  `sup_occ.mean(-1)`/`qry_occ.mean(-1)` -- zero new encoder compute (no `fine_decode`
+  requirement, no fine-row widening, no K-scaling cost `"fine"` pays). Computed INSIDE `_attn`
+  (everything it needs is already local there) rather than `forward()`, guarded on `pool_feat
+  is None` so it never clobbers an explicitly-fine-mode-supplied `pool_feat`; the existing
+  insertion block (proj/type/context-tag/slot-tag, `_attn` lines ~837-857) is completely
+  unchanged and works generically for either source. `forward()`'s fine-row-widening
+  (`need_all_rows`) now only fires for `pool_source="fine"`.
+
+Threaded through `experiments/3d/train.py::build_model` (`"pool_source": a.get("pool_source",
+"fine")`) and documented in `configs/experiment/3d/model/patchset3d.yaml`. 9 new tests in
+`tests/test_patchset3d.py` mirroring the existing `pool_token` suite (default/shape/backward,
+differs-from-off, invalid-value rejection, register_routed rejection, no-NaN on all-background
+mask, no fine-row-widening even when `fine_decode=True` is also set, combined context_id_embed/
+cascade_registers/mask_slots smoke test, query_prior branch) -- 71/71 total pass, including the
+full pre-existing `pool_token="fine"` suite (no regression).
+
+New configs `108_cascade_register_varspacing_synth03_texture_pool.yaml` (`pool_source=fine`)
+and `109_cascade_register_varspacing_synth03_texture_pool_coarse.yaml` (`pool_source=coarse`) --
+SIBLINGS, both resuming `107`'s checkpoint (`checkpoint_allow_partial=true`, `pool_proj`/
+`pool_type` are new params either way, shapes differ by mode but both are absent from 107's
+checkpoint regardless), epoch-51 cap matching 105/106/107. 109 queued to auto-launch once 108
+frees the GPU (tmux `train_109` polls for `train_108`'s session to end). Extends the ablation
+chain to a 5-way comparison at matching epochs: 105 (real-only) / 106 (flat-noise synth) / 107
+(+texture) / 108 (+pool_token fine) / 109 (+pool_token coarse) -- 108 vs 109 is the direct test
+of IRIS's mask-after-upsample finding in this codebase (see the `109` config header for the
+full hypothesis).
+
+## 2026-09-22 (cont.) — pool_token result: fine beats coarse, both beat no-pool
+
+`108` (`pool_source=fine`) and `109` (`pool_source=coarse`) both completed their epoch-50 cap,
+both resumed from `107`'s checkpoint. Full 5-arm chain (TotalSeg val, matching epochs):
+
+| epoch | 105 real | 106 flat-noise | 107 +texture | 108 +pool(fine) | 109 +pool(coarse) |
+|---|---|---|---|---|---|
+| 0  | 0.4803 | 0.4540 | 0.4575 | 0.4659 | 0.4752 |
+| 10 | 0.4922 | 0.4871 | 0.4910 | 0.4825 | 0.4912 |
+| 20 | 0.4824 | 0.4776 | 0.4755 | 0.4841 | 0.4843 |
+| 30 | 0.4814 | 0.4762 | 0.4815 | 0.4906 | 0.4816 |
+| 40 | 0.4872 | 0.4854 | 0.4910 | 0.5035 | 0.4963 |
+| 50 | 0.4868 | 0.4899 | 0.4955 | **0.5067** | 0.4997 |
+
+Both pool_token modes clearly beat `107` (no pool) by e50, and both were still rising (own
+curve peak = final epoch, same pattern 106/107 showed). `109` (coarse) actually led `108`
+(fine) through e20 (0.4752 vs 0.4659 at e0, 0.4912 vs 0.4825 at e10) -- the opposite of what
+IRIS's ablation would predict -- but `108` pulled steadily ahead from e30 onward (0.4906 vs
+0.4816, then 0.5035 vs 0.4963, then 0.5067 vs 0.4997), ending with a real but modest gap
+(+0.0070 val_dice, +0.0050 seen, +0.0091 unseen). Read: partial confirmation of IRIS's
+mask-after-upsample finding (fine ultimately wins), but weaker/later-emerging than IRIS's own
+62.13->78.92 gap, and coarse is clearly NOT a bad option in isolation -- it's a genuine
+improvement over no pooling at essentially zero extra compute (no K-scaling encoder cost).
+Given neither run had converged at the epoch-50 cutoff, this gap could still widen or narrow
+with more training -- not a final verdict.
+
+wandb: [105](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/y3kcv5w1) ·
+[106](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/pg7veapf) ·
+[107](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/gdap5nuo) ·
+[108](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/mr91mta9) ·
+[109](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/q4umnca3)

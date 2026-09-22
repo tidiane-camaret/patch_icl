@@ -144,3 +144,55 @@ benchmarked (gap G3).
   ablation uses a different training regime than "Ours" elsewhere in this
   section (gap G1-adjacent) — state that explicitly if/when merged into
   a single results table.
+
+## Pooling token ablation (`arch.pool_token`)
+
+- **Setup:** two further runs continuing the texture-noise checkpoint
+  above (same recipe, same epoch-50 cutoff), adding an IRIS-style
+  foreground-masked pooling token (one extra prefix row per volume,
+  §3's "Synthetic supervision" arch is otherwise unchanged) and varying
+  only *which* feature map it pools: `fine` (IRIS's own choice — a
+  near-native-resolution stage, real per-K compute cost) vs. `coarse`
+  (the same coarse grid features the main transformer already uses,
+  essentially free).
+- **Preliminary result — both help, `fine` wins by a modest, late-emerging
+  margin:** val Dice 0.507 (`fine`) vs. 0.500 (`coarse`) vs. 0.496 (no
+  pooling token), at matching epoch. Notably `coarse` *led* `fine`
+  through the first third of training before `fine` pulled ahead — a
+  weaker and later-emerging version of the effect IRIS's own ablation
+  reports for masking after (vs. before) upsampling, not a clean
+  replication of their reported magnitude.
+  Runs (curves not yet converged):
+  [pool=fine](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/mr91mta9) ·
+  [pool=coarse](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/q4umnca3)
+- **Per-sample breakdown — the small-object story is real, just concentrated at
+  the extreme tail:** paired per-sample Dice (same deterministic 800-task eval
+  set across all three checkpoints, confirmed identical `(class, subject,
+  context)` at every row) bucketed by target foreground-voxel count. `coarse`'s
+  gain over no-pooling is essentially **zero** in the smallest quintile
+  (+0.0003, median 42 voxels) and only turns clearly positive from the second
+  quintile up (+0.003 to +0.005); `fine`'s gain is positive everywhere and
+  highest in that same smallest bucket (+0.017). Tightening to <100 voxels
+  (n=166): `fine` beats `coarse` on 58% of tiny samples vs. 54% on the rest.
+  This is a direct, sample-level match for *why* IRIS's own ablation frames
+  this as a small-object effect — `coarse` pools an already spatially-blended
+  R³-grid feature (~stride-8 receptive field per cell), so small structures
+  are diluted with neighboring content before pooling ever happens, regardless
+  of mask precision. Caveat: the whole-distribution correlation between
+  target size and the fine-vs-coarse gap is weak (Spearman ρ=−0.05, p=0.16)
+  — this is a tail effect, not a smooth gradient, and the 95% CI on the tiny-
+  bucket gap (±0.019) still crosses zero at this sample size.
+- **Follow-up — pooling more than one stage:** `pool_token`'s `fine` mode
+  originally read only the single finest requested encoder stage even when
+  `fine_decode` was configured with more than one (`fine_stage=[0,1]`,
+  the decoder's own default); fixed to mask-average every requested stage
+  independently and concatenate, mirroring how the decoder itself already
+  combines multiple fine_stage maps. Run in progress, continuing the `fine`
+  checkpoint above:
+  [pool=fine, 2 stages](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/xha3lxx2).
+- **TODO/blocker:** prediction figures per arm; convergence check (same
+  caveat as the synthetic-data ablation above); external-cohort OOD
+  numbers; decide whether `coarse`'s near-free compute makes it the
+  better default despite the small Dice gap, once VRAM/latency for both
+  variants is actually measured (no compute numbers exist yet for either);
+  result of the 2-stage `fine` run above.

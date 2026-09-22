@@ -38,6 +38,31 @@ Totalsegmentator
 - other modalities (MRI, etc)
 - Far OOD tasks
 
+## Synthetic data (synth_gmm)
+- 3-arm chain, one shared checkpoint, epoch-50 cutoff, val dice (seen/unseen split):
+  real-only 0.487 (.574/.389) -> +i.i.d.-noise synth p=0.3 0.490 (.568/.402) ->
+  +multi-octave texture noise 0.496 (.575/.406)
+- i.i.d. synth trades seen-class acc for unseen-class gen.; texture noise recovers the
+  seen-class cost while keeping the unseen gain -- texture is the free win here
+- motivated by lit: SynthSeg's own ablation (deformation/bias-field > flat GMM intensity),
+  domain-randomization lit ranks texture > shape, GIN/IPA gets strong DG from appearance
+  alone -- texture was untested in-repo since 2026-09-16, now validated
+
+## Pooling token (arch.pool_token, IRIS T_f)
+- fine (near-native-res stage) vs coarse (same R³ grid feats transformer already uses,
+  ~free) vs no-pool, continuing the texture checkpoint, epoch-50 cutoff:
+  no-pool 0.496 -> coarse 0.500 -> fine 0.507
+- coarse LED fine through ~1/3 of training before fine pulled ahead -- weaker/later than
+  IRIS's own mask-after-upsample ablation magnitude (62.13->78.92 theirs)
+- per-sample breakdown (paired, same 800 deterministic tasks) is the real story: coarse's
+  gain vs no-pool is ~0 on the smallest-object quintile (+0.0003, median 42vox), fine's is
+  its LARGEST there (+0.017) -- small objects specifically don't survive coarse's already-
+  blended R³ feature regardless of mask precision. whole-distribution size<->gap
+  correlation is weak (rho=-0.05, p=0.16) though -- tail effect, not a smooth gradient
+- fix: fine mode was only pooling the SINGLE finest fine_decode stage even when 2 were
+  configured (fine_stage=[0,1]) -- now pools+concats both, mirrors how the decoder itself
+  already combines multi-stage fine maps. Run in progress (continuing the fine checkpoint)
+
 ## Compute scaling (token compression)
 - v2's compress_m (R³ raw tokens -> m compressed slots) cuts the main transformer's own
   cost hugely (measured: ~20x wall-clock, ~74x FLOPs at the real R=16/m=128 configs) but
