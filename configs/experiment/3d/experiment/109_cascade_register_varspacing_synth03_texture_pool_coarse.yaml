@@ -1,0 +1,147 @@
+# @package _global_
+# 109_cascade_register_varspacing_synth03_texture_pool_coarse — the pool_source='coarse'
+# sibling of 108 (108_cascade_register_varspacing_synth03_texture_pool, wandb `mr91mta9`).
+# Both resume 107's own checkpoint with only the pool-token knob differing, for a clean 3-way
+# comparison: 107 (no pool) / 108 (pool_source=fine) / 109 (pool_source=coarse).
+#
+#   python experiments/3d/train.py experiment=109_cascade_register_varspacing_synth03_texture_pool_coarse
+#
+# WHY (2026-09-22): user proposed pooling the SAME R^3 grid features that already feed the
+# transformer (self.encoder.out_ch channels, the concatenated nnunet_ts_stages=[2,3] maps),
+# weighted by a properly antialiased occupancy derived from the existing tiled mask content
+# (sup_occ/qry_occ mean-reduced over their p^3 axis -- mathematically an exact avg-pool of the
+# native mask to R^3, NOT a cruder representation than pool_source='fine's own upsample-then-
+# interpolate mask) -- instead of pool_source='fine's separate fine_decode extraction. This
+# needs ZERO new encoder compute (sup_feat/qry_feat/sup_occ/qry_occ already exist in _attn for
+# every volume regardless of pool_token) vs. 'fine's real K-scaling cost (extending fine-row
+# extraction from query-only to all K+1 volumes). New `arch.pool_source` knob implemented this
+# session (src/models/patchset3d.py: __init__/_attn/_pool_tokens_coarse/forward; threaded
+# through experiments/3d/train.py::build_model; 9 new tests in tests/test_patchset3d.py, all
+# passing alongside the existing pool_token=fine suite, 71/71 total).
+#
+# THE TRADEOFF (not assumed to favor either mode): pool_source='coarse' pools an
+# already-spatially-blended feature (R=16 cells, ~stride-8 receptive field under
+# nnunet_ts_stages=[2,3]) -- small structures are already averaged into a cell's content
+# alongside neighboring tissue BEFORE any pooling happens, regardless of how precisely the
+# mask weight is computed. This is exactly the failure mode IRIS's own ablation found for
+# masking a feature BEFORE upsampling it to full resolution (62.13 -> 78.92 Dice gain from
+# masking after upsampling instead) -- pool_source='fine' was built specifically to avoid it
+# by pooling a near-native-resolution (S=128) stage instead. If 109 matches or beats 108, it's
+# a free compute win (drop the K-scaling cost entirely); if it clearly underperforms, that's
+# direct in-repo confirmation of IRIS's finding, worth citing over IRIS's own number.
+#
+# CHECKPOINT: resumes 107's `best.pt` (NOT 108's) -- a sibling of 108, not a continuation of
+# it, so both differ from that shared starting point by exactly one knob. `pool_proj`'s shape
+# differs between modes (in_features=32 for fine's fine_stage_channels(0) vs.
+# in_features=encoder.out_ch=768 for coarse) but both are entirely absent from 107's
+# checkpoint either way, so `checkpoint_allow_partial=true` handles both identically (missing
+# keys -> random init, matching 108's own precedent).
+#
+# BUDGET: epochs=51 (0..50), matching 105/106/107/108's own cutoff for direct comparability.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  pool_source: coarse   # ONLY delta vs 108 -- see WHY above
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_107_cascade_register_varspacing_synth03_texture/best.pt
+  checkpoint_allow_partial: true
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 109_cascade_register_varspacing_synth03_texture_pool_coarse

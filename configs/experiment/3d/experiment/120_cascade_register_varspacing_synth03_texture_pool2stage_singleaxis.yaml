@@ -1,0 +1,149 @@
+# @package _global_
+# 120_..._singleaxis — SIBLING of 110 (both resume 108's checkpoint), isolating
+# arch.dual_axis=False against 110's arch.dual_axis=True (the default) with every other
+# setting held identical: pool_token=true, fine_stage=[0,1] (2-stage fine pooling, same
+# code path 110 exercises), cascade_registers, synth_gmm texture noise p_synth=0.3, same
+# varspacing recipe. This is the bi-axial-vs-single-axis attention ablation.
+#
+#   python experiments/3d/train.py experiment=120_cascade_register_varspacing_synth03_texture_pool2stage_singleaxis
+#
+# WHY (2026-09-22): "bi-axial attention (patch, img<->label)" is the architecture's own
+# framing in results/publications/main/IDEAS.md's method comparison table, contrasted there
+# against Medverse's "concat image and label before u-net". dual_axis=False isolates
+# exactly that: TransformerEncoderLayer's column-axis (img<->mask) attention block is not
+# even allocated (src/models/pfn_seg_2d.py) -- row-axis (cross-context) attention only.
+# Img+mask are instead fused into ONE column BEFORE the transformer via Iris Eq 3-4's own
+# PixelShuffle trick (docs/methods/iris.md), applied PER CELL: occ's real p³ occupancy
+# tile (mask_patch_size=8, avg-pooled to axis_fuse_r=4) is concatenated with img's
+# channel-to-space-shuffled e-dim embedding at that r³=64 sub-cell grid, mixed by a tiny
+# shared 1x1x1 conv (self.fuse_conv, Conv3d(13,12,1) at e=768/r=4), then unshuffled back to
+# one e-vector/cell (src/models/patchset3d.py::_tokens_fused). r=4 not mask_patch_size=8:
+# e=768 is divisible by 4^3=64 but not 8^3=512 -- same constraint arch.iris_pixelshuffle_r
+# already satisfies for the (structurally separate) IRIS decoder path. Deliberately NOT a
+# flat concat+Linear fusion: that would flatten occ into an unordered p³ vector before
+# mixing, confounding "attention removed" with "mask spatial precision lost" -- exactly
+# the effect the same-day pool_token fine-vs-coarse per-sample analysis found to matter
+# most for small objects (docs/logs.md, results/publications/main/4_experiments.md).
+# Pixel-shuffle keeps real sub-cell mask structure in the fusion step instead.
+#
+# CHECKPOINT: resumes 108's own best.pt (SAME as 110, not 110's own checkpoint) -- kept a
+# sibling of 110 rather than 110's child so dual_axis is the ONLY isolated variable between
+# 110 and 120; both already get the 2-stage fine-pool fix "for free" since that's just how
+# _pool_tokens behaves now, not a separate flag. qkv_col/norm1 (per transformer layer) are
+# dropped as extra keys (not present in this arch); fuse_conv/fuse_mask_token are new
+# (randomly initialized) -- everything else (encoder, img_embed, mask_embed, row-axis
+# qkv_row, cascade_proj, pool_proj, decoder) transfers straight from 108's checkpoint.
+# `resume_weights_only=true` stays on, `checkpoint_allow_partial=true` required for the
+# shape/key changes above.
+#
+# BUDGET: epochs=51 (0..50), matching the whole chain's own cutoff for direct comparability.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  # pool_source left at its default ('fine'); fine_stage=[0,1] inherited from
+  # model=m2_patchset_decoder -- both stages get pooled (same as 110).
+  dual_axis: false             # the isolated variable vs 110 -- see WHY above
+  axis_fuse_r: 4                # e=768 divisible by 4^3=64, not by mask_patch_size=8's 8^3=512
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_108_cascade_register_varspacing_synth03_texture_pool/best.pt
+  checkpoint_allow_partial: true   # qkv_col/norm1 dropped, fuse_conv/fuse_mask_token new -- see CHECKPOINT above
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 120_cascade_register_varspacing_synth03_texture_pool2stage_singleaxis

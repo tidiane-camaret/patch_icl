@@ -1,0 +1,140 @@
+# @package _global_
+# 110_cascade_register_varspacing_synth03_texture_pool2stage — continues 108's checkpoint
+# (108_cascade_register_varspacing_synth03_texture_pool, wandb `mr91mta9`, val_dice=0.5067,
+# the strongest result so far in this chain) after a code change: `pool_source='fine'` now
+# pools EVERY requested fine_decode stage (both entries of `fine_stage=[0,1]`, m2_patchset_
+# decoder's own default -- no config change needed here, the behavior is purely a
+# src/models/patchset3d.py fix), not just the single finest one.
+#
+#   python experiments/3d/train.py experiment=110_cascade_register_varspacing_synth03_texture_pool2stage
+#
+# WHY (2026-09-22): user decided to keep pool_source='fine' going forward (108 beat 109/coarse
+# on every metric, see docs/logs.md "pool_token result" + the per-sample small-object analysis
+# same date) and asked to pool the first 2 feature stages instead of just the first. Old
+# behavior: `_pool_tokens` only ever read `fine[fine_stage.index(min(fine_stage))]` -- stage 0
+# alone (32ch @ e4_plainconv_ts's [32,64,256,512] widths) -- even though `fine_decode=true`
+# with `fine_stage=[0,1]` already extracts BOTH stages for every volume in fine-pool mode (the
+# K-scaling extraction cost was already being paid for stage 1's map; it just wasn't being
+# used by the pool). Now `_pool_tokens` masked-averages EACH requested stage independently (own
+# resolution, own mask, own z-score) and concatenates -- mirrors `_decode`'s own fine_filter
+# path, which already reads every `fine_stage` entry (there: projected+summed at the finest
+# grid; here: concatenated, since pooling produces one vector per volume, not a spatial map).
+# `pool_proj`'s input width grows 32 -> 32+64=96 accordingly. 1 new test
+# (test_pool_token_fine_pools_all_requested_stages), 113/113 total pass (no regression to any
+# existing pool_token/pool_source="coarse" test).
+#
+# CHECKPOINT: resumes 108's own `best.pt` (continuing the strongest line so far, not restarting
+# from 107 like 108/109 did as siblings) -- `pool_proj`'s SHAPE changed (32->96 in_features) so
+# it's dropped as a shape-mismatch and randomly reinitialized under
+# `train.checkpoint_allow_partial=true`; `pool_type` (shape-identical, e-dim regardless of
+# input width) transfers strict along with everything else. `resume_weights_only=true` stays on.
+#
+# BUDGET: epochs=51 (0..50), matching the whole chain's own cutoff for direct comparability.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  # pool_source left at its default ('fine'); fine_stage=[0,1] inherited from
+  # model=m2_patchset_decoder -- both stages now get pooled automatically, see WHY above.
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_108_cascade_register_varspacing_synth03_texture_pool/best.pt
+  checkpoint_allow_partial: true   # pool_proj's shape changed (32->96 in_features) -- see CHECKPOINT above
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 110_cascade_register_varspacing_synth03_texture_pool2stage
