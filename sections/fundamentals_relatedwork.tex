@@ -1,1 +1,45 @@
 \subsection{Related Work}\label{sec:fundamentals-relatedwork}
+
+Three prior systems attempt in-context medical image segmentation, each
+making a different choice on the three axes this thesis organizes around.
+
+\paragraph{UniverSeg~\cite{butoiUniverSegUniversalMedical2023}} popularized
+the approach with a CrossBlock architecture that densely cross-attends
+target and context features at full resolution -- no coarse-to-fine
+structure, and no synthetic-task training.
+
+\paragraph{Iris~\cite{gaoShowSegmentUniversal2025}} encodes each context
+pair into a compact per-class task embedding and fuses it into the target
+through a pixel shuffle-unshuffle operation -- a single fusion step,
+applied once, with no iterative refinement across scales.
+
+\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} performs
+next-scale autoregressive segmentation, inspired by next-scale image
+generation~\cite{tian2024visual}: at each step, the target and the
+previous step's (perturbed) prediction are concatenated and processed by
+a shared U-Net, together with the real context pairs. Every step still
+re-scans the \emph{entire} volume with a sliding window -- only the input
+changes with scale, not the spatial extent processed.
+
+\paragraph{Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a}}
+stacks levels of increasing resolution for large-volume segmentation, but
+targets single-model supervised segmentation rather than in-context,
+few-shot prediction -- an architectural precedent for coarse-to-fine
+cascades outside the ICL setting.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Positioning against prior in-context segmentation models on
+  the three axes this thesis organizes around.}\label{tab:relatedwork}
+  \begin{tabular}{lccc}
+    \toprule
+     & Fusion & Coarse-to-fine & Synthetic tasks \\
+    \midrule
+    UniverSeg & dense cross-attn. & no & no \\
+    Iris & one-shot pixel shuffle & no & no \\
+    Medverse & early concatenation & full-volume re-scan & no \\
+    \textbf{Ours} & bi-axial (repeated) & region-restricted, register-carried & GMM repaint + texture \\
+    \bottomrule
+  \end{tabular}
+\end{table}

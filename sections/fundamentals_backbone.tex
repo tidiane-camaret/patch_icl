@@ -1,1 +1,39 @@
 \subsection{Volumetric Encoders and Attention}\label{sec:fundamentals-backbone}
+
+\paragraph{Convolutional volumetric backbones.} 3D
+U-Net~\cite{cciccek20163d} and its self-configuring descendant
+nnU-Net~\cite{isensee2021nnu} encode a volume through a downsampling
+encoder into a feature pyramid, then decode back to full resolution via a
+mirrored upsampling path with skip connections carrying fine detail past
+the bottleneck. Deeper encoder stages have coarser spatial extent and more
+channels; shallower stages retain spatial detail at low channel count.
+This split -- a coarse, semantically rich bottleneck feeding a
+computationally light attention stack, and fine, spatially precise early
+stages reserved for the decoder -- is exactly what the coarse/fine tap
+split in \autoref{sec:methodology-overview} reuses. UNETR~\cite{hatamizadeh2022unetr}
+is a prior example of combining a convolutional decoder with transformer
+attention for 3D segmentation.
+
+\paragraph{Attention.} Scaled dot-product attention~\cite{vaswani2017attention}
+computes, for each query token, a weighted average of value vectors, with
+weights given by the similarity between the query and each key:
+%
+\begin{equation}
+  \mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V.
+\end{equation}
+%
+Multi-head attention runs several such operations in parallel subspaces
+and concatenates the results, letting different heads attend to different
+relationships in the same input.
+
+\paragraph{Position encoding.} Attention itself is permutation-invariant,
+so position must be injected separately. Rotary position embedding
+(RoPE)~\cite{su2021roformer} does this by rotating each query/key vector
+by an angle proportional to its position before the dot product, so the
+result depends only on the \emph{relative} position between the two
+tokens rather than their absolute indices. In 3D, this is applied
+axially: the head dimension is split into three chunks, one per spatial
+axis, each rotated by an angle proportional to that axis's physical
+coordinate (scaled by voxel spacing) -- letting attention between two
+cells at different cascade resolutions still reflect their true physical
+distance, not just their grid index.
