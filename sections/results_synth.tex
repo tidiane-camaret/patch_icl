@@ -1,1 +1,89 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
+
+This section isolates the effect of the synthetic generator itself
+(\autoref{sec:methodology-synth}) -- paint noise texture and
+shape/intensity calibration -- from the model's training data mix.
+All runs below are trained on CT only; the separate question of what
+adding MRI training data does to generalization is a training-regime
+choice, not a property of the synthetic generator, and is reported
+elsewhere rather than folded into these numbers.
+
+\paragraph{Texture noise beats flat noise beats real-only.} A
+controlled three-arm chain shares one starting checkpoint and varies
+only the paint-noise mechanism: real-only ($p_{\text{synth}}{=}0$),
+synthetic with i.i.d.\ paint noise ($p_{\text{synth}}{=}0.3$), and
+synthetic with multi-octave correlated texture noise (same
+$p_{\text{synth}}$). Metric: TotalSegmentator validation Dice, seen and
+unseen class macro splits, at a shared epoch-50 cutoff.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Paint-noise ablation, TotalSegmentator validation Dice,
+  epoch 50. Neither synthetic arm had converged at this cutoff (both
+  still rising); the real-only arm had already plateaued.}
+  \label{tab:synth-texture}
+  \begin{tabular}{lccc}
+    \toprule
+    Arm & Dice & seen & unseen \\
+    \midrule
+    Real-only & 0.4868 & 0.5737 & 0.3886 \\
+    Flat i.i.d.\ noise & 0.4899 & 0.5676 & 0.4022 \\
+    \textbf{Multi-octave texture} & \textbf{0.4955} & \textbf{0.5748} & 0.4059 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Texture noise wins on all three metrics -- notably it recovers the
+seen-class cost that flat noise alone pays (narrowly beating even the
+real-only arm), while matching flat noise's unseen-class gain.
+
+\paragraph{Shape and intensity realism, calibrated against measurement.}
+The procedural shape-mode generator's host-anchored intensity
+contrast (\autoref{sec:methodology-synth}) was calibrated against a
+fresh measurement of real target-vs-surrounding-tissue contrast, taken
+directly on the same held-out sources used for generalization testing
+(749 cases, effect size in ring-standard-deviation units) rather than
+guessed.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Measured target-vs-surrounding-tissue contrast, used to set
+  the shape generator's calibration range. Sign and magnitude match
+  each source's known imaging contrast pattern.}
+  \label{tab:contrast-calibration}
+  \begin{tabular}{llr}
+    \toprule
+    Source & Known pattern & Contrast (ring-$\sigma$) \\
+    \midrule
+    ISLES22 (DWI, acute stroke) & hyperintense & $+2.42$ \\
+    Shifts-MS (FLAIR, MS lesion) & hyperintense & $+1.49$ \\
+    GNC\_705 (kidney lesion) & mixed cyst/complex & $+0.49$ \\
+    MSD Prostate (zones) & -- & $+0.35$ \\
+    HU\_LWK1 (vertebra ROI, CT) & $\approx 0$ expected & $-0.07$ \\
+    MSD Hippocampus & -- & $-0.51$ \\
+    ATLAS v2.0 (T1, chronic stroke) & hypointense & $-0.59$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Every source's sign and rough magnitude matches its known radiological
+contrast direction, validating the measurement before it was used to
+set the generator's calibration range. The measurement also caught a
+design error: an initial \emph{absolute}-offset version of this
+calibration was, by this same measurement, roughly 7--12$\times$ too
+extreme relative to the generator's own per-class variance scale --
+corrected to a ratio-of-host-variance design before any reported
+checkpoint used it.
+
+\paragraph{Not yet isolated from the training-mix change.} Two further
+generator changes -- cross-class intensity/variance correlation and
+widened shape diversity -- exist and have been evaluated, but only on
+top of a checkpoint that concurrently switched the training data mix
+from CT-only to CT+MRI. Their standalone effect, isolated from that
+mix change, has not been measured.
+\todo{Rerun the cross-class-correlation and shape-diversity ablations
+on a CT-only baseline (matching this section's texture-noise arms) so
+the synthetic-generator effect can be reported without being
+confounded by the CT+MRI training-mix change reported elsewhere.}

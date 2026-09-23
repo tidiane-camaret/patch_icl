@@ -1,1 +1,57 @@
 \subsection{Experimental Setup}\label{sec:results-setup}
+
+\paragraph{Model scope.} Two configurations of the architecture are
+reported in this chapter, kept explicitly separate. The reference
+configuration (bi-axial attention, query-prior init, register carry gated
+off) is the source of every Fusion and Cascade number below. An extended
+configuration (adding cascade registers, a pooling token, and synthetic
+texture noise on top of it) is the source of every Synthetic Task
+Generation number. The two are trained independently and not directly
+comparable to each other -- the extended configuration is read as a
+promising newer result, not a replacement for the numbers reported above
+it. \todo{Resolve before submission: does the thesis report a single
+``Ours'' configuration, or keep this split?}
+
+\paragraph{Baselines.} Medverse~\cite{huMedverseUniversalModel2025a}
+(released weights, and -- where noted -- finetuned on the same
+TotalSegmentator split) is the only baseline evaluated empirically here.
+\todo{No Iris baseline exists yet; the comparison in
+\autoref{sec:fundamentals-relatedwork} remains architectural, not empirical.}
+
+\paragraph{Metrics.} Accuracy is reported as Dice (macro, per-class then
+averaged, unless stated per-sample) and Normalized Surface Dice (NSD).
+Compute is reported as GFLOPs, wall-clock latency, and peak VRAM where
+available; VRAM comes from a standalone $B{=}1,K{=}1$ inference benchmark
+rather than the evaluation loop itself, so it should not be read as
+representative of a real $K{>}1$ eval run.
+
+\paragraph{Datasets.} In-distribution evaluation uses
+TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
+(117 classes, CT). Generalization is tested on seven held-out sources
+spanning CT and MRI and classes entirely outside the TotalSegmentator
+vocabulary (\autoref{tab:ood-sources}).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Held-out generalization sources. None of these classes or
+  modalities appear during training.}
+  \label{tab:ood-sources}
+  \begin{tabular}{llll}
+    \toprule
+    Source & Modality & Target & $n$ \\
+    \midrule
+    ISLES22 & MRI DWI & stroke lesion & -- \\
+    Shifts-MS & MRI FLAIR & MS lesion & 46 \\
+    MSD Hippocampus & MRI T1 & hippocampus & -- \\
+    MSD Prostate & MRI T2+ADC & prostate zone & -- \\
+    ATLAS v2.0$^{*}$ & MRI T1 & chronic stroke lesion & -- \\
+    GNC\_705 & MRI Dixon & kidney lesion & -- \\
+    HU\_LWK1 & CT & L1 vertebra ROI & 36 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+\noindent $^{*}$Sourced from an unofficial data mirror; provenance not yet
+independently confirmed.
+\todo{Fill in $n$ for the sources left blank; add citations for each source
+once confirmed (currently uncited).}
