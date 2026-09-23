@@ -1,0 +1,180 @@
+# @package _global_
+# 140_..._cascade_gtprior_regon — coarse-to-fine ablation, cell (registers=ON,
+# prior=perturbed-GT). One of a 2x2 of ACTUAL cascade-mode training runs off the same
+# 135b parent checkpoint:
+#
+#   140 (this)  registers=on,  prior=perturbed-GT
+#   141         registers=on,  prior=real prev.pred
+#   142         registers=off, prior=perturbed-GT
+#   143         registers=off, prior=real prev.pred
+#
+#   python experiments/3d/train.py experiment=140_cascade_gtprior_regon
+#
+# WHY (2026-09-23): `arch.cascade_registers` (carries level i-1's pooled thinking-row
+# output into level i, src/models/patchset3d.py) has been `true` in EVERY config since
+# 105 -- the whole 105-135 lineage has never trained a sibling with it off, AND has never
+# actually trained/evaluated in real multi-level cascade mode at all (105-135 train on
+# `data.train_spacing_range`, a random SINGLE level per step -- `arch.cascade_registers`
+# is architecturally inert there, `regs=None` in every step). Its parent, 135b, is ALSO a
+# no-cascade checkpoint (user-confirmed) -- so all four cells in this matrix, including
+# this one, are the first time this lineage's data recipe (intensity calibration, texture
+# noise, host-anchored shape synth, ct+mri cohort) is trained through an ACTUAL cascade
+# forward (`experiments/3d/cascade.py::run_cascade`), not just resumed as-is.
+#
+# QUERY PRIOR (perturbed-GT cell): `cascade_query_prior={modes:[gt,pred], p:[1.0,0.0],
+# eval_mode:pred}` -- every TRAIN step draws `gt_coarse` (level i-1's own augmented GT,
+# M2-warped; `_resolve_prior_spec` requires `eval_mode` to be a listed mode, hence
+# `pred` at weight 0 rather than omitted) then degrades it via `prior_perturb` (dilate/
+# erode/shift/noise -- the SAME values already used non-cascade in 130-135, and
+# identical to 88_cascade's own convention for this exact purpose: "a gt/oracle prior
+# looks like a real upstream seg"). EVAL deterministically uses `pred` (the real
+# cascade), so val/test Dice reflects genuine inference, not an oracle leak -- this is
+# the cascade-mode analogue of the lineage's existing non-cascade `data.query_prior=
+# {modes:[gt,none],p:[0.3,0.7]}` (which is dropped here: inert once cascade_spacings is
+# set, `train.py`'s `qp_on` gate).
+#
+# CASCADE LADDER: TRAIN uses `data.cascade_train={levels:2, spacing_range:[1,6]}` (per
+# user request, mirroring 88_cascade) -- a random 2-level ladder per step, coarse point
+# drawn in [1,6]mm by `CascadeSpacingBatchSampler`, fine point drawn finer than it by
+# `draw_cascade_ladder` (`experiments/3d/common.py`). `data.cascade_spacings=[4, 1.5]`
+# is the separate FIXED ladder `resolve_cascade_train` reserves for eval / the periodic
+# val pass during training (`cascade.py`/`train.py` docstrings: "eval / the val pass
+# keep the fixed data.cascade_spacings ladder") -- also the ladder for the standalone
+# post-hoc eval.py sweep across all four checkpoints, so no separate CLI override is
+# needed there either. `data.crop_spacing_mm` must equal `cascade_spacings[0]` (4, was
+# 4.24 -- coincidentally close, unrelated); `data.train_spacing_range` must be null
+# (mutually exclusive with cascade_spacings, `common.py::_assert_cascade_supported`).
+# `train.cascade_loss_weights=[1,1]` (length matches both the 2-level cascade_train
+# ladder and the 2-entry cascade_spacings ladder, so no ambiguity in which it satisfies).
+#
+# CHECKPOINT: resumes 135b's own best.pt (135's own further-continued checkpoint --
+# user-directed; same data recipe as the committed 135 config: p_synth=0.5, gmm.p_shape=
+# 1.0, host_anchored shape, ct_mri intensity calibration). Same arch as 135b
+# (cascade_registers stays true, unchanged) -- only the training loop/data regime
+# changes (single-level -> real cascade), so `checkpoint_allow_partial: false` (strict,
+# full-shape load).
+#
+# BUDGET: epochs=31, matching the 131-135 quick-probe convention. NOTE real multi-level
+# cascade training is substantially more expensive per step than this lineage's own
+# varspacing training (synchronous re-crop + N forward passes per step, ~2.3s/step
+# measured on H100 for exp92's 3-level ladder, docs/logs.md 2026-09-14) -- expect a
+# longer wall-clock per epoch than 135b at the same epoch count.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: null      # was [3, 6] -- mutually exclusive with cascade_spacings
+  crop_spacing_mm: 4             # was 4.24 -- must == cascade_spacings[0]
+  cascade_spacings: [4, 1.5]     # NEW: fixed ladder for eval / periodic val-during-train
+  cascade_train:                 # NEW: randomized 2-level TRAIN ladder (see CASCADE LADDER)
+    levels: 2
+    spacing_range: [1, 6]
+  cascade_query_prior:            # NEW: train always draws gt_coarse (perturbed below);
+    modes: [gt, pred]            # eval deterministically uses the real cascade (pred).
+    p: [1.0, 0.0]
+    eval_mode: pred
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    shape:
+      host_anchored: true
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+  # NEW (cascade-mode prior_perturb): degrades the train-time gt_coarse draw so it looks
+  # like a real, imperfect upstream seg rather than a clean oracle. Same values as the
+  # lineage's own non-cascade block / 88_cascade's own convention for this exact purpose.
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+  # data.query_prior (the non-cascade single-level path) intentionally absent -- inert
+  # under cascade_spacings (train.py's qp_on gate), dropped rather than left as dead config.
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 60
+  batch_size: 4                  # was 8 -- lr scaled sqrt(4/8) accordingly, see below
+  eval_every: 20
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 7.1e-5                     # was 1.0e-4 -- sqrt(4/8)=0.71 scaling for batch_size 8->4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  cascade_loss_weights: [1, 1]   # NEW: length matches the 2-level ladder
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_135b_varspacing_synth05_shape1_intensitycalib_continue/best.pt
+  checkpoint_allow_partial: false   # identical arch to 135b -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 140_cascade_gtprior_regon

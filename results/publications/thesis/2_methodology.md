@@ -124,15 +124,41 @@ appearance distribution covered by the training cohort. To broaden
 training beyond this, a fraction $p_{\text{synth}}$ of training tasks are
 drawn from a synthetic generator instead of real context/target subjects.
 
-**Supervoxel repainting.** A real-anatomy volume is first oversegmented
-into supervoxels (unsupervised, appearance-agnostic regions). One
-supervoxel is treated as the target class, and its binary mask is
-label-perfect by construction. Each of the $K{+}1$ volumes needed for a
-task is then produced by repainting the same supervoxel geometry with
-independently sampled per-class Gaussian intensities (a Gaussian mixture
-over classes), giving $K{+}1$ (image, mask) pairs that share identical
-anatomy but differ in appearance — no real cross-subject registration or
-annotation is required.
+**Correction (2026-09-23):** an earlier draft of this section described a
+*supervoxel*-repainting generator (unsupervised oversegmentation, one
+supervoxel as target). That mechanism exists in the codebase
+(`scripts/synth_labels/generate.py --method slic`) but is **not** what
+`exp92` or any of the checkpoints cited in this thesis actually train
+with — it is a separate, older data-prep path. The generator actually in
+use is MAISI-bank GMM repainting, described below.
+
+**MAISI-bank GMM repainting.** A large bank of candidate anatomical
+masks (from MAISI, a diffusion-based CT/label generator) supplies
+real-anatomy label maps at scale, decoupled from any specific real image.
+One class in a sampled mask is the task's target; all $K{+}1$ volumes a
+task needs are produced by repainting the *same* mask geometry (or $K{+}1$
+independently sampled masks sharing the target class) with a **cohort-shared**
+Gaussian-mixture draw: every label id $c$ gets a mean $\mu_c$ and standard
+deviation $\sigma_c$ drawn once per task and reused by every voxel of that
+class, in every one of the $K{+}1$ volumes — so target and context share
+one consistent "scanner," while different tasks are different scanners.
+This gives label-perfect $K{+}1$ (image, mask) pairs at scale with no real
+cross-subject registration or annotation.
+
+**Cross-class intensity correlation.** By default every $\mu_c$/$\sigma_c$
+is drawn independently, which is more decorrelated than real tissue: real
+CT shows strong between-class correlation within an anatomical group
+(e.g. every rib/vertebra shares one skeletal-density axis, r=0.79–0.94;
+bilateral organ pairs correlate at r$\geq$0.9) that independent draws
+erase entirely. An optional calibration groups label ids into
+real-data-measured clusters and draws a shared latent factor per group
+(a Gaussian-copula construction that keeps each id's own marginal
+distribution exactly unchanged — only the *joint* structure across ids in
+the same group changes), for both the mean and, separately, the variance
+parameter. Two calibration sources are available: a CT-only fit (finer,
+18 groups) and a pooled CT+MRI fit (coarser, 6 groups, chosen where the
+mean group sizes needed to differ enough that a single modality's fit
+would not transfer — see appearance-contrast paragraph below).
 
 **Paint noise.** The default painting noise is i.i.d. per voxel: it
 matches each class's target intensity variance but has near-zero spatial
@@ -141,11 +167,39 @@ autocorrelation at native resolution, versus $\approx 0.0$ for i.i.d.
 paint). An optional multi-octave variant instead sums several
 coarse-to-fine random fields before painting, producing spatially
 correlated texture that better matches real tissue statistics while
-leaving the per-class intensity variance unchanged.
+leaving the per-class intensity variance unchanged. A separate optional
+within-mask heterogeneity mode blends two intensity draws ("core" and
+"rim") across a smoothed random field, giving organic multi-region
+targets instead of one flat shade per class — aimed at lesion-style
+targets, which are rarely intensity-homogeneous.
 
-**TODO:** no architecture diagram exists yet for this axis (supervoxel →
-GMM repaint → i.i.d. vs. multi-octave texture pipeline). Worth sketching
-one to match the other three axes' figures.
+**Procedural shape mode.** A further optional mode replaces the sampled
+mask's target class entirely with a procedurally generated geometric
+primitive (blob / multi-component splatter / flattened disk / capsule)
+stamped into the same real host anatomy, under a new pseudo-class label —
+so the model must learn "a distinct region of *this* shape family inside
+a real organ" as a general geometric-reasoning skill, rather than only
+ever recognizing whole known organs. By default the stamped shape's own
+intensity is drawn independently of its host tissue, which is unrealistic
+(real focal abnormalities are usually only moderately brighter or darker
+than the tissue they sit in, not an arbitrary unrelated shade). An
+optional anchoring mode instead draws the shape's mean intensity relative
+to its host class's own mean and standard deviation; the multiplier range
+was calibrated against real target-vs-immediately-surrounding-tissue
+contrast, measured as a ring-standard-deviation-normalized effect size on
+held-out lesion/abnormality datasets outside the training vocabulary
+(stroke lesion, MS lesion, kidney lesion, chronic-lesion, hippocampus,
+prostate-zone) — real values ranged from roughly $-1$ to $+3$
+ring-$\sigma$ and varied by source in a way that matched each source's own
+known imaging contrast pattern (e.g. acute stroke lesions read strongly
+hyperintense on DWI, chronic lesions strongly hypointense on T1),
+confirming the measurement before it was used to set the calibration
+range.
+
+**TODO:** no architecture diagram exists yet for this axis (MAISI-bank
+sampling → cohort-shared GMM draw (± cross-class correlation) → i.i.d. vs.
+multi-octave texture vs. heterogeneity → optional shape-mode overwrite
+pipeline). Worth sketching one to match the other three axes' figures.
 
 ## Training objective
 

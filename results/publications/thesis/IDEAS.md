@@ -30,7 +30,17 @@ and implementation reference).
   Results §Fusion (architecture/feature-aggregation framing) or gets its
   own subsection — currently parked under Fusion, see `3_results.md`.
 - No architecture diagram exists yet for Axis 3 (synthetic task
-  generation). Worth sketching one (supervoxel → GMM repaint → i.i.d. vs.
-  multi-octave texture) to match the other three axes' figures.
+  generation). Worth sketching one (MAISI-bank sampling → cohort-shared
+  GMM repaint, optionally cross-class-correlated → i.i.d./multi-octave/
+  heterogeneity noise → optional procedural shape-mode overwrite) to
+  match the other three axes' figures.
+- **New (2026-09-23):** a third checkpoint lineage (`108`→`135b`) now has
+  the best OOD numbers of anything trained so far (PERFORMANCE_ANALYSIS.md
+  §6), on top of an unrelated CT+MRI joint-training result that's the
+  cleanest ablation in the whole evidence base. Neither was trained with
+  the thesis in mind, and both currently sit at N=1 seed. Open framing
+  question: does this lineage become "Ours" (supersedes `exp92` as the
+  reported architecture), stay a Discussion/future-work pointer, or get
+  promoted only if a replicate seed confirms the CT+MRI result first?
 - Degree program / faculty for the front matter (Physics? CS? Scientific
   Computing?) still unknown — affects `information.tex`'s Faculty line.

@@ -16,8 +16,23 @@ should be resolved by porting the answer back from here once decided.
 
 ## Methodology — drafted, small gaps remain
 
+- [x] Axis 3 (synthetic task generation) description corrected 2026-09-23
+  — was describing a supervoxel-repainting generator not actually used by
+  any cited checkpoint; now describes the real MAISI-bank GMM system plus
+  the cross-class correlation / host-anchored-shape calibrations added
+  this session. See `PERFORMANCE_ANALYSIS.md` §6.
 - [ ] No architecture diagram for Axis 3 (synthetic task generation) —
   `methodology_synth.tex` is text-only, unlike the other three axes.
+  Now needs to show: MAISI-bank sampling → cohort-shared GMM draw (±
+  cross-class correlation) → i.i.d./multi-octave/heterogeneity noise →
+  optional shape-mode overwrite.
+- [ ] New (2026-09-23): decide whether the `108`→`135b` checkpoint
+  lineage (§6 of `PERFORMANCE_ANALYSIS.md`) is in scope for the thesis at
+  all, given it wasn't trained specifically for it and mixes several
+  changes vs. `exp92` (architecture + CT/MRI data mix + synth
+  calibration) — see gap G1's restatement. If in scope, needs at minimum
+  a second training seed for the CT+MRI ablation (its strongest, most
+  citable result) before being reported as a headline finding.
 
 ## Front matter (`ics_3d_medical/sections/information.tex`, `acknowledgements.tex`)
 

@@ -269,9 +269,130 @@ not analysis.
 
 ---
 
+## 6. CT+MRI joint training + synth intensity/shape calibration (2026-09-23 session) — a new checkpoint lineage
+
+**Scope note:** this section's numbers come from a *third* checkpoint
+lineage (configs `108`→`130`→`135`→`135b`), distinct from both `exp92`
+(§1–4 above) and `PatchSetV2` (§5). It descends from `exp92` via the
+`105`–`121` chain (adds `cascade_registers`, `pool_token`, synth texture
+noise on top of `exp92`'s own feature set) and is the most-recently-trained,
+best-performing line on the OOD eval-expansion sources — but it changes
+several axes at once relative to `exp92` (architecture *and* data mix *and*
+synth calibration), so it should not be read as an ablation against §1–4,
+only as its own internally-controlled sequence. **This sharpens gap G1**:
+"is Ours = exp92 or PatchSetV2" now has a third real candidate.
+
+**CT+MRI joint training — clean, controlled, the strongest single result
+of this session.** All experiments up to `108`–`121` trained CT-only
+despite already being wired for a configurable CT/MRI task mix. A matched
+pair — `110` (CT-only) vs. `130` (identical recipe, only
+`regime_p` changed to 50/50 CT/MRI) — isolates the effect on the same 7
+eval-expansion OOD sources used in §4:
+
+| source | 110 (CT-only) | 130 (CT+MRI) | Δ |
+|---|---:|---:|---:|
+| isles22 | 0.0211 | 0.0406 | +0.0195 |
+| shifts_ms | 0.0012 | 0.0141 | +0.0129 |
+| msd_hippocampus | 0.1342 | 0.2913 | **+0.1571** |
+| msd_prostate | 0.0430 | 0.0806 | +0.0376 |
+| atlas_v2 | 0.0206 | 0.0298 | +0.0092 |
+| gnc_kidney | 0.0412 | 0.0602 | +0.0190 |
+| hu_lwk1 (CT) | 0.1297 | 0.1357 | +0.0060 |
+
+CT+MRI mixing improves Dice on **all 7** OOD sources, including the one
+CT-only source — i.e. this is not simply "MRI training helps MRI eval,"
+it is a genuine broad generalization gain from modality diversity in
+training. This directly counters an earlier, *confounded* impression:
+comparing the same `130` checkpoint against the older `exp92`/
+`cascade_register` baselines (different architecture generation entirely)
+had suggested CT+MRI mixing looked *worse* — resolved only once the
+matched-lineage ablation was run. **Methodological lesson worth stating
+explicitly in Discussion:** an appealing but architecturally-confounded
+baseline comparison gave the opposite conclusion from a clean ablation: do
+not trust a cross-lineage comparison for a data-mix claim.
+
+**Synth shape-diversity: real short-budget effect, did not hold up at a
+real training budget — an honest negative/mixed result.** Widening the
+procedural shape generator's parameter ranges (`131`, splatter-scatter
+realism motivated by measuring real lesion multiplicity — e.g. MS lesions:
+median 54 separate components per case, vs. the generator's un-widened cap
+of 6) improved 4/7 OOD sources after a short 31-epoch probe. A paired
+diversity-only control (`132`, widening *non-scatter* shape parameters
+instead) reproduced most of that gain, showing the dominant mechanism was
+generic shape-parameter diversity, not scatter-realism specifically.
+Consolidating both changes at a full 51-epoch budget (`133`) **reverted
+to baseline on the cross-source mean** (0.0913, vs. baseline `130`'s
+0.0932, vs. the two 31-epoch probes' 0.1121/0.1065) — one source
+(`hu_lwk1`) even reversed from the probes' biggest win to a net loss.
+**Do not cite the 31-epoch shape-diversity probe numbers as a stable
+finding** — they read differently at different training budgets, and no
+replicate seeds exist to separate genuine training-dynamics
+non-monotonicity from noise on the smaller sources (`hu_lwk1` n=36,
+`shifts_ms` n=46).
+
+**Intensity/shape realism calibration, grounded in measurement, not
+guesswork.** Three previously-unused or newly-built calibration
+mechanisms (§ Methodology Axis 3) were wired in together (`135`):
+cross-class mean correlation (`mu_group_ids`, pre-existing but never
+enabled in any config before this session), cross-class variance
+correlation (`sd_group_ids`, did not exist before this session — `sd` was
+always independent regardless of `mu_group_ids`), and host-anchored shape
+intensity (a shape's own painted intensity is now drawn relative to its
+host organ's real mean/std, ratio range calibrated against a fresh
+measurement of real target-vs-surrounding-tissue contrast on the 7 OOD
+sources — 749 cases, physiologically sensible per-source signatures that
+validate the measurement: isles22/DWI stroke lesion +2.42 ring-$\sigma$
+hyperintense, atlas_v2/T1 chronic lesion $-0.59$ hypointense, matching
+known radiological contrast direction for each). An initial version of
+the host-anchoring calibration used an *absolute* intensity offset and
+was, by this same later measurement, found to be roughly 7–12$\times$ too
+extreme relative to the generator's own per-class variance scale —
+caught and corrected before any reported result used it.
+
+**Headline result (`135b`, this checkpoint's own recipe continued to
+epoch 170, not yet converged when stopped):**
+
+| dataset | 130 (baseline) | best of 131/132/133 | **135b** |
+|---|---:|---:|---:|
+| isles22 | 0.0406 | 0.0770 | 0.0499 |
+| shifts_ms | 0.0141 | 0.0326 | 0.0080 |
+| msd_hippocampus | 0.2913 | 0.3074 | **0.3262** |
+| msd_prostate | 0.0806 | 0.0697 | **0.1303** |
+| atlas_v2 | 0.0298 | 0.0271 | 0.0281 |
+| gnc_kidney | 0.0602 | 0.0692 | **0.0819** |
+| hu_lwk1 (CT) | 0.1357 | 0.2229 | 0.1964 |
+| **mean of 7** | 0.0932 | — | **0.1173** |
+
+`135b` has the highest cross-source mean of every checkpoint tested this
+session, winning 3/7 sources outright — most notably `msd_prostate`
+(0.1303, >1.6$\times$ the previous best), the *one* source that had
+regressed under every earlier shape-diversity intervention. It was still
+improving on its own in-domain validation metric when training was
+stopped (val Dice still rising from epoch $\sim$120 onward), so this may
+not be its ceiling. Weaker on `isles22`/`shifts_ms`/`hu_lwk1` than the
+best short-probe numbers — plausibly the same non-monotonic-with-budget
+pattern seen in `133`, not yet disentangled.
+
+**New gaps this section adds:**
+- **G9:** `135b` was stopped mid-training, not converged — no replicate,
+  no confirmation the reported numbers are a stable endpoint rather than
+  a snapshot on a still-moving trajectory.
+- **G10:** the CT+MRI ablation (the cleanest result in this section) has
+  not been re-checked on the `exp92` architecture lineage — it is only
+  demonstrated on the `108`+ line. Unclear how much of the effect is
+  architecture-independent vs. specific to features (`cascade_registers`,
+  `pool_token`) `exp92` lacks.
+- **G11:** no replicate seeds anywhere in this session's checkpoint
+  sequence (`130`–`135b`) — every comparison in this section is an N=1
+  training run per condition. The shape-diversity non-monotonicity
+  finding especially should be read as "not yet stable," not "disproven."
+
 ## Prioritized gap list (for `TODO.md`)
 
-1. **G1 — scope decision:** is "Ours" = exp92 line or PatchSetV2? Blocks
+1. **G1 — scope decision:** is "Ours" = exp92 line, PatchSetV2, or the
+   newer `108`→`135b` line (§6 — best OOD numbers of any lineage so far,
+   but changes architecture+data+calibration together vs. exp92, so it
+   isn't a drop-in replacement claim without more isolation work). Blocks
    everything else.
 2. **G5 — no Iris baseline exists anywhere.** Biggest hole relative to what
    the paper claims to compare against.
@@ -291,6 +412,13 @@ not analysis.
    completed gnc_kidney cascade cell before citing that ablation.
 8. Verify whether `99_iris_decoder_plainconv_doubling`'s low dice (0.056,
    fully trained) is a genuine finding or a training-config bug.
+9. **G9/G11 — replicate.** Resume `135b` to convergence (it was stopped
+   mid-climb) and, separately, re-run at least the CT+MRI ablation (§6,
+   the strongest claim in this file) with a second seed before it goes in
+   the thesis as a headline result — currently N=1.
+10. **G10 — check the CT+MRI joint-training effect on the exp92 lineage
+    too**, to know whether it's a general finding or specific to the
+    `108`+ feature set.
 
 ## What's already solid enough to write into the paper now
 
@@ -303,3 +431,15 @@ not analysis.
   targets (HU_LWK1), hurts when the coarse level is already failing
   (GNC_705, ISLES22) — generalizable framing backed by the independent
   Medverse query-prior finding.
+- **CT+MRI joint training improves OOD generalization** (§6): +Dice on all
+  7 eval-expansion sources in a matched, single-variable-changed ablation
+  (`110` vs `130`) — the cleanest, most directly citable result in this
+  file. Caveat: N=1 seed (item G11), and only demonstrated on the `108`+
+  lineage, not cross-checked against `exp92` (item G10).
+- **Real-data-grounded synth calibration methodology** (§6, Methodology
+  Axis 3): cross-class intensity/variance correlation and host-anchored
+  shape-intensity ranges were calibrated against measurements on the
+  actual OOD eval sources (not guessed), and the measurement itself
+  reproduces known per-source radiological contrast direction — a solid,
+  citable methodology contribution independent of whether the resulting
+  checkpoint's Dice numbers hold up under more training.
