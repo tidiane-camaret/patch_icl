@@ -1,1 +1,44 @@
 \subsection{Image--Label Fusion}\label{sec:results-fusion}
+
+\paragraph{Isolating the bi-axial attention effect.} The design choice
+this axis makes is keeping image and label tokens as separate streams
+that repeatedly cross-attend (the slot axis,
+\autoref{sec:methodology-fusion}), rather than fusing them once. To
+isolate its effect, the reference model is compared against a
+single-axis control that removes the slot axis (\texttt{arch.dual\_axis=false}),
+collapsing image and label evidence into one stream -- closer in spirit
+to Medverse's early-concatenation design
+(\autoref{sec:fundamentals-relatedwork}) -- while keeping everything
+else in the recipe unchanged.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Bi-axial attention vs.\ a single-axis (early-fusion-style)
+  control, TotalSegmentator validation Dice. The two runs are continued
+  from different checkpoints for a different number of epochs (see
+  caveat below) -- not yet a matched comparison.}
+  \label{tab:fusion-axis}
+  \begin{tabular}{lccccc}
+    \toprule
+     & epoch & Dice & seen & unseen & GFLOPs \\
+    \midrule
+    Single-axis (control) & 40/51 & 0.286 & 0.338 & 0.227 & 2407.7 \\
+    \textbf{Bi-axial (ours)} & 50/51 & \textbf{0.510} & \textbf{0.591} & \textbf{0.419} & 3892.5 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The bi-axial model reaches roughly $1.8\times$ the single-axis control's
+Dice, at both seen and unseen classes, for about $1.6\times$ the GFLOPs.
+
+\paragraph{Not yet an apples-to-apples ablation.} This is a first look,
+not a controlled ablation: the two runs continue from different
+upstream checkpoints (from separately-trained bi-axial and single-axis
+lineages respectively) and are read at different points -- the bi-axial
+run completed its full 51-epoch schedule, while the single-axis run had
+reached only epoch 40 and was still improving each eval at last check.
+\todo{Run a controlled comparison: same initialization/training budget
+for both, both trained to convergence, ideally $\geq 2$ seeds, before
+this is cited as a settled effect size rather than a preliminary
+signal.}
