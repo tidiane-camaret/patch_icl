@@ -1,0 +1,142 @@
+# @package _global_
+# 144_cascade_predprior_randomfg — coarse-to-fine ablation, step 3 of a 3-step CUMULATIVE
+# build-up (not a factorial A/B): each step adds ONE more mechanism swap on top of the
+# previous step's config, all three resuming 135b independently (same shared ancestor,
+# not chained checkpoints -- user-confirmed).
+#
+#   140  registers=on, prior=perturbed-GT, center=com   (anchor -- see 140's own header)
+#   141  140 + prior=real prev.pred                     (see 141's own header)
+#   144  141 + center=random_fg                         (this)
+#
+#   python experiments/3d/train.py experiment=144_cascade_predprior_randomfg
+#
+# WHY THIS ORDER (2026-09-23): registers stays ON throughout (already baked into 135b's
+# checkpoint architecture, structurally free -- not part of the "add" chain). Query-prior
+# source was added first (141) because it's a pure data-generation change with no
+# geometry interaction, and was the ORIGINAL motivating question for this whole probe.
+# Center mode is added LAST because it changes re-crop GEOMETRY, not just the prior signal
+# -- safer to layer on top of an already-settled prior source than combine two
+# geometry/signal changes in one step. It's also the most novel of the three: implemented
+# 2026-09-12 (`cascade.py::_random_fg_point`) and never once measured against `com` with an
+# actual Dice number anywhere in this repo (checked `docs/logs.md` + every dataset doc).
+#
+# CENTER MODE: `data.cascade_center_mode={mode: random_fg, eval_mode: com}` -- TRAIN
+# samples the re-crop centre from a random voxel *inside* the (binarized) prediction
+# instead of its probability-weighted centroid (built because COM can land off-mask on
+# donut/non-convex/multi-focal targets -- exactly ISLES22/shifts_ms's failure shape). EVAL
+# stays deterministic `com` (the mapping form's documented default) so val/test Dice
+# remains stable and comparable across epochs/checkpoints, same train/eval-split
+# convention already used for `cascade_query_prior`. `SynthGmmProvider` (this cohort's
+# `p_synth=0.5` branch) has real `random_fg` support (wired + tested 2026-09-13, not the
+# `NotImplementedError` stub from its first cut) -- confirmed safe to combine with this
+# recipe's synth fraction.
+#
+# See 140's WHY/CASCADE LADDER/CHECKPOINT notes and 141's QUERY PRIOR note for everything
+# else here, unchanged.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: null      # was [3, 6] -- mutually exclusive with cascade_spacings
+  crop_spacing_mm: 4             # was 4.24 -- must == cascade_spacings[0]
+  cascade_spacings: [4, 1.5]     # fixed ladder for eval / periodic val-during-train
+  cascade_train:                 # randomized 2-level TRAIN ladder -- see 140's CASCADE LADDER
+    levels: 2
+    spacing_range: [1, 6]
+  cascade_query_prior: pred      # real previous-level prediction -- unchanged from 141
+  cascade_center_mode:            # NEW: train samples inside the mask; eval stays COM
+    mode: random_fg
+    eval_mode: com
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    shape:
+      host_anchored: true
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+  # data.query_prior / data.prior_perturb intentionally absent -- see 141's QUERY PRIOR note.
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 60
+  batch_size: 4
+  eval_every: 20
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 7.1e-5
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  cascade_loss_weights: [1, 1]
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_135b_varspacing_synth05_shape1_intensitycalib_continue/best.pt
+  checkpoint_allow_partial: false   # identical arch to 135b -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 144_cascade_predprior_randomfg
