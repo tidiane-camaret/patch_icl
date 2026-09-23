@@ -1,0 +1,142 @@
+# @package _global_
+# 132_..._shapediv — diversity-ONLY counterfactual for 131's scattered-shape probe. Continues
+# 130's checkpoint (SAME base as 131, not 131 itself) with a widened non-splatter shape param
+# range, splatter left untouched at its original defaults -- isolates whether 131's broad gain
+# (including hu_lwk1's single-compact-CT-target +0.087, which has nothing to do with scatter)
+# was really about scattered/multi-focal task-structure realism, or just "more synth shape
+# diversity, any axis, helps broadly" (a general regularization effect).
+#
+#   python experiments/3d/train.py experiment=132_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_shapediv
+#
+# WHY (2026-09-23): 131's own post-hoc mechanism check (docs/logs.md, same date) was mixed --
+# isles22's Dice gain was nearly UNIFORM across low/high n_components subjects (not
+# concentrated on the scattered cases a surgical fix would predict), and the within-131
+# n_components->dice correlation was unchanged from 130 (rho=+0.269 vs +0.223) rather than
+# flattening. Combined with hu_lwk1's large, scatter-irrelevant gain, "general shape-cohort
+# diversity helped broadly" is at least as plausible as "scatter realism specifically helped".
+# This run tests that alternative directly: widen blob_roughness_range (0.05,0.3)->(0.05,0.6),
+# disk_aspect_ratio_range (0.15,0.4)->(0.05,0.6), cylinder_length_mm_range (30,100)->(15,150) --
+# comparable "more shape variety" exposure on the three families that DON'T produce scattered
+# multi-component targets. splatter_n_components_range/spread_mm_range/family_weights all left
+# at their ORIGINAL (130) defaults -- the isolated variable here is non-splatter shape
+# diversity, not splatter at all.
+#
+# READ TOGETHER WITH 131: if 132 ALSO broadly improves OOD Dice (esp. on non-scattered sources
+# like hu_lwk1/msd_hippocampus) by a similar margin to 131, that supports "general diversity"
+# as 131's real mechanism. If 132 is flat/mixed while 131 was clearly positive, that supports
+# scatter-structure realism specifically mattering.
+#
+# CHECKPOINT: resumes 130's own best.pt (not 131's) -- same base as 131 for a clean two-way
+# comparison, both children of 130. Architecture identical -- strict full-shape load.
+# 31 epochs, matching 131's probe budget exactly for comparability.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape:
+      blob_roughness_range: [0.05, 0.6]        # was [0.05, 0.3] -- the isolated change
+      disk_aspect_ratio_range: [0.05, 0.6]     # was [0.15, 0.4]
+      cylinder_length_mm_range: [15.0, 150.0]  # was [30.0, 100.0]
+      # splatter_n_components_range / splatter_spread_mm_range / family_weights: left at
+      # ShapeCohortSpec defaults (2,6) / (5,20)mm / all 1.0 -- NOT touched, see WHY above.
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 31
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_130_cascade_register_varspacing_synth03_texture_pool2stage_ctmri/best.pt
+  checkpoint_allow_partial: false   # identical arch to 130 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 132_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_shapediv

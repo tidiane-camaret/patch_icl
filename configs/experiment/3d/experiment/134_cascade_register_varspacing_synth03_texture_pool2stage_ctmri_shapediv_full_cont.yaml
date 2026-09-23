@@ -1,0 +1,139 @@
+# @package _global_
+# 134_..._cont — continues 133's own checkpoint for another 51-epoch block (same combined
+# shape-diversity recipe unchanged), to see whether 133's OOD dip vs the 31-epoch probes
+# (131/132) is a transient mid-training regression that recovers with more training, or a
+# genuine sustained one.
+#
+#   python experiments/3d/train.py experiment=134_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_shapediv_full_cont
+#
+# WHY (2026-09-23): 133 (130 + 131's splatter widening + 132's non-splatter widening, 51
+# epochs) landed at cross-source OOD mean 0.0913 -- back at 130's own baseline (0.0932),
+# despite both component 31-epoch probes averaging clearly above it (131: 0.1121, 132: 0.1065).
+# hu_lwk1 specifically reversed from the probes' biggest win (+0.087/+0.067 at e30) to a net
+# loss at e50 (0.1145 < 130's 0.1357). 133's own IN-DOMAIN val_dice was still climbing at e50
+# (0.4344, up from e30's 0.4163, not clearly plateaued the way 131/132 were by e10) -- unlike
+# 121's own cold-start-vs-warm-continuation question earlier this chain, this isn't about a
+# reinit confound (133 is already a clean continuation of 130, no shape/key changes anywhere
+# in this sub-chain), it's the open question of whether OOD Dice on the harder sources
+# recovers, keeps degrading, or has genuinely plateaued below where the short probes were.
+#
+# CHECKPOINT: resumes 133's own best.pt. Architecture identical throughout this whole
+# 130->131/132->133->134 family -- strict, full-shape load, no partial/shape-mismatch
+# handling needed. warmup_epochs=1 (chain standard) -- genuine warm continuation, no
+# reinitialized parameters.
+#
+# BUDGET: epochs=51 (0..50 again, a second full block on top of 133's own 51) -- doubles
+# 133's total training to ~100 epochs, matching the 120->121 continuation precedent earlier
+# in this chain. Re-eval the full 7-source sweep once done; compare against 130/131/132/133.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape:
+      family_weights: {blob: 1.0, splatter: 3.0, disk: 1.0, cylinder: 1.0}
+      splatter_n_components_range: [2, 60]
+      splatter_spread_mm_range: [5.0, 60.0]
+      blob_roughness_range: [0.05, 0.6]
+      disk_aspect_ratio_range: [0.05, 0.6]
+      cylinder_length_mm_range: [15.0, 150.0]
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_133_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_shapediv_full/best.pt
+  checkpoint_allow_partial: false   # identical arch throughout -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 134_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_shapediv_full_cont

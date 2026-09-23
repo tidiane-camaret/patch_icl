@@ -4,12 +4,14 @@
 #
 # Routes through the v2 in-context engine (src/incontext_dataset_v2.py) +
 # src/providers/totalseg.py with modality="mri": organ-crop from native
-# `ct_raw.npy`, per-volume MRI z-score from root `ct_stats.json`, mask from
+# `mri_raw.npy`, per-volume MRI z-score from root `mri_stats.json`, mask from
 # the CT-`ALL_CLASSES`-encoded `label.npy` (verified: every MRI class name,
 # incl. merged vertebrae / intervertebral_discs / lung_left|right, is in
 # ALL_CLASSES, so the provider's _ALL_CLASSES_IDX decodes it directly).
+# (mri_raw.npy / mri_stats.json were named ct_raw.npy / ct_stats.json until
+# 2026-09-22 -- a from-CT copy-paste mistake, fixed repo- and data-wide.)
 #
-# ONE-TIME DATA PREP (v2 requires ct_raw.npy; MRI also requires ct_stats.json):
+# ONE-TIME DATA PREP (v2 requires mri_raw.npy; MRI also requires mri_stats.json):
 #   python scripts/convert_to_npy.py \
 #     --data /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalsegmri \
 #     --modality mri --store-raw --workers 16

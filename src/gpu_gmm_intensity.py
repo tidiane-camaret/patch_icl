@@ -106,6 +106,33 @@ MERGED_GROUP_MAISI_IDS = (
 )
 MERGED_GROUP_RHO = (0.72, 0.78, 0.85, 0.76, 0.81, 0.88)
 
+# Cross-class correlation of the VARIANCE parameter (not the mean) -- the sd analog of
+# CT_GROUP_MAISI_IDS/MERGED_GROUP_MAISI_IDS above (docs/logs.md 2026-09-23 "CT+MRI voxel-
+# variance correlation"). sd was ALWAYS drawn fully independently per slot until this date --
+# unlike mu, there was no grouped-correlation mechanism for sd at all, regardless of
+# mu_group_ids. Real per-subject WITHIN-SCAN voxel variance (not the between-subject MEAN)
+# correlates across classes by tissue type too: measured via the same pairwise-correlation +
+# avg-linkage clustering machinery as the mu analysis, but fed each subject's own per-class
+# voxel-std column instead of mean_hu. Pooled CT (1228 subj) + MRI (616 subj), each
+# standardized to its own mean/std first (same method as MERGED_GROUP_RHO), on the 46 classes
+# both cover: pooled mean|r|=0.33 (CT-alone 0.35, MRI-alone 0.23 on the same shared classes --
+# same direction, CT the stronger/more reliable signal given 2x the subjects). 6 clusters
+# survive at dist<=0.35, rho 0.72-0.94, all but the first are bilateral L/R pairs (autochthon
+# 0.94, clavicula+scapula 0.81, iliac_artery 0.84, hip 0.72, gluteus_minimus 0.73) -- the first
+# is a broad 18-member abdominal-organ+muscle+vessel supercluster where CT-alone (0.82) and
+# MRI-alone (0.33) disagree substantially (likely over-merged at this coarse a threshold given
+# MRI's smaller sample), kept at its pooled compromise value (0.73) rather than dropped, since
+# even the disagreement is directionally consistent (both positive, just different magnitude).
+VAR_GROUP_MAISI_IDS = (
+    (1, 3, 4, 5, 7, 8, 9, 14, 17, 60, 61, 98, 99, 100, 101, 106, 107, 121),  # 18 abdominal organs+muscle+vessels
+    (89, 90, 91, 92),                                                       # 4 clavicula+scapula
+    (104, 105),                                                             # 2 autochthon
+    (102, 103),                                                             # 2 gluteus_minimus
+    (95, 96),                                                               # 2 hip
+    (58, 59),                                                               # 2 iliac_artery
+)
+VAR_GROUP_RHO = (0.73, 0.81, 0.94, 0.73, 0.72, 0.84)
+
 # Real intra-cohort (BETWEEN-MEMBER) intensity variance, TotalSegmentator CT (docs/logs.md
 # 2026-08-29 "real intra-cohort variance analysis", analyze_intracohort_variance.py). Today
 # mu[c]/sd[c] are drawn ONCE per cohort and shared verbatim by every member -- sd[c] models
@@ -136,6 +163,37 @@ CT_BETWEEN_WITHIN_GROUPS = (
     ((22, 57, 121), 0.30),                                                         # trachea/spinal_cord/other
 )
 
+# CT+MRI blended version (docs/logs.md 2026-09-23 "CT+MRI between/within variance ratio"):
+# re-ran the same real-data measurement (analyze_totalseg_intensity.py --dataset totalsegmri,
+# then the between/within ratio from its class_table, mirroring analyze_intracohort_variance.py)
+# on TotalSegMRI (39 classes, n_present>=100, z-score units -- unit-free ratio, so directly
+# comparable to CT's HU-unit ratio without rescaling). Two findings: (1) MRI's ratio runs ~3x
+# CT's in ABSOLUTE terms (median 1.661 vs 0.474) -- MRI signal is far more between-subject/
+# scanner variable than CT's calibrated HU, even after per-subject z-scoring; a plain pooled
+# average would be dominated by whichever set has more classes, not by the real 50/50 training
+# mix. (2) The RELATIVE (per-family) ordering is consistent across modalities (35 shared
+# classes: rank corr 0.562; family z-score pattern matches -- vascular/cardiac highest in both,
+# bone/lung lowest in both; muscle is the one family that reorders, low-relative in CT but
+# mid-relative in MRI). Reuses CT_BETWEEN_WITHIN_GROUPS' exact same MAISI-id membership (same
+# label vocabulary, same 6 name-pattern families) with values REPLACED by the 50/50
+# modality-blended mean ((ct_family_mean + mri_family_mean) / 2 -- weighted by modality to
+# match data.source_mix.regime_p=[0.5,0.5], not by raw class count, which would just be "mostly
+# CT" since CT has 116 eligible classes vs MRI's 39): vascular/cardiac 1.72, organ 1.18,
+# muscle 1.10, bone 0.85, other 0.88, lung 0.81. Default is the unweighted mean of those 6
+# blended family values, not a separately-computed global pooled median.
+CT_MRI_BETWEEN_WITHIN_DEFAULT = 1.09   # mean of the 6 blended family values below
+CT_MRI_BETWEEN_WITHIN_GROUPS = (
+    ((6, 7, 17, 58, 59, 60, 61, 108, 109, 110, 111, 112, 113, 115, 119, 123, 124, 125), 1.72),  # vascular/cardiac
+    ((1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 19, 62, 118, 126), 1.18),           # organ
+    ((28, 29, 30, 31, 32), 0.81),                                                  # lung
+    ((33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,   # bone
+      52, 53, 54, 55, 56, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+      77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+      96, 97, 114, 120, 122, 127), 0.85),
+    ((98, 99, 100, 101, 102, 103, 104, 105, 106, 107), 1.10),                      # muscle
+    ((22, 57, 121), 0.88),                                                         # trachea/spinal_cord/other
+)
+
 
 def build_between_ratio_table(maxid, groups=CT_BETWEEN_WITHIN_GROUPS,
                               default=CT_BETWEEN_WITHIN_DEFAULT):
@@ -150,14 +208,23 @@ def build_between_ratio_table(maxid, groups=CT_BETWEEN_WITHIN_GROUPS,
     return table
 
 
+_BETWEEN_RATIO_PRESETS = {
+    "ct": (CT_BETWEEN_WITHIN_GROUPS, CT_BETWEEN_WITHIN_DEFAULT),
+    "ct_mri": (CT_MRI_BETWEEN_WITHIN_GROUPS, CT_MRI_BETWEEN_WITHIN_DEFAULT),
+}
+
+
 def resolve_between_ratio(spec, maxid):
-    """spec: None (disabled, unchanged today's behavior) | 'ct' (CT_BETWEEN_WITHIN_GROUPS
-    preset) | an explicit (maxid+1,)-length array-like. Returns None or a float32 array."""
+    """spec: None (disabled, unchanged today's behavior) | 'ct' (CT_BETWEEN_WITHIN_GROUPS,
+    CT-only calibration) | 'ct_mri' (CT_MRI_BETWEEN_WITHIN_GROUPS, 50/50 modality-blended --
+    see docs/logs.md 2026-09-23) | an explicit (maxid+1,)-length array-like. Returns None or a
+    float32 array."""
     if spec is None:
         return None
     if isinstance(spec, str):
-        assert spec == "ct", f"unknown between-ratio preset {spec!r}"
-        return build_between_ratio_table(maxid)
+        assert spec in _BETWEEN_RATIO_PRESETS, f"unknown between-ratio preset {spec!r}"
+        groups, default = _BETWEEN_RATIO_PRESETS[spec]
+        return build_between_ratio_table(maxid, groups=groups, default=default)
     arr = np.asarray(spec, dtype=np.float32)
     assert arr.shape == (maxid + 1,), (arr.shape, maxid)
     return arr

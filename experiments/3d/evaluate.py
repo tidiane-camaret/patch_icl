@@ -746,6 +746,7 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 )
                 figs_saved.add(cls)
             cids = ctx_subjects[i] if ctx_subjects is not None else None
+            _meta_i = metas[i] if metas is not None else None
             case = {
                 "class":   cls,
                 "subject": subjects[i],
@@ -754,8 +755,16 @@ def evaluate_classes(model, cfg, classes, *, split=None, fig_dir: Path | None = 
                 "self_ctx":  bool(cids and all(c == subjects[i] for c in cids)),
                 "dice":    round(float(dice_vec[i]), 4),
                 "time_ms": round(per_sample_ms, 1),
-                "detail":  _sample_detail(metas[i] if metas is not None else None),
+                "detail":  _sample_detail(_meta_i),
             }
+            # multisource cohort (src/providers/multisource.py): target modality + regime
+            # (ct/mri/cross) as raw keys, not just baked into `detail` -- mirrors cascade.py's
+            # case dict so train.py's per-regime/per-modality Dice aggregation (val/dice_ct,
+            # val/dice_mri, val/dice_cross, val/dice_tgt_ct, val/dice_tgt_mri) works the same
+            # way whether or not data.cascade_spacings is set. None/absent for every other source.
+            if _meta_i and "regime" in _meta_i:
+                case["modality"] = _meta_i.get("tgt_mod")
+                case["regime"] = _meta_i["regime"]
             case.update(_occupancy_stats(label[i], context_masks[i]))
             if nsd_vec is not None:
                 case["nsd"] = round(float(nsd_vec[i]), 4)

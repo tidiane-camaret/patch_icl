@@ -71,9 +71,9 @@ from data.totalseg_classes import ALL_CLASSES  # noqa: E402
 _DATA_ROOT = Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/"
                    "ANALYSIS_20251122/data")
 # modality drives normalization: CT's raw HU is one absolute physical unit shared by every
-# subject/scanner (comparable as-is); MRI has no such absolute unit -- ct_raw.npy is
+# subject/scanner (comparable as-is); MRI has no such absolute unit -- mri_raw.npy is
 # arbitrary per-scan gain, so it must be put in a comparable per-subject frame FIRST (the
-# same clip+zscore normalize_mri() applies at train time, via each subject's ct_stats.json)
+# same clip+zscore normalize_mri() applies at train time, via each subject's mri_stats.json)
 # before pooling across subjects means anything. label.npy uses the shared CT ALL_CLASSES
 # encoding for both (totalseg_mri.yaml), so the rest of the pipeline is unchanged.
 DATASETS = {
@@ -93,7 +93,7 @@ BODY_COL = N_BINS
 
 def _subject_stats(args):
     """One np.bincount pass: (sum, sumsq, count) of intensity per label id, for one subject.
-    CT: raw HU as-is. MRI: clip+zscore via that subject's own ct_stats.json entry first (no
+    CT: raw HU as-is. MRI: clip+zscore via that subject's own mri_stats.json entry first (no
     absolute unit otherwise) -- `stats` is None for CT, the subject's stats dict for MRI.
 
     With `with_body` (CT only) one extra column is appended (index BODY_COL) for the "body"
@@ -101,8 +101,9 @@ def _subject_stats(args):
     of the 117 classes). 0/0/0 if pred_body.npy is missing or off-grid."""
     root, subj, stats, with_body = args
     d = Path(root) / subj
+    img_prefix = "mri" if stats is not None else "ct"
     try:
-        ct = np.asarray(np.load(d / "ct_raw.npy", mmap_mode="r"), dtype=np.float64)
+        ct = np.asarray(np.load(d / f"{img_prefix}_raw.npy", mmap_mode="r"), dtype=np.float64)
         lbl = np.asarray(np.load(d / "label.npy", mmap_mode="r")).ravel().astype(np.int64)
     except (FileNotFoundError, EOFError, ValueError, OSError):
         return subj, None
@@ -142,12 +143,13 @@ def extract(dataset="totalseg", recompute=False, workers=32, with_body=False):
     mri_stats = {}
     if modality == "mri":
         import json
-        with open(root / "ct_stats.json") as f:
+        with open(root / "mri_stats.json") as f:
             mri_stats = json.load(f)
 
+    img_name = "mri_raw.npy" if modality == "mri" else "ct_raw.npy"
     subjects = sorted(p.name for p in root.iterdir()
                        if p.is_dir() and (p / "label.npy").exists()
-                       and (p / "ct_raw.npy").exists()
+                       and (p / img_name).exists()
                        and (modality != "mri" or p.name in mri_stats))
     nb = N_BINS + (1 if with_body else 0)
     print(f"extract[{dataset}]: {len(subjects)} subjects ({modality}), {workers} workers"
@@ -556,7 +558,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", choices=sorted(DATASETS) + ["merged"], default="totalseg",
                     help="totalseg (CT, raw HU) | totalsegmri (MRI, per-subject clip+zscore "
-                         "via ct_stats.json -- no absolute intensity unit otherwise) | merged "
+                         "via mri_stats.json -- no absolute intensity unit otherwise) | merged "
                          "(pool both, per-class-standardized within each first; see "
                          "analyze_merged)")
     p.add_argument("--recompute", action="store_true", help="ignore the stats cache, rescan all subjects")

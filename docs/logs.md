@@ -1,5 +1,388 @@
 # Change log
 
+## 2026-09-23 (cont.) — target-vs-surrounding-tissue contrast measured on the 7 OOD sources; `host_anchored` redesigned as a ratio, not an absolute offset
+
+Session was restarted mid-training (killed `134`/`135` tmux sessions with no error in either
+log -- clean external truncation, not a code crash; `134` had reached e40 val_dice=0.4295, its
+best value yet, before dying). User redirected: focus on `135`, with the framing that synthetic
+shapes exist specifically to help generalization to classes OUTSIDE the ~130 TotalSeg/MAISI
+vocabulary (tumors/lesions -- exactly the OOD eval sources this whole session's diagnostics
+targeted) -- so calibrate shape realism against the REAL target-vs-surrounding-tissue contrast
+in those sources, not a guess.
+
+Built `experiments/3d/synth_task_generation/analyze_target_surround_contrast.py`: for each
+(subject, class) across all 7 OOD sources, crop to the GT's local bbox, dilate the mask by a
+fixed 8mm ring, measure `(target_mean - ring_mean) / ring_std` -- a modality/scale-invariant
+effect size (unlike `compute_class_properties.py`'s existing "contrast" column, which compares
+against a coarse WHOLE-SCAN stride, not the immediately adjacent tissue this calibration
+actually needs). 749 cases, physiologically sensible per-source signatures (validates the
+methodology): isles22 (stroke lesion, DWI) +2.42 -- classic DWI hyperintensity; shifts_ms (MS
+lesion, FLAIR) +1.49 -- classic FLAIR hyperintensity; atlas_v2 (chronic stroke, T1) -0.59 --
+classic T1 hypointensity (gliosis/encephalomalacia); msd_hippocampus -0.51; gnc_kidney +0.49
+(std=1.31, wide -- mixed cyst/complex-lesion appearance); msd_prostate +0.35; hu_lwk1 -0.07
+(std=0.17, near-zero -- an internal vertebra measurement ROI, not a real lesion boundary, so
+near-zero contrast is the CORRECT answer here, not a methodology failure). Pooled: mean=0.44,
+[p10,p90]=[-0.87,2.00].
+
+**This caught a real design flaw in the `host_anchored` fix from earlier today**: it used an
+ABSOLUTE offset (`host_contrast_range=(-60,60)` mu-units), but `sd` only spans ~[0,9] at
+`var_max=80` -- so +/-60 was ~7-12 standard deviations of "contrast", nowhere near the measured
+real range of roughly -1 to +3 ring-std. Redesigned as a RATIO (matching how `sd_between_ratio`/
+`intensity_between_ratio` already scale by `sd` instead of using a flat constant):
+`ShapeCohortSpec.host_contrast_ratio_range` (default `(-2.5, 2.5)`, replaces
+`host_contrast_range`), and `_anchor_shape_mu` (`src/providers/synth_gmm.py`, both call sites)
+now takes `sd` too: `mu[shape_id] = clip(mu[host_cls_id] + ratio * sd[host_cls_id], 0, 255)`.
+Symmetric range (not per-source-signed) since which sign applies to an arbitrary synthetic host
+class isn't knowable in advance -- a coarser approximation than per-source-calibrated signed
+ranges, deferred. Re-verified with `plot_shape_intensity.py --anchored` on the same 4 seeds:
+|mu diff| dropped from [8.7-25 under the old absolute design] to [8.7, 5.0, 8.4, 3.1] -- now
+properly scaled to each host's own sd (~5-9), not an arbitrary huge jump. 70/70
+`src/providers/` + `src/shapes3d/` tests still pass.
+
+## 2026-09-23 (cont.) — shape intensity was uncorrelated with its host organ; added `host_anchored`
+
+User asked whether a synthetic shape's painted intensity (`ShapeCohortSpec`, blob/splatter/
+disk/cylinder stamped into a real host organ crop) is correlated with the real tissue it's
+embedded in, and asked to draw some examples. It was not: `src/providers/synth_gmm.py`'s
+`mu_e[shape_id] = mu[shape_id] + ...` reads the shape pseudo-class's OWN independent slot in
+the cohort's `mu`/`sd` array (same mechanism as any real class), and shape ids (`shape_blob`
+etc.) are members of NO calibration group (`CT_GROUP_MAISI_IDS`/`MERGED_GROUP_MAISI_IDS`/
+`VAR_GROUP_MAISI_IDS` only cover real anatomy) — so even with all three intensity calibrations
+on, a shape's brightness has zero relationship to its host tissue. Built
+`experiments/3d/synth_task_generation/plot_shape_intensity.py` (draws shape-mode cohorts
+through the real cascade pipeline: `SynthGmmProvider(cascade=True)` -> `_build_nc` ->
+`gpu_realize_crop._realize_member`, the same path `data.p_synth>0` training uses) and confirmed
+both visually and numerically: host/shape mu pairs (83.0/203.0), (45.9/18.0), (8.4/20.4),
+(173.5/225.6) — |diff| up to 120, i.e. close to the full independent range, no relationship.
+
+Added `ShapeCohortSpec.host_anchored` (default `False`, byte-identical to before) +
+`host_contrast_range=(-60,60)`: when on, `mu[shape_id]` is overwritten to
+`clip(mu[host_cls_id] + U(*host_contrast_range), 0, 255)` instead of staying at its
+independent draw -- a lesion/abnormality that reads as moderately brighter or darker than its
+surrounding tissue, not an arbitrary unrelated shade (real lesions/abnormalities generally have
+*some* density relationship to the tissue they're in). New `_anchor_shape_mu()` helper
+(`src/providers/synth_gmm.py`) mutates `mu` in place, called identically from both
+`assemble_task` (initial draw) and `load_native_crop` (cascade re-crop re-derivation) --
+**two call sites needed it, same pattern as the earlier `sd_group_ids` fix**. Drawn from a
+dedicated seed-derived rng (`_SHAPE_INTENSITY_SEED_KEY`, distinct from `_SHAPE_COHORT_HP_SEED_KEY`
+so turning this on/off never perturbs the shape's geometry draw) -- cohort-shared (same
+contrast for target + every context member) and reproducible at any cascade level from
+`gmm_seed` alone. `intensity_between_ratio` still layers its existing per-member jitter on top
+of whichever value (anchored or not) ends up in `mu[shape_id]`, unchanged.
+
+No new config wiring needed in `common.py` -- `ShapeCohortSpec(**shape_kwargs)` is already
+built generically from `data.gmm.shape`, so `host_anchored: true` / `host_contrast_range: [...]`
+work immediately as config keys. 70/70 `src/providers/` + `src/shapes3d/` tests still pass.
+Re-ran the SAME 4 seeded draws with `host_anchored=True`: |mu diff| dropped to 25.4/17.4/8.4/11.8
+(bounded by the new ±60 range instead of the full 0-255 independent spread; the heart+cylinder
+case clamps to 0 since host mu=8.4 was already near the floor). **Not yet validated** in
+training -- this is a calibration/realism fix, not yet turned on in any experiment config or
+eval'd.
+
+## 2026-09-23 (cont.) — CT+MRI between/within variance ratio (`sd_between_ratio="ct_mri"`)
+
+Follow-up to the "widen the training distribution" synthesis: `mu`'s cross-class correlation
+structure already has both a `"ct"` and a `"merged"` (CT+MRI-blended) preset
+(`gpu_gmm_intensity.py::_MU_PRESETS`), but neither is actually wired into any experiment config
+(`mu_group_ids: null` everywhere, including the whole 130-134 chain — a real, previously
+unnoticed gap). The between/within variance-RATIO calibration (`CT_BETWEEN_WITHIN_GROUPS`,
+`sd_between_ratio`) had the same gap AND only ever had a CT-only preset.
+
+Computed the MRI side for the first time: reran `analyze_totalseg_intensity.py --dataset
+totalsegmri --recompute` (the cached run predated today's mri_raw.npy rename + 2/98-percentile
+`mri_stats.json` fix, so it would have been stale) to get MRI's own `between_subj_std_z`/
+`within_subj_voxel_std_z` per class, then computed the ratio the same way
+`analyze_intracohort_variance.py` did for CT.
+
+**Finding: unlike `mu`'s correlation (which agreed closely CT-alone vs MRI-alone), the
+between/within ratio is NOT modality-invariant in absolute terms** — MRI runs ~3x CT's (median
+1.661 vs 0.474; MRI signal is far more between-subject/scanner variable than CT's calibrated
+HU, even after per-subject z-scoring removes the absolute-scale difference). But the RELATIVE
+per-family ordering transfers well (35 shared classes: rank corr 0.562; vascular/cardiac
+highest in both, bone/lung lowest in both — muscle is the one family that reorders, low-
+relative in CT but mid-relative in MRI).
+
+User asked for a single calibration usable for both modalities (not two tables + a per-cohort
+draw mechanism). Built `CT_MRI_BETWEEN_WITHIN_GROUPS`/`CT_MRI_BETWEEN_WITHIN_DEFAULT`
+(`src/gpu_gmm_intensity.py`) — same 6 name-pattern families, same MAISI-id membership as
+`CT_BETWEEN_WITHIN_GROUPS`, but each value replaced by the 50/50 modality-blended mean
+(`(ct_family_mean + mri_family_mean) / 2`, weighted by MODALITY to match
+`data.source_mix.regime_p=[0.5,0.5]`, not by raw class count — CT has 116 eligible classes vs
+MRI's 39, so an unweighted pool would just read as "mostly CT"): vascular/cardiac 1.72, organ
+1.18, muscle 1.10, other 0.88, bone 0.85, lung 0.81; default 1.09 (mean of the 6). New
+`sd_between_ratio="ct_mri"` preset in `resolve_between_ratio` (`_BETWEEN_RATIO_PRESETS` dict,
+alongside the existing `"ct"`). 20/20 `tests/test_gmm_intensity.py` still pass.
+
+**Follow-up, same session — cross-class VARIANCE correlation (`sd_group_ids`)**: user asked
+whether `sd` (the per-class GMM standard deviation) has any cross-class correlation mechanism
+analogous to `mu_group_ids`. Checked directly in `synth_gmm_maisi_dataset.py`: `sd = np.sqrt(
+nrng.uniform(0.0, self.var_max, size=n))` — always fully independent, `sample_grouped_uniform`
+was never called for `sd` at all, regardless of `mu_group_ids`.
+
+Measured it for the first time: same pairwise-correlation + avg-linkage clustering machinery as
+the `mu` analysis (`_pairwise_corr`/`_cluster_classes` from `analyze_totalseg_intensity.py`,
+reused directly), fed each subject's per-class voxel-STD column (`class_mean_matrix`'s
+`voxel_var`, already computed as a byproduct of the mean analysis, just never used for this)
+instead of the mean column. Pooled CT (1228 subj)+MRI (616 subj), standardized to their own
+mean/std first (same method as `MERGED_GROUP_RHO`), 46 shared classes: pooled mean|r|=0.33
+(CT-alone 0.35, MRI-alone 0.23 — same direction, CT more reliable given 2x the subjects). 6
+clusters survive at dist<=0.35, rho 0.72-0.94, mostly bilateral L/R pairs (autochthon 0.94,
+clavicula+scapula 0.81, iliac_artery 0.84) plus one broad 18-member abdominal-organ+muscle+
+vessel supercluster where CT-alone (0.82) and MRI-alone (0.33) disagree substantially (kept at
+its pooled 0.73 compromise rather than dropped or trusted at either extreme).
+
+Added `VAR_GROUP_MAISI_IDS`/`VAR_GROUP_RHO` (`src/gpu_gmm_intensity.py`) and a new
+`sd_group_ids`/`sd_group_rho` param pair to `SynthGmmMaisiDataset`, mirroring `mu_group_ids`
+exactly (same `maisi_ids_to_indices` conversion, same byte-identical-when-unset guarantee — the
+non-grouped branch is the literal unchanged old line). **Two draw sites needed the fix, not
+one**: `SynthGmmMaisiDataset.assemble()`'s own inline draw, AND `SynthGmmProvider._draw_gmm()`
+(`src/providers/synth_gmm.py`) — a SEPARATE re-derivation of the identical draw from just the
+cohort seed, used by the cascade-determinism contract and (critically) the ACTUAL code path
+`data.source=multisource` + `p_synth>0` exercises (i.e., what the whole 108-135 chain runs
+through) — this second site had its own hardcoded flat `nrng.uniform(...)` call that would have
+silently ignored `sd_group_ids` even after fixing the first site. `common.py` wiring mirrors
+`mu_group_ids`'s exact pattern at both its call sites (`source=multisource`+`p_synth>0` and
+standalone `source=synth_gmm_maisi`), with a `"merged"` preset (no `"ct"`-only preset built,
+unlike `mu`/`sd_between_ratio` -- not requested).
+
+90/90 `src/providers/` + `src/shapes3d/` + `tests/test_gmm_intensity.py` pass. Verified
+end-to-end (not just unit-level): built `135`'s actual dataset stack and confirmed
+`sd_group_ids`/`sd_group_rho` reach `SynthGmmProvider.synth.ds` with the correct 0-based
+positions and rho values.
+
+**Folded into `135`** (not a separate probe) — added `sd_group_ids: merged` to the
+already-queued `135` config (had not yet launched) alongside `mu_group_ids=merged` and
+`sd_between_ratio=ct_mri`: all three are additive/non-confounding (different parameters or
+different axes of the same parameter), so combined in one run rather than isolated the way the
+shape-diversity A/B needed to be.
+
+## 2026-09-23 — OOD failure diagnostics -> scattered-shape synth probe (`131`, +0.02-0.09 Dice on 4/7 sources)
+
+Built `experiments/3d/synth_task_generation/diagnose_ood_failures.py`: merges every OOD eval
+case's Dice (`evaluate_classes`) with per-sample shape/intensity/texture task-property features
+(mask size, bbox extent, connected-component count, fg/bg contrast, fg intensity std) computed
+the same way as `results/presentations/val/compute_class_properties.py`, but per-SAMPLE (every
+case, not a 40-subject-per-class cap) so it can be correlated directly against per-sample Dice.
+3117 rows across all 7 integrated OOD sources (`results/presentations/val/ood_failure_diag.csv`),
+checkpoint `130` (see below). Per-DATASET Spearman correlations (pooling across sources washes
+the signal out via cross-dataset scale confounds) found isles22/gnc_kidney: bigger/more-extended/
+more-scattered/higher-contrast targets score clearly better (isles22 n_components rho=+0.223
+p=4e-4, bbox_extent rho=+0.264 p=3e-5); msd_hippocampus (model's best OOD source) is the
+opposite — bigger-than-typical extent HURTS (rho=-0.266) because its real targets are almost
+always one compact blob (96% single-component).
+
+The real numbers: shifts_ms (worst source, dice 0.014) has a MEDIAN of 54 separate lesion
+components per case (max 517) spread across a 107-150mm bbox (near the whole 128vox/4.24mm crop);
+isles22 (dice 0.041) median 7 components (max 245), bbox median 80mm. The synth training shape
+cohort's `splatter` family (`src/shapes3d/spec.py::ShapeCohortSpec`, the only family producing
+>1 component) defaults to `splatter_n_components_range=(2,6)`, `splatter_spread_mm_range=
+(5,20)mm`, and is only 1/4 of `family_weights` — so ~1/4 * p_shape=0.5 * p_synth=0.3 = 3.75% of
+ALL training tasks, capped at 6 components spread within 20mm. The model had essentially never
+trained on "find many small scattered foci under one label, spread across most of the crop" —
+a task-STRUCTURE gap, not primarily a size/contrast gap (`make_splatter`'s per-component volume
+= total size_vox / n, so widening n alone already yields realistically-sized individual
+components: a 10-50mm-diameter total target split 60 ways gives ~2.5-13mm individual lesions,
+in-range for real MS/stroke foci — no `size_mm_range` change needed; verified `make_splatter`'s
+loop and `reach_vox`'s bounding box in `src/shapes3d/primitives.py` both already scale correctly
+with n and spread, no hard cap, no code change needed).
+
+**Probe `131`** (`configs/experiment/3d/experiment/131_..._ctmri_scatter.yaml`, continues `130`'s
+checkpoint, 31 epochs): `splatter_n_components_range` (2,6)->(2,60), `splatter_spread_mm_range`
+(5,20)->(5,60)mm, `family_weights.splatter` 1.0->3.0 (25%->50% of shape-cohort draws, 3.75%->7.5%
+of all training tasks). No arch change. Training stable (val_dice plateaued 0.4178 by e10, no
+regression vs 130's own trajectory), per-modality logging (see below) showed ct=0.479/mri=0.359
+at e30, consistent with 130.
+
+Result (non-cascade eval, same 7 sources, 130 vs 131):
+
+| dataset | 130 | 131 (scatter) | Δ |
+|---|---:|---:|---:|
+| isles22 | 0.0406 | 0.0770 | **+0.0364** |
+| shifts_ms | 0.0141 | 0.0326 | **+0.0185** |
+| msd_hippocampus | 0.2913 | 0.3041 | +0.0128 |
+| msd_prostate | 0.0806 | 0.0697 | -0.0109 |
+| atlas_v2 | 0.0298 | 0.0244 | -0.0054 |
+| gnc_kidney | 0.0602 | 0.0541 | -0.0061 |
+| hu_lwk1 (CT) | 0.1357 | 0.2229 | **+0.0872** |
+
+4/7 up (the two most-scattered sources by far the most, plus hu_lwk1 — a single-compact-target
+CT source, so likely a general regularization/diversity benefit rather than the scatter mechanism
+specifically), 3/7 down by small amounts (prostate/atlas_v2/gnc_kidney, all likely within noise
+given small N or already-near-total-collapse baselines). Net clearly positive — validates the
+diagnostic's causal story, not just a correlational artifact. **Not yet validated**: whether the
+isles22/shifts_ms gain concentrates specifically on the high-n_components cases (would confirm
+the scattered-shape mechanism directly rather than a generic effect of more training diversity);
+whether a full 51-epoch budget (vs this 31-epoch probe) extends the gain further; the 3 small
+regressions are unexplained. Next: rerun `diagnose_ood_failures.py` against 131's checkpoint to
+check the n_components correlation on isles22/shifts_ms weakens.
+
+**Mechanism check (same day)**: reran `diagnose_ood_failures.py` against `131`'s checkpoint and
+compared per-subject Dice deltas (130->131) against each subject's pre-existing `n_components`/
+`bbox_extent_mm`. Result is MIXED, not a clean confirmation of the scattered-shape-specific
+story: isles22's improvement is fairly UNIFORM across the whole dataset (median-split mean delta
+low-n_components-half +0.0376 vs high-half +0.0350 — essentially equal, despite a real positive
+rank correlation rho=+0.254 p=5e-5 driven by the tail), and the within-131 n_components->dice
+correlation is unchanged from 130 (rho=+0.269 vs +0.223) rather than flattening out as it would
+if the model had specifically learned to close the multi-focal gap. shifts_ms shows more of the
+hypothesized pattern (low-half mean delta +0.0079 vs high-half +0.0291) but only at marginal
+significance (p=0.088, n=46 limits power). Combined with hu_lwk1's large gain (+0.087) on a
+single-compact-target CT source that has nothing to do with scatter, the more likely
+interpretation is that widening the shape cohort acted mostly as a general task-DIVERSITY
+regularizer (broader synth training distribution -> better overall robustness), not a surgical
+fix for the specific multi-focal-lesion weakness the diagnostic pointed at. The intervention is
+still a clear net win either way, but the causal story motivating it is only partially supported
+-- worth a controlled diversity-only counterfactual (widen a non-scatter knob by a similar
+margin, e.g. `blob_roughness_range`, and check whether it ALSO produces broad gains) before
+concluding scatter-shape realism specifically is the lever, vs. shape-cohort diversity in
+general.
+
+**Diversity-only counterfactual (`132`, same day)**: same base (`130`), same 31-epoch budget,
+widened `blob_roughness_range`/`disk_aspect_ratio_range`/`cylinder_length_mm_range` instead of
+`splatter` (left splatter at its ORIGINAL defaults, zero scatter exposure change) —
+
+| dataset | 130 | 131 (scatter) | 132 (diversity-only) |
+|---|---:|---:|---:|
+| isles22 | 0.0406 | 0.0770 | 0.0647 |
+| shifts_ms | 0.0141 | 0.0326 | 0.0314 |
+| msd_hippocampus | 0.2913 | 0.3041 | 0.3074 |
+| msd_prostate | 0.0806 | 0.0697 | 0.0553 |
+| atlas_v2 | 0.0298 | 0.0244 | 0.0271 |
+| gnc_kidney | 0.0602 | 0.0541 | 0.0573 |
+| hu_lwk1 (CT) | 0.1357 | 0.2229 | 0.2023 |
+
+`132` reproduces MOST of `131`'s gain with zero splatter change — 94% of the shifts_ms gain, 77%
+of the hu_lwk1 gain, and even slightly exceeds 131 on msd_hippocampus. **Settled: the dominant
+mechanism behind 131's improvement is general shape-cohort diversity/regularization, not the
+scattered-lesion task-structure fix the original diagnostic motivated.** A smaller genuine
+scatter-specific residual remains on top, visible mainly on isles22 (131's 0.0770 vs 132's
+0.0647 — the source with the most real multi-focal structure) and marginally on hu_lwk1, but
+it's second-order, layered on a first-order general-diversity effect. msd_prostate is the one
+source where MORE shape diversity of any kind hurts (130 0.0806 > 132 0.0553 > 131 0.0697,
+monotonically worse with more diversity) — unexplained, worth revisiting if prostate OOD
+performance becomes a priority. Practical takeaway for future synth-task design: shape-parameter
+range WIDTH in general (not just splatter/scatter-specific realism) looks like an
+under-exploited, cheap, broadly-positive regularizer in the current recipe (which uses fairly
+narrow default ranges throughout `ShapeCohortSpec`) — additive to, and independent of, the
+CT+MRI mixing win above.
+
+**msd_prostate regression, investigated further**: per-sample delta (130->131) breaks down as
+prostate_pz -0.0030 (n=64, thin/crescent, already-hardest subclass) vs prostate_tz -0.0184
+(n=60, larger/bulkier subclass) — the regression concentrates in TZ, not PZ. Delta correlates
+POSITIVELY with bbox_extent_mm (rho=+0.211, p=0.02) and n_components (rho=+0.191, p=0.03): the
+SMALLEST, most compact, single-component cases regressed the most, larger/more-scattered ones
+were roughly unaffected. Plausible mechanism (untested): TZ is a compact, bulky, disk/blob-like
+structure the NARROW original `disk_aspect_ratio_range=(0.15,0.4)` already matched fairly well;
+widening it to (0.05,0.6) trades some of that calibrated realism for extreme flat/round outliers
+that dilute the training signal specifically for targets the tighter default already suited.
+Not chased further this session (133, queued next, combines both widenings at full budget and
+will show whether this regression persists or washes out with more training).
+
+**`133` result: the short-probe gains did NOT hold up at full budget.** Combined both widenings
+(131's splatter + 132's non-splatter), same base (130), full 51-epoch budget (vs the two probes'
+31). In-domain val_dice was the run's best yet (0.4344, above 130's own 0.4253) -- but OOD:
+
+| dataset | 130 | 131 (31ep) | 132 (31ep) | 133 (51ep, combined) |
+|---|---:|---:|---:|---:|
+| isles22 | 0.0406 | 0.0770 | 0.0647 | 0.0579 |
+| shifts_ms | 0.0141 | 0.0326 | 0.0314 | 0.0139 |
+| msd_hippocampus | 0.2913 | 0.3041 | 0.3074 | 0.3013 |
+| msd_prostate | 0.0806 | 0.0697 | 0.0553 | 0.0578 |
+| atlas_v2 | 0.0298 | 0.0244 | 0.0271 | 0.0242 |
+| gnc_kidney | 0.0602 | 0.0541 | 0.0573 | **0.0692** |
+| hu_lwk1 (CT) | 0.1357 | **0.2229** | **0.2023** | 0.1145 |
+| **mean of 7** | **0.0932** | **0.1121** | **0.1065** | **0.0913** |
+
+`133`'s cross-source mean (0.0913) is essentially back to `130`'s baseline (0.0932) -- actually
+marginally BELOW it -- despite both component probes averaging clearly above baseline
+individually (131: 0.1121, 132: 0.1065). shifts_ms fully reverts to baseline; hu_lwk1 (the
+probes' single biggest win, +0.087/+0.067) REVERSES to below baseline (0.1145 < 0.1357). Only
+gnc_kidney improves further with the combined+longer run (best of all four checkpoints, 0.0692).
+**Conclusion: the shape-diversity effect measured in the two 31-epoch probes is real but
+UNSTABLE/non-monotonic under longer training** -- it does not simply compound when the two
+widenings are combined, nor does it persist when training continues past the point the probes
+stopped at. Plausible contributors, none isolated yet: (a) pure noise -- several of these
+sources are small (hu_lwk1 n=36, shifts_ms n=46), single-seed runs with no replicates, so a
+0.05-0.1 Dice swing on hu_lwk1 specifically may not be a reliable signal either direction;
+(b) genuine peak-then-decay training dynamics -- the val_dice curves for 131/132 were already
+flat by e10 on the IN-DOMAIN CT+MRI val set, so continuing to e50 may be overfitting further to
+that set at some OOD sources' expense, in a way the 31-epoch probes never reached; (c) combining
+both widenings may not compose additively (interaction effects in how `family_weights`
+normalizes draw probability across a now-more-crowded shape cohort).
+**Practical takeaway: do NOT adopt the combined 133 recipe as a new default based on this
+evidence alone.** The CT+MRI joint-training result (110 vs 130 above) remains the one
+robust, clearly-established win from this session's work -- consistent across all 7 sources,
+large in magnitude, from a controlled matched-lineage ablation. The shape-diversity story needs
+either replicate seeds or a principled checkpoint-selection criterion (e.g. track OOD Dice
+directly during training, not just in-domain val_dice) before it can be trusted as an actual
+improvement rather than a short-training-window artifact.
+
+## 2026-09-22 — CT+MRI joint training (`130`) + MRI pipeline fixes
+
+**MRI 2nd/98th percentile renorm**: `totalsegmri`'s `mri_stats.json` (per-subject clip+z-score,
+`src/totalseg_dataset.py::mri_stats`) was computed at `pct_lo=0.5, pct_hi=99.5` — a straight
+carry-over from the CT-side nnU-Net convention, not tuned for MRI. IRIS's own preprocessing note
+(`docs/methods/iris.md:189`) and Medverse's released preprocessing (arxiv 2509.09232) both clip
+MRI at 2nd/98th percentile. Recomputed for all 616 subjects via `scripts/recompute_mri_stats.py`
+(re-reads existing `mri_raw.npy`, no `.nii.gz` re-decode / no resample needed) at `pct_lo=2,
+pct_hi=98`.
+
+**MRI ct*-naming fix**: `totalsegmri` subjects were writing/reading `ct.npy`/`ct_raw.npy`/
+`ct_{size}.npy`/`ct_raw_{pitch}mm.npy`/`ct_stats.json` — a from-CT copy-paste in
+`convert_to_npy.py` (shared with the real `totalseg` CT converter) that the MRI branch never
+renamed. Fixed repo- and data-wide: `TotalSegProvider._img_prefix` ("mri"/"ct") now drives every
+path (`src/providers/totalseg.py`), `volume_cache.get_cache()` takes an `image_filename` param,
+`convert_to_npy.py`'s writer side and the legacy v1 `raw_ct` MRI path
+(`src/totalseg_dataloader_incontext.py`) updated to match. Renamed 3698 files on the NFS
+`totalsegmri` root via atomic `os.rename` (`scripts/rename_mri_files.py`) — `mri.npy`,
+`mri_raw.npy`, `mri_{size}.npy`, `mri_raw_{pitch}mm.npy` per subject, `mri_stats.json`[`.bak`] at
+root. Deliberately did NOT touch the *other* MRI-ish sources (isles22/atlas_v2/gnc_kidney/
+msd_hippocampus/shifts_ms/msd_prostate) — those go through `NativeGridProvider`'s own, separate,
+already-documented `ct_raw.npy`/`ct_stats.json` convention (deliberately modality-agnostic
+naming shared across many sources, not a mistake).
+
+**Multisource per-modality Dice logging was silently dead for every non-cascade run**: `train.py`
+computed `val/dice_ct`/`val/dice_mri`/`val/dice_cross`/`val/dice_tgt_{ct,mri}` from each case's
+`regime`/`modality` tags, but the whole block was nested inside `if cfg.data.cascade_spacings`
+— so it never ran for the entire 108+ chain (all non-cascade). Root cause: `evaluate.py`'s
+non-cascade `case` dict (`evaluate_classes`) never set `regime`/`modality` in the first place —
+only `cascade.py`'s cascade-path case dict did. Fixed both: `evaluate.py` now sets
+`case["modality"]`/`case["regime"]` from the per-item meta (mirrors `cascade.py`'s convention);
+`train.py`'s aggregation block moved out from under the cascade gate (runs for any
+`source=multisource` run) and now also prints in the per-epoch `[eN] ...` line
+(`ct=... mri=...`), not just wandb. Note: editing the module on disk does NOT hot-reload into an
+already-running training process (confirmed empirically on `130`, launched before this fix) —
+only takes effect on the next fresh launch (`131` onward).
+
+**`130`** (`configs/experiment/3d/experiment/130_..._ctmri.yaml`): continues `110`'s checkpoint
+(the CT-only mainline, val_dice=0.5103) with the one isolated change `data.source_mix.regime_p`
+1.0/0.0/0.0 -> 0.5/0.5/0.0 — MRI subjects enter training (previously the whole 108-121 chain sat
+on the CT+MRI-capable `multisource_ct_mri` dataset but was pinned CT-only). No arch change
+(`arch.encoder_input_norm=instance` already carried since exp80 "ready for the planned CT+MRI
+joint run"). 51 epochs, best val_dice=0.4253 (not directly comparable to 110's 0.5103 — the val
+set itself is now a 50/50 CT/MRI mix).
+
+**Controlled CT+MRI ablation vs the matched `110` sibling** (same lineage, arch, everything
+except regime_p — NOT the stale exp92/cascade_register baselines already in
+`docs/datasets/eval_expansion_status.md`, which are a different, less-evolved checkpoint family
+and gave a misleadingly negative first impression before this matched rerun): non-cascade eval,
+same 7 OOD sources —
+
+| dataset | 110 (CT-only) | 130 (CT+MRI) | Δ |
+|---|---:|---:|---:|
+| isles22 | 0.0211 | 0.0406 | +0.0195 |
+| shifts_ms | 0.0012 | 0.0141 | +0.0129 |
+| msd_hippocampus | 0.1342 | 0.2913 | +0.1571 |
+| msd_prostate | 0.0430 | 0.0806 | +0.0376 |
+| atlas_v2 | 0.0206 | 0.0298 | +0.0092 |
+| gnc_kidney | 0.0412 | 0.0602 | +0.0190 |
+| hu_lwk1 (CT) | 0.1297 | 0.1357 | +0.0060 |
+
+CT+MRI joint training improves OOD generalization on **every** held-out source, most dramatically
+on msd_hippocampus (+0.157, a well-defined single-blob target — exactly where more real MRI
+intensity-statistics exposure should transfer most directly), including even the one CT source.
+Clean, unconfounded result — settles the earlier misleading impression from the stale-lineage
+comparison.
+
 ## 2026-09-17 — PatchSet3D Iris-decoder (`arch.decoder=iris`)
 
 **arch.decoder=iris** (`src/models/patchset3d.py`): literal reproduction of Iris's contextual

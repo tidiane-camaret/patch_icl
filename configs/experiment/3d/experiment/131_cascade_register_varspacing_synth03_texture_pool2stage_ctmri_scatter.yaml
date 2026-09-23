@@ -1,0 +1,162 @@
+# @package _global_
+# 131_..._scatter — continues 130's checkpoint (CT+MRI, val_dice=0.4253) with ONE isolated
+# change: data.gmm.shape widens the synth `splatter` shape family to cover real scattered
+# multi-focal lesion burden, which the OOD failure-diagnostic script found is the single
+# clearest driver of catastrophic failure on isles22/shifts_ms.
+#
+#   python experiments/3d/train.py experiment=131_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_scatter
+#
+# WHY (2026-09-23): built experiments/3d/synth_task_generation/diagnose_ood_failures.py to
+# merge every OOD eval case's Dice with per-sample shape/intensity/texture task-property
+# features (mask size, bbox extent, connected-component count, fg/bg contrast, fg intensity
+# std) -- results/presentations/val/ood_failure_diag.csv, 3117 rows across all 7 sources.
+# Per-dataset Spearman correlations (not pooled -- pooling across sources washes out the
+# effect via cross-dataset scale confounds) show isles22 and gnc_kidney: bigger/more-
+# extended/more-scattered/higher-contrast targets score CLEARLY better (isles22 n_components
+# rho=+0.223 p=4e-4, bbox_extent rho=+0.264 p=3e-5); msd_hippocampus (the model's best OOD
+# source, 0.48 dice) is the opposite -- bigger-than-typical extent HURTS (rho=-0.266) because
+# its real targets are almost always a single compact blob (n_components median=1, 96%
+# single-component).
+#
+# The real numbers behind this: shifts_ms (worst source, dice 0.014) has a MEDIAN of 54
+# separate lesion components per case (max 517), spread across a 107-150mm bbox (near the
+# whole crop); isles22 (dice 0.041) median 7 components (max 245), bbox median 80mm. The
+# synth training shape cohort's `splatter` family -- the only family that produces >1
+# component -- defaults to `splatter_n_components_range=(2,6)`,
+# `splatter_spread_mm_range=(5,20)mm`, and is only 1/4 of the shape-cohort's family_weights
+# (so ~1/4 * p_shape=0.5 * p_synth=0.3 = 3.75% of ALL training tasks, and even then capped at
+# 6 components spread within 20mm). The model has essentially never trained on the "find many
+# small scattered foci under one label, spread across most of the crop" task structure that
+# shifts_ms/isles22 actually are -- a genuine task-structure gap, not a size or contrast gap
+# per se (make_splatter's per-component volume = total size_vox / n, so widening n alone
+# already yields realistically-sized *individual* components -- a 10-50mm-diameter total
+# target split 60 ways gives ~2.5-13mm individual lesions, in-range for real MS/stroke foci;
+# no size_mm_range change needed).
+#
+# CHANGE: data.gmm.shape.splatter_n_components_range (2,6) -> (2,60); splatter_spread_mm_range
+# (5,20) -> (5,60)mm (lets some draws scatter across most of a 128vox crop, not just a small
+# cluster); family_weights.splatter 1.0 -> 3.0 (of 1+3+1+1=6, splatter goes from 25% to 50%
+# of shape-cohort draws -- 0.3*0.5*0.5=7.5% of all training tasks, still a minority, but 2x
+# the previous scattered-shape exposure). No arch change, no code change (make_splatter's
+# per-component loop and reach_vox bounding box both already scale correctly with n and
+# spread -- verified in src/shapes3d/primitives.py, no hard cap).
+#
+# THIS IS A PROBE, not a new chain-mainline entry: epochs=31 (a bit over half the chain's
+# usual 51) to get a fast readout before committing to a full budget. Re-eval isles22 +
+# shifts_ms (+ full 7-source sweep) against 130 once done; also re-run
+# diagnose_ood_failures.py to see whether the n_components/bbox_extent correlation on those
+# two sources weakens (the model handling scattered targets better, not just memorizing this
+# specific probe).
+#
+# CHECKPOINT: resumes 130's own best.pt. Architecture is IDENTICAL to 130 -- strict,
+# full-shape weight load. warmup_epochs=1 (chain standard) -- no new/reinitialized
+# parameters, purely a training-data-distribution change.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape:
+      family_weights: {blob: 1.0, splatter: 3.0, disk: 1.0, cylinder: 1.0}   # the isolated change -- see WHY above
+      splatter_n_components_range: [2, 60]                                   # was [2, 6]
+      splatter_spread_mm_range: [5.0, 60.0]                                  # was [5.0, 20.0]
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 31
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_130_cascade_register_varspacing_synth03_texture_pool2stage_ctmri/best.pt
+  checkpoint_allow_partial: false   # identical arch to 130 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 131_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_scatter

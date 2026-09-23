@@ -418,6 +418,9 @@ class TotalSegInContextDataset(Dataset):
         assert modality in ("ct", "mri"), modality
         self.raw_ct = bool(raw_ct)
         self.modality = modality
+        # MRI subjects use their own mri*.npy / mri_stats.json naming (previously
+        # mistakenly reused the ct*.npy / ct_stats.json names — fixed 2026-09-22).
+        self._img_prefix = "mri" if modality == "mri" else "ct"
         # self_context: PROBABILITY (0..1; True->1.0) that an item's K contexts are replaced by
         # clones of the (augmented) target. 1.0 = always (the decoder/matching ceiling probe:
         # every query token has an identical support twin -> trivial matching, pure reconstruction,
@@ -557,12 +560,12 @@ class TotalSegInContextDataset(Dataset):
         # isotropic for subjects not present (pre-existing data without spacing info).
         self._spacings = self._load_spacings()
 
-        # Per-volume MRI normalisation stats (ct_stats.json), needed only for raw_ct MRI.
-        self._ct_stats = (self._load_ct_stats()
-                          if self.raw_ct and self.modality == "mri" else {})
+        # Per-volume MRI normalisation stats (mri_stats.json), needed only for raw_ct MRI.
+        self._mri_stats = (self._load_mri_stats()
+                           if self.raw_ct and self.modality == "mri" else {})
         if self.raw_ct:
-            print(f"raw_ct path ON (modality={self.modality}): native reads use ct_raw.npy "
-                  f"+ on-the-fly normalisation", flush=True)
+            print(f"raw_ct path ON (modality={self.modality}): native reads use "
+                  f"{self._img_prefix}_raw.npy + on-the-fly normalisation", flush=True)
 
         # Synth path: build SV-ID cache for fast __getitem__ sampling. Supervoxel labels
         # feed both the old p_synth path (_get_synth_item) and the self_context synth_masks
@@ -827,10 +830,10 @@ class TotalSegInContextDataset(Dataset):
             result[subj] = sp
         return result
 
-    def _load_ct_stats(self) -> dict[str, dict]:
-        """Load per-volume MRI normalisation stats (ct_stats.json) written by
+    def _load_mri_stats(self) -> dict[str, dict]:
+        """Load per-volume MRI normalisation stats (mri_stats.json) written by
         convert_to_npy --store-raw --modality mri. Returns {} if absent."""
-        path = self.root / "ct_stats.json"
+        path = self.root / "mri_stats.json"
         if not path.exists():
             return {}
         with open(path) as f:
@@ -840,26 +843,27 @@ class TotalSegInContextDataset(Dataset):
         """Normalise a raw native array (or a crop of it) to model input space.
 
         CT: global pointwise transform (crop == whole). MRI: per-volume stats from
-        ct_stats.json (whole-volume, so every crop of a subject normalises identically)."""
+        mri_stats.json (whole-volume, so every crop of a subject normalises identically)."""
         if self.modality == "mri":
-            st = self._ct_stats.get(subj)
+            st = self._mri_stats.get(subj)
             if st is None:
                 raise KeyError(
-                    f"raw_ct MRI: no ct_stats.json entry for {subj!r} — run "
+                    f"raw_ct MRI: no mri_stats.json entry for {subj!r} — run "
                     f"convert_to_npy.py --store-raw --modality mri to build it")
             return normalize_mri(arr, st)
         return normalize_ct(arr)
 
     def _load_native_ct_mmap(self, subj_dir: Path):
-        """mmap the native CT array for the crop path: ct_raw.npy (raw) when raw_ct, else the
-        pre-normalised ct.npy. Guards against feeding raw HU as if it were normalised."""
+        """mmap the native array for the crop path: {ct,mri}_raw.npy (raw) when raw_ct, else
+        the pre-normalised {ct,mri}.npy. Guards against feeding raw HU as if it were
+        normalised."""
         if self.raw_ct:
-            arr = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
+            arr = np.load(subj_dir / f"{self._img_prefix}_raw.npy", mmap_mode="r")
             if self.modality == "ct":
                 assert arr.dtype == np.int16, (
                     f"ct_raw.npy for {subj_dir.name} is {arr.dtype}, expected int16 raw HU")
             return arr
-        return np.load(subj_dir / "ct.npy", mmap_mode="r")
+        return np.load(subj_dir / f"{self._img_prefix}.npy", mmap_mode="r")
 
     def _get_spacing(self, subj: str) -> torch.Tensor:
         """Return effective spacing (3,) for subject, defaulting to 1mm isotropic."""
@@ -1093,14 +1097,14 @@ class TotalSegInContextDataset(Dataset):
             image_t = torch.from_numpy(img_arr).unsqueeze(0)  # (1, T, T, T)
             mask_t  = torch.from_numpy(msk_arr).long()        # (T, T, T)
         else:
-            # CT — fast path: pre-resized; slow path: native npy/nii.gz → resize
-            ct_pre = subj_dir / f"ct_{self._size_str}.npy" if self._size_str else None
+            # fast path: pre-resized; slow path: native npy/nii.gz → resize
+            ct_pre = subj_dir / f"{self._img_prefix}_{self._size_str}.npy" if self._size_str else None
             if ct_pre is not None and ct_pre.exists():
                 image_t = torch.from_numpy(
                     np.load(ct_pre, mmap_mode="r").astype(np.float32)
                 ).unsqueeze(0)                                          # (1, D, H, W)
             else:
-                ct_npy = subj_dir / "ct.npy"
+                ct_npy = subj_dir / f"{self._img_prefix}.npy"
                 image = (np.load(ct_npy, mmap_mode="r").astype(np.float32)
                          if ct_npy.exists() else _load_ct(subj_dir / "ct.nii.gz"))
                 image_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
@@ -1499,7 +1503,7 @@ class TotalSegInContextDataset(Dataset):
 
         subj_dir = self.root / subj
         if self._size_str is not None:
-            ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
+            ct_pre    = subj_dir / f"{self._img_prefix}_{self._size_str}.npy"
             label_pre = subj_dir / f"label_{self._size_str}.npy"
             if ct_pre.exists() and label_pre.exists():
                 image = np.load(ct_pre,    mmap_mode="r").astype(np.float32)
@@ -1539,7 +1543,7 @@ class TotalSegInContextDataset(Dataset):
             return self._load_crop(subj, cls, pred_center=pred_center)
 
         if self._size_str is not None:
-            ct_pre    = subj_dir / f"ct_{self._size_str}.npy"
+            ct_pre    = subj_dir / f"{self._img_prefix}_{self._size_str}.npy"
             label_pre = subj_dir / f"label_{self._size_str}.npy"
             if ct_pre.exists() and label_pre.exists():
                 image = np.load(ct_pre,    mmap_mode="r").astype(np.float32)

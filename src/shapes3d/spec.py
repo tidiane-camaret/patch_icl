@@ -30,6 +30,37 @@ class ShapeCohortSpec:
     position_between_ratio: float = 0.5
     intensity_between_ratio: float | None = None
 
+    # host_anchored: False (default) = today's behavior, the shape's mu is an INDEPENDENT
+    # draw from the same U(0,255) domain as every other class -- confirmed by
+    # experiments/3d/synth_task_generation/plot_shape_intensity.py to be visually and
+    # numerically unrelated to the host organ it's stamped inside (docs/logs.md 2026-09-23
+    # "shape intensity vs host organ"). True = the shape's mu is drawn RELATIVE to its host
+    # class's own mu, SCALED BY THE HOST'S OWN sd (mu[host_cls_id] + U(*host_contrast_ratio_range)
+    # * sd[host_cls_id], clipped to [0,255]) -- a ratio, not an absolute offset, matching how
+    # sd_between_ratio/intensity_between_ratio already scale by sd rather than using a flat
+    # constant (an earlier absolute-offset version, (-60,60) mu-units, was ~7-12x too extreme
+    # relative to sd's own ~[0,9] range at var_max=80 -- caught by calibrating against real
+    # data, see below). Drawn ONCE per cohort (same seed-derived rng pattern as shape_hp
+    # itself), so target+context share the same host-relative contrast; intensity_between_ratio
+    # (above) still layers its own per-member jitter on top of whichever value (anchored or
+    # not) ends up in mu[shape_id], unchanged.
+    #
+    # host_contrast_ratio_range calibrated from REAL target-vs-immediately-surrounding-tissue
+    # contrast (docs/logs.md 2026-09-23 "target-surround contrast calibration",
+    # experiments/3d/synth_task_generation/analyze_target_surround_contrast.py), measured as
+    # (target_mean - ring_mean)/ring_std (a ring-std-normalized effect size, comparable across
+    # CT/MRI) on the 7 integrated OOD sources, 749 cases: per-source medians range +2.38
+    # (isles22 stroke lesion, DWI -- classically hyperintense) to -0.69 (atlas_v2 chronic
+    # stroke lesion, T1 -- classically hypointense) to ~0 (hu_lwk1 -- an internal vertebra ROI,
+    # not a real lesion boundary); pooled [p10,p90]=[-0.87,2.00]. (-2.5,2.5) covers this
+    # measured range with margin on both signs (real lesion types are usually consistently
+    # hyper- OR hypo-intense, not symmetric per-instance, but which sign applies to an
+    # arbitrary synthetic host class isn't knowable in advance, so both signs are drawn with
+    # equal probability here -- a coarser approximation than per-source-calibrated signed
+    # ranges, deferred).
+    host_anchored: bool = False
+    host_contrast_ratio_range: tuple = (-2.5, 2.5)   # multiplies sd[host_cls_id]
+
     blob_roughness_range: tuple = (0.05, 0.3)
     splatter_n_components_range: tuple = (2, 6)
     splatter_spread_mm_range: tuple = (5.0, 20.0)

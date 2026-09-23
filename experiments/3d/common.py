@@ -450,16 +450,21 @@ def build_dataset(cfg, split: str):
             from src.providers.tri_source import TriSourceProvider
             from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
             from src.gpu_gmm_intensity import (CT_GROUP_MAISI_IDS, CT_GROUP_RHO,
-                                               MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)
+                                               MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO,
+                                               VAR_GROUP_MAISI_IDS, VAR_GROUP_RHO)
             _MU_PRESETS = {"ct": (CT_GROUP_MAISI_IDS, CT_GROUP_RHO),
                            "merged": (MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)}
+            _VAR_PRESETS = {"merged": (VAR_GROUP_MAISI_IDS, VAR_GROUP_RHO)}
             bank = cfg.paths.get("gmm_bank")
             if bank is None:
                 raise ValueError("data.p_synth > 0 requires cfg.paths.gmm_bank")
             g = d.get("gmm", {}) or {}
-            _mu_cfg = (OmegaConf.to_container(g, resolve=True) if OmegaConf.is_config(g)
-                       else dict(g)).get("mu_group_ids")
+            _g_plain = (OmegaConf.to_container(g, resolve=True) if OmegaConf.is_config(g)
+                       else dict(g))
+            _mu_cfg = _g_plain.get("mu_group_ids")
             _mu_ids, _mu_rho = _MU_PRESETS.get(_mu_cfg, (None, None))
+            _sd_group_cfg = _g_plain.get("sd_group_ids")
+            _sd_group_ids, _sd_group_rho = _VAR_PRESETS.get(_sd_group_cfg, (None, None))
             cohort_cfg = d.get("cohort", {}) or {}
             synth_ds = SynthGmmMaisiDataset(
                 bank_dir=bank,
@@ -493,6 +498,9 @@ def build_dataset(cfg, split: str):
                                     else g.get("mu_group_rho"))),
                 sd_between_ratio=(g.get("sd_between_ratio") if OmegaConf.is_config(g)
                                   else g.get("sd_between_ratio")),
+                sd_group_ids=(_sd_group_ids if _sd_group_ids is not None else _sd_group_cfg),
+                sd_group_rho=(_sd_group_rho if _sd_group_rho is not None
+                             else _g_plain.get("sd_group_rho")),
             )
             p_shape = float(g.get("p_shape", 0.0) or 0.0)
             shape_spec = None
@@ -682,9 +690,11 @@ def build_dataset(cfg, split: str):
         from omegaconf import OmegaConf
         from src.synth_gmm_maisi_dataset import SynthGmmMaisiDataset
         from src.gpu_gmm_intensity import (CT_GROUP_MAISI_IDS, CT_GROUP_RHO,
-                                          MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)
+                                          MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO,
+                                          VAR_GROUP_MAISI_IDS, VAR_GROUP_RHO)
         _MU_GROUP_PRESETS = {"ct": (CT_GROUP_MAISI_IDS, CT_GROUP_RHO),
                             "merged": (MERGED_GROUP_MAISI_IDS, MERGED_GROUP_RHO)}
+        _VAR_GROUP_PRESETS = {"merged": (VAR_GROUP_MAISI_IDS, VAR_GROUP_RHO)}
         d = cfg.data
         bank = cfg.paths.get("gmm_bank")
         if bank is None:
@@ -694,6 +704,8 @@ def build_dataset(cfg, split: str):
         g = cfg.data.get("gmm", {})
         _mu_group_ids_cfg = g.get("mu_group_ids")
         _mu_preset_ids, _mu_preset_rho = _MU_GROUP_PRESETS.get(_mu_group_ids_cfg, (None, None))
+        _sd_group_ids_cfg = g.get("sd_group_ids")
+        _sd_preset_ids, _sd_preset_rho = _VAR_GROUP_PRESETS.get(_sd_group_ids_cfg, (None, None))
         # train iterates epoch_length generative samples; val is capped small (deterministic
         # per idx via eval_seed) — max_val_subjects overrides, default 100.
         length = (int(d.get("epoch_length", 10000)) if split == "train"
@@ -742,7 +754,14 @@ def build_dataset(cfg, split: str):
             # None (default) = unchanged (mu is member-invariant, today's behavior). 'ct' =
             # CT_BETWEEN_WITHIN_GROUPS preset (6-family lookup, docs/logs.md "real intra-cohort
             # variance analysis"). Or pass an explicit (maxid+1,)-length list.
-            sd_between_ratio=g.get("sd_between_ratio"))
+            sd_between_ratio=g.get("sd_between_ratio"),
+            # sd analog of mu_group_ids above -- cross-CLASS correlation of the VARIANCE
+            # parameter (docs/logs.md 2026-09-23 "CT+MRI voxel-variance correlation"). Empty
+            # (default) = unchanged fully-independent behavior. 'merged' = the pooled CT+MRI
+            # preset (6 groups, rho 0.72-0.94). Or pass explicit lists via
+            # data.gmm.sd_group_ids / data.gmm.sd_group_rho.
+            sd_group_ids=(_sd_preset_ids if _sd_preset_ids is not None else _sd_group_ids_cfg),
+            sd_group_rho=(_sd_preset_rho if _sd_preset_rho is not None else g.get("sd_group_rho")))
         if not d.get("loader_v2", False):
             return synth_ds
         # loader_v2: drive the same cohort dataset through the generic v2 engine via the

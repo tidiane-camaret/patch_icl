@@ -1112,25 +1112,31 @@ def main(cfg: DictConfig) -> None:
           f"| sched={cfg.train.get('scheduler','plateau')} | val classes={len(val_classes)}")
 
     loader = train_loader(cfg)
-    # The per-spacing ct_raw_{s}mm.npy image caches only accelerate the CPU provider.load()
-    # re-crop path. They are irrelevant when data.gpu_realize_crop is on (default under
-    # cascade): training re-crops entirely from the RAM cache via load_native_crop + GPU
-    # realize and never calls provider.load(); the cascade val pass still loads level 0 on
-    # CPU, but that is a deliberate non-goal (see the 2026-09-01 cascade RAM-cache spec).
-    # Also skip the native 1.5 mm pitch — every TotalSeg subject is 1.5 mm isotropic, so
-    # ct_raw.npy *is* the 1.5 mm volume and ct_raw_1.5mm.npy is intentionally never built.
+    # The per-spacing {ct,mri}_raw_{s}mm.npy image caches only accelerate the CPU
+    # provider.load() re-crop path. They are irrelevant when data.gpu_realize_crop is on
+    # (default under cascade): training re-crops entirely from the RAM cache via
+    # load_native_crop + GPU realize and never calls provider.load(); the cascade val pass
+    # still loads level 0 on CPU, but that is a deliberate non-goal (see the 2026-09-01
+    # cascade RAM-cache spec). Also skip the native 1.5 mm pitch — every TotalSeg subject is
+    # 1.5 mm isotropic, so {ct,mri}_raw.npy *is* the 1.5 mm volume and the 1.5mm cache is
+    # intentionally never built.
     if cfg.data.get("cascade_spacings") and not bool(cfg.data.get("gpu_realize_crop", True)):
         import warnings
-        _cache_root = _source_root(cfg)[1]     # the source the provider actually reads (totalsegmri etc.), not always paths.totalseg
+        # the source the provider actually reads (totalsegmri etc.), not always paths.totalseg;
+        # is_mri picks the {ct,mri}_raw_*mm.npy naming (multisource always resolves to the CT
+        # root here — see _source_root — so is_mri is only ever True for a plain totalsegmri source).
+        _, _cache_root, _cache_is_mri = _source_root(cfg)
+        _img_prefix = "mri" if _cache_is_mri else "ct"
         _sd = next(iter(sorted(Path(_cache_root).glob("s*"))), None)
         for _s in cfg.data.cascade_spacings:
             if float(_s) == 1.5:
                 continue
-            if _sd is not None and not (_sd / f"ct_raw_{float(_s):g}mm.npy").exists():
+            if _sd is not None and not (_sd / f"{_img_prefix}_raw_{float(_s):g}mm.npy").exists():
                 warnings.warn(
-                    f"cascade: no ct_raw_{float(_s):g}mm.npy image cache — provider falls back "
-                    f"to full-res ct_raw.npy per re-crop load (slow: ~+0.3 s/step, ~100 s/val). "
-                    f"Build the per-spacing caches, or set data.gpu_realize_crop=true, to remove it.")
+                    f"cascade: no {_img_prefix}_raw_{float(_s):g}mm.npy image cache — provider "
+                    f"falls back to full-res {_img_prefix}_raw.npy per re-crop load (slow: "
+                    f"~+0.3 s/step, ~100 s/val). Build the per-spacing caches, or set "
+                    f"data.gpu_realize_crop=true, to remove it.")
     val_split = cfg.train.get("val_split", "val")
     val_loader = make_eval_loader(vcfg, val_classes, split=val_split)  # built once, reused every eval
     if len(val_loader.dataset) == 0:
@@ -1515,25 +1521,31 @@ def main(cfg: DictConfig) -> None:
                     if vals:
                         log[f"val/dice_r{s:g}"] = sum(vals) / len(vals)
                 log["val/dice_stitched"] = val_dice     # == macro stitched (checkpoint metric)
-                # multisource cohort: per-regime (ct / mri / cross) and per-target-modality
-                # (ct / mri) micro Dice, from the per-case `regime` / `modality` tags
-                # evaluate_cascade attaches. Reporting only — val/dice above is unchanged.
-                if cfg.data.get("source") == "multisource":
-                    from collections import defaultdict as _dd
-                    _reg, _tgt = _dd(list), _dd(list)
-                    for _c in cases:
-                        _d = _c.get("dice", float("nan"))
-                        if math.isnan(_d):
-                            continue
-                        if _c.get("regime"):
-                            _reg[_c["regime"]].append(_d)
-                        if _c.get("modality"):
-                            _tgt[_c["modality"]].append(_d)
-                    for _k, _v in _reg.items():
-                        log[f"val/dice_{_k}"] = sum(_v) / len(_v)
-                        log[f"val/n_{_k}"] = len(_v)
-                    for _k, _v in _tgt.items():
-                        log[f"val/dice_tgt_{_k}"] = sum(_v) / len(_v)
+            # multisource cohort: per-regime (ct / mri / cross) and per-target-modality (ct /
+            # mri) micro Dice, from the per-case `regime` / `modality` tags both evaluate.py's
+            # non-cascade evaluate_classes and cascade.py's evaluate_cascade attach. Reporting
+            # only — val/dice above is unchanged. Previously nested under `cascade_spacings`,
+            # so a plain (non-cascade) multisource run like this whole 108+ chain never got a
+            # per-modality breakdown even though every case already carries the tags — fixed
+            # 2026-09-22.
+            _tgt_dice = {}
+            if cfg.data.get("source") == "multisource":
+                from collections import defaultdict as _dd
+                _reg, _tgt = _dd(list), _dd(list)
+                for _c in cases:
+                    _d = _c.get("dice", float("nan"))
+                    if math.isnan(_d):
+                        continue
+                    if _c.get("regime"):
+                        _reg[_c["regime"]].append(_d)
+                    if _c.get("modality"):
+                        _tgt[_c["modality"]].append(_d)
+                for _k, _v in _reg.items():
+                    log[f"val/dice_{_k}"] = sum(_v) / len(_v)
+                    log[f"val/n_{_k}"] = len(_v)
+                for _k, _v in _tgt.items():
+                    _tgt_dice[_k] = sum(_v) / len(_v)
+                    log[f"val/dice_tgt_{_k}"] = _tgt_dice[_k]
             # Seen/unseen macro split. data.val_classes may deliberately hold classes the model
             # never trained on, as a generalization control (exp57: 8 trained + 8 held-out, each
             # size-matched to a trained class). REPORTING ONLY — val/dice above stays the plain
@@ -1583,6 +1595,7 @@ def main(cfg: DictConfig) -> None:
                        f"(best {max(best, val_dice):.4f})"
                        + ("".join(f" {k}={v:.4f}" for k, v in seen_unseen.items())
                           if len(seen_unseen) == 2 else "")
+                       + ("".join(f" {k}={v:.4f}" for k, v in _tgt_dice.items()))
                        + (f" enc_drift={log['encoder_drift/total']:.4f}" if drift else ""))
             if val_dice > best:
                 best = val_dice

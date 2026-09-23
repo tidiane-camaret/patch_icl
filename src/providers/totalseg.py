@@ -201,7 +201,7 @@ def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback, fg_sam
 
 class TotalSegProvider:
     """Source-specific I/O for the totalseg family: scan + bbox caches and a single
-    raw_ct organ-crop `load`. Missing ct_raw.npy is a hard error."""
+    raw_ct organ-crop `load`. Missing {ct,mri}_raw.npy is a hard error."""
 
     def __init__(self, root, classes, image_size, split=None, meta_csv=None,
                  max_subjects=None, crop_spacing_mm=1.5, crop_jitter=None,
@@ -219,6 +219,10 @@ class TotalSegProvider:
         self.mask_downsample = mask_downsample
         self.mask_occupancy_thr = float(mask_occupancy_thr)
         self.modality = modality
+        # Raw-image filename prefix: MRI subjects get their own mri*.npy files (a from-CT
+        # copy-paste originally left them wrongly named ct*.npy/ct_stats.json — fixed
+        # 2026-09-22). CT keeps its established ct*.npy naming.
+        self._img_prefix = "mri" if modality == "mri" else "ct"
 
         subjects = self._subjects(split, meta_csv, max_subjects)
         scan = self._load_or_build_scan()
@@ -230,14 +234,15 @@ class TotalSegProvider:
                     self._label_to_subjects[c].append(s)
         self._bbox = self._load_or_build_bbox()
         self._spacings = self._load_spacings()
-        self._ct_stats = self._load_ct_stats() if modality == "mri" else {}
+        self._mri_stats = self._load_mri_stats() if modality == "mri" else {}
 
         # Optional process-lifetime RAM cache of native volumes, preloaded here in
         # the main process so DataLoader forks share the buffers copy-on-write.
         self._ram = None
         if ram_cache:
             subs = sorted({s for lst in self._label_to_subjects.values() for s in lst})
-            self._ram = get_cache(self.root, subs, max_subjects=ram_cache_max_subjects)
+            self._ram = get_cache(self.root, subs, max_subjects=ram_cache_max_subjects,
+                                  image_filename=f"{self._img_prefix}_raw.npy")
 
     def __getstate__(self):
         """Never ship the RAM cache through pickle.
@@ -273,15 +278,15 @@ class TotalSegProvider:
         jitter = _resolve_jitter(req, self.crop_jitter)
         native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
         norm = ((lambda a: normalize_ct(a, self.ct_spec)) if self.modality == "ct"
-                else (lambda a: normalize_mri(a, self._ct_stats[subject])))
-        # Fast path: a pre-resampled `ct_raw_{crop_spacing:g}mm.npy` image cache (whole-body
-        # native CT downsampled to the crop pitch once, offline). Used only when its pitch
-        # equals the requested crop_spacing (so the image is never upsampled); the mask still
-        # comes from the full-res native label so occupancy is unchanged. See docs/logs.md.
-        # Skipped on a RAM-cache hit: the resident native ct_raw already removes the NFS read
-        # this exists to avoid, and a varspacing run's pitch is continuous so the per-pitch
-        # file essentially never exists anyway.
-        cache_p = subj_dir / f"ct_raw_{req.crop_spacing_mm:g}mm.npy"
+                else (lambda a: normalize_mri(a, self._mri_stats[subject])))
+        # Fast path: a pre-resampled `{ct,mri}_raw_{crop_spacing:g}mm.npy` image cache
+        # (whole-body native volume downsampled to the crop pitch once, offline). Used only
+        # when its pitch equals the requested crop_spacing (so the image is never upsampled);
+        # the mask still comes from the full-res native label so occupancy is unchanged. See
+        # docs/logs.md. Skipped on a RAM-cache hit: the resident native raw array already
+        # removes the NFS read this exists to avoid, and a varspacing run's pitch is
+        # continuous so the per-pitch file essentially never exists anyway.
+        cache_p = subj_dir / f"{self._img_prefix}_raw_{req.crop_spacing_mm:g}mm.npy"
         if not ram_hit and cache_p.exists():
             img_cache_np = np.load(cache_p, mmap_mode="r")
             image_t, label_t, geom = crop_and_place_cached(
@@ -295,9 +300,9 @@ class TotalSegProvider:
             if ram_hit:
                 image_np = ram[subject]["ct_raw"]
             else:
-                raw = subj_dir / "ct_raw.npy"
+                raw = subj_dir / f"{self._img_prefix}_raw.npy"
                 if not raw.exists():
-                    raise FileNotFoundError(f"{raw} missing (v2 requires ct_raw.npy)")
+                    raise FileNotFoundError(f"{raw} missing (v2 requires {raw.name})")
                 image_np = np.load(raw, mmap_mode="r")
             image_t, label_t, geom = crop_and_place(
                 image_np, label_np, _ALL_CLASSES_IDX.get(cls, -1), center, self.T,
@@ -322,7 +327,7 @@ class TotalSegProvider:
         else:
             subj_dir = self.root / subject
             label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
-            image_np = np.load(subj_dir / "ct_raw.npy", mmap_mode="r")
+            image_np = np.load(subj_dir / f"{self._img_prefix}_raw.npy", mmap_mode="r")
         center = req.center
         if center is None:
             D, H, W = label_np.shape
@@ -338,7 +343,7 @@ class TotalSegProvider:
         # foreground stats for MRI (normalize_mri is the same pointwise clip+z-score
         # form, so one CtNormSpec reproduces it). The GPU realize step reads nc.norm.
         norm = (self.ct_spec if self.modality == "ct"
-                else resolve_ct_norm(self._ct_stats[subject]))
+                else resolve_ct_norm(self._mri_stats[subject]))
         return build_native_crop(
             crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
             crop_spacing_mm=float(req.crop_spacing_mm),
@@ -408,8 +413,8 @@ class TotalSegProvider:
             raw = json.load(f)
         return {s: tuple(float(x) for x in m["spacing"]) for s, m in raw.items()}
 
-    def _load_ct_stats(self):
-        path = self.root / "ct_stats.json"
+    def _load_mri_stats(self):
+        path = self.root / "mri_stats.json"
         if not path.exists():
             return {}
         with open(path) as f:

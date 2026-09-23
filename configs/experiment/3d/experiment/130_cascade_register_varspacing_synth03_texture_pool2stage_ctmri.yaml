@@ -1,0 +1,159 @@
+# @package _global_
+# 130_..._ctmri — continues 110's checkpoint (the current mainline: bi-axial, pool2stage,
+# CT-only, val_dice=0.5103 @ e50) with the ONE isolated change: data.source_mix.regime_p
+# 1.0/0.0/0.0 -> 0.5/0.5/0.0 -- MRI subjects now enter training (half the tasks are all-MRI,
+# half are all-CT, no forced cross-modality tasks yet).
+#
+#   python experiments/3d/train.py experiment=130_cascade_register_varspacing_synth03_texture_pool2stage_ctmri
+#
+# WHY (2026-09-22): first CT+MRI joint-training run since exp81 (which predates this whole
+# 105-121 cascade_register/pool_token/synth-texture chain). Architecture is UNCHANGED from
+# 110 -- MRI images flow through the exact same img_embed/encoder as CT, so this is a pure
+# data-distribution change, not a parameter-introducing one (unlike 120's dual_axis=false,
+# which needed a longer warmup because fuse_conv REPLACED the token-construction pathway).
+# `arch.encoder_input_norm=instance` has been carried since exp80 specifically "ready for
+# the planned CT+MRI joint run" (per-instance re-norm regardless of source stats), so no
+# arch change is needed here either.
+#
+# MRI DATA PREP done same day, before this run:
+#   1. totalsegmri's ct_stats.json was recomputed at 2nd/98th foreground percentiles
+#      (previously 0.5/99.5 -- a straight carry-over from the CT-side nnU-Net convention,
+#      not what MRI needs; IRIS's own preprocessing note (docs/methods/iris.md:189) and
+#      Medverse's released preprocessing (arxiv 2509.09232) both clip MRI at 2nd/98th).
+#      scripts/recompute_mri_stats.py --pct-lo 2 --pct-hi 98 (re-reads existing mri_raw.npy,
+#      no .nii.gz re-decode needed).
+#   2. totalsegmri's files were mistakenly ct*-named throughout the pipeline (a from-CT
+#      copy-paste in convert_to_npy.py) -- renamed repo- and data-wide to mri*.npy /
+#      mri_stats.json (scripts/rename_mri_files.py; src/providers/totalseg.py,
+#      src/providers/volume_cache.py, scripts/convert_to_npy.py, and the legacy v1
+#      src/totalseg_dataloader_incontext.py raw_ct MRI path all updated to match).
+# Neither of these needed new preprocessing -- both worked off the already-converted
+# mri_raw.npy files.
+#
+# data.mask_occupancy_thr stays at the chain default (0.5, shared between CT and MRI --
+# no per-source override exists). Confirmed this is NOT a vanish-vs-survive threshold under
+# the active mask_downsample=soft: it only floors the peak cell of an already-surviving
+# sub-cell-thin structure's soft target (never binarizes, never drops anything) -- see
+# docs/logs.md.
+#
+# CHECKPOINT: resumes 110's own best.pt (the current mainline, not 121's still-training
+# dual_axis=false ablation branch) -- architecture is IDENTICAL to 110, so this is a strict,
+# full-shape weight load, no partial/shape-mismatch handling needed.
+# `train.checkpoint_allow_partial=false`. `resume_weights_only=true` stays on.
+# `train.warmup_epochs=1` (chain standard) -- unlike 120, no new/reinitialized parameters are
+# introduced here, so there is no cold-start pathway to hedge against.
+#
+# EVAL: eval.source_mix.eval_epoch_length left at 800 (chain default) -- now split ~400/400
+# between the ct/mri pure regimes (per_source_train_classes=[balanced, balanced]: CT's
+# balanced pool is 47 classes, MRI's is 31 -- see evaluate.py's sample-table `detail` column
+# for the per-regime/per-modality Dice breakdown).
+#
+# BUDGET: epochs=51 (0..50), matching the whole chain's own cutoff for direct comparability.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  # pool_source left at its default ('fine'); fine_stage=[0,1] inherited from
+  # model=m2_patchset_decoder -- identical to 110, unaffected by the CT/MRI mix.
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]   # the isolated variable vs 110 -- see WHY above
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_110_cascade_register_varspacing_synth03_texture_pool2stage/best.pt
+  checkpoint_allow_partial: false   # identical arch to 110 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 130_cascade_register_varspacing_synth03_texture_pool2stage_ctmri

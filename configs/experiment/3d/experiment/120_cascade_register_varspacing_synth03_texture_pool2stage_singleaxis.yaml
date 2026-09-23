@@ -132,9 +132,16 @@ train:
   profile_timing: true
   drop_last: true
 
-  lr: 1.0e-4
+  lr: 1.0e-4     # unchanged from 105-110 -- already m2_patchset_decoder's own stated B=8
+                 # base (not a reduced fine-tune value), see 105's ASSUMPTIONS
   encoder_lr_scale: 1
-  warmup_epochs: 1
+  warmup_epochs: 2   # bumped from the chain's usual 1: unlike pool_proj/pool_type (108-110,
+                     # additive extra rows the pretrained path can ignore at step 0), fuse_conv/
+                     # fuse_mask_token REPLACE the entire token-construction step -- no
+                     # pretrained fallback, a not-yet-tuned random conv feeds the whole
+                     # (mostly pretrained) transformer's input from step 0. Not the full
+                     # from-scratch default (5): everything downstream of the fusion is still
+                     # a genuine warm-start.
   checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_108_cascade_register_varspacing_synth03_texture_pool/best.pt
   checkpoint_allow_partial: true   # qkv_col/norm1 dropped, fuse_conv/fuse_mask_token new -- see CHECKPOINT above
   resume_weights_only: true

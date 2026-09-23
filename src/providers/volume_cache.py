@@ -16,8 +16,8 @@ import numpy as np
 _CACHE: dict[str, dict[str, dict[str, np.ndarray]]] = {}   # str(root) -> {subject -> {"ct_raw","label"}}
 
 
-def _load_one(root: Path, s: str):
-    cp, lp = root / s / "ct_raw.npy", root / s / "label.npy"
+def _load_one(root: Path, s: str, image_filename: str):
+    cp, lp = root / s / image_filename, root / s / "label.npy"
     if not (cp.exists() and lp.exists()):
         return s, None
     ct = np.load(cp)                       # materialize into RAM (not mmap)
@@ -27,8 +27,14 @@ def _load_one(root: Path, s: str):
     return s, {"ct_raw": ct, "label": lb}
 
 
-def get_cache(root, subjects, *, max_subjects=None, workers=16) -> dict:
-    """See plan Task 1 Interfaces. Idempotent per str(root); tops up missing subjects."""
+def get_cache(root, subjects, *, max_subjects=None, workers=16,
+             image_filename: str = "ct_raw.npy") -> dict:
+    """See plan Task 1 Interfaces. Idempotent per str(root); tops up missing subjects.
+
+    `image_filename` names the raw-image file inside each subject dir ("ct_raw.npy" for
+    CT sources; "mri_raw.npy" for the totalsegmri modality — see TotalSegProvider). The
+    returned per-subject dict key stays "ct_raw" regardless (an internal cache-slot label,
+    not a file name)."""
     key = str(root)
     root = Path(root)
     store = _CACHE.setdefault(key, {})
@@ -41,7 +47,7 @@ def get_cache(root, subjects, *, max_subjects=None, workers=16) -> dict:
     if todo:
         t0, n, nbytes = time.perf_counter(), 0, 0
         with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as ex:
-            for s, payload in ex.map(lambda s: _load_one(root, s), todo):
+            for s, payload in ex.map(lambda s: _load_one(root, s, image_filename), todo):
                 if payload is not None:
                     store[s] = payload
                     n += 1

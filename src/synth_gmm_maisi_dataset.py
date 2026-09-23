@@ -36,7 +36,7 @@ class SynthGmmMaisiDataset(Dataset):
                  cohort=None, mask_downsample="occupancy", mask_occupancy_thr=0.1,
                  class_balanced=True, gpu_realize=False, gpu_realize_max_native=256,
                  paint_mask_aligned=False, mu_group_ids=None, mu_group_rho=None,
-                 sd_between_ratio=None):
+                 sd_between_ratio=None, sd_group_ids=None, sd_group_rho=None):
         assert image_size[0] == image_size[1] == image_size[2], "cubic crops only"
         self.T = int(image_size[0])
         self.k = int(context_size)
@@ -104,6 +104,21 @@ class SynthGmmMaisiDataset(Dataset):
         # preset (6-family lookup, see src.gpu_gmm_intensity). Or pass an explicit
         # (maxid+1,)-length array.
         self.between_ratio = resolve_between_ratio(sd_between_ratio, self.maxid)
+        # sd_group_ids/sd_group_rho: the sd analog of mu_group_ids -- cross-CLASS correlation
+        # of the VARIANCE parameter itself (does bone-class-A's variance draw correlate with
+        # bone-class-B's, the way their mu draws already do), a DIFFERENT axis from
+        # sd_between_ratio above (which is cross-MEMBER, within one class). Was entirely
+        # absent until now: sd was always drawn fully independently regardless of
+        # mu_group_ids. Real per-subject within-scan voxel variance correlates across classes
+        # by tissue type similarly to mean intensity (docs/logs.md 2026-09-23 "CT+MRI voxel-
+        # variance correlation" -- pooled CT+MRI mean|r|=0.33, e.g. autochthon L/R rho=0.94,
+        # clavicula+scapula rho=0.81, iliac_artery L/R rho=0.84). None/empty (default) = fully
+        # independent, unchanged. Same 1-based-MAISI-id / 0-based-position convention as
+        # mu_group_ids (maisi_ids_to_indices, applied to the same-shape sd[1:] slots).
+        self.sd_group_ids = (maisi_ids_to_indices(sd_group_ids) if sd_group_ids else ())
+        self.sd_group_rho = tuple(sd_group_rho) if sd_group_rho else ()
+        assert len(self.sd_group_ids) == len(self.sd_group_rho), \
+            (self.sd_group_ids, self.sd_group_rho)
         # cohort-sampling knobs (distance weights + diversity) -> CohortSampler; empty = defaults.
         # class_balanced (uniform-over-classes vs mask-frequency prior) is a top-level knob
         # mirroring totalseg data.class_balanced, passed alongside the cohort dict.
@@ -237,7 +252,17 @@ class SynthGmmMaisiDataset(Dataset):
                                             self.mu_group_rho, nrng)
         else:
             mu[1:] = nrng.uniform(0.0, 255.0, size=n - 1)
-        sd = np.sqrt(nrng.uniform(0.0, self.var_max, size=n)).astype(np.float32)
+        # sd: EITHER fully independent (default, byte-identical to pre-sd_group_ids behavior)
+        # OR grouped-correlated (sd_group_ids set) -- mirrors mu's branch exactly. sd[0] is
+        # always overwritten by the background-mode branch just below regardless of which
+        # path drew it, so the grouped branch leaves it at 0.0 rather than spending an extra
+        # draw on a value that never survives.
+        if self.sd_group_ids:
+            sd = np.zeros(n, dtype=np.float32)
+            sd[1:] = np.sqrt(sample_grouped_uniform(n - 1, 0.0, self.var_max, self.sd_group_ids,
+                                                     self.sd_group_rho, nrng)).astype(np.float32)
+        else:
+            sd = np.sqrt(nrng.uniform(0.0, self.var_max, size=n)).astype(np.float32)
         if self.bg_mode == "zero":
             mu[0] = 0.0; sd[0] = 0.0
         else:

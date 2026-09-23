@@ -1,0 +1,142 @@
+# @package _global_
+# 121_..._singleaxis_cont — continues 120's own checkpoint for another epoch-51 block, to
+# remove the cold-start confound from the dual_axis=False vs 110 comparison.
+#
+#   python experiments/3d/train.py experiment=121_cascade_register_varspacing_synth03_texture_pool2stage_singleaxis_cont
+#
+# WHY (2026-09-22): 120 (dual_axis=False, resumed from 108) started at val_dice=0.0067 (e0)
+# and only reached 0.1398 by e40, vs 110's (dual_axis=True) 0.4774 at e0 / 0.5042 at e40 --
+# a huge gap, not a modest one. Root cause: unlike 108/109/110's pool_proj/pool_type reinit
+# (an ADDITIVE extra row the pretrained path can ignore at step 0), dual_axis=False's
+# fuse_conv/fuse_mask_token REPLACE the entire token-construction step every pretrained
+# downstream layer (qkv_row, MLP, decoder) was trained to expect -- a random fuse_conv at
+# step 0 feeds those layers a token distribution they've never seen, so most of the
+# (otherwise 90%+ transferred) network effectively has to relearn how to use its own inputs.
+# warmup_epochs=2 (120's own bump from the chain's usual 1) clearly wasn't enough to prevent
+# this being a near-from-scratch climb rather than a warm start. This run continues 120's
+# OWN checkpoint (now genuinely warm -- fuse_conv has had 51 epochs of real gradient signal,
+# not a cold random init) so the comparison against 110 isn't confounded by this transition
+# artifact: either (a) it catches up substantially and the eventual gap is the real
+# bi-axial-vs-single-axis signal, or (b) it plateaus well below 110's ~0.51 even with double
+# the total budget, in which case that itself is a real (not cold-start-confounded) result.
+#
+# CHECKPOINT: resumes 120's own best.pt. Architecture is IDENTICAL to 120 (same dual_axis=
+# false, axis_fuse_r=4, pool_token=true, fine_stage=[0,1]) -- a strict, full-shape weight
+# load, no partial/shape-mismatch handling needed. warmup_epochs back down to the chain's
+# usual 1 (this is now a genuine warm continuation of 120's own progress, not a structural
+# change) -- unlike 120's own bumped warmup_epochs=2, which hedged against the cold fuse_conv.
+# resume_weights_only=true stays on (fresh optimizer/scheduler/epoch each step, chain-wide
+# convention).
+#
+# BUDGET: epochs=51 (0..50 again, i.e. a second full block on top of 120's own 51) -- doubles
+# 120's total training to ~100 epochs. Re-evaluate once this finishes: if val_dice is still
+# rising steeply, extend further; if it's clearly plateaued, that's the deconfounded result.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  dual_axis: false
+  axis_fuse_r: 4
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: null
+    mu_group_rho: null
+    sd_between_ratio: null
+    p_shape: 0.5
+    shape: {}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 51
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1    # back to the chain's usual value -- this is a genuine warm continuation
+                      # of 120's own progress now, not the structural fuse_conv cold-start
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_120_cascade_register_varspacing_synth03_texture_pool2stage_singleaxis/best.pt
+  checkpoint_allow_partial: false   # identical arch to 120 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 121_cascade_register_varspacing_synth03_texture_pool2stage_singleaxis_cont

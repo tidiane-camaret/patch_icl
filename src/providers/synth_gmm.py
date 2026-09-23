@@ -161,6 +161,23 @@ def _heterogeneity_map(mask, rng, spec):
 # member indices 0, 1, 2, ...) -- np.random.default_rng's SeedSequence coerces every
 # entry to uint32, so this must be a valid non-negative int, not -1.
 _SHAPE_COHORT_HP_SEED_KEY = 2**32 - 1
+# Distinct sentinel for the host-anchored shape-intensity draw (ShapeCohortSpec.host_anchored)
+# -- a separate rng stream from _SHAPE_COHORT_HP_SEED_KEY so turning host_anchored on/off
+# never perturbs the shape geometry draw (or vice versa).
+_SHAPE_INTENSITY_SEED_KEY = 2**32 - 2
+
+
+def _anchor_shape_mu(mu, sd, host_cls_id, shape_id, gmm_seed, spec):
+    """Mutates mu[shape_id] in place to spec.host_anchored's contract -- see ShapeCohortSpec.
+    No-op (today's fully-independent-draw behavior, unchanged) when host_anchored=False. Drawn
+    from a dedicated seed-derived rng (not rng/member_nrng) so it is cohort-shared (same value
+    for target + every context member, like shape_hp) and reproducible at any cascade re-crop
+    level from gmm_seed alone -- called identically from assemble_task and load_native_crop."""
+    if shape_id is None or not spec.host_anchored:
+        return
+    orng = np.random.default_rng([int(gmm_seed), _SHAPE_INTENSITY_SEED_KEY])
+    ratio = orng.uniform(*spec.host_contrast_ratio_range)
+    mu[shape_id] = float(np.clip(mu[host_cls_id] + ratio * sd[host_cls_id], 0.0, 255.0))
 
 
 class SynthGmmProvider:
@@ -202,7 +219,17 @@ class SynthGmmProvider:
                                             self.ds.mu_group_rho, nrng)
         else:
             mu[1:] = nrng.uniform(0.0, 255.0, size=n - 1)
-        sd = np.sqrt(nrng.uniform(0.0, self.ds.var_max, size=n)).astype(np.float32)
+        # sd: mirrors SynthGmmMaisiDataset.assemble()'s own branch exactly (same
+        # self.ds.sd_group_ids/sd_group_rho, same byte-identical-when-unset guarantee) --
+        # this function's whole point is reproducing assemble()'s draw from the seed alone,
+        # so it must stay in lockstep with that method's logic.
+        if self.ds.sd_group_ids:
+            sd = np.zeros(n, dtype=np.float32)
+            sd[1:] = np.sqrt(sample_grouped_uniform(n - 1, 0.0, self.ds.var_max,
+                                                     self.ds.sd_group_ids, self.ds.sd_group_rho,
+                                                     nrng)).astype(np.float32)
+        else:
+            sd = np.sqrt(nrng.uniform(0.0, self.ds.var_max, size=n)).astype(np.float32)
         if self.ds.bg_mode == "zero":
             mu[0] = 0.0; sd[0] = 0.0
         else:
@@ -360,6 +387,7 @@ class SynthGmmProvider:
                 np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
             family_by_shape_name = {v: k for k, v in SHAPE_ID_TO_FAMILY.items()}
             shape_id = family_by_shape_name[shape_hp.family]
+            _anchor_shape_mu(mu, sd, host_cls_id, shape_id, gmm_seed, self.shape_spec)
 
         # Cohort-level (not per-member) decision, independent of p_shape -- target and
         # context members represent the same task, so either all or none get the
@@ -430,6 +458,7 @@ class SynthGmmProvider:
                 f"shape id/family mismatch: cls={cls_id!r} resolved family "
                 f"{SHAPE_ID_TO_FAMILY.get(shape_id)!r} != redrawn cohort family "
                 f"{shape_hp.family!r} -- mis-routed cls or subject string")
+            _anchor_shape_mu(mu, sd, host_cls_id, shape_id, gmm_seed, self.shape_spec)
             cls_id = host_cls_id       # resolve center/crop against the real host anchor
 
         # no jitter for cascade recrops (center is predicted, not default centroid)

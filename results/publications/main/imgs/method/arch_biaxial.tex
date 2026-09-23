@@ -32,6 +32,15 @@
   \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
         line width=0.9pt,#3] #1 to[bend left=12] #2;
 }
+% \fanarrow{x}{y1}{y2}{bulge}{color} -- Bezier double-arrow between two
+% points at the same x, bulging sideways by a FIXED amount (signed) rather
+% than one that scales with the (possibly tiny) y1-y2 distance -- lets a
+% nested fan of these stay visible/distinguishable at increasing radii.
+\newcommand{\fanarrow}[5]{
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,#5]
+    (#1,#2) .. controls +(#4,0.05) and +(#4,-0.05) .. (#1,#3);
+}
 
 \def\tsz{0.16}
 \def\toff{0.22}
@@ -61,7 +70,7 @@
   \draw[black!25,rounded corners=3pt]
     (\ximgA-0.45,\yCtx-\clusterhalf-0.15) rectangle (\xlblA+0.45,\yTgt+\clusterhalf+0.15);
   \draw[black!25,rounded corners=3pt]
-    (\ximgB-0.45,\yCtx-\clusterhalf-0.15) rectangle (\xlblB+0.45,\yTgt+\clusterhalf+0.15);
+    (\ximgB-0.68,\yCtx-\clusterhalf-0.15) rectangle (\xlblB+0.68,\yTgt+\clusterhalf+0.15);
   \node[anchor=south,font=\bfseries\small] at ({(\ximgA+\xlblA)/2},\yTgt+\clusterhalf+0.25) {Image/label axis};
   \node[anchor=south,font=\bfseries\small] at ({(\ximgB+\xlblB)/2},\yTgt+\clusterhalf+0.25) {Patch axis};
 
@@ -73,15 +82,15 @@
   \node[anchor=south,font=\scriptsize] at (\ximgB,\yTgt+\clusterhalf+0.05) {img};
   \node[anchor=south,font=\scriptsize] at (\xlblB,\yTgt+\clusterhalf+0.05) {lbl};
 
-  % ---- token clusters (both panels). img fill is neutral (blue) with a
-  % role-colored ring; lbl fill IS the role color (context=red, target=
-  % green), so its ring is plain black instead of a same-color/invisible
-  % colored ring. ----
-  \foreach \y/\imgring/\lblfill in {\yTgt/archTargetAccent/archTargetAccent,
-                                     \yCtx/archContextPink!70!black/archContextAccent} {
-    \tpcluster{\ximgA}{\y}{archAttnBlue}{\imgring}
+  % ---- token clusters (both panels). Fill carries the role color for
+  % BOTH streams, matching the other figures' convention (light pastel
+  % for image content, dark accent for label/mask content) -- so both
+  % rings are plain black instead of a same-color/invisible colored ring.
+  \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/archTargetAccent,
+                                     \yCtx/archContextPink/archContextAccent} {
+    \tpcluster{\ximgA}{\y}{\imgfill}{black!70}
     \tpcluster{\xlblA}{\y}{\lblfill}{black!70}
-    \tpcluster{\ximgB}{\y}{archAttnBlue}{\imgring}
+    \tpcluster{\ximgB}{\y}{\imgfill}{black!70}
     \tpcluster{\xlblB}{\y}{\lblfill}{black!70}
   }
 
@@ -91,22 +100,22 @@
     \dblarrow{(\ximgA+\tsz/2,\yTgt+\doff)}{(\xlblA-\tsz/2,\yTgt+\doff)}{archTargetAccent}
   }
 
-  % ---- Panel B: patch axis -- one representative edge per stream between
-  % the context and target token clusters (stands in for full attention
-  % among all N tokens of both volumes). Context/target tokens are adjacent
-  % (no gap), so a bend-shorthand arc (radius scales with the now-tiny
-  % endpoint distance) would be imperceptible -- explicit Bezier control
-  % points give a loop of fixed, visible size regardless. ----
-  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
-        line width=0.9pt,archTargetAccent]
-    (\ximgB-\tsz/2,\yCtx+\toff) .. controls +(-0.28,0.05) and +(-0.28,-0.05) .. (\ximgB-\tsz/2,\yTgt-\toff);
-  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
-        line width=0.9pt,archTargetAccent]
-    (\xlblB+\tsz/2,\yCtx+\toff) .. controls +(0.28,0.05) and +(0.28,-0.05) .. (\xlblB+\tsz/2,\yTgt-\toff);
+  % ---- Panel B: patch axis -- a nested fan of edges (TabPFN Fig. 1's "1D
+  % sample attention" device) instead of one representative connector.
+  % Each of the 3 target tokens pairs with a context token at increasing
+  % depth/radius (a diagonal sweep, not literally all 3x3=9 pairs -- TabPFN
+  % itself doesn't draw every pair either, just enough nesting to read as
+  % "many-to-many"). Fixed-bulge arcs (\fanarrow) stay visible at their own
+  % radius even though context/target tokens are adjacent (no gap). ----
+  \foreach \yt/\yc/\bulge in {0.44/0.22/0.26, 0.66/0/0.42, 0.88/-0.22/0.58} {
+    \pgfmathsetmacro{\bneg}{-\bulge}
+    \fanarrow{\ximgB-\tsz/2}{\yc}{\yt}{\bneg}{archTargetAccent}
+    \fanarrow{\xlblB+\tsz/2}{\yc}{\yt}{\bulge}{archTargetAccent}
+  }
 
   % ---- caption note ----
   \node[anchor=north,align=center,font=\scriptsize,black!55] at ({(\ximgB+\xlblB)/2},\yCtx-\clusterhalf-0.25)
-    {edge stands in for full attention\\among all $N$ tokens, both volumes};
+    {nested edges stand in for full attention\\among all $N$ tokens, both volumes};
 
   % ---- legend ----
   \node[anchor=west,font=\scriptsize] at (\ximgA-0.45,\yCtx-\clusterhalf-1.15)

@@ -1,0 +1,181 @@
+# @package _global_
+# 135_..._intensitycalib — continues 130's checkpoint (clean CT+MRI baseline, NOT the shaky
+# 131/132/133/134 shape-diversity branch) with THREE real-data intensity calibrations built
+# 2026-09-23: `mu_group_ids=merged` (cross-class MEAN correlation) + `sd_between_ratio=ct_mri`
+# (between-subject/within-scan variance RATIO) + `sd_group_ids=merged` (cross-class VARIANCE
+# correlation, added to this config after it was first written -- same day, same probe). All
+# three were already implemented+tested in src/gpu_gmm_intensity.py but sat completely unused
+# (`null`/absent in every config in the repo, including the whole 108-134 chain) -- this is the
+# first run that actually turns any of them on.
+#
+# ALSO bumped `data.p_synth` 0.3->0.5 and `data.gmm.p_shape` 0.5->1.0 (user request, same
+# session): more synthetic-task exposure overall, and EVERY synth cohort now becomes a
+# procedural-shape task (blob/splatter/disk/cylinder stamped into a real host organ) rather
+# than half real-organ-mask / half-shape.
+#
+# ALSO enabled `shape.host_anchored=true` (added after the p_synth/p_shape bump, same
+# session): the shape's own mu is now anchored to its host organ's real mu/sd
+# (ratio range (-2.5,2.5), calibrated against REAL target-vs-surrounding-tissue contrast
+# measured on the 7 OOD eval sources -- docs/logs.md 2026-09-23 "target-surround contrast" --
+# not guessed) instead of an independent, host-unrelated draw (confirmed via
+# plot_shape_intensity.py to previously be totally uncorrelated with the host tissue). Directly
+# targets the user's stated goal for this probe: synthetic shapes are meant to help
+# generalization to classes OUTSIDE the ~130 TotalSeg/MAISI vocabulary (tumors/lesions), so they
+# should look like plausible tissue-consistent abnormalities, not arbitrary unrelated shades.
+#
+#   python experiments/3d/train.py experiment=135_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_intensitycalib
+#
+# WHY (2026-09-23): synth_gmm's mu/var are drawn fully independently per label slot today
+# ("intended domain randomization" -- no cross-class structure, no calibration to real data).
+# Two calibrations exist in code and were EITHER never wired (mu_group_ids) or only had a
+# CT-only preset (sd_between_ratio) until today:
+#   - mu_group_ids="merged": MERGED_GROUP_MAISI_IDS/MERGED_GROUP_RHO -- real TotalSeg CT +
+#     TotalSegMRI pooled cross-class mean-intensity correlation (6 groups, rho 0.72-0.88,
+#     confirmed CT-alone/MRI-alone agree closely on the same shared 46-class set -- genuine
+#     modality-invariant anatomy, not one modality dominating the pool).
+#   - sd_between_ratio="ct_mri": CT_MRI_BETWEEN_WITHIN_GROUPS/CT_MRI_BETWEEN_WITHIN_DEFAULT --
+#     UNLIKE mu's correlation, the real between/within variance ratio is NOT modality-invariant
+#     in absolute terms (MRI ~3x CT's), so this is a 50/50 modality-BLENDED table (matching
+#     data.source_mix.regime_p=[0.5,0.5]), not a literal "measured on both, they agree" number
+#     like mu's. Adds real member-to-member intensity variability within a synth cohort (today
+#     mu/sd are drawn once and shared verbatim by every member, so any organ with a few hundred
+#     voxels has ~zero actual member-to-member variability once noise averages out).
+#   - sd_group_ids="merged": VAR_GROUP_MAISI_IDS/VAR_GROUP_RHO -- cross-class correlation of the
+#     VARIANCE parameter itself (does bone-A's variance draw correlate with bone-B's, the way
+#     mu already does). This had NO mechanism at all before today (sd was always fully
+#     independent regardless of mu_group_ids). Pooled CT+MRI, 6 groups (rho 0.72-0.94, mostly
+#     bilateral L/R pairs). Two draw sites needed the same fix: SynthGmmMaisiDataset.assemble()
+#     AND SynthGmmProvider._draw_gmm() (the cascade-determinism re-derivation path, which is
+#     what this multisource+p_synth run actually exercises) -- both now branch identically.
+# These three calibrations are ADDITIVE and non-confounding (mu / sd_group_ids target
+# cross-CLASS structure of two different parameters within one draw; sd_between_ratio targets
+# cross-MEMBER structure within one class) -- combined in one probe rather than isolated like
+# the shape-diversity A/B, since there's no competing-mechanism question here the way
+# scatter-vs-diversity had.
+#
+# CHECKPOINT: resumes 130's own best.pt. Architecture identical -- strict full-shape load.
+# No new/reinitialized parameters (both changes are pure data-generation config, not model
+# structure) -- warmup_epochs=1, chain standard.
+#
+# BUDGET: epochs=31, matching the established quick-probe convention (131/132). Full 7-source
+# OOD sweep + diagnose_ood_failures.py rerun once done, compared against 130's own baseline.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5   # was 0.3
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged      # was null -- the isolated change (both knobs, see WHY above)
+    mu_group_rho: null
+    sd_between_ratio: ct_mri  # was null
+    sd_group_ids: merged      # was null -- cross-class VARIANCE correlation (added after this
+                               # config was first written, see docs/logs.md 2026-09-23 "CT+MRI
+                               # voxel-variance correlation"); complementary to mu_group_ids
+                               # (different parameter, non-confounding), so folded into the
+                               # same probe rather than isolated separately
+    sd_group_rho: null
+    p_shape: 1.0   # was 0.5
+    shape:
+      host_anchored: true   # was absent (=false) -- shape mu anchored to its host organ's own
+                             # mu/sd, ratio range (-2.5,2.5) calibrated against real target-vs-
+                             # surrounding-tissue contrast on the 7 OOD sources (docs/logs.md
+                             # 2026-09-23 "target-surround contrast"). Directly targets the
+                             # user's stated goal: synthetic shapes standing in for tumors/
+                             # lesions outside the ~130 TotalSeg/MAISI vocabulary should look
+                             # like plausible tissue-consistent abnormalities, not arbitrary
+                             # unrelated shades.
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 31
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-22_130_cascade_register_varspacing_synth03_texture_pool2stage_ctmri/best.pt
+  checkpoint_allow_partial: false   # identical arch to 130 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 135_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_intensitycalib

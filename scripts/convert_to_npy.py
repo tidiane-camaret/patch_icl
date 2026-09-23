@@ -11,10 +11,12 @@ With --size D H W (e.g. --size 128 128 128), also writes:
 
 Modality handling (--modality):
   ct  (default) : reads ct.nii.gz; clips HU to [CT_CLIP_MIN, CT_CLIP_MAX]; global z-score.
+                  Writes ct.npy / ct_raw.npy / ct_stats.json is N/A (CT uses a fixed frame).
   mri           : reads mri.nii.gz; clips to [0, per-volume 99.5th percentile of foreground]
                   by default (--mri-percentile-lo/--mri-percentile-hi to override);
-                  per-volume z-score (foreground mean/std).  Output still named ct.npy so the
-                  dataloader needs no changes.
+                  per-volume z-score (foreground mean/std). Writes mri.npy / mri_raw.npy /
+                  mri_stats.json (own naming — previously mistakenly reused the ct.npy /
+                  ct_raw.npy / ct_stats.json names, fixed 2026-09-22).
 
 Usage
 -----
@@ -172,7 +174,7 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
     Returns (subject_id, status, native_spacing, native_shape, mri_stats).
     native_spacing and native_shape are None when the NIfTI was not read
     (skipped subjects or sized-only runs where the native files already exist).
-    mri_stats is the per-volume MRI normalisation stats dict (for ct_stats.json) when
+    mri_stats is the per-volume MRI normalisation stats dict (for mri_stats.json) when
     store_raw + modality=mri, else None.
     """
     subj_dir = Path(task["inputs"]["subj_dir"])
@@ -185,17 +187,21 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
     mri_pct_hi = task.get("mri_percentile_hi", 99.5)
     subj = subj_dir.name
 
-    ct_out    = subj_dir / "ct.npy"
-    ct_raw_out = subj_dir / "ct_raw.npy"
+    # img_prefix: MRI subjects get their own mri*.npy files, matching TotalSegProvider's
+    # _img_prefix (a from-CT copy-paste originally left MRI outputs wrongly named ct*.npy /
+    # ct_stats.json — fixed 2026-09-22).
+    img_prefix = "mri" if modality == "mri" else "ct"
+    ct_out    = subj_dir / f"{img_prefix}.npy"
+    ct_raw_out = subj_dir / f"{img_prefix}_raw.npy"
     label_out = subj_dir / "label.npy"
 
     size_str    = f"{size[0]}x{size[1]}x{size[2]}" if size else None
-    ct_sized    = subj_dir / f"ct_{size_str}.npy"  if size else None
+    ct_sized    = subj_dir / f"{img_prefix}_{size_str}.npy"  if size else None
     label_sized = subj_dir / f"label_{size_str}.npy" if size else None
 
     # Pre-resampled image cache at `target_sp` mm (image only; the v2 loader keeps the
     # occupancy mask on the full-res native label). Named to match TotalSegProvider.load.
-    ct_cache_out = subj_dir / f"ct_raw_{target_sp:g}mm.npy" if target_sp else None
+    ct_cache_out = subj_dir / f"{img_prefix}_raw_{target_sp:g}mm.npy" if target_sp else None
 
     need_native = overwrite or not (ct_out.exists() and label_out.exists())
     need_raw    = store_raw and (overwrite or not ct_raw_out.exists())
@@ -265,7 +271,7 @@ def _convert_totalseg(task: dict) -> tuple[str, str, list | None, list | None, d
 
         if need_cache:
             # Raw HU (native) + native spacing: reuse the in-memory read when the native/raw
-            # block ran, else load ct_raw.npy (raw int16 HU) and read spacing from the header.
+            # block ran, else load {ct,mri}_raw.npy and read spacing from the header.
             raw_hu = raw if (need_native or need_raw) else None
             if raw_hu is None:
                 if ct_raw_out.exists():
@@ -361,9 +367,9 @@ def main():
                         help="ct (default): reads ct.nii.gz with HU normalisation; "
                              "mri: reads mri.nii.gz with per-volume percentile z-score")
     parser.add_argument("--store-raw", action="store_true",
-                        help="also write native ct_raw.npy (raw intensities: int16 HU for CT, "
-                             "float16 for MRI) so the loader can normalise on the fly. For MRI "
-                             "also writes per-volume stats to ct_stats.json.")
+                        help="also write native {ct,mri}_raw.npy (raw intensities: int16 HU "
+                             "for CT, float16 for MRI) so the loader can normalise on the fly. "
+                             "For MRI also writes per-volume stats to mri_stats.json.")
     parser.add_argument("--source", choices=["totalseg", "chemotox"], default="totalseg",
                         help="dataset source: totalseg (dir tree, default) or chemotox (JSON of paths)")
     parser.add_argument("--out", default=None,
@@ -375,10 +381,10 @@ def main():
                         help="convert only the first N subjects (smoke test)")
     parser.add_argument("--mri-percentile-lo", type=float, default=0.5, dest="mri_percentile_lo",
                         help="mri only: lower foreground percentile for the clip window "
-                             "written to ct_stats.json (default: 0.5)")
+                             "written to mri_stats.json (default: 0.5)")
     parser.add_argument("--mri-percentile-hi", type=float, default=99.5, dest="mri_percentile_hi",
                         help="mri only: upper foreground percentile for the clip window "
-                             "written to ct_stats.json (default: 99.5)")
+                             "written to mri_stats.json (default: 99.5)")
     args = parser.parse_args()
 
     data_dir = args.data
@@ -403,7 +409,7 @@ def main():
             spacings = json.load(f)
     else:
         spacings = {}
-    stats_path = out_root / "ct_stats.json"
+    stats_path = out_root / "mri_stats.json"   # only ever populated for --modality mri
     if stats_path.exists():
         with open(stats_path) as f:
             ct_stats = json.load(f)
