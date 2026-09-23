@@ -1,0 +1,128 @@
+# @package _global_
+# 135b — continues 135's own checkpoint (the full intensity-calibration + host-anchored-shapes
+# recipe: mu_group_ids=merged, sd_between_ratio=ct_mri, sd_group_ids=merged, p_synth=0.5,
+# p_shape=1.0, shape.host_anchored=true) for a much longer 200-epoch budget. 135 itself only
+# ran 31 epochs (the chain's usual quick-probe budget) and plateaued early (best val_dice=0.4104
+# at e10, flat-to-slightly-down through e30) -- this run checks whether it was still finding its
+# footing on the now much-more-different synth distribution (every synth cohort is a shape, not
+# half-real-organ) and genuinely improves with a real training budget, rather than reading the
+# 31-epoch snapshot as a final verdict.
+#
+#   python experiments/3d/train.py experiment=135b_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_intensitycalib_cont
+#
+# CHECKPOINT: resumes 135's own best.pt (not 130's) -- architecture identical throughout the
+# whole 130->135->135b line, strict full-shape load. warmup_epochs=1 (chain standard, genuine
+# warm continuation, no new/reinitialized parameters).
+#
+# BUDGET: epochs=200 -- far beyond anything else in this chain (previous longest was 133/134's
+# 51+51). User-requested long run to let the shape-heavy recipe actually converge before
+# judging it, rather than another short probe.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    shape:
+      host_anchored: true
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 200
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_135_cascade_register_varspacing_synth03_texture_pool2stage_ctmri_intensitycalib/best.pt
+  checkpoint_allow_partial: false   # identical arch to 135 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 135b
