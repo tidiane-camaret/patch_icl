@@ -1,1 +1,19 @@
 \subsection{In-Context Segmentation}\label{sec:fundamentals-icl}
+
+Given a target image $I^t$ and a context set
+$\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image/mask pairs for the same class,
+in-context segmentation predicts a mask $\hat{L}^t$ for the target in a
+single forward pass, with no gradient update and no class-specific
+parameters. This sits between two more familiar paradigms: closed-set
+supervised segmentation, which fixes a label set at training time and
+must be retrained (or fine-tuned) to add a class; and interactive
+segmentation, where a human supplies clicks or boxes on the target image
+itself, per image, at inference time. In-context segmentation instead
+supplies the ``prompt'' as a handful of \emph{other}, already-labeled
+examples of the same class -- closer to how a radiologist might be shown
+a few example cases of a rare finding and asked to find it in a new scan.
+This is valuable in medical imaging specifically because annotation
+requires domain expertise, new structures and pathologies are defined
+faster than segmentation datasets can be built for them, and per-site
+protocol differences limit how far a closed-set model trained elsewhere
+transfers.

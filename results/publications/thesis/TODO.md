@@ -6,8 +6,8 @@ should be resolved by porting the answer back from here once decided.
 
 ## Content chapters — not yet drafted
 
-- [ ] `0_motivation.md` → `motivation.tex`
-- [ ] `1_fundamentals.md` → `fundamentals_*.tex` (4 subsections)
+- [x] `0_motivation.md` → `motivation.tex`
+- [x] `1_fundamentals.md` → `fundamentals_*.tex` (4 subsections)
 - [ ] `3_results.md` → `results_*.tex` (4 subsections) — which numbers to
   show is a separate decision from drafting; see `PERFORMANCE_ANALYSIS.md`
   for the evidence base and its open gaps (G1–G8).
@@ -28,10 +28,13 @@ should be resolved by porting the answer back from here once decided.
 - [ ] Lab/group name
 - [ ] Faculty (depends on degree program — Physics / CS / Scientific
   Computing?)
-- [ ] Regenerate `assets/cover.pdf` from the official Uni Freiburg LaTeX
-  cover kit (currently the template author's own leftover sample,
-  "Analysis of Heatpumps" — can't be text-edited directly, needs the
-  external source project)
+- [x] Regenerate `assets/cover.pdf` from the official Uni Freiburg LaTeX
+  cover kit — source lives in `front_page/` (title + name filled in,
+  compiled, copied to `ics_3d_medical/assets/cover.pdf`). Re-run
+  `pdflatex Thesis_Titlepage.tex` there and re-copy if the title changes.
+  Minor cosmetic overfull-hbox (~3.7pt) on the title line at this length —
+  not fixed since `front_page/setup.tex` is the university's fixed
+  corporate-design file and shouldn't be edited.
 
 ## Housekeeping
 

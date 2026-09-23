@@ -1,0 +1,40 @@
+% Autor: Dr. Carl Skarbek für die Abteilung Marketing & Events der Universität Freiburg
+% October 2024
+% Diese Datei sollte nicht verändert werden, damit die Corporate-Design-Elemente der Universität Freiburg erhalten bleiben.
+% Rechte liegen bei der Albert-Ludwigs-Universität Frieburg
+% Weitere Informationen zum Corporate Design finden Sie unter https://cd.uni-freiburg.de/
+
+
+\documentclass[A4paper, 12pt]{article} %set paper size and font size
+%------------------------------------------------------------------------------
+%       package includes
+%------------------------------------------------------------------------------
+
+
+    \usepackage[english, ngerman]{babel} % For documents written in german
+    \usepackage[utf8]{inputenc} % proper encoding
+    \usepackage{helvet} % Font package for sans serif helvetica
+    \usepackage[T1]{fontenc} % Font encoding
+    \renewcommand{\familydefault}{\sfdefault} % Set sans serif as default
+
+    \usepackage[a4paper, left=2.5cm, right=2.5cm, top=2.5cm]{geometry} % customize page layout
+    \usepackage{fancyhdr} % Extended header and footer options
+    \pagestyle{fancy} % Customizing the header and footer
+    \fancyhf{} % Clear all header and footer fields
+    \renewcommand{\headrulewidth}{0pt} % Remove the header line
+    \usepackage{graphicx} % Required for inserting images
+    \usepackage[absolute,overlay]{textpos} % For absolute positioning of logo
+
+    \usepackage{setspace} % Line spacing
+    \setstretch{1.2} % Set custom spacing
+
+    % Custom footer with images at specific coordinates
+    \fancyfoot[C]{%
+        \begin{textblock*}{5cm}(2.5cm,27.5cm) % {width}(x-coordinate, y-coordinate)
+         \includegraphics[width=8.5cm]{UFR_Wortmarke.pdf}
+        \end{textblock*}
+        \begin{textblock*}{5cm}(15.4cm,24.1cm) % {width}(x-coordinate, y-coordinate)
+            \includegraphics[width=4.2cm]{UFR_Siegel_Blau.png}
+        \end{textblock*}
+}
+\pagenumbering{gobble} % Supress page numbering on title page
