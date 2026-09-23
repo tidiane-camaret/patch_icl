@@ -1,0 +1,52 @@
+\subsection{Problem Setup and Backbone}\label{sec:methodology-overview}
+
+Given a target volume $I^t$ and a context set $\{(I^c_k, L^c_k)\}_{k=1}^{K}$
+of image/mask pairs for the same anatomical class as the (unknown) target
+mask, the model predicts a target mask $\hat{L}^t$. Prediction proceeds
+through a coarse-to-fine cascade of $M$ resolution levels with decreasing
+voxel spacing $r_1 > r_2 > \dots > r_M$; each level produces a full mask
+that seeds the next, finer level (\autoref{sec:methodology-cascade}).
+\autoref{fig:overview} contrasts our architecture with Medverse's.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{arch_medverse.pdf}
+    \caption{Medverse: early concatenation + dual U-Net.}
+    \label{fig:overview-medverse}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{arch_patchset.pdf}
+    \caption{Ours: separate image/label streams + bi-axial attention.}
+    \label{fig:overview-ours}
+  \end{subfigure}
+  \caption{Architecture overview, contrasted against Medverse's early-concatenation fusion.}
+  \label{fig:overview}
+\end{figure}
+\todo{Draft diagram, ported from the conference draft; finalize labels/scale once the architecture is settled.}
+
+\paragraph{Shared encoder.} All $T = K+1$ volumes of a task -- the $K$
+context images and the target -- are passed once through a single shared
+convolutional encoder (a from-scratch, nnU-Net-style plain-convolution
+stack~\cite{isensee2021nnu}, without external pretraining), producing a
+feature pyramid per volume. Two disjoint subsets of its stages are read
+out: \emph{coarse} stages, resampled to a common $R \times R \times R$
+token grid ($N = R^3$ cells per volume) and consumed by the attention
+stack below; and \emph{fine} stages, kept at native resolution and
+reserved for the decoder's skip connections (\autoref{sec:methodology-fusion}).
+This split keeps the attention stack on a small, fixed-size token grid
+while still allowing a full-resolution decoded mask.
+
+\paragraph{Tokenization.} Each cell of every volume yields two tokens
+sharing one row -- an image token $z^{\text{img}}$ and a label token
+$z^{\text{lbl}}$ -- assembled into a single sequence together with a
+small number of learned \emph{thinking rows}, shared across all volumes,
+that give the attention stack fixed-size read/write capacity not tied to
+any single spatial cell. Context rows always carry the ground-truth mask
+in their label token; the target's label token instead starts from either
+a neutral placeholder or the previous cascade level's prediction
+(\autoref{sec:methodology-cascade}), since the target mask is exactly what
+is being predicted.

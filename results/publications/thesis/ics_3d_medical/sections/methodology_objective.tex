@@ -1,0 +1,14 @@
+\subsection{Training Objective}\label{sec:methodology-objective}
+
+Each cascade level is supervised independently at its own resolution with
+a combined binary cross-entropy and soft Dice loss, summed over the $M$
+levels:
+%
+\begin{equation}
+  \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell \left( \mathcal{L}_{\text{BCE}}^\ell + \mathcal{L}_{\text{Dice}}^\ell \right).
+\end{equation}
+%
+Level weights $\lambda_\ell$ are uniform ($\lambda_\ell{=}1$) in the
+reference configuration; the query-prior path is detached between levels
+(\autoref{sec:methodology-cascade}), so each level's loss trains its own
+prediction without back-propagating through the coarser level's mask.

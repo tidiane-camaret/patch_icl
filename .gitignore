@@ -73,3 +73,16 @@ results/publications/**/*.synctex.gz
 results/publications/**/*.fdb_latexmk
 results/publications/**/*.fls
 results/publications/**/*.toc
+results/publications/**/*.lof
+results/publications/**/*.lot
+results/publications/**/*.lol
+results/publications/**/*.glo
+results/publications/**/*.gls
+results/publications/**/*.glg
+results/publications/**/*.ist
+results/publications/**/*.slo
+results/publications/**/*.sls
+results/publications/**/*.slg
+
+# Nested git clone (own remote/history) — reference template, not vendored content.
+results/publications/thesis/latex-template-uni-freiburg/
