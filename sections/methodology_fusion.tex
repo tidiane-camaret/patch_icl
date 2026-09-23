@@ -1,0 +1,50 @@
+\subsection{Bi-Axial Image--Label Fusion}\label{sec:methodology-fusion}
+
+How a model combines image and label evidence is a central design choice.
+Medverse~\cite{huMedverseUniversalModel2025a} concatenates image and label
+channels before a shared U-Net, merging the two streams before most of the
+network's capacity is applied. Iris~\cite{gaoShowSegmentUniversal2025}
+instead fuses image and label features once, through a pixel
+shuffle--unshuffle operation between context and target. Both commit to a
+single fusion point. We instead keep image tokens $z^{\text{img}}$ and
+label tokens $z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as
+separate streams throughout the network and let them exchange information
+repeatedly, over two attention axes applied at every layer:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
+  \item \textbf{Slot axis}: at each cell, the image and label token attend
+    to each other, letting label evidence sharpen the image representation
+    and vice versa, independently per cell.
+  \item \textbf{Row axis}: every cell of every volume -- context, target,
+    and the thinking rows -- attends over the entire token sequence at
+    once, using 3D axial rotary position embeddings so attention is a
+    function of physical distance between cells rather than raw grid
+    index. This single joint attention performs within-volume
+    self-attention and cross-context matching together, since tokens from
+    every volume already share one sequence.
+\end{itemize}
+
+\autoref{fig:biaxial} illustrates both axes within a single layer.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{arch_biaxial.pdf}
+  \caption{Bi-axial attention within one transformer layer, shown for a
+  single context volume ($K{=}1$ for clarity) and 3 of its $N$ spatial
+  tokens per stream. Left: the slot axis -- image and label tokens
+  attend to each other within the same cell. Right: the row axis --
+  tokens attend across cells and, for the target, across contexts. Green
+  edges touch the target row, which cross-attends read-only into context
+  and whose label-stream input is the query prior
+  (\autoref{sec:methodology-cascade}) rather than ground truth.}
+  \label{fig:biaxial}
+\end{figure}
+\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
+
+Only the target's post-attention \emph{image} token is read out for
+decoding; the label token is discarded after the last layer, since it
+started from a placeholder rather than real image evidence for the target
+row. The decoded image tokens are projected back to the coarse token grid
+and progressively fused with the encoder's fine-resolution skip features
+(\autoref{sec:methodology-overview}) via upsampling and convolution, one step
+per fine stage, into the final full-resolution mask logits.

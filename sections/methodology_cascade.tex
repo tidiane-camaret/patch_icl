@@ -1,0 +1,62 @@
+\subsection{Coarse-to-Fine Cascade}\label{sec:methodology-cascade}
+
+The cascade connects consecutive resolution levels through three
+mechanisms, each replacing a coarser design choice made by Medverse or
+Iris.
+
+\paragraph{Query prior.} Medverse~\cite{huMedverseUniversalModel2025a}
+feeds an upsampled, perturbed ground-truth mask into an extra U-Net branch
+at every step; Iris~\cite{gaoShowSegmentUniversal2025} uses no prior at
+all. At level $\ell > 1$, we instead initialize the target's
+label token directly from level $\ell{-}1$'s own prediction:
+%
+\begin{equation}
+  z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1})\big),
+\end{equation}
+%
+where $\mathrm{Warp}$ resamples level $\ell{-}1$'s prediction onto level
+$\ell$'s crop grid, correcting for the two levels' different centers,
+field of view, and any augmentation applied independently to each. This
+makes the previous level's belief part of the same token stream that
+attends bi-axially with the image (\autoref{sec:methodology-fusion}), rather
+than a separate side channel. \autoref{fig:query-prior} shows this flow
+across two levels.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{arch_query_prior.pdf}
+  \caption{Query image prior across two cascade levels, with the full
+  model input/output flow. At level 1 the target has no real prior yet
+  (dashed support-mean placeholder); at level 2 the target's second lane
+  is a real crop of level 1's own prediction $\hat{L}^t_1$ -- the same
+  lane the context mask always occupies.}
+  \label{fig:query-prior}
+\end{figure}
+\todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
+
+\paragraph{Region-restricted fine processing.} Medverse and Iris re-scan
+the entire volume with a sliding window at every step. Once a coarse level
+has localized the structure of interest, we instead restrict the sliding
+window at the next, finer level to the coarse prediction's foreground
+region, thresholded and padded by a fixed margin. Compute at fine levels
+then scales with the size of the structure rather than the size of the
+input volume, at the cost of depending on the coarse level's localization
+being approximately correct.
+
+\paragraph{Cross-level training via register tokens.} Medverse and Iris
+connect levels only through the rendered prediction feeding the next
+step, with no gradient path between them. We add a small set of learned
+register tokens $\mathbf{r}_\ell$ that participate in level $\ell$'s
+attention alongside the image and label tokens; their final state is
+carried into level $\ell{+}1$ via a learned projection and a
+level-independent type embedding:
+%
+\begin{equation}
+  \mathbf{r}_{\ell+1,0} = W_r\, \mathbf{r}_{\ell,\text{final}} + \mathbf{e}_{\ell+1}.
+\end{equation}
+%
+Unlike the query prior, this path is not detached between levels: level
+$\ell{+}1$'s loss can backpropagate into level $\ell$'s own attention,
+giving the model a direct incentive to carry forward whatever helps the
+next level -- e.g.\ uncertainty or cues about neighboring structures --
+beyond what the rendered mask alone can encode.

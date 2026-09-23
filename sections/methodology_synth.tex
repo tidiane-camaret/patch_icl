@@ -1,0 +1,25 @@
+\subsection{Synthetic Task Generation}\label{sec:methodology-synth}
+
+Real (image, mask) pairs are limited to the anatomical classes and
+appearance distribution covered by the training cohort. To broaden
+training beyond this, a fraction $p_{\text{synth}}$ of training tasks are
+drawn from a synthetic generator instead of real context/target subjects.
+
+\paragraph{Supervoxel repainting.} A real-anatomy volume is first
+oversegmented into supervoxels (unsupervised, appearance-agnostic
+regions). One supervoxel is treated as the target class, and its binary
+mask is label-perfect by construction. Each of the $K{+}1$ volumes needed
+for a task is then produced by repainting the same supervoxel geometry
+with independently sampled per-class Gaussian intensities (a Gaussian
+mixture over classes), giving $K{+}1$ (image, mask) pairs that share
+identical anatomy but differ in appearance -- no real cross-subject
+registration or annotation is required.
+
+\paragraph{Paint noise.} The default painting noise is i.i.d.\ per voxel:
+it matches each class's target intensity variance but has near-zero
+spatial autocorrelation, unlike real CT/MRI tissue (measured
+$\approx 0.6$ autocorrelation at native resolution, versus $\approx 0.0$
+for i.i.d.\ paint). An optional multi-octave variant instead sums several
+coarse-to-fine random fields before painting, producing spatially
+correlated texture that better matches real tissue statistics while
+leaving the per-class intensity variance unchanged.
