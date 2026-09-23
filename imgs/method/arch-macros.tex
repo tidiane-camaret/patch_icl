@@ -1,0 +1,145 @@
+% Shared TikZ macros for the architecture figures (Medverse vs. Ours).
+% Load with \input{arch-macros.tex} after \usepackage{tikz,ifthen} and
+% \usetikzlibrary{arrows.meta,calc,positioning}. All macro names are
+% prefixed `arch` to avoid clashing with pgf/tikz internals.
+
+% ---- palette (approximating the PowerPoint drafts) ----
+\definecolor{archTargetGreen}{HTML}{9BC7AC}
+\definecolor{archContextPink}{HTML}{E8B8B0}
+\definecolor{archAttnBlue}{HTML}{BBD6EC}
+\definecolor{archEncGray}{HTML}{E4E4E4}
+\definecolor{archArrowPale}{HTML}{CFE6D6}
+\definecolor{archCtBg}{HTML}{2B2B2B}
+\definecolor{archCtBlob}{HTML}{8C8C8C}
+\definecolor{archCtxYellow}{HTML}{E8D24C}
+% darker, more saturated siblings of archTargetGreen/archContextPink --
+% pastel fills read poorly as 1pt strokes, and mask/label content needs to
+% read as "which volume owns this" at a glance, so masks/labels and any
+% line (arrow, brace) touching that volume's row use these instead of the
+% pastel role color or the old flat archMaskGold.
+\definecolor{archTargetAccent}{HTML}{2F6B4A}  % target: darker green
+\definecolor{archContextAccent}{HTML}{A8453E} % context: darker red
+
+% fake-isometric depth skew shared by every cube
+\newcommand{\archdx}{0.30}
+\newcommand{\archdy}{0.20}
+
+% ---------------------------------------------------------------
+% \archvolcube{x}{y}{w}{h}{topcolor}{content}{label}
+%   content: ct | ctmask | predmask | <flat color name>
+% ---------------------------------------------------------------
+\newcommand{\archvolcube}[7]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}%
+    \pgfmathsetmacro{\w}{#3}\pgfmathsetmacro{\h}{#4}%
+    \fill[#5] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \fill[#5!60!black] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \begin{scope}
+      \clip (\cx,\cy) rectangle ++(\w,\h);
+      \ifthenelse{\equal{#6}{ct}}{%
+        \fill[archCtBg] (\cx,\cy) rectangle ++(\w,\h);
+        \fill[archCtBlob] plot[smooth cycle] coordinates
+          {(\cx+.25*\w,\cy+.55*\h) (\cx+.45*\w,\cy+.75*\h) (\cx+.7*\w,\cy+.6*\h)
+           (\cx+.6*\w,\cy+.3*\h) (\cx+.35*\w,\cy+.25*\h)};
+      }{\ifthenelse{\equal{#6}{ctmask}}{%
+        \fill[archCtBg] (\cx,\cy) rectangle ++(\w,\h);
+        \fill[archCtBlob] plot[smooth cycle] coordinates
+          {(\cx+.25*\w,\cy+.55*\h) (\cx+.45*\w,\cy+.75*\h) (\cx+.7*\w,\cy+.6*\h)
+           (\cx+.6*\w,\cy+.3*\h) (\cx+.35*\w,\cy+.25*\h)};
+        \fill[archCtxYellow] plot[smooth cycle] coordinates
+          {(\cx+.42*\w,\cy+.42*\h) (\cx+.52*\w,\cy+.5*\h) (\cx+.5*\w,\cy+.35*\h) (\cx+.44*\w,\cy+.3*\h)};
+      }{\ifthenelse{\equal{#6}{predmask}}{%
+        \fill[black] (\cx,\cy) rectangle ++(\w,\h);
+        \fill[white] plot[smooth cycle] coordinates
+          {(\cx+.4*\w,\cy+.65*\h) (\cx+.6*\w,\cy+.7*\h) (\cx+.62*\w,\cy+.45*\h)
+           (\cx+.48*\w,\cy+.3*\h) (\cx+.38*\w,\cy+.4*\h)};
+      }{%
+        \fill[#6] (\cx,\cy) rectangle ++(\w,\h);
+      }}}%
+    \end{scope}
+    \draw[black,thin] (\cx,\cy) rectangle ++(\w,\h);
+    \draw[black,thin] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \draw[black,thin] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \node[anchor=north,align=center] at (\cx+\w/2,\cy-0.1) {#7};
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
+% \archfeatcube{x}{y}{w}{h}{color}{label} -- flat-colored feature volume
+% ---------------------------------------------------------------
+\newcommand{\archfeatcube}[6]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}%
+    \pgfmathsetmacro{\w}{#3}\pgfmathsetmacro{\h}{#4}%
+    \fill[#5] (\cx,\cy) rectangle ++(\w,\h);
+    \fill[#5!80!white] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \fill[#5!60!black] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \draw[black,thin] (\cx,\cy) rectangle ++(\w,\h);
+    \draw[black,thin] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \draw[black,thin] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \node[align=center] at (\cx+\w/2,\cy+\h/2) {#6};
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
+% \archfunnel{x}{y}{h}{wwide}{wnarrow}{dir}{color}{label}
+%   dir=1  : wide on left, narrow on right  (encoder)
+%   dir=-1 : narrow on left, wide on right  (decoder)
+% ---------------------------------------------------------------
+\newcommand{\archfunnel}[8]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}\pgfmathsetmacro{\h}{#3}%
+    \pgfmathsetmacro{\ww}{#4}\pgfmathsetmacro{\wn}{#5}%
+    \pgfmathsetmacro{\inset}{(\ww-\wn)/2}%
+    \ifnum#6=1
+      \fill[#7] (\cx,\cy) -- (\cx+\ww,\cy+\inset) -- (\cx+\ww,\cy+\h-\inset) -- (\cx,\cy+\h) -- cycle;
+      \draw[black,thin] (\cx,\cy) -- (\cx+\ww,\cy+\inset) -- (\cx+\ww,\cy+\h-\inset) -- (\cx,\cy+\h) -- cycle;
+    \else
+      \fill[#7] (\cx,\cy+\inset) -- (\cx+\ww,\cy) -- (\cx+\ww,\cy+\h) -- (\cx,\cy+\h-\inset) -- cycle;
+      \draw[black,thin] (\cx,\cy+\inset) -- (\cx+\ww,\cy) -- (\cx+\ww,\cy+\h) -- (\cx,\cy+\h-\inset) -- cycle;
+    \fi
+    \node[align=center] at (\cx+\ww/2,\cy+\h/2) {#8};
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
+% \archbowtie{x}{y}{w}{h}{pinch}{color}{label} -- Medverse-style
+% single-row "dual U-Net" hourglass (funnel-in then funnel-out).
+% ---------------------------------------------------------------
+\newcommand{\archbowtie}[7]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}%
+    \pgfmathsetmacro{\w}{#3}\pgfmathsetmacro{\h}{#4}\pgfmathsetmacro{\p}{#5}%
+    \pgfmathsetmacro{\inset}{(\h-\p)/2}%
+    \fill[#6] (\cx,\cy) -- (\cx+\w/2,\cy+\inset) -- (\cx+\w,\cy) -- (\cx+\w,\cy+\h)
+      -- (\cx+\w/2,\cy+\h-\inset) -- (\cx,\cy+\h) -- cycle;
+    \draw[black,thin] (\cx,\cy) -- (\cx+\w/2,\cy+\inset) -- (\cx+\w,\cy) -- (\cx+\w,\cy+\h)
+      -- (\cx+\w/2,\cy+\h-\inset) -- (\cx,\cy+\h) -- cycle;
+    \node[align=center] at (\cx+\w/2,\cy+\h/2) {#7};
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
+% \archtokengrid{x}{y}{rows}{cols}{cell}{color} -- grid of patch tokens
+% ---------------------------------------------------------------
+\newcommand{\archtokengrid}[6]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}\pgfmathsetmacro{\cell}{#5}%
+    \pgfmathtruncatemacro{\rmax}{#3-1}%
+    \pgfmathtruncatemacro{\cmax}{#4-1}%
+    \foreach \r in {0,...,\rmax}{%
+      \foreach \c in {0,...,\cmax}{%
+        \fill[#6] ({\cx+\c*\cell},{\cy+\r*\cell}) rectangle ++(\cell*0.82,\cell*0.82);
+        \draw[black,thin] ({\cx+\c*\cell},{\cy+\r*\cell}) rectangle ++(\cell*0.82,\cell*0.82);
+      }%
+    }%
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
+% \archarrow{start}{end}{color} -- block arrow between stages
+% ---------------------------------------------------------------
+% #1 and #2 are full coordinates including parentheses, e.g. (1,2)
+\newcommand{\archarrow}[3]{%
+  \draw[-{Latex[length=2.4mm,width=2mm]},line width=2.2pt,#3] #1 -- #2;
+}
