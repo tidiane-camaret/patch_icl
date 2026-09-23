@@ -1,0 +1,253 @@
+\documentclass[tikz,border=4pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% ---------------------------------------------------------------------------
+% Early feature fusion (baseline) vs. bi-axial attention (ours), placed side
+% by side (not stacked) so the two pipelines read left-to-right in parallel.
+% Style follows TabPFN's Fig. 1 (Hollmann et al., Nature 2024): small token
+% grids connected by simple curved double-arrows rather than full
+% cell/token-block renderings. The "special test row" device (edges
+% touching it get a distinct color) maps onto our target row, which really
+% is architecturally special in both methods: it cross-attends/fuses
+% read-only into context, and its label-stream input is a predicted prior,
+% not ground truth like context's. Each image/label volume is patchified
+% into N spatial tokens; each cell below shows 3 of them as a
+% representative sample (not literally N=3).
+%
+% Baseline (left): 1x Fuse (image/label tokens merged once per cell by one
+% shared operator -- concat / sum / MLP / pixel-shuffle, drawn as a single
+% ⊕) followed by Lx Patch axis -- fusion happens once, patch-axis attention
+% repeats for L layers, so only the Patch-axis box carries the "xL" mark.
+% Ours (right): the WHOLE pair (image/label axis -> patch axis) repeats as
+% one layer, Lx -- so both boxes sit inside one outer dashed wrapper that
+% carries the single "xL" mark for the pair.
+%
+% All 4 inner panels (2 steps x 2 methods) share the SAME box width/height,
+% with each panel's content centered inside its box -- even though the
+% baseline's single-stream patch-axis panel only fills a fraction of its
+% box on the fan side. That empty space is the point: the box size
+% communicates "this step", not "how much content it happens to have".
+% ---------------------------------------------------------------------------
+
+% \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
+\newcommand{\tpsq}[4]{
+  \fill[#3] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+  \draw[#4,line width=0.8pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpcluster{x}{y}{fill}{ring} -- 3 stacked tokens standing in for N.
+\newcommand{\tpcluster}[4]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsq{#1}{#2+\doff}{#3}{#4}
+  }
+}
+% \tpsqsplit{x}{y}{fillImg}{fillLbl}{ring} -- one token, diagonally split
+% between the two source colors -- stands in for "these got merged into one".
+\newcommand{\tpsqsplit}[5]{
+  \begin{scope}
+    \clip (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+    \fill[#3] (#1-\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+    \fill[#4] (#1-\tsz/2,#2-\tsz/2) -- (#1-\tsz/2,#2+\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+  \end{scope}
+  \draw[#5,line width=0.8pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpclustersplit{x}{y}{fillImg}{fillLbl}{ring} -- 3 stacked split tokens.
+\newcommand{\tpclustersplit}[5]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsqsplit{#1}{#2+\doff}{#3}{#4}{#5}
+  }
+}
+% \dblarrow{p1}{p2}{color} -- curved double-headed attention edge.
+\newcommand{\dblarrow}[3]{
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,#3] #1 to[bend left=12] #2;
+}
+% \fusearrow{p1}{p2}{color} -- straight single-headed merge edge (fusion is
+% a fixed operation, not a learned bidirectional exchange -- single-headed
+% marks that distinction against \dblarrow/\fanarrow throughout this file).
+\newcommand{\fusearrow}[3]{
+  \draw[-{Latex[length=1.6mm,width=1.3mm]},line width=0.9pt,#3] #1 -- #2;
+}
+% \fanarrow{x}{y1}{y2}{bulge}{color} -- Bezier double-arrow between two
+% points at the same x, bulging sideways by a FIXED amount (signed) rather
+% than one that scales with the (possibly tiny) y1-y2 distance -- lets a
+% nested fan of these stay visible/distinguishable at increasing radii.
+\newcommand{\fanarrow}[5]{
+  \draw[{Latex[length=1.6mm,width=1.3mm]}-{Latex[length=1.6mm,width=1.3mm]},
+        line width=0.9pt,#5]
+    (#1,#2) .. controls +(#4,0.05) and +(#4,-0.05) .. (#1,#3);
+}
+
+\def\tsz{0.16}
+\def\toff{0.22}
+\def\colpitch{0.95}
+\def\rowpitch{0.66} % 3*\toff -- target/context sit at the SAME pitch as the
+                     % 3 tokens within a cluster, so all 6 read as one
+                     % continuous column; only the ring/fill color marks the
+                     % boundary between the two volumes
+\def\panelgap{1.5}   % gap between the two boxes within one method
+\def\clusterhalf{\toff+\tsz/2}
+\def\pairpitch{0.5}  % ours' patch-axis img/lbl spacing -- much tighter than
+                      % \colpitch, since one attention pass reads the pair
+                      % as a single unit, not two independent streams
+
+\def\xlab{-0.15}
+\def\yTgt{\rowpitch}
+\def\yCtx{0}
+
+\def\boxw{2.85}       % shared width of all 4 inner panel boxes
+\def\xA{-0.10}        % baseline Fuse box, left edge
+\def\ximgTop{0.35}
+
+% all 9 target x context token pairs (full attention, not just the 3
+% diagonal ones) -- bulge grows with the pair's rank by |yt-yc| distance
+% so the 9 nested arcs stay visually distinguishable at one consistent
+% (rightward) bulge direction.
+\def\allpairs{0.44/0.22/0.15, 0.44/0/0.21, 0.66/0.22/0.27, 0.44/-0.22/0.33,
+              0.66/0/0.39, 0.88/0.22/0.45, 0.66/-0.22/0.51, 0.88/0/0.57,
+              0.88/-0.22/0.63}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm,scale=1.35,transform shape]
+
+  % ---- pre-computed (flat decimal) derived positions -- \pgfmathsetmacro
+  % fully evaluates each one, rather than chaining symbolic \def's, since a
+  % deep \def chain rooted in a negative literal confused pgfmath's
+  % coordinate parser when substituted bare into later macros. ----
+  \pgfmathsetmacro{\xB}{\xA+\boxw+\panelgap}                  % baseline Patch-axis box
+  \pgfmathsetmacro{\boxAcenter}{\xA+\boxw/2}
+  \pgfmathsetmacro{\boxBcenter}{\xB+\boxw/2}
+  \pgfmathsetmacro{\xLlabelBase}{\xB+\boxw+0.35}               % "xL" next to baseline's box B
+  \pgfmathsetmacro{\dividerX}{\xLlabelBase+1.35}               % vertical divider between methods
+  \pgfmathsetmacro{\xC}{\dividerX+0.55}                        % ours Image/label-axis box
+  \pgfmathsetmacro{\xD}{\xC+\boxw+\panelgap}                   % ours Patch-axis box
+  \pgfmathsetmacro{\boxCcenter}{\xC+\boxw/2}
+  \pgfmathsetmacro{\boxDcenter}{\xD+\boxw/2}
+  \pgfmathsetmacro{\outerLeft}{\xC-0.25}
+  \pgfmathsetmacro{\outerRight}{\xD+\boxw+0.25}                % outer wrapper around ours' 2 boxes
+  \pgfmathsetmacro{\xLlabelOurs}{\outerRight+0.35}             % "xL" next to that wrapper
+  \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+0.25+0.45}
+  \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-0.30}
+  \pgfmathsetmacro{\methodTitleY}{\outerTop+0.35}              % shared y for both method titles
+  \pgfmathsetmacro{\dividerYbot}{\outerBot-0.15}
+  \pgfmathsetmacro{\dividerYtop}{\methodTitleY+0.2}
+  \pgfmathsetmacro{\xlblTop}{\ximgTop+\colpitch}
+  \pgfmathsetmacro{\xFusedTop}{\xlblTop+1.0}
+  \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
+  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.14}
+  \pgfmathsetmacro{\yMid}{\rowpitch/2}
+  \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
+  \pgfmathsetmacro{\ximgBot}{\boxCcenter-\colpitch/2}
+  \pgfmathsetmacro{\xlblBot}{\ximgBot+\colpitch}
+  \pgfmathsetmacro{\ximgPatchBot}{\boxDcenter-\pairpitch/2}
+  \pgfmathsetmacro{\xlblPatchBot}{\ximgPatchBot+\pairpitch}
+
+  % ---- shared row labels (one N-token row pair for both methods, since
+  % both sit at the same y now) ----
+  \node[anchor=east,font=\scriptsize] at (\xlab,\yTgt) {target ($N$)};
+  \node[anchor=east,font=\scriptsize] at (\xlab,\yCtx) {context ($N$)};
+
+  % ---- method titles + divider ----
+  \node[anchor=south,font=\bfseries\small] at ({\boxAcenter+(\boxBcenter-\boxAcenter)/2},{\methodTitleY}) {Baseline: early fusion};
+  \node[anchor=south,font=\bfseries\small] at ({(\outerLeft+\outerRight)/2},{\methodTitleY}) {Ours: bi-axial attn.};
+  \draw[black!20,dashed] ({\dividerX},{\dividerYbot}) -- ({\dividerX},{\dividerYtop});
+
+  % =========================================================================
+  % Baseline: 1x Fuse, then Lx Patch axis.
+  % =========================================================================
+
+  \draw[black!25,rounded corners=3pt]
+    (\xA,\yCtx-\clusterhalf-0.15) rectangle ({\xA+\boxw},\yTgt+\clusterhalf+0.15);
+  \draw[black!25,rounded corners=3pt]
+    ({\xB},\yCtx-\clusterhalf-0.15) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+0.15);
+  \node[anchor=south,font=\bfseries\small] at ({\boxAcenter},\yTgt+\clusterhalf+0.25) {Fuse};
+  \node[anchor=south,font=\bfseries\small] at ({\boxBcenter},\yTgt+\clusterhalf+0.25) {Patch axis};
+  \node[anchor=west,font=\bfseries\small] at ({\xLlabelBase},{\yMid}) {$\times L$};
+
+  \node[anchor=south,font=\scriptsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {lbl};
+  \node[anchor=south,font=\scriptsize] at (\xFusedTop,\yTgt+\clusterhalf+0.05) {fused};
+  \node[anchor=south,font=\scriptsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.05) {fused};
+
+  \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/archTargetAccent,
+                                     \yCtx/archContextPink/archContextAccent} {
+    % input img/lbl clusters (same convention as ours, below)
+    \tpcluster{\ximgTop}{\y}{\imgfill}{black!70}
+    \tpcluster{\xlblTop}{\y}{\lblfill}{black!70}
+    % merged token, split-fill to mark "these got squashed into one"
+    \tpclustersplit{\xFusedTop}{\y}{\imgfill}{\lblfill}{black!70}
+    % same merged identity carries into the patch-axis column
+    \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
+  }
+
+  % one shared fusion operator, centered on the whole panel (not per row)
+  % -- it collapses both streams identically regardless of role -- and one
+  % single arrow carrying the merged result to the fused column.
+  \node[draw,circle,inner sep=0.4pt,font=\scriptsize,fill=white] at ({\xFuseOp},{\yMid}) {$\oplus$};
+  \fusearrow{({\xFuseArrowStart},{\yMid})}{({\xFusedTop-\tsz/2-0.05},{\yMid})}{black!55}
+
+  % ---- patch axis -- single stream (image/label already merged); full
+  % attention (all 3x3 pairs), arcs on the right side only (no second
+  % stream on the left to justify a left-side fan here) ----
+  \foreach \yt/\yc/\bulge in \allpairs {
+    \fanarrow{\xFusedPatchTop+\tsz/2}{\yc}{\yt}{\bulge}{archTargetAccent}
+  }
+
+  % =========================================================================
+  % Ours: Lx (image/label axis -> patch axis), the pair repeats as one
+  % layer -- hence the single outer wrapper + "xL" around both boxes.
+  % =========================================================================
+
+  \draw[black!25,rounded corners=3pt]
+    (\xC,\yCtx-\clusterhalf-0.15) rectangle ({\xC+\boxw},\yTgt+\clusterhalf+0.15);
+  \draw[black!25,rounded corners=3pt]
+    ({\xD},\yCtx-\clusterhalf-0.15) rectangle ({\xD+\boxw},\yTgt+\clusterhalf+0.15);
+  \draw[black!40,dashed,rounded corners=5pt]
+    ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
+  \node[anchor=south,font=\bfseries\small] at ({\boxCcenter},\yTgt+\clusterhalf+0.25) {Image/label axis};
+  \node[anchor=south,font=\bfseries\small] at ({\boxDcenter},\yTgt+\clusterhalf+0.25) {Patch axis};
+  \node[anchor=west,font=\bfseries\small] at ({\xLlabelOurs},{\yMid}) {$\times L$};
+
+  \node[anchor=south,font=\scriptsize] at ({\ximgBot},\yTgt+\clusterhalf+0.05) {img};
+  \node[anchor=south,font=\scriptsize] at ({\xlblBot},\yTgt+\clusterhalf+0.05) {lbl};
+  \node[anchor=south east,font=\scriptsize] at ({\ximgPatchBot+\tsz/2},\yTgt+\clusterhalf+0.05) {img};
+  \node[anchor=south west,font=\scriptsize] at ({\xlblPatchBot-\tsz/2},\yTgt+\clusterhalf+0.05) {lbl};
+
+  % one shared light-gray box per img/lbl row-pair in the patch-axis panel
+  % -- a single attention pass reads each pair as one unit, so the two
+  % tokens are boxed together rather than read as independent columns.
+  \foreach \y in {\yTgt,\yCtx} {
+    \foreach \doff in {-\toff,0,\toff} {
+      \fill[black!8,rounded corners=1pt]
+        ({\ximgPatchBot-\tsz/2-0.04},{\y+\doff-\tsz/2-0.04}) rectangle
+        ({\xlblPatchBot+\tsz/2+0.04},{\y+\doff+\tsz/2+0.04});
+    }
+  }
+
+  \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/archTargetAccent,
+                                     \yCtx/archContextPink/archContextAccent} {
+    \tpcluster{\ximgBot}{\y}{\imgfill}{black!70}
+    \tpcluster{\xlblBot}{\y}{\lblfill}{black!70}
+    \tpcluster{\ximgPatchBot}{\y}{\imgfill}{black!70}
+    \tpcluster{\xlblPatchBot}{\y}{\lblfill}{black!70}
+  }
+
+  % ---- Panel A: image/label axis -- per-token edge, same spatial cell ----
+  \foreach \doff in {-\toff,0,\toff} {
+    \dblarrow{({\ximgBot+\tsz/2},\yCtx+\doff)}{({\xlblBot-\tsz/2},\yCtx+\doff)}{black!55}
+    \dblarrow{({\ximgBot+\tsz/2},\yTgt+\doff)}{({\xlblBot-\tsz/2},\yTgt+\doff)}{archTargetAccent}
+  }
+
+  % ---- Panel B: patch axis -- a nested fan of edges (TabPFN Fig. 1's "1D
+  % sample attention" device) instead of one representative connector. Full
+  % attention: all 3x3=9 target/context pairs are drawn. Arcs on the right
+  % side only, off the img/lbl pair as a whole (not one fan per column) --
+  % this is ONE attention pass over the boxed pair, not two independent
+  % per-stream passes. ----
+  \foreach \yt/\yc/\bulge in \allpairs {
+    \fanarrow{\xlblPatchBot+\tsz/2}{\yc}{\yt}{\bulge}{archTargetAccent}
+  }
+
+\end{tikzpicture}
+\end{document}

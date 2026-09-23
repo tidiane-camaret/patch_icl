@@ -1,0 +1,35 @@
+\documentclass[tikz,border=4pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  % title
+  \node[anchor=west,font=\Large] at (0,7.6) {Medverse \textnormal{(Hu et al., 2025)}};
+  \draw[archContextPink!0,line width=0.8pt] (0,7.15) -- (12,7.15); % placeholder rule
+
+  % ---- row 1: target ----
+  \node[anchor=east,align=center] at (-0.3,5.25) {target\\image};
+  \archvolcube{0}{4}{1.6}{2.5}{archTargetGreen}{ct}{$I^T$}
+  \archarrow{(2.1,5.25)}{(2.9,5.25)}{archArrowPale}
+  \archbowtie{3.0}{4}{4}{2.5}{0.9}{archTargetGreen}{dual\\U-Net}
+
+  % ---- row 2: context ----
+  \node[anchor=east,align=center] at (-0.3,1.25) {context\\image + mask};
+  \archvolcube{0}{0}{1.6}{2.5}{archContextPink}{ctmask}{$I^C,M^C$}
+  \archarrow{(2.1,1.25)}{(2.9,1.25)}{archArrowPale}
+  \archbowtie{3.0}{0}{4}{2.5}{0.9}{archContextPink}{dual\\U-Net}
+
+  % ---- cross arrows between the two U-Nets (weight interaction) ----
+  \archarrow{(4.85,4)}{(4.85,2.5)}{black}
+  \archarrow{(5.15,2.5)}{(5.15,4)}{black}
+
+  % ---- output ----
+  \archarrow{(7.1,5.25)}{(7.9,5.25)}{archArrowPale}
+  \archvolcube{8.0}{4}{1.6}{2.5}{archTargetGreen}{predmask}{$M^T_{\mathrm{pred}}$}
+  \node[anchor=west,align=center] at (10,5.25) {predicted\\target mask};
+
+\end{tikzpicture}
+\end{document}

@@ -6,24 +6,13 @@ mask, the model predicts a target mask $\hat{L}^t$. Prediction proceeds
 through a coarse-to-fine cascade of $M$ resolution levels with decreasing
 voxel spacing $r_1 > r_2 > \dots > r_M$; each level produces a full mask
 that seeds the next, finer level (\autoref{sec:methodology-cascade}).
-\autoref{fig:overview} contrasts our architecture with Medverse's.
+\autoref{fig:overview} shows our architecture (Medverse's, for comparison,
+is shown in \autoref{fig:overview-medverse} in the appendix).
 
 \begin{figure}[t]
   \centering
-  \begin{subfigure}[b]{0.48\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{arch_medverse.pdf}
-    \caption{Medverse: early concatenation + dual U-Net.}
-    \label{fig:overview-medverse}
-  \end{subfigure}
-  \hfill
-  \begin{subfigure}[b]{0.48\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{arch_patchset.pdf}
-    \caption{Ours: separate image/label streams + bi-axial attention.}
-    \label{fig:overview-ours}
-  \end{subfigure}
-  \caption{Architecture overview, contrasted against Medverse's early-concatenation fusion.}
+  \includegraphics[width=0.6\linewidth]{arch_patchset.pdf}
+  \caption{Architecture overview: separate image/label streams + bi-axial attention.}
   \label{fig:overview}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize labels/scale once the architecture is settled.}
