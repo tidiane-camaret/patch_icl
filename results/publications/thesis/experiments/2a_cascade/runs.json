@@ -1,0 +1,28 @@
+{
+  "experiment": "2a_cascade",
+  "description": "Coarse-to-fine cascade ablation (thesis Methodology Axis 2): cumulative 3-step chain isolating query-prior source (perturbed-GT vs real prev.pred) and cascade_registers, cascade_center_mode=random_fg throughout. All three resume checkpoint 135b independently (not chained). data.p_synth=0 (real anatomy only). Train ladder cascade_train={levels:2,spacing_range:[1,6]} (random per-step); eval ladder cascade_spacings=[4,1.5] (fixed). 60 epochs, batch_size=4, lr=7.1e-5.",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_train",
+  "runs": [
+    {
+      "id": "6ylg2l3o",
+      "name": "145_cascade_randomfg_gtprior_regoff",
+      "description": "step 1/3 (anchor): registers=off, prior=perturbed-GT (gt_coarse + prior_perturb dilate/erode/shift/noise), center=random_fg (train) / com (eval)"
+    },
+    {
+      "id": "wrwzs5fs",
+      "name": "146_cascade_randomfg_predprior_regoff",
+      "description": "step 2/3: 145 + prior=real prev.pred (cascade_query_prior=pred, no perturbation), registers still off"
+    },
+    {
+      "id": "i1f4ah8t",
+      "name": "147_cascade_randomfg_predprior_regon",
+      "description": "step 3/3, part a (epochs 0-40, crashed on infra, not a training divergence): 146 + cascade_registers=true, checkpoint_allow_partial=false"
+    },
+    {
+      "id": "e4cd8yek",
+      "name": "147b_cascade_randomfg_predprior_regon_continue",
+      "description": "step 3/3, part b (epochs 41-59): resumed from 147a's own checkpoint after the infra crash, same config"
+    }
+  ]
+}

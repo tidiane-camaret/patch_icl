@@ -9947,3 +9947,70 @@ wandb: [105](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg
 [107](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/gdap5nuo) ·
 [108](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/mr91mta9) ·
 [109](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/q4umnca3)
+
+## 2026-09-24 — coarse-to-fine cascade ablation: real prev.pred prior wins, registers hurt it
+
+First REAL multi-level cascade training of `cascade_center_mode=random_fg` and
+`cascade_registers`, isolating three coarse-to-fine mechanisms in one cumulative 3-step chain
+(user-specified order, not a factorial). All three resume `135b`'s own `best.pt` independently
+(`checkpoint_allow_partial=true` for 145/146 since dropping `cascade_registers` drops
+`cascade_proj`/`cascade_type`; `false` for 147). `data.p_synth=0` (real anatomy only, no
+synth_gmm — isolates the cascade mechanism from the synth-generation confound). Train ladder
+`data.cascade_train={levels:2, spacing_range:[1,6]}` (random per-step), eval ladder
+`data.cascade_spacings=[4, 1.5]` (fixed), 60 epochs, `batch_size=4`, `lr=7.1e-5`.
+
+- `145` registers=off, prior=perturbed-GT (`gt_coarse` + `prior_perturb` dilate/erode/shift/
+  noise), center=random_fg (train)/com (eval) — anchor.
+- `146` = 145 + prior=real prev.pred (`cascade_query_prior=pred`, no perturbation).
+- `147` = 146 + `cascade_registers=true` — all three mechanisms active. Crashed at epoch 40
+  (infra, not a training divergence — loss/dice were on the same trend as 146 up to the crash)
+  and resumed from its own checkpoint (`147b`, `e4cd8yek`) to epoch 59; table below stitches
+  147a's epoch-0/20/40 rows to 147b's final epoch-59 row.
+
+TotalSeg val, `val/dice` (stitched, `[4,1.5]` ladder) at matching epochs:
+
+| epoch | 145 pred-GT/reg-off | 146 pred-pred/reg-off | 147 pred-pred/reg-on |
+|---|---|---|---|
+| 0  | 0.4308 | 0.4365 | 0.4451 |
+| 20 | 0.4852 | 0.5068 | 0.4929 |
+| 40 | 0.4977 | 0.5214 | 0.4981 |
+| 59 | 0.4988 | **0.5247** | 0.5050 |
+
+Final-epoch breakdown:
+
+| | 145 | 146 | 147 |
+|---|---|---|---|
+| seen | 0.5672 | 0.6034 | 0.5940 |
+| unseen | 0.4269 | 0.4418 | 0.4114 |
+| ct | 0.5539 | 0.5818 | 0.5603 |
+| mri | 0.4319 | 0.4571 | 0.4608 |
+| r1.5 (fine) | 0.4949 | 0.5213 | 0.5013 |
+| r4 (coarse) | 0.4348 | 0.4377 | 0.4295 |
+
+Two findings:
+
+1. **Real prev.pred prior clearly beats perturbed-GT** (146 vs 145: +0.026 val_dice, +0.036
+   seen, +0.015 unseen, consistent from epoch 20 onward). Training on the actual imperfect
+   upstream prediction — rather than a synthetically-degraded GT standing in for it — better
+   matches the eval-time distribution the fine level actually sees, and the synthetic
+   dilate/erode/shift/noise perturbation apparently doesn't cover the real failure modes
+   closely enough to be a good substitute. First isolated Dice comparison of this knob.
+2. **Adding cascade_registers on top REGRESSES it** (147 vs 146: -0.020 val_dice), undoing
+   ~75% of the prior-switch gain, and lands 147 barely above the 145 anchor. The regression is
+   concentrated in the fine level (r1.5: -0.020) more than coarse (r4: -0.008), and hits unseen
+   classes hardest (unseen -0.030 vs seen -0.009) — i.e. the level-(i-1)->level-i thinking-row
+   carry looks like it's injecting noise into fine-level adaptation rather than useful context,
+   worse for classes the model can't already fall back on memorized shape priors for. This
+   matches the earlier mixed/negative `cascade_registers` result on the older exp92 checkpoint
+   family (regressed hu_lwk1 0.1287->0.0935, see 2026-09-13 entry) — now confirmed as a
+   regression in a controlled ablation on real cascade training too, not just a checkpoint-
+   family fluke.
+
+`random_fg` center mode itself (baked into all three arms here, never compared against `com`
+in matched real-cascade training within this chain) still has no isolated Dice number — would
+need a 4th arm or a rerun of one cell with `center_mode=com` to close that gap.
+
+wandb: [145](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/6ylg2l3o) ·
+[146](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/wrwzs5fs) ·
+[147a](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/i1f4ah8t) ·
+[147b](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/e4cd8yek)
