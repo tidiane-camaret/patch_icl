@@ -67,7 +67,7 @@ def _decim_avg_pool(arr_t, decim):
 
 
 def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
-                      crop_spacing_mm, norm=None, modality="ct"):
+                      crop_spacing_mm, norm=None, modality="ct", max_native=None):
     """Assemble a `NativeCrop` payload from an `organ_crop_arrays` result.
 
     `decim[a] = crop_sizes[a] // out_sizes[a]` (>=1), so the payload grid stays >=
@@ -80,8 +80,24 @@ def build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom, *,
     final `_area_pool_3d` to out_sizes reproduces the reference's single native->out_sizes
     area pool for integer factors. `has_fg` records class presence pre-decimation so the
     never-empty / soft peak-floor guards still fire for sub-cell structures.
+
+    `max_native`, when set, bounds the native crop before it's materialized: axes over the
+    cap are nearest-strided first (mirrors gpu_realize_max_native in
+    src/synth_gmm_maisi_dataset.py — crop_ct/crop_lbl are still lazy views into the RAM
+    cache/mmap here, so striding before the `np.array()` copy avoids the full memcpy+avgpool
+    cost). `geom` (the physical crop_sizes used for cross-level placement) is untouched —
+    only the local decimation math sees the strided shape. Needed for MRI: unlike CT's
+    uniform 1.5mm native grid, MRI native spacing is heterogeneous and often much finer, so
+    a physical crop window can clamp to the ENTIRE native volume (tens of millions of
+    voxels) — see docs/logs.md. Nearest-striding a thin structure before pooling can miss it
+    (the same has_fg-aliasing tradeoff synth_gmm's cap already accepts).
     """
     crop_sizes = geom[1].tolist()
+    if max_native and max(crop_sizes) > max_native:
+        step = tuple(-(-int(cs) // int(max_native)) for cs in crop_sizes)  # ceil division
+        crop_ct = crop_ct[::step[0], ::step[1], ::step[2]]
+        crop_lbl = crop_lbl[::step[0], ::step[1], ::step[2]]
+        crop_sizes = list(crop_ct.shape)
     decim = tuple(max(1, int(cs) // max(1, int(o)))
                   for cs, o in zip(crop_sizes, out_sizes))
     # np.array (not ascontiguousarray) always copies -> never aliases the read-only RAM cache
@@ -206,8 +222,14 @@ class TotalSegProvider:
     def __init__(self, root, classes, image_size, split=None, meta_csv=None,
                  max_subjects=None, crop_spacing_mm=1.5, crop_jitter=None,
                  mask_downsample="occupancy", mask_occupancy_thr=0.1, modality="ct",
-                 ct_norm=None, ram_cache=False, ram_cache_max_subjects=None):
+                 ct_norm=None, ram_cache=False, ram_cache_max_subjects=None,
+                 native_crop_max_native=None):
         assert modality in ("ct", "mri"), modality
+        # Native-crop voxel cap (data.gpu_realize_max_native), forwarded to build_native_crop
+        # -- see its docstring. CT's native grid is uniformly 1.5mm so this never fires for
+        # CT in practice; MRI's finer/heterogeneous native spacing is what needs it.
+        self._native_crop_max_native = (int(native_crop_max_native)
+                                        if native_crop_max_native else None)
         # The one CT frame the whole pipeline runs in (see src/totalseg_dataset.CtNormSpec).
         self.ct_spec = resolve_ct_norm(ct_norm)
         self.root = Path(root)
@@ -347,7 +369,7 @@ class TotalSegProvider:
         return build_native_crop(
             crop_ct, crop_lbl, _ALL_CLASSES_IDX.get(cls, -1), out_sizes, pad_lo, geom,
             crop_spacing_mm=float(req.crop_spacing_mm),
-            norm=norm, modality=self.modality)
+            norm=norm, modality=self.modality, max_native=self._native_crop_max_native)
 
     # --- subjects + caches --------------------------------------------------
     def _subjects(self, split, meta_csv, max_subjects):

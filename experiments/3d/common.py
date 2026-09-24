@@ -425,7 +425,8 @@ def build_dataset(cfg, split: str):
                                        else d.get("mask_downsample", "occupancy"))),
                 mask_occupancy_thr=d.get("mask_occupancy_thr", 0.1),
                 modality=mod, ct_norm=d.get("ct_norm"), ram_cache=_ram,
-                ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
+                ram_cache_max_subjects=d.get("ram_cache_max_subjects"),
+                native_crop_max_native=d.get("gpu_realize_max_native"))
             # A broken split_map / class spec (or a wrong root) would leave a sub-provider
             # with zero usable subjects -> the run silently degrades to one modality with
             # bogus "cross" labels. Fail loudly instead.
@@ -566,7 +567,8 @@ def build_dataset(cfg, split: str):
             modality=("mri" if is_mri else "ct"),
             ct_norm=d.get("ct_norm"),
             ram_cache=bool(d.get("ram_cache", _realize)),
-            ram_cache_max_subjects=d.get("ram_cache_max_subjects"))
+            ram_cache_max_subjects=d.get("ram_cache_max_subjects"),
+            native_crop_max_native=d.get("gpu_realize_max_native"))
         return InContextDataset(
             provider, context_size=d.context_size,
             class_balanced=(is_train and d.get("class_balanced", False)),

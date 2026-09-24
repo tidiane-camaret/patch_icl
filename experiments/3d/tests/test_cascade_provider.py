@@ -40,7 +40,7 @@ import torch
 from src.providers.totalseg import NativeCrop
 
 
-def _tiny_provider(tmp_path, spacing=1.5, T=8):
+def _tiny_provider(tmp_path, spacing=1.5, T=8, native_crop_max_native=None):
     """A TotalSegProvider over a 2-subject fake root with ram_cache on."""
     from src.providers.totalseg import TotalSegProvider
     from src.totalseg_dataset import _ALL_CLASSES_IDX
@@ -62,7 +62,8 @@ def _tiny_provider(tmp_path, spacing=1.5, T=8):
     return TotalSegProvider(
         root=str(tmp_path), classes=["liver"], image_size=(T, T, T), split="train",
         crop_spacing_mm=spacing, crop_jitter=0, mask_downsample="soft",
-        mask_occupancy_thr=0.5, ram_cache=True)
+        mask_occupancy_thr=0.5, ram_cache=True,
+        native_crop_max_native=native_crop_max_native)
 
 
 def test_load_native_crop_geom_matches_crop_and_place(tmp_path):
@@ -131,6 +132,41 @@ def test_load_native_crop_label_is_partial_volume_fraction(tmp_path):
     assert abs(float(f.sum()) - 4 ** 3 / 8) < 1e-3
     # image is HU-clipped to the ct_spec window BEFORE the decimation average
     assert float(nc.image.float().max()) <= prov.ct_spec.clip_hi + 1e-3
+
+
+def test_native_crop_max_native_caps_materialized_voxels(tmp_path):
+    """data.gpu_realize_max_native, when forwarded to TotalSegProvider, nearest-strides an
+    over-cap native crop BEFORE build_native_crop materializes it (root cause: a physical
+    crop window can clamp to the entire native volume when native spacing is fine -- MRI's
+    heterogeneous, often sub-1.5mm grid, unlike CT's uniform 1.5mm -- making the uncapped
+    np.array() copy + avg_pool3d an unbounded-size single-threaded CPU op)."""
+    import random
+
+    from src.incontext_dataset_v2 import LoadRequest
+
+    # spacing=6.0, T=8 -> target_sizes = round(8*6/1.5) = 32 > the 20^3 fake native volume,
+    # so organ_crop_arrays clamps crop_sizes to the FULL native extent (20,20,20) on every
+    # axis -- the exact "physical window clamps to the whole volume" condition from prod.
+    (tmp_path / "uncapped").mkdir()
+    (tmp_path / "capped").mkdir()
+    prov_uncapped = _tiny_provider(tmp_path / "uncapped", spacing=6.0, T=8,
+                                   native_crop_max_native=None)
+    center = (10, 10, 10)
+    req = lambda: LoadRequest(rng=random.Random(0), crop_spacing_mm=6.0, center=center, jitter=0)
+    nc_uncapped = prov_uncapped.load_native_crop("s0", "liver", req())
+    assert nc_uncapped.crop_geom[1].tolist() == [20, 20, 20]   # confirms the clamp fired
+    assert nc_uncapped.decim == (4, 4, 4)                      # 20 // out_sizes(5)
+
+    prov_capped = _tiny_provider(tmp_path / "capped", spacing=6.0, T=8, native_crop_max_native=10)
+    nc_capped = prov_capped.load_native_crop("s0", "liver", req())
+    # crop_geom (physical bookkeeping for cross-level placement) is untouched by the cap
+    assert nc_capped.crop_geom[1].tolist() == [20, 20, 20]
+    assert nc_capped.out_sizes == nc_uncapped.out_sizes
+    # decim is recomputed off the STRIDED (<=10^3) shape, not the original 20^3
+    assert all(d < u for d, u in zip(nc_capped.decim, nc_uncapped.decim))
+    assert nc_capped.image.shape == tuple(nc_capped.out_sizes)
+    assert nc_capped.label_frac.shape == tuple(nc_capped.out_sizes)
+    assert nc_capped.has_fg is True                            # the liver block still hit
 
 
 def test_provider_is_not_pickled_with_its_ram_cache(tmp_path):
