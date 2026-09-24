@@ -12,58 +12,99 @@
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
-
-  % Three parallel lanes, all token grids at the same x (7.40) so the
-  % three token streams read as aligned right before attention:
-  %   target (image only)      y:  4.45-6.05, center 5.25
-  %   context image ($I^C$)    y:  1.825-3.425, center 2.625
-  %   context mask ($M^C$)     y: -0.80-0.80, center 0.00
-
   % ---- lane 1: target image ----
   \archvolcube{0}{4.45}{1.6}{1.6}{archTargetGreen}{ct}{$I^T$}
   \archarrow{(1.7,5.25)}{(2.35,5.25)}{archArrowPale}
   \archfunnel{2.45}{4.45}{1.6}{1.9}{1.0}{1}{archEncGray}{Encoder}
   \archarrow{(4.45,5.25)}{(5.00,5.25)}{archArrowPale}
   \archfeatcube{5.10}{4.70}{1.0}{1.1}{archTargetGreen}{$F^T$}
-  \archarrow{(6.20,5.25)}{(6.80,5.25)}{archArrowPale}
-  \archtokengrid{7.40}{4.5}{3}{1}{0.5}{archTargetGreen}
+  \archarrow{(6.20,5.25)}{(6.95,5.25)}{archArrowPale}
+  
+  % Tgt Img and Tgt Lbl (grey) tokens stacked on top. 
+  % Cell size 0.875 perfectly centers 3 rows at y=5.25 (3.9375 + 1.5*0.875 = 5.25)
+  \archtokengrid{7.05}{3.9375}{3}{1}{0.875}{archTargetGreen}
+  \archtokengrid{7.925}{3.9375}{3}{1}{0.875}{black!25}
 
-  % ---- lane 3: context mask -- fed to attention as its own token
-  % stream, with no encoder box at all: patch embedding here is a
-  % single lightweight projection, not a deep encoder, so it is shown
-  % as one long arrow straight into its tokens rather than a block.
-  % Kept 0.7 below lane 2 (not just the 0.1 baseline gap): the $I^C$
-  % label below lane 2 is plain black text, and anything closer
-  % overlapped this cube's solid-black mask content, making the label
-  % unreadable regardless of draw order. ----
+  % ---- lane 3: context mask -- fed to attention as its own token stream
   \archvolcube{0}{-0.8}{1.6}{1.6}{archContextAccent}{predmask}{$M^C$}
-  \archarrow{(1.7,0.00)}{(6.80,0.00)}{archArrowPale}
-  \archtokengrid{7.40}{-0.75}{3}{1}{0.5}{archContextAccent}
+  % Route Context Mask to the bottom center of the large Ctx Lbl token grid
+  \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.7,0.00) -| (8.28,1.25);
 
-  % ---- lane 2: context image (mask no longer overlaid on it) ----
+  % ---- lane 2: context image ----
   \archvolcube{0}{1.825}{1.6}{1.6}{archContextPink}{ct}{$I^C$}
   \archarrow{(1.7,2.625)}{(2.35,2.625)}{archArrowPale}
   \archfunnel{2.45}{1.825}{1.6}{1.9}{1.0}{1}{archEncGray}{Encoder}
   \archarrow{(4.45,2.625)}{(5.00,2.625)}{archArrowPale}
   \archfeatcube{5.10}{2.075}{1.0}{1.1}{archContextPink}{$F^C$}
-  \archarrow{(6.20,2.625)}{(6.80,2.625)}{archArrowPale}
-  \archtokengrid{7.40}{1.875}{3}{1}{0.5}{archContextPink}
+  \archarrow{(6.20,2.625)}{(6.95,2.625)}{archArrowPale}
+  
+  % Ctx Img and Ctx Lbl tokens stacked perfectly below Tgt tokens (no gap).
+  % Cell size 0.875 perfectly centers 3 rows at y=2.625
+  \archtokengrid{7.05}{1.3125}{3}{1}{0.875}{archContextPink}
+  \archtokengrid{7.925}{1.3125}{3}{1}{0.875}{archContextAccent}
 
-  % ---- bi-axial attention block: all three token lanes converge here ----
-  \archarrow{(8.00,5.25)}{(8.35,5.25)}{archArrowPale}
-  \archarrow{(8.00,2.625)}{(8.35,2.625)}{archArrowPale}
-  \archarrow{(8.00,0.00)}{(8.35,0.00)}{archArrowPale}
-  \draw[archAttnBlue!70!black,thin,dashed] (8.35,-0.15) rectangle ++(1.80,5.55);
-  \archtokengrid{8.50}{0.25}{10}{3}{0.5}{archAttnBlue}
-  \node[align=center] at (9.25,5.70) {patch-level\\attention};
+  % ---- bi-axial attention block ----
+  % Centered arrow entering the block
+  \archarrow{(8.80,3.9375)}{(9.30,3.9375)}{archArrowPale}
+  
+  % Outer Attention wrapper
+  \draw[archAttnBlue!70!black,thin,dashed] (9.30, 2.10) rectangle (14.80, 6.30);
+  \node[align=center] at (12.05,6.60) {bi-axial\\attention};
 
-  % ---- output (target stream only) ----
-  \archarrow{(10.25,5.25)}{(10.80,5.25)}{archArrowPale}
-  \archtokengrid{10.90}{4.5}{3}{1}{0.5}{archTargetGreen}
-  \archarrow{(12.00,5.25)}{(12.60,5.25)}{archArrowPale}
-  \archfunnel{12.70}{4.45}{1.6}{1.9}{1.0}{-1}{archEncGray}{Decoder}
-  \archarrow{(14.70,5.25)}{(15.20,5.25)}{archArrowPale}
-  \archvolcube{15.30}{4.45}{1.6}{1.6}{archTargetGreen}{predmask}{$M^T_{\mathrm{pred}}$}
+  % --- Sub-block 1: Image/Label axis ---
+  % Box width is 2.5
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.45, 2.25) rectangle (11.95, 5.60);
+  
+  % Smaller inner tokens spread out to allow roomy arrows
+  \archtokengrid{9.65}{3.9375}{3}{1}{0.5}{archTargetGreen!40!white}
+  \archtokengrid{11.25}{3.9375}{3}{1}{0.5}{black!15}
+  \archtokengrid{9.65}{2.4375}{3}{1}{0.5}{archContextPink!40!white}
+  \archtokengrid{11.25}{2.4375}{3}{1}{0.5}{archContextAccent!40!white}
+  
+  % Horizontal bidirectional arrows merging image and label axes
+  \foreach \y in {2.6875, 3.1875, 3.6875, 4.1875, 4.6875, 5.1875} {
+    \draw[{Latex[length=1.5mm,width=1.5mm]}-{Latex[length=1.5mm,width=1.5mm]}, line width=1pt, black!50] (10.25, \y) -- (11.15, \y);
+  }
+
+  % --- Sub-block 2: Patch axis ---
+  % Box width is 2.5 (identical to sub-block 1)
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (12.15, 2.25) rectangle (14.65, 5.60);
+  
+  % Smaller inner tokens grouped tighter to make room for fan arrows
+  \archtokengrid{12.35}{3.9375}{3}{1}{0.5}{archTargetGreen!40!white}
+  \archtokengrid{13.05}{3.9375}{3}{1}{0.5}{black!15}
+  \archtokengrid{12.35}{2.4375}{3}{1}{0.5}{archContextPink!40!white}
+  \archtokengrid{13.05}{2.4375}{3}{1}{0.5}{archContextAccent!40!white}
+  
+  % Vertical bezier fan arrows connecting Target rows to Context rows
+  \foreach \yt/\yc/\bulge in {
+    4.1875/3.6875/0.25, 4.1875/3.1875/0.40, 4.1875/2.6875/0.55,
+    4.6875/3.6875/0.40, 4.6875/3.1875/0.55, 4.6875/2.6875/0.70,
+    5.1875/3.6875/0.55, 5.1875/3.1875/0.70, 5.1875/2.6875/0.85
+  } {
+    \draw[{Latex[length=1.5mm,width=1.2mm]}-{Latex[length=1.5mm,width=1.2mm]}, line width=0.8pt, archTargetAccent!70!white]
+      (13.65,\yc) .. controls +(\bulge,0.1) and +(\bulge,-0.1) .. (13.65,\yt);
+  }
+
+  % ---- post-attention output grids ----
+  % Centered arrow exiting the block
+  \archarrow{(14.90,3.9375)}{(15.40,3.9375)}{archArrowPale}
+  
+  % Output token grids maintaining the lighter tone from inside attention
+  \archtokengrid{15.50}{3.9375}{3}{1}{0.875}{archTargetGreen!40!white}
+  \archtokengrid{16.375}{3.9375}{3}{1}{0.875}{black!15}
+  \archtokengrid{15.50}{1.3125}{3}{1}{0.875}{archContextPink!40!white}
+  \archtokengrid{16.375}{1.3125}{3}{1}{0.875}{archContextAccent!40!white}
+  
+  % Grey box highlighting the Target Label tokens
+  \draw[black!40, line width=1.5pt, rounded corners=2pt] (16.27, 3.84) rectangle (17.19, 6.46);
+  
+  % ---- output decoder (fed from Target Label only) ----
+  \archarrow{(17.30,5.25)}{(17.80,5.25)}{archArrowPale}
+  \archfunnel{17.90}{4.45}{1.6}{1.9}{1.0}{-1}{archEncGray}{Decoder}
+  
+  \archarrow{(19.60,5.25)}{(20.10,5.25)}{archArrowPale}
+  \archvolcube{20.20}{4.45}{1.6}{1.6}{archTargetGreen}{predmask}{$M^T_{\mathrm{pred}}$}
 
 \end{tikzpicture}
 \end{document}
