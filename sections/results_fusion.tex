@@ -1,44 +1,51 @@
 \subsection{Image--Label Fusion}\label{sec:results-fusion}
 
-\paragraph{Isolating the bi-axial attention effect.} The design choice
-this axis makes is keeping image and label tokens as separate streams
-that repeatedly cross-attend (the slot axis,
-\autoref{sec:methodology-fusion}), rather than fusing them once. To
-isolate its effect, the reference model is compared against a
-single-axis control that removes the slot axis (\texttt{arch.dual\_axis=false}),
-collapsing image and label evidence into one stream -- closer in spirit
-to Medverse's early-concatenation design
-(\autoref{sec:fundamentals-relatedwork}) -- while keeping everything
-else in the recipe unchanged.
+\paragraph{Isolating the slot-axis effect.} The design choice this axis
+makes is keeping image and label tokens as separate streams that
+repeatedly cross-attend at every layer (the slot axis,
+\autoref{sec:methodology-fusion}), rather than fusing them once before the
+transformer. To isolate its effect, the reference model
+(\texttt{arch.dual\_axis=true}) is compared against a single-axis control
+that removes the slot axis (\texttt{arch.dual\_axis=false}): image and
+label evidence are merged into one token per cell via a pixel
+shuffle--unshuffle operation before the transformer, closer in spirit to
+Iris's fusion point (\autoref{sec:fundamentals-relatedwork}), and only the
+row axis (cross-context attention) remains.
+
+Two adjustments relative to a naive dual-axis-flag toggle: (1) the
+single-axis control's transformer depth is raised from $l{=}4$ to
+$l{=}9$ so its GFLOPs are within 3\% of the reference model's --
+removing the slot axis also removes a large share of the model's compute,
+and parameter count and compute could not be matched simultaneously by
+this route (matching compute instead leaves parameters 52\% higher for
+the single-axis control); (2) both runs warm-start \emph{only} the
+encoder and decoder from a shared checkpoint, with the entire in-context
+reasoning core (transformer, image/label embeddings, context/query id,
+thinking rows, cascade projection, pool projection) randomly initialized
+for both arms, so neither model starts from an already-trained
+transformer. Both runs use real anatomy only ($p_\text{synth}{=}0$),
+CT only, and are read at a matched epoch (160) of a shared 400-epoch
+training budget.
 
 \begin{table}[t]
   \centering
   \small
   \caption{Bi-axial attention vs.\ a single-axis (early-fusion-style)
-  control, TotalSegmentator validation Dice. The two runs are continued
-  from different checkpoints for a different number of epochs (see
-  caveat below) -- not yet a matched comparison.}
+  control, TotalSegmentator validation Dice at a matched epoch (160/400)
+  and matched transformer compute.}
   \label{tab:fusion-axis}
-  \begin{tabular}{lccccc}
+  \begin{tabular}{lcccccc}
     \toprule
-     & epoch & Dice & seen & unseen & GFLOPs \\
+     & $l$ & Dice & seen & unseen & GFLOPs (transformer) & params \\
     \midrule
-    Single-axis (control) & 40/51 & 0.286 & 0.338 & 0.227 & 2407.7 \\
-    \textbf{Bi-axial (ours)} & 50/51 & \textbf{0.510} & \textbf{0.591} & \textbf{0.419} & 3892.5 \\
+    Single-axis (control) & 9 & 0.448 & 0.510 & 0.377 & 2817.8 & 74.1M \\
+    \textbf{Bi-axial (ours)} & 4 & \textbf{0.462} & \textbf{0.527} & \textbf{0.389} & 2737.4 & 48.7M \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-The bi-axial model reaches roughly $1.8\times$ the single-axis control's
-Dice, at both seen and unseen classes, for about $1.6\times$ the GFLOPs.
-
-\paragraph{Not yet an apples-to-apples ablation.} This is a first look,
-not a controlled ablation: the two runs continue from different
-upstream checkpoints (from separately-trained bi-axial and single-axis
-lineages respectively) and are read at different points -- the bi-axial
-run completed its full 51-epoch schedule, while the single-axis run had
-reached only epoch 40 and was still improving each eval at last check.
-\todo{Run a controlled comparison: same initialization/training budget
-for both, both trained to convergence, ideally $\geq 2$ seeds, before
-this is cited as a settled effect size rather than a preliminary
-signal.}
+\paragraph{Status.} Both runs were still improving at epoch 160 (neither
+had converged); the single-axis run had not yet reached its full
+400-epoch budget at analysis time. N=1 seed per arm.
+\todo{Re-read this table once both runs reach the full 400-epoch budget;
+add $\geq 2$ seeds before citing an effect size.}

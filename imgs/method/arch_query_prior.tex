@@ -25,10 +25,10 @@
 \begin{tikzpicture}[x=1cm,y=1cm]
 
   % -------------------------------------------------------------------------
-  % 2 Cascade Levels (Level 1: support-mean prior -> Level 2: cropped prior)
+  % 2 Cascade Levels (Compact & Simplified)
   % -------------------------------------------------------------------------
   \foreach \L/\xs/\rname in {1/0/{Level 1 -- coarse ($r_1=6$mm)}, 
-                             2/21.0/{Level 2 -- fine ($r_2=3$mm)}} {
+                             2/11.5/{Level 2 -- fine ($r_2=3$mm)}} {
     \begin{scope}[xshift=\xs cm]
       
       \node[anchor=west,font=\bfseries\Large,black!80] at (0,7.3) {\rname};
@@ -38,10 +38,8 @@
       \archvolcube{0}{5.5}{1.15}{1.3}{archTargetGreen}{ct}{}
       \archarrow{(1.25,6.15)}{(1.6,6.15)}{archArrowPale}
       \archfunnel{1.7}{5.5}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
-      \archarrow{(3.0,6.15)}{(3.4,6.15)}{archArrowPale}
-      \archfeatcube{3.5}{5.6}{0.7}{1.1}{archTargetGreen}{$F^T$}
-      % Route down to Target Img tokens
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (4.3,6.15) -| (4.6,4.55) -- (4.9,4.55);
+      % Direct compact route to Attention
+      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (2.45,6.15) -| (3.1,5.0) -- (3.5,5.0);
 
       % ---- lane 1: target PRIOR ----
       \ifthenelse{\equal{\L}{1}}{
@@ -49,13 +47,13 @@
         \fill[black!3] (0,3.8) rectangle (1.15, 5.1);
         \draw[black!25, dashed, line width=1.2pt] (0,3.8) rectangle (1.15, 5.1);
         \node[align=center, font=\scriptsize, black!40] at (0.575, 4.45) {support\\mean};
-        % Ghosted routing arrow
-        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,black!15] (1.25,4.45) -| (5.4,4.55) -- (5.6,4.55);
+        % Ghosted routing arrow directly into Attention
+        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,black!20] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
       }{
         % Level 2: REAL prior cube (receives crop from Level 1)
         \node[anchor=east,font=\normalsize] at (-0.2,4.45) {$P^T$};
         \archvolcube{0}{3.8}{1.15}{1.3}{archTargetAccent}{predmask}{}
-        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,4.45) -| (5.4,4.55) -- (5.6,4.55);
+        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
       }
 
       % ---- lane 2: context image (always real) ----
@@ -63,99 +61,59 @@
       \archvolcube{0}{2.1}{1.15}{1.3}{archContextPink}{ct}{}
       \archarrow{(1.25,2.75)}{(1.6,2.75)}{archArrowPale}
       \archfunnel{1.7}{2.1}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
-      \archarrow{(3.0,2.75)}{(3.4,2.75)}{archArrowPale}
-      \archfeatcube{3.5}{2.2}{0.7}{1.1}{archContextPink}{$F^C$}
-      % Route down to Context Img tokens
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (4.3,2.75) -| (4.6,2.45) -- (4.9,2.45);
+      % Direct route to Attention
+      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (2.45,2.75) -- (3.5,2.75);
 
       % ---- lane 3: context mask (always real) ----
       \node[anchor=east,font=\normalsize] at (-0.2,0.9) {$M^C$};
       \archvolcube{0}{0.4}{1.15}{1.0}{archContextAccent}{predmask}{}
-      % Route up to Context Lbl tokens
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,0.9) -| (5.4,2.45) -- (5.6,2.45);
+      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
 
 
       % -------------------------------------------------------------------------
-      % Unified Pre-Attention Tokens (2x2 Grid)
+      % Compact Single-Block Attention
       % -------------------------------------------------------------------------
-      \archtokengrid{5.0}{3.5}{3}{1}{0.7}{archTargetGreen}         % Tgt Img
-      \ifthenelse{\equal{\L}{1}}{
-        \archtokengrid{5.7}{3.5}{3}{1}{0.7}{black!15}              % Tgt Lbl (ghosted for L1)
-      }{
-        \archtokengrid{5.7}{3.5}{3}{1}{0.7}{archTargetAccent}      % Tgt Lbl (active for L2)
-      }
-      \archtokengrid{5.0}{1.4}{3}{1}{0.7}{archContextPink}         % Ctx Img
-      \archtokengrid{5.7}{1.4}{3}{1}{0.7}{archContextAccent}       % Ctx Lbl
-
-
-      % -------------------------------------------------------------------------
-      % Compact Bi-axial Attention Block
-      % -------------------------------------------------------------------------
-      \archarrow{(6.5,3.5)}{(7.0,3.5)}{archArrowPale}
+      % Background and Border
+      \fill[archAttnBlue!10, rounded corners=4pt] (3.5, 1.1) rectangle (5.7, 5.9);
+      \draw[archAttnBlue!70!black, thin, dashed, rounded corners=4pt] (3.5, 1.1) rectangle (5.7, 5.9);
       
-      \draw[archAttnBlue!70!black,thin,dashed] (7.0, 1.1) rectangle ++(5.5, 4.8);
-      \node[align=center] at (9.75, 6.2) {bi-axial attention};
+      % Label
+      \node[align=center, font=\bfseries\normalsize, archAttnBlue!70!black] at (4.6, 6.25) {attention};
 
-      % Sub-box 1: Image/Label axis
-      \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (7.15, 1.25) rectangle ++(2.4, 4.5);
-      \archtokengrid{7.4}{3.5}{3}{1}{0.45}{archTargetGreen!40!white}
-      \archtokengrid{8.8}{3.5}{3}{1}{0.45}{black!15}
-      \archtokengrid{7.4}{2.15}{3}{1}{0.45}{archContextPink!40!white}
-      \archtokengrid{8.8}{2.15}{3}{1}{0.45}{archContextAccent!40!white}
-      \foreach \y in {2.375, 2.825, 3.275, 3.725, 4.175, 4.625} {
-        \draw[{Latex[length=1.2mm,width=1.2mm]}-{Latex[length=1.2mm,width=1.2mm]}, line width=0.8pt, black!50] (7.95, \y) -- (8.7, \y);
+      % Internal 6x2 Token Grid
+      \archtokengrid{3.8}{3.5}{3}{1}{0.7}{archTargetGreen}         % Tgt Img
+      \ifthenelse{\equal{\L}{1}}{
+        \archtokengrid{4.7}{3.5}{3}{1}{0.7}{black!15}              % Tgt Lbl (ghosted for L1)
+      }{
+        \archtokengrid{4.7}{3.5}{3}{1}{0.7}{archTargetAccent}      % Tgt Lbl (active for L2)
       }
-
-      % Sub-box 2: Patch axis
-      \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.75, 1.25) rectangle ++(2.6, 4.5);
-      \archtokengrid{10.0}{3.5}{3}{1}{0.45}{archTargetGreen!40!white}
-      \archtokengrid{11.4}{3.5}{3}{1}{0.45}{black!15}
-      \archtokengrid{10.0}{2.15}{3}{1}{0.45}{archContextPink!40!white}
-      \archtokengrid{11.4}{2.15}{3}{1}{0.45}{archContextAccent!40!white}
-      \foreach \yt/\yc/\bulge in {
-        3.725/3.275/0.2, 3.725/2.825/0.3, 3.725/2.375/0.4,
-        4.175/3.275/0.3, 4.175/2.825/0.4, 4.175/2.375/0.5,
-        4.625/3.275/0.4, 4.625/2.825/0.5, 4.625/2.375/0.6
-      } {
-        \draw[{Latex[length=1.2mm,width=1.0mm]}-{Latex[length=1.2mm,width=1.0mm]}, line width=0.6pt, archTargetAccent!70!white]
-          (11.95,\yc) .. controls +(\bulge,0.1) and +(\bulge,-0.1) .. (11.95,\yt);
-      }
+      \archtokengrid{3.8}{1.4}{3}{1}{0.7}{archContextPink}         % Ctx Img
+      \archtokengrid{4.7}{1.4}{3}{1}{0.7}{archContextAccent}       % Ctx Lbl
 
 
       % -------------------------------------------------------------------------
       % Output & Decoder Routing
       % -------------------------------------------------------------------------
-      \archarrow{(12.6, 3.5)}{(13.1, 3.5)}{archArrowPale}
-
-      % Post-attention tokens
-      \archtokengrid{13.2}{3.5}{3}{1}{0.7}{archTargetGreen!40!white}
-      \archtokengrid{13.9}{3.5}{3}{1}{0.7}{black!15}
-      \archtokengrid{13.2}{1.4}{3}{1}{0.7}{archContextPink!40!white}
-      \archtokengrid{13.9}{1.4}{3}{1}{0.7}{archContextAccent!40!white}
-
-      % Grey bounding box selecting Target Label stream for output
-      \draw[black!40, line width=1.2pt, rounded corners=2pt] (13.8, 3.4) rectangle (14.7, 5.7);
-
-      % Route into Decoder
-      \archarrow{(14.8, 4.55)}{(15.3, 4.55)}{archArrowPale}
-      \archfunnel{15.4}{3.9}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
-      \archarrow{(16.8, 4.55)}{(17.3, 4.55)}{archArrowPale}
-      \archvolcube{17.4}{3.9}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
+      \archarrow{(5.7, 4.55)}{(6.6, 4.55)}{archArrowPale}
+      
+      \archfunnel{6.7}{3.9}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
+      \archarrow{(7.45, 4.55)}{(7.95, 4.55)}{archArrowPale}
+      \archvolcube{8.05}{3.9}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
 
       % Level 1 specific Crop Bounding Box
       \ifthenelse{\equal{\L}{1}}{
         % Dashed box directly on the centroid of Level 1's output mask
-        \draw[archCtxYellow, line width=1.5pt, dashed] (17.975-0.3, 4.55-0.3) rectangle ++(0.6, 0.6);
+        \draw[archCtxYellow, line width=1.5pt, dashed] (8.325, 4.25) rectangle ++(0.6, 0.6);
       }{}
     \end{scope}
   }
 
   % -------------------------------------------------------------------------
-  % The Inter-Level Crop Arrow (The core point of the diagram)
+  % The Inter-Level Crop Arrow
   % -------------------------------------------------------------------------
   \draw[-{Latex[length=3.8mm,width=3.4mm]},line width=2.5pt,archCtxYellow!90!black]
-    (18.35, 4.65) to[bend left=18] (20.8, 4.45);
-  \node[align=center,font=\bfseries\Large,archCtxYellow!90!black] at (19.6, 5.3) {crop};
+    (9.25, 4.65) to[bend left=18] (11.4, 4.45);
+  \node[align=center,font=\bfseries\Large,archCtxYellow!90!black] at (10.35, 5.3) {crop};
 
 \end{tikzpicture}
 \end{document}

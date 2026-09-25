@@ -1,1 +1,59 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:results-cascade}
+
+This section reports a controlled ablation of two of the cascade
+mechanisms introduced in \autoref{sec:methodology-cascade}: the query
+prior and the cross-level register tokens. A three-arm chain --
+\texttt{145} $\to$ \texttt{146} $\to$ \texttt{147} -- resumes the same
+starting checkpoint independently for each arm and changes exactly one
+setting per step, evaluated in-distribution on TotalSegmentator (119
+classes, real anatomy only, $p_{\text{synth}}{=}0$) at a shared
+epoch-59 cutoff (60-epoch budget).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Query-prior source and register-carry ablation, TotalSegmentator
+  macro Dice (119 classes), epoch 59.}
+  \label{tab:cascade-ablation}
+  \begin{tabular}{llcc}
+    \toprule
+    Arm & Config & Dice & $\Delta$ \\
+    \midrule
+    145 & GT prior (perturbed), registers off & 0.499 & -- \\
+    \textbf{146} & \textbf{Predicted prior, registers off} & \textbf{0.525} & \textbf{+0.026} \\
+    147 & Predicted prior, registers on & 0.505 & $-0.020$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{A real predicted prior beats a perturbed ground-truth prior.}
+Arms 145 and 146 differ only in what feeds the query prior at the fine
+level: a perturbed ground-truth mask (dilated, eroded, shifted, and
+noised) versus the model's own real previous-level prediction. The real
+prediction wins, 0.499 $\to$ 0.525 macro Dice, improving 90 of 119
+classes (median $+0.026$). This is an ablation of \emph{which} non-null
+prior source is better, not of whether a prior helps at all --
+\autoref{sec:results-cascade} does not yet contain an arm that drops the
+query prior entirely.
+\todo{Add a no-query-prior control arm to complete the ablation table
+promised in the methodology chapter (full model vs.\ $-$query-prior vs.\
+$-$region-restriction vs.\ $-$register-carry).}
+
+\paragraph{Register carry regresses accuracy.} Arms 146 and 147 differ
+only in \texttt{cascade\_registers}. Turning it on regresses macro Dice,
+0.525 $\to$ 0.505, across 77 of 119 classes, and costs roughly 2.5\%
+additional inference latency for it. The regression is larger on classes
+held out of training than on seen classes ($-0.030$ vs.\ $-0.009$ mean
+per-class Dice), and is not uniform across anatomy: the worst-hit classes
+are almost all repeated fine structures that co-occur many times in one
+volume -- individual ribs and vertebral levels, with
+\texttt{brachiocephalic\_vein\_left} collapsing to Dice 0.0 at every
+evaluated epoch once registers are on. A smaller set of large,
+uniquely-shaped structures (lungs, skull, aorta) improve under registers,
+consistent with the carried state helping global context at the cost of
+confusing instance disambiguation among near-identical repeated
+structures.
+\todo{N=1 seed for this chain; re-run with a second seed before citing
+the register-carry effect size. Region-restriction margin is unablated
+here (\autoref{sec:methodology-cascade}); the accuracy/compute Pareto
+sweep as the margin is relaxed has not been run.}
