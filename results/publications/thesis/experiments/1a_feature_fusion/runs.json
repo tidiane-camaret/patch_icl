@@ -1,0 +1,18 @@
+{
+  "experiment": "1a_feature_fusion",
+  "description": "Bi-axial cross-context/within-volume attention (dual_axis=True) vs early img-mask feature fusion (dual_axis=False, PixelShuffle fuse_conv pre-transformer, no column-axis attention) — thesis Methodology feature-fusion ablation. Compute-matched: 151's arch.l=9 gives gflops_transformer within 3% of 150's arch.l=4,dual_axis=True baseline (params are NOT matched: 151 is +52% over 150, since row-axis-only layers can't buy back column-axis compute per-param — see 151's own config header). Both runs warm-start ONLY encoder+decoder from a stripped 108 checkpoint (scripts/strip_checkpoint_encoder_decoder.py); the entire in-context reasoning core (transformer, img/mask embed, ctx/qry id, thinking rows, cascade_proj, pool_proj) is randomly initialized for BOTH arms, removing the asymmetric-warm-start confound the earlier 110-vs-120 pair had. data.p_synth=0 (real anatomy only), CT-only (data.source_mix.regime_p=[1,0,0]). train.epochs=400, but both runs are extracted at epoch 160 here for a fair matched-budget comparison (151 was still running past 160 at extraction time).",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_train",
+  "runs": [
+    {
+      "id": "502z85nl",
+      "name": "150_cascade_coldtransformer_dualaxis",
+      "description": "dual_axis=True (default), l=4 — full bi-axial (row cross-context + column img<->mask) attention, cold transformer"
+    },
+    {
+      "id": "xs5933wt",
+      "name": "151_cascade_coldtransformer_singleaxis_l9",
+      "description": "dual_axis=False, l=9 — early img-mask fusion via PixelShuffle (axis_fuse_r=4) before a row-axis-only (cross-context) transformer, cold transformer, l=9 compute-matched vs 150"
+    }
+  ]
+}

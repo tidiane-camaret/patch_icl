@@ -157,7 +157,7 @@ argument.
 
 ---
 
-## 3. Coarse-to-fine cascade — helps in-distribution, ablations incomplete
+## 3. Coarse-to-fine cascade — helps in-distribution; register-carry regresses
 
 **In-distribution, cascade helps, cleanly, in two independent measurements:**
 
@@ -175,27 +175,46 @@ argument.
   r1.5/r3/r6 = **0.5716 / 0.5088 / 0.3889** — monotonic coarse-to-fine gain,
   11673 GFLOPs, 666ms total for the 3-level pass.
 
-**Register-carry ablation (`arch.cascade_registers`) is incomplete and
-mixed**, not a clean ablation result yet (`[[project_cascade_register_carry]]`):
-still mid-training (epoch 36/140 at last check), single-level improves on
-3/7 OOD sources (e.g. `hu_lwk1` +0.045) but the *cascade* result on
-`hu_lwk1` regresses (0.1287 → 0.0935), and the `gnc_kidney` cascade cell for
-this checkpoint never completed (3 failed attempts, suspected
-`torch.compile` hang, not a scoring bug). **Do not report a register-carry
-ablation number until (a) training finishes and (b) the gnc_kidney run
-either completes or is explicitly excluded with a stated reason.**
+**Register-carry ablation is now complete and confirmed negative**
+(`[[project_cascade_register_carry]]`): experiment `2a_cascade`
+(`results/publications/thesis/experiments/2a_cascade/`), a 3-arm chain
+`145`→`146`→`147` all resuming checkpoint `135b` independently, trained
+to completion (60 epochs, `p_synth=0`, in-distribution TotalSegmentator,
+119 classes / 800 fixed eval samples). `146` (pred-prior, registers off)
+vs. `147` (pred-prior, registers on): macro Dice **0.5246 → 0.5050**
+(−0.020), regressing 77/119 classes, worse on held-out than seen classes
+(−0.030 vs. −0.009), and +2.5% inference latency for it. This is a
+**second, independent negative result**, agreeing in direction with the
+earlier mid-training OOD probe below (`hu_lwk1` single-level
+0.1287→0.0935) — that earlier probe's own caveats (mid-training,
+incomplete `gnc_kidney` cell) no longer block citing the *direction* of
+the finding, only its OOD-specific numbers. Per-class breakdown shows the
+regression is structural, not uniform: worst-hit classes are almost all
+repeated fine anatomy in one volume (individual ribs/vertebral levels,
+worst case `brachiocephalic_vein_left` — Dice 0.0 at every epoch under
+registers-on), while large uniquely-shaped structures (lungs, skull,
+aorta) improve — consistent with registers interfering with instance
+disambiguation.
 
-**Query-prior finding exists, but only for Medverse's own cascade, not
-ours specifically:** `query_prior=pred` (i.e., feeding the model's own
-imperfect coarse prediction forward) hurts Medverse's harness-cascade
-universally, 7/7 OOD sources, sometimes catastrophically
-(`msd_hippocampus` 0.6905→0.0500, `docs/datasets/eval_expansion_status.md:339-345`).
-This is strong indirect evidence that coarse-to-fine cascades are
-generically vulnerable to compounding error from an unreliable prior — but
-it has not yet been isolated as an ablation on *our* architecture's own
-query-prior design (the TODO.md ask: "full model vs −query prior vs −region
-restriction vs −register carry" does not exist as a controlled ablation
-anywhere). **Gap (G6).**
+**Query-prior *source* ablation now exists on our own architecture too —
+but it is not the same comparison as the Medverse finding, and does not by
+itself close G6.** `query_prior=pred` (feeding the model's own imperfect
+coarse prediction forward) hurts Medverse's harness-cascade universally,
+7/7 OOD sources, sometimes catastrophically (`msd_hippocampus`
+0.6905→0.0500, `docs/datasets/eval_expansion_status.md:339-345`) — that
+comparison is *prior present vs. absent*. `2a_cascade`'s `145` (GT-prior,
+perturbed) vs. `146` (real prev.-pred prior), both registers off, is a
+different comparison — *which non-null prior source is better* — with
+both arms already using a prior: macro Dice **0.4988 → 0.5246** (+0.026),
+improving 90/119 classes, i.e. a real predicted prior beats a noisy
+synthetic (perturbed-GT) one. This is not in tension with the Medverse
+result (different comparisons, not opposite findings on the same one),
+but it also isn't the "−query-prior" arm G6 asks for — no arm here drops
+the prior entirely. **G6 narrows, does not close:** still need a true
+no-prior arm on our own architecture to complete "full model vs
+−query-prior vs −region-restriction vs −register-carry"; the
+register-carry leg of that ablation table is now filled in by this same
+experiment (§ above).
 
 **Gap (G7):** the accuracy/compute Pareto sweep as the region-restriction
 margin is relaxed (full volume → tight crop) — the plot `4_experiments.md`
@@ -399,24 +418,23 @@ pattern seen in `133`, not yet disentangled.
 3. **G2/G8 — reconcile Medverse-comparison confounds:** crop setting (nb20
    vs nb36), and finetuned-vs-released-zero-shot (OOD table). Pick one
    canonical protocol per experiment and rerun both baselines under it.
-4. **G6 — run the actual ablation table** for our own cascade (full model
-   vs −query-prior vs −region-restriction vs −register-carry), not just
-   Medverse's query-prior-hurts finding used as indirect evidence.
+4. **G6 (narrowed) — still need a true −query-prior arm.** `2a_cascade`
+   (§3) now fills in the register-carry leg and a prior-*source* ablation
+   (real pred vs. perturbed-GT), but no arm drops the query prior entirely
+   — that comparison, and −region-restriction, are still open.
 5. **G3/G4 — build one script that reports accuracy AND compute together**
    (including VRAM, currently unmeasured in the eval path) for a matched
    checkpoint/setting, so `tab:fixed-spacing` can be filled from a single
    source instead of stitched from two unrelated benchmarks.
 6. **G7 — run the region-restriction margin sweep** (Pareto plot) promised
    in `4_experiments.md`.
-7. Finish register-carry training (currently epoch 36/140) and get a
-   completed gnc_kidney cascade cell before citing that ablation.
-8. Verify whether `99_iris_decoder_plainconv_doubling`'s low dice (0.056,
+7. Verify whether `99_iris_decoder_plainconv_doubling`'s low dice (0.056,
    fully trained) is a genuine finding or a training-config bug.
-9. **G9/G11 — replicate.** Resume `135b` to convergence (it was stopped
+8. **G9/G11 — replicate.** Resume `135b` to convergence (it was stopped
    mid-climb) and, separately, re-run at least the CT+MRI ablation (§6,
    the strongest claim in this file) with a second seed before it goes in
    the thesis as a headline result — currently N=1.
-10. **G10 — check the CT+MRI joint-training effect on the exp92 lineage
+9. **G10 — check the CT+MRI joint-training effect on the exp92 lineage
     too**, to know whether it's a general finding or specific to the
     `108`+ feature set.
 
@@ -443,3 +461,12 @@ pattern seen in `133`, not yet disentangled.
   reproduces known per-source radiological contrast direction — a solid,
   citable methodology contribution independent of whether the resulting
   checkpoint's Dice numbers hold up under more training.
+- **`cascade_registers` regresses accuracy** (§3): completed, controlled
+  in-distribution ablation (`2a_cascade`, `146` vs `147`), macro Dice
+  0.5246→0.5050 across 119 classes, a second independent negative result
+  agreeing with the earlier mid-training OOD probe. Caveat: N=1 seed, and
+  only demonstrated on the `108`→`135b` lineage.
+- **Real predicted prior beats a perturbed-GT prior** (§3): same
+  `2a_cascade` chain, `145` vs `146`, macro Dice 0.4988→0.5246, 90/119
+  classes improve. This is a prior-*source* ablation, not the still-open
+  prior-*presence* one (G6) — don't conflate the two when citing.

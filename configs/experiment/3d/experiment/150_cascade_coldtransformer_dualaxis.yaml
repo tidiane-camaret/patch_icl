@@ -1,0 +1,147 @@
+# @package _global_
+# 150_cascade_coldtransformer_dualaxis — SIBLING of 151, isolating arch.dual_axis=True
+# (the default) against 151's arch.dual_axis=False,arch.l=9 with every other setting held
+# identical. Re-does the 110-vs-120 bi-axial-vs-single-axis ablation with two confounds
+# removed: (1) 120's arch.l=9 compensating layer count (see the l-sweep in this chain's
+# own notes: l=9 single-axis matches dual_axis's gflops_transformer to within 3%, since
+# l=5 would match params instead — params and compute can't be matched simultaneously by
+# stacking row-axis-only layers, so compute (the more standard ablation-fairness proxy,
+# and the number train.py already auto-logs) was picked); (2) 110/120's asymmetric warm
+# start — 110 fine-tuned an ALREADY ~200-epoch-trained transformer (105->106->107->108's
+# own chain, each stage resuming the last at 51 epochs), while 120 only got the row-axis
+# half of that warm-started (fuse_conv/fuse_mask_token cold) and any l=9 variant would
+# additionally orphan 5 of 9 layers with no checkpoint weights at all — not a controlled
+# ablation, just a checkpoint-compatibility accident.
+#
+#   python experiments/3d/train.py experiment=150_cascade_coldtransformer_dualaxis
+#
+# WHY (2026-09-24): to isolate dual_axis alone, BOTH arms now warm-start ONLY the parts
+# that are structurally identical regardless of dual_axis/l — `encoder.*` (plainconv_ts,
+# never touches the transformer) and the conv-decoder readout (`token_proj.*`,
+# `dec_skip_norm/proj/blocks/film/head/token_residual.*`) — via a stripped checkpoint
+# (scripts/strip_checkpoint_encoder_decoder.py) built from 108's best.pt. Everything that
+# constitutes the in-context reasoning core under ablation is randomly initialized for
+# BOTH arms: `transformer.*` (all qkv_row/qkv_col/mlp/norms), `img_embed`, `mask_embed`,
+# `mask_token`, `ctx_id`/`qry_id`, `thinking` (ThinkingRows), `cascade_proj`/`cascade_type`,
+# `pool_proj`/`pool_type`. The conv-decoder's first layer (`token_proj`) does technically
+# consume the transformer's e-dim tokens, so a cold transformer feeding a warm decoder is
+# a rockier start than either being co-trained — but that cost lands on BOTH arms equally
+# (same decoder structure, same random-transformer distribution shape at step 0), so it's
+# shared noise, not a source of bias between conditions.
+#
+# data.p_synth=0 (per direct instruction): real subjects only, no supervoxel synth-GMM
+# augmentation for this cold-transformer chain — keeps the comparison to real anatomy
+# only, off the texture/heterogeneity recipe 106-120 was tuned around.
+#
+# BUDGET: epochs=400 (vs the chain's usual 51) — a cold transformer needs far more than a
+# fine-tune's budget to reach a comparable signal; 400 is in the same order as the total
+# epochs 108's transformer itself accumulated across its own chain (105->106->107->108,
+# ~4x51=204), not a guarantee of full convergence but enough to see whether the two
+# variants separate past the noisy early-training regime 120's partial-cold run was still
+# in at its own (much shorter) cutoff.
+#
+# warmup_epochs=10 (vs 1-2 for the 105-120 fine-tunes): a full from-scratch transformer
+# needs a longer ramp than a warm-started one.
+# encoder_lr_scale=0.5 (vs 1 for the 105-120 fine-tunes): protects the pretrained encoder
+# from being disrupted by the large early gradients a freshly-random downstream stack
+# (transformer + token-construction + decoder's token_proj entry point) will produce.
+#
+# CHECKPOINT: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/
+# ANALYSIS_20251122/results/patch_icl/3d_train/108_encdec_only.pt — built via
+#   python scripts/strip_checkpoint_encoder_decoder.py \
+#     --input  .../2026-09-22_108_cascade_register_varspacing_synth03_texture_pool/best.pt \
+#     --output .../108_encdec_only.pt
+# 82 encoder/decoder keys kept, 60 dropped (transformer + token-construction) -> random
+# init, confirmed via a dry net.load_state_dict(strict=False) probe (no shape mismatches,
+# no unexpected keys). `resume_weights_only=true`: fresh LR schedule from epoch 0 (this is
+# a new recipe, not a continuation).
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  # l/dual_axis left at their defaults (4, True) -- the isolated variable vs 151's l=9/False.
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0                      # real subjects only for this chain -- see WHY above
+  gpu_realize_max_native: 128
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: false
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 0.5   # protect the pretrained encoder from the cold downstream stack's early gradients
+  warmup_epochs: 10       # longer ramp for a from-scratch transformer
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/108_encdec_only.pt
+  checkpoint_allow_partial: true   # transformer/img_embed/mask_embed/ctx_id/qry_id/thinking/cascade_proj/pool_proj are missing -> random init, see CHECKPOINT above
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 150_cascade_coldtransformer_dualaxis

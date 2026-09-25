@@ -1,0 +1,126 @@
+# @package _global_
+# 151_cascade_coldtransformer_singleaxis_l9 — SIBLING of 150, isolating arch.dual_axis=False,
+# arch.l=9 against 150's arch.dual_axis=True,arch.l=4 (the default) with every other setting
+# held identical. See 150's own header for the full rationale (l=9 chosen to match
+# gflops_transformer, not params, since the two can't be matched simultaneously by stacking
+# row-axis-only layers; both arms warm-start ONLY encoder+decoder off a stripped checkpoint,
+# with the entire in-context reasoning core -- transformer, token construction, pooling --
+# randomly initialized for both, removing the asymmetric-warm-start confound 110 vs 120 had).
+#
+#   python experiments/3d/train.py experiment=151_cascade_coldtransformer_singleaxis_l9
+#
+# arch.l=9: the l-sweep (measure_flops against dual_axis=True,l=4's 2737.35 gflops_transformer
+# / 48.671M params) gave, at l=4 dual_axis=False: 1252.37 gflops_transformer / 41.581M params;
+# each extra single-axis layer costs a flat +313.1 gflops_transformer / +6.50M params. l=9 ->
+# 2817.83 gflops_transformer (+3% over baseline) / 74.060M params (+52% over baseline) -- the
+# closest compute match; l=5 would have matched params instead (48.077M, <1.5% off) at only
+# 57% of baseline compute. Compute was picked as the fairness axis (train.py's own
+# measure_flops already logs it for every run, and it's the more standard ablation-fairness
+# proxy) -- see 150's header for why this mismatch is itself a real caveat to keep in the
+# writeup, not a solved confound.
+#
+# data.p_synth=0 (per direct instruction): same as 150.
+#
+# BUDGET / warmup / encoder_lr_scale: identical to 150 (epochs=400, warmup_epochs=10,
+# encoder_lr_scale=0.5) -- see 150's header. Matching budget is the whole point of the
+# sibling design.
+#
+# CHECKPOINT: same stripped file as 150 (/nfs/data/nii/data1/Analysis/camaret___in_context_
+# segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/108_encdec_only.pt, 82 encoder/
+# decoder keys). Confirmed via a dry net.load_state_dict(strict=False) probe against this
+# exact l=9,dual_axis=False arch: 0 shape mismatches, 0 unexpected keys, 91 missing keys
+# (transformer x9 layers' qkv_row/mlp/norms + fuse_conv/fuse_mask_token + the shared
+# img_embed/mask_embed/ctx_id/qry_id/thinking/cascade_proj/pool_proj cold set) -> random
+# init. `resume_weights_only=true`: fresh LR schedule from epoch 0.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+  dual_axis: false             # the isolated variable vs 150 -- see 150's header
+  l: 9                         # compute-matched vs 150's l=4,dual_axis=True -- see WHY above
+  axis_fuse_r: 4                # e=768 divisible by 4^3=64, not by mask_patch_size=8's 8^3=512
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0                      # real subjects only for this chain -- see 150's header
+  gpu_realize_max_native: 128
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: false
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 0.5   # protect the pretrained encoder from the cold downstream stack's early gradients
+  warmup_epochs: 10       # longer ramp for a from-scratch transformer
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/108_encdec_only.pt
+  checkpoint_allow_partial: true   # transformer(x9)/fuse_conv/fuse_mask_token/img_embed/mask_embed/ctx_id/qry_id/thinking/cascade_proj/pool_proj are missing -> random init, see CHECKPOINT above
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 151_cascade_coldtransformer_singleaxis_l9

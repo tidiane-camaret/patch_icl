@@ -99,6 +99,40 @@ matched (bf16) precision the wall-clock advantage narrows to ~1.05–1.27×
 from the native-precision 1.6–1.9× — most of that gap is a precision
 artifact, not architecture.
 
+**Bi-axial attention vs. early feature fusion.** A direct ablation of the
+architecture's own bi-axial design (row-axis cross-context + column-axis
+within-volume img↔mask attention) against an IRIS-style early-fusion
+alternative: img and mask are merged into one token per cell via a
+PixelShuffle trick *before* the transformer (`arch.dual_axis=false`), and
+only row-axis (cross-context) attention remains. Compute-matched (the
+single-axis arm's transformer layer count is raised to `l=9` so its
+GFLOPs land within 3% of the bi-axial baseline's — params could not be
+matched simultaneously this way and are +52% higher for single-axis, since
+row-axis-only layers are a parameter-inefficient way to buy back the
+missing column-axis compute). Both arms warm-start *only* the encoder and
+decoder from a shared checkpoint; the entire in-context reasoning core
+(transformer, img/mask embed, context/query id, thinking rows, cascade
+projection, pool projection) is randomly initialized for **both** arms —
+removing the asymmetric-warm-start confound an earlier, uncontrolled
+version of this ablation had (one arm fine-tuning an already
+~200-epoch-trained transformer, the other only partially warm). Real
+anatomy only (`p_synth=0`), CT-only, TotalSeg val, both arms read at a
+matched epoch (160) since the single-axis run had not yet reached its full
+400-epoch budget at analysis time:
+
+| arm | val Dice | seen | unseen |
+|---|---:|---:|---:|
+| **bi-axial (dual_axis=true)** | **0.462** | **0.527** | **0.389** |
+| single-axis fusion (dual_axis=false, l=9) | 0.448 | 0.510 | 0.377 |
+
+Bi-axial attention wins on all three metrics at matched epoch, matched
+compute, and a from-scratch reasoning core — a smaller and better-controlled
+gap than the earlier uncontrolled comparison. Not yet a settled result:
+single-axis was still training toward its full budget (both arms were
+still climbing at epoch 160, neither converged), this is N=1 seed per arm,
+and the params mismatch (+52% for single-axis) means a residual capacity
+confound remains even after compute-matching.
+
 ## Cascade (Axis 2)
 
 **In-distribution, coarse-to-fine helps cleanly**, replicated two ways:
@@ -132,12 +166,38 @@ is evidence the compounding-error pattern is **generic to coarse-to-fine
 cascades**, not specific to this architecture, though it has not yet been
 isolated as a controlled ablation on our own query-prior design (gap G6).
 
-**Not yet citable:** the register-carry ablation (`arch.cascade_registers`)
-is incomplete — checkpoint was mid-training at last check, results are
-mixed (helps single-level on 3/7 OOD sources, but the one directly
-comparable *cascade* cell regresses, and one source's cascade cell never
-completed after 3 attempts). The region-restriction-margin Pareto sweep
-(gap G7) has not been run.
+**Register carry hurts; a real predicted prior beats a perturbed-GT
+prior** — a completed, controlled 3-arm chain (`145`→`146`→`147`, all
+resuming checkpoint `135b` independently, `p_synth=0`, in-distribution
+TotalSegmentator, 119 classes / 800 fixed eval samples, macro Dice at
+epoch 59/60):
+
+| arm | config | macro Dice | Δ |
+|---|---|---:|---:|
+| 145 | GT-prior (perturbed), registers off | 0.499 | — |
+| 146 | pred-prior (real prev. pred), registers off | **0.525** | **+0.026** |
+| 147 | pred-prior, registers on | 0.505 | **−0.020** |
+
+Two findings from one chain. First, feeding the model's own real previous
+prediction forward as the query prior beats a perturbed-GT prior on 90/119
+classes (median +0.026) — a *prior-source* ablation (real prediction vs.
+noisy synthetic), distinct from the Medverse finding above, which is a
+*prior-presence* one (real prediction vs. none); the two aren't in
+tension, but a true no-prior arm on our own architecture is still needed
+(gap G6) before claiming the full ablation. Second,
+`cascade_registers` regresses accuracy (77/119 classes, mean −0.020,
+worse on held-out classes than seen: −0.030 vs. −0.009) and adds ~2.5%
+latency for it — a second, independent negative result agreeing in
+direction with an earlier mid-training OOD probe (`hu_lwk1` single-level
+0.1287→0.0935). The regression concentrates structurally: the
+worst-hit classes are almost all repeated fine anatomy in the same volume
+(individual ribs, individual vertebral levels — worst case
+`brachiocephalic_vein_left`, which collapses to Dice 0.0 at every epoch
+under registers-on), while a smaller set of large, uniquely-shaped
+structures (lungs, skull, aorta) actually improve — consistent with
+registers interfering with instance disambiguation rather than uniformly
+degrading capacity. The region-restriction-margin Pareto sweep (gap G7)
+has not been run.
 
 ## Synthetic Task Generation (Axis 3)
 

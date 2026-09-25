@@ -1,0 +1,113 @@
+{
+  "experiment": "2b_cascade_val",
+  "description": "OOD eval-expansion sweep of the 2a_cascade checkpoints (145/146/147) on the 7 held-out 'val dataset' sources (docs/datasets/{isles22,shifts_ms,msd_hippocampus,msd_prostate,atlas_v2,gnc_kidney_lesions,hu_lwk1}.md). Per-source cascade ladder chosen from each dataset's own geometry (see those docs' 'crop_spacing_mm' sections): hu_lwk1/gnc_kidney reuse the exp92-era established ladder, isles22/shifts_ms/atlas_v2 use a whole-volume-coverage 2x ladder, msd_prostate uses a 3-level find-in-scene ladder, msd_hippocampus is single-level only (no cascade -- the native volumes are already pre-cropped to the ROI, so there is no wider context to localize against). All runs use eval.split=test, data.mask_downsample=occupancy, data.gpu_realize_crop=false (required overrides for these native-grid sources, which lack the totalseg-specific soft->occupancy eval remap). Run against ct_stats.json recomputed at pct_lo=2/pct_hi=98 (2026-09-24) to match the corresponding fix to totalsegmri's training-time mri_stats.json -- an earlier isles22 attempt (before this fix) was discarded, not included here.",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {
+      "id": "jzj47gn7",
+      "name": "145_cascade_randomfg_gtprior_regoff_hu_lwk1_ood",
+      "description": "145 (registers=off, prior=perturbed-GT) on hu_lwk1 (CT, vertebra ROI), cascade [6,3,1]mm"
+    },
+    {
+      "id": "tysekuqv",
+      "name": "145_cascade_randomfg_gtprior_regoff_isles22_ood",
+      "description": "145 on isles22 (MRI DWI, stroke lesion), cascade [3,1.5]mm"
+    },
+    {
+      "id": "ce85nr2a",
+      "name": "145_cascade_randomfg_gtprior_regoff_shifts_ms_ood",
+      "description": "145 on shifts_ms (MRI FLAIR, MS lesion), cascade [3,1.5]mm"
+    },
+    {
+      "id": "i4douj2j",
+      "name": "145_cascade_randomfg_gtprior_regoff_atlas_v2_ood",
+      "description": "145 on atlas_v2 (MRI T1, chronic stroke lesion; provenance caveat, see docs/datasets/atlas_v2.md), cascade [3.8,1.9]mm"
+    },
+    {
+      "id": "uyklzbo0",
+      "name": "145_cascade_randomfg_gtprior_regoff_msd_prostate_ood",
+      "description": "145 on msd_prostate (MRI T2+ADC, PZ/TZ zones), cascade [3,1.5,0.75]mm"
+    },
+    {
+      "id": "1r16rv39",
+      "name": "145_cascade_randomfg_gtprior_regoff_msd_hippocampus_ood",
+      "description": "145 on msd_hippocampus (MRI T1, ant/post), single-level 0.5mm (no cascade)"
+    },
+    {
+      "id": "uvr2qc97",
+      "name": "145_cascade_randomfg_gtprior_regoff_gnc_kidney_ood",
+      "description": "145 on gnc_kidney (MRI Dixon, kidney lesion, 13 classes), cascade [6,3,1.2]mm"
+    },
+    {
+      "id": "q536o3ez",
+      "name": "146_cascade_randomfg_predprior_regoff_hu_lwk1_ood",
+      "description": "146 (145 + prior=real prev.pred) on hu_lwk1, cascade [6,3,1]mm"
+    },
+    {
+      "id": "u6ibrmzm",
+      "name": "146_cascade_randomfg_predprior_regoff_isles22_ood",
+      "description": "146 on isles22, cascade [3,1.5]mm"
+    },
+    {
+      "id": "zywis70g",
+      "name": "146_cascade_randomfg_predprior_regoff_shifts_ms_ood",
+      "description": "146 on shifts_ms, cascade [3,1.5]mm"
+    },
+    {
+      "id": "km2sskse",
+      "name": "146_cascade_randomfg_predprior_regoff_atlas_v2_ood",
+      "description": "146 on atlas_v2, cascade [3.8,1.9]mm"
+    },
+    {
+      "id": "u0mrm9zi",
+      "name": "146_cascade_randomfg_predprior_regoff_msd_prostate_ood",
+      "description": "146 on msd_prostate, cascade [3,1.5,0.75]mm"
+    },
+    {
+      "id": "p3r1hn7g",
+      "name": "146_cascade_randomfg_predprior_regoff_msd_hippocampus_ood",
+      "description": "146 on msd_hippocampus, single-level 0.5mm (no cascade)"
+    },
+    {
+      "id": "dx8w1ug1",
+      "name": "146_cascade_randomfg_predprior_regoff_gnc_kidney_ood",
+      "description": "146 on gnc_kidney, cascade [6,3,1.2]mm"
+    },
+    {
+      "id": "fh5mek7v",
+      "name": "147_cascade_randomfg_predprior_regon_hu_lwk1_ood",
+      "description": "147 (146 + registers=on) on hu_lwk1, cascade [6,3,1]mm"
+    },
+    {
+      "id": "ak7ln73n",
+      "name": "147_cascade_randomfg_predprior_regon_isles22_ood",
+      "description": "147 on isles22, cascade [3,1.5]mm"
+    },
+    {
+      "id": "87hqgk9i",
+      "name": "147_cascade_randomfg_predprior_regon_shifts_ms_ood",
+      "description": "147 on shifts_ms, cascade [3,1.5]mm"
+    },
+    {
+      "id": "4lryi9p3",
+      "name": "147_cascade_randomfg_predprior_regon_atlas_v2_ood",
+      "description": "147 on atlas_v2, cascade [3.8,1.9]mm"
+    },
+    {
+      "id": "5t7eluw3",
+      "name": "147_cascade_randomfg_predprior_regon_msd_prostate_ood",
+      "description": "147 on msd_prostate, cascade [3,1.5,0.75]mm"
+    },
+    {
+      "id": "lnjoushy",
+      "name": "147_cascade_randomfg_predprior_regon_msd_hippocampus_ood",
+      "description": "147 on msd_hippocampus, single-level 0.5mm (no cascade)"
+    },
+    {
+      "id": "s6wpgy9a",
+      "name": "147_cascade_randomfg_predprior_regon_gnc_kidney_ood",
+      "description": "147 on gnc_kidney, cascade [6,3,1.2]mm"
+    }
+  ]
+}

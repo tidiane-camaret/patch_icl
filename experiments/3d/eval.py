@@ -439,6 +439,21 @@ def main(cfg: DictConfig) -> None:
             raise ValueError("data.cascade_spacings (v2 cascade eval) is mutually exclusive "
                              "with eval.spacing_sweep / spacing_locator / spacing_cascade.")
         _assert_cascade_supported(cfg)
+        # Cascade eval workers only fetch lightweight level-0 batches -- gpu_realize_crop's
+        # re-crop for levels>=1 runs in THIS process via a thread pool (cascade.py::
+        # _recrop_level), never in a DataLoader worker. eval.yaml's workers=20 default is
+        # tuned for the non-cascade path (per-item CPU resize genuinely hidden behind GPU
+        # compute there — docs/logs.md); for cascade eval it's pure forkserver-spawn
+        # overhead. Measured on a 146_cascade_randomfg_predprior_regoff / totalsegmri
+        # 10-class/100-sample subset: workers=20 -> 186.6s, workers=4 -> 135.4s wall
+        # (-27%), byte-identical Dice/NSD (docs/logs.md). Auto-lower unless the user
+        # explicitly set eval.workers.
+        if not _explicitly_overridden("eval.workers"):
+            from omegaconf import open_dict
+            with open_dict(cfg):
+                cfg.eval.workers = min(int(cfg.eval.workers), 4)
+            print(f"  [info] eval.workers not set -> lowered to {cfg.eval.workers} for v2 "
+                  f"cascade eval (more workers only adds forkserver spin-up cost here)\n")
         spacings = [float(s) for s in cfg.data.cascade_spacings]
         from cascade import _resolve_prior_spec
         _pspec = _resolve_prior_spec(cfg.data.get("cascade_query_prior", False))

@@ -3,12 +3,18 @@
 
 Reads a `runs.json` (wandb run pointers + names/descriptions, one per thesis
 experiment folder — see `2a_cascade/runs.json` for the format) and
-concatenates each run's per-task eval table (`evaluate.py`'s `val/samples_*`
-wandb Table, one row per eval task) into one unified CSV, tagged with
+concatenates each run's per-task eval table into one unified CSV, tagged with
 `run_id`/`run_name`/`description` so every row is traceable back to its
-source run.
+source run. One row per eval task, same schema either way (`evaluate.py`'s
+`build_sample_table`); two source shapes are auto-detected per run:
 
-Reads tables from the LOCAL `wandb/run-*-<id>/files/media/table/<split>/`
+  - a training run's periodic validation: one table per eval epoch, under
+    `files/media/table/<split>/samples_<epoch>_*.table.json` (`split`
+    defaults to "val" — see `--split`).
+  - a standalone `experiments/3d/eval.py` run: one table for the whole run,
+    under `files/media/table/cases_*.table.json` (epoch is the `-1` sentinel).
+
+Reads tables from the LOCAL `wandb/run-*-<id>/files/media/table/...`
 directory (same source `results/experiments/82_multisource.py` uses) — no
 wandb API call, so it only works for runs whose local wandb dir still exists
 on this machine.
@@ -38,14 +44,33 @@ def _find_run_dir(run_id: str) -> Path:
     return matches[-1]
 
 
-def _load_samples_table(run_dir: Path, split: str) -> pd.DataFrame:
-    table_dir = run_dir / "files" / "media" / "table" / split
+def _load_samples_table(run_dir: Path, split: str, epoch: int | None) -> pd.DataFrame:
+    table_root = run_dir / "files" / "media" / "table"
+    if epoch is not None:
+        # single eval epoch only — e.g. comparing two still-running/differently-cut-off
+        # training runs at a matched epoch instead of each run's own last logged eval.
+        paths = sorted((table_root / split).glob(f"samples_{epoch}_*.table.json"))
+        if not paths:
+            raise FileNotFoundError(
+                f"no samples_{epoch}_*.table.json under {table_root / split} "
+                f"(epoch={epoch} not logged for this run — check train.eval_every)"
+            )
+        parts = [pd.DataFrame((d := json.loads(p.read_text()))["data"], columns=d["columns"])
+                 for p in paths]
+        return pd.concat(parts, ignore_index=True)
+    # training-run convention: one table per eval epoch, under <split>/samples_<epoch>_*.json
     paths = sorted(
-        table_dir.glob("samples_*.table.json"),
+        (table_root / split).glob("samples_*.table.json"),
         key=lambda p: int(re.search(r"samples_(\d+)_", p.name).group(1)),
     )
     if not paths:
-        raise FileNotFoundError(f"no samples_*.table.json found under {table_dir}")
+        # standalone eval.py convention: one table for the whole run, cases_*.json
+        paths = sorted(table_root.glob("cases_*.table.json"))
+    if not paths:
+        raise FileNotFoundError(
+            f"no samples_*.table.json (under {table_root / split}) or "
+            f"cases_*.table.json (under {table_root}) found"
+        )
     parts = []
     for p in paths:
         d = json.loads(p.read_text())
@@ -53,12 +78,12 @@ def _load_samples_table(run_dir: Path, split: str) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
-def extract(runs_json: Path, split: str = "val") -> pd.DataFrame:
+def extract(runs_json: Path, split: str = "val", epoch: int | None = None) -> pd.DataFrame:
     spec = json.loads(runs_json.read_text())
     frames = []
     for run in spec["runs"]:
         run_dir = _find_run_dir(run["id"])
-        df = _load_samples_table(run_dir, split=split)
+        df = _load_samples_table(run_dir, split=split, epoch=epoch)
         df.insert(0, "description", run.get("description", ""))
         df.insert(0, "run_name", run["name"])
         df.insert(0, "run_id", run["id"])
@@ -74,10 +99,15 @@ def main():
         help="output CSV path (default: <runs_json dir>/samples.csv)",
     )
     ap.add_argument("--split", default="val", help="eval split subfolder to read (default: val)")
+    ap.add_argument(
+        "--epoch", type=int, default=None,
+        help="extract only this eval epoch from each run (default: all logged epochs, "
+             "concatenated) — use to compare runs at a matched epoch",
+    )
     args = ap.parse_args()
 
     out = args.output or args.runs_json.parent / "samples.csv"
-    df = extract(args.runs_json, split=args.split)
+    df = extract(args.runs_json, split=args.split, epoch=args.epoch)
     df.to_csv(out, index=False)
     print(f"wrote {len(df)} rows ({df['run_id'].nunique()} runs) -> {out}")
 
