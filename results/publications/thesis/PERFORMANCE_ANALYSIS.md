@@ -183,18 +183,38 @@ to completion (60 epochs, `p_synth=0`, in-distribution TotalSegmentator,
 119 classes / 800 fixed eval samples). `146` (pred-prior, registers off)
 vs. `147` (pred-prior, registers on): macro Dice **0.5246 → 0.5050**
 (−0.020), regressing 77/119 classes, worse on held-out than seen classes
-(−0.030 vs. −0.009), and +2.5% inference latency for it. This is a
-**second, independent negative result**, agreeing in direction with the
-earlier mid-training OOD probe below (`hu_lwk1` single-level
-0.1287→0.0935) — that earlier probe's own caveats (mid-training,
-incomplete `gnc_kidney` cell) no longer block citing the *direction* of
-the finding, only its OOD-specific numbers. Per-class breakdown shows the
-regression is structural, not uniform: worst-hit classes are almost all
-repeated fine anatomy in one volume (individual ribs/vertebral levels,
-worst case `brachiocephalic_vein_left` — Dice 0.0 at every epoch under
-registers-on), while large uniquely-shaped structures (lungs, skull,
-aorta) improve — consistent with registers interfering with instance
-disambiguation.
+(−0.030 vs. −0.009), and +2.5% inference latency for it. Per-class
+breakdown shows the regression is structural, not uniform: worst-hit
+classes are almost all repeated fine anatomy in one volume (individual
+ribs/vertebral levels, worst case `brachiocephalic_vein_left` — Dice 0.0
+at every epoch under registers-on), while large uniquely-shaped
+structures (lungs, skull, aorta) improve.
+
+**⚠️ Supersedes an earlier claim:** the mid-training OOD probe previously
+cited alongside this result (`hu_lwk1` single-level 0.1287→0.0935) is now
+superseded by a matched, fully-trained comparison — see the `146` vs
+`147` row in the `2b_cascade_val` table below (0.152→0.155, flat, not a
+regression). **Do not cite the 0.1287→0.0935 number any more.**
+
+**OOD sweep of the same 145/146/147 checkpoints** (`2b_cascade_val`,
+`results/publications/thesis/experiments/2b_cascade_val/`, each source's
+own native cascade ladder, `msd_hippocampus` single-level only), macro
+Dice:
+
+| source | n | 145 (GT-prior) | 146 (pred-prior) | 147 (+registers) |
+|---|---:|---:|---:|---:|
+| hu_lwk1 (CT) | 36 | 0.099 | 0.152 | 0.155 |
+| msd_prostate | 124 | 0.310 | 0.375 | 0.358 |
+| msd_hippocampus | 520 | 0.319 | 0.302 | 0.400 |
+| isles22 | 247 | 0.067 | 0.069 | 0.060 |
+| shifts_ms | 46 | 0.035 | 0.031 | 0.030 |
+| atlas_v2 | 654 | 0.029 | 0.026 | 0.025 |
+| gnc_kidney | 1490 | 0.027 | 0.024 | 0.021 |
+
+Prior-source (145→146): helps 3/7 sources, hurts 4/7. Registers
+(146→147): helps 2/7 (`hu_lwk1` flat-positive within noise,
+`msd_hippocampus` +0.097), hurts 5/7. Neither in-distribution direction
+replicates cleanly OOD.
 
 **Query-prior *source* ablation now exists on our own architecture too —
 but it is not the same comparison as the Medverse finding, and does not by
@@ -461,12 +481,15 @@ pattern seen in `133`, not yet disentangled.
   reproduces known per-source radiological contrast direction — a solid,
   citable methodology contribution independent of whether the resulting
   checkpoint's Dice numbers hold up under more training.
-- **`cascade_registers` regresses accuracy** (§3): completed, controlled
-  in-distribution ablation (`2a_cascade`, `146` vs `147`), macro Dice
-  0.5246→0.5050 across 119 classes, a second independent negative result
-  agreeing with the earlier mid-training OOD probe. Caveat: N=1 seed, and
-  only demonstrated on the `108`→`135b` lineage.
-- **Real predicted prior beats a perturbed-GT prior** (§3): same
-  `2a_cascade` chain, `145` vs `146`, macro Dice 0.4988→0.5246, 90/119
-  classes improve. This is a prior-*source* ablation, not the still-open
-  prior-*presence* one (G6) — don't conflate the two when citing.
+- **`cascade_registers` regresses accuracy in-distribution** (§3):
+  completed, controlled ablation (`2a_cascade`, `146` vs `147`), macro
+  Dice 0.5246→0.5050 across 119 classes. Caveat: N=1 seed, only
+  demonstrated on the `108`→`135b` lineage, and does **not** replicate
+  OOD — the matched `2b_cascade_val` sweep of the same checkpoints is
+  mixed (helps 2/7 sources, hurts 5/7).
+- **Real predicted prior beats a perturbed-GT prior in-distribution**
+  (§3): same `2a_cascade` chain, `145` vs `146`, macro Dice
+  0.4988→0.5246, 90/119 classes improve. This is a prior-*source*
+  ablation, not the still-open prior-*presence* one (G6) — don't conflate
+  the two when citing. Also does not replicate OOD (`2b_cascade_val`:
+  helps 3/7 sources, hurts 4/7).

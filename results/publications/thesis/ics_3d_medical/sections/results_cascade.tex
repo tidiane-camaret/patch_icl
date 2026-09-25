@@ -57,3 +57,36 @@ structures.
 the register-carry effect size. Region-restriction margin is unablated
 here (\autoref{sec:methodology-cascade}); the accuracy/compute Pareto
 sweep as the margin is relaxed has not been run.}
+
+\paragraph{Neither effect replicates on held-out generalization sources.}
+The same three checkpoints, evaluated on the seven held-out sources of
+\autoref{tab:ood-sources} (each source's own cascade ladder;
+\texttt{msd\_hippocampus} single-level only), give a mixed picture.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Same ablation as \autoref{tab:cascade-ablation}, evaluated
+  out-of-distribution, macro Dice.}
+  \label{tab:cascade-ablation-ood}
+  \begin{tabular}{lrccc}
+    \toprule
+    Source & $n$ & 145 & 146 & 147 \\
+    \midrule
+    HU\_LWK1 (CT) & 36 & 0.099 & 0.152 & 0.155 \\
+    MSD Prostate & 124 & 0.310 & 0.375 & 0.358 \\
+    MSD Hippocampus & 520 & 0.319 & 0.302 & 0.400 \\
+    ISLES22 & 247 & 0.067 & 0.069 & 0.060 \\
+    Shifts-MS & 46 & 0.035 & 0.031 & 0.030 \\
+    ATLAS v2.0 & 654 & 0.029 & 0.026 & 0.025 \\
+    GNC\_705 & 1490 & 0.027 & 0.024 & 0.021 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The prior-source change (145 $\to$ 146) helps 3 of 7 sources and hurts 4;
+the register-carry change (146 $\to$ 147) helps 2 of 7 and hurts 5.
+\texttt{HU\_LWK1}'s cascade does not regress under registers here
+(0.152 $\to$ 0.155).
+\todo{This table supersedes an earlier, mid-training OOD number for
+\texttt{HU\_LWK1} (0.1287 $\to$ 0.0935) -- do not cite that number.}

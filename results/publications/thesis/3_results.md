@@ -187,9 +187,7 @@ tension, but a true no-prior arm on our own architecture is still needed
 (gap G6) before claiming the full ablation. Second,
 `cascade_registers` regresses accuracy (77/119 classes, mean −0.020,
 worse on held-out classes than seen: −0.030 vs. −0.009) and adds ~2.5%
-latency for it — a second, independent negative result agreeing in
-direction with an earlier mid-training OOD probe (`hu_lwk1` single-level
-0.1287→0.0935). The regression concentrates structurally: the
+latency for it. The regression concentrates structurally: the
 worst-hit classes are almost all repeated fine anatomy in the same volume
 (individual ribs, individual vertebral levels — worst case
 `brachiocephalic_vein_left`, which collapses to Dice 0.0 at every epoch
@@ -198,6 +196,16 @@ structures (lungs, skull, aorta) actually improve — consistent with
 registers interfering with instance disambiguation rather than uniformly
 degrading capacity. The region-restriction-margin Pareto sweep (gap G7)
 has not been run.
+
+**Neither in-distribution direction replicates on OOD.** The same three
+checkpoints (`145`/`146`/`147`), evaluated on 7 held-out sources
+(`2b_cascade_val`, each source's own cascade ladder), give a mixed
+picture: the pred-prior gain (145→146) helps 3/7 sources (`hu_lwk1`
++0.053, `msd_prostate` +0.065) and hurts 4/7; the register regression
+(146→147) helps 2/7 (`hu_lwk1` flat, `msd_hippocampus` +0.097) and hurts
+5/7. Notably, `hu_lwk1`'s cascade does **not** regress under registers
+here (0.152→0.155) — superseding an earlier, mid-training OOD number
+(0.1287→0.0935) that should no longer be cited.
 
 ## Synthetic Task Generation (Axis 3)
 

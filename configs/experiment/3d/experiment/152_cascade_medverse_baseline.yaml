@@ -1,0 +1,135 @@
+# @package _global_
+# 152_cascade_medverse_baseline — SIBLING of 150/151, swapping in the released Medverse
+# architecture as a third arm against 150's arch.dual_axis=True and 151's
+# arch.dual_axis=False,arch.l=9, with every DATA/AUGMENTATION/SCHEDULE setting held
+# identical EXCEPT query_prior (see below) -- dataset=multisource_ct_mri,
+# train_spacing_range=[3,6], crop_spacing_mm=4.24, p_synth=0, cohort/source_mix, the
+# calibrated augmentation recipe, epochs=400, batch_size=8, eval_every=10, workers=12,
+# grad_clip=1.0,
+# optimizer=adamw/lr=1e-4/wd=0.01/scheduler=cosine/warmup_epochs=10, loss=bce_dice,
+# dice_weight=1.0). No `arch.*` / `/encoder` keys here — those are patchset3d-only
+# (is_patchset-gated / arch-schema-only in train.py; medverse ignores them entirely).
+#
+#   python experiments/3d/train.py experiment=152_cascade_medverse_baseline
+#
+# WHY (2026-09-25, per direct instruction): 150/151 isolate a patchset3d design axis
+# (dual-axis attention vs. single-axis+more layers); this run adds the architecture axis —
+# same data/schedule, a different in-context segmentation backbone entirely — as the third
+# point of comparison.
+#
+# medverse_bounded_head=true: appends a sigmoid to Medverse's native unbounded plain-conv
+# head, so train_forward returns a real LOGIT and the standard bce_dice-with-logits path
+# is used (model_output_is_prob() -> False) — no [0,1] clamp, no out-of-bounds anchor
+# (train.py:114-137, 156-188). This is what makes reusing 150/151's adamw/1e-4/bce_dice
+# recipe safe: WITHOUT it, Medverse's raw output random-walks under that exact recipe and
+# overflows to NaN (docs/logs.md 2026-07-29; the failure exp 69 sidestepped by dropping to
+# Medverse-native adam/3e-5 instead). With the bounded head, that obstacle is gone, so
+# there's no longer a reason to deviate from 150/151's recipe -- true "same training
+# conditions" is possible for the first time in this chain.
+#
+# eval_autocast=true: `fast_eval` (train.py:965) -- which bf16-autocasts the val forward and
+# reuses train_forward's logits instead of a separate fp32 predict pass -- defaults ON for
+# patchset3d (150/151 get it for free) but OFF for medverse (kept fp32-stable by default so
+# its val/dice stays comparable to the released benchmark). Setting it explicitly here is
+# the medverse-side equivalent: the val forward now also runs under the same bf16 autocast
+# as training, matching 150/151's eval precision. NB medverse still gets a separate
+# predict() pass (reuse_logits=fast_eval stays false for it, train.py:982) -- eval_autocast
+# only controls the autocast dtype around it, not the reuse.
+#
+# medverse.compile=true: torch.compile the whole net (fuses norm/elementwise tail, ~-10%
+# step time; slow first batch) -- the medverse-side equivalent of 150/151's
+# arch.compile=true (inherited from m2_patchset_decoder).
+#
+# checkpoint=orig_weights: start from the released Medverse.ckpt, matching this chain's use
+# of a real pretrained starting point (150/151 warm-start encoder+decoder off 108's
+# checkpoint) rather than random init -- the fairest 3-way comparison is "best available
+# starting point per architecture", not "all cold".
+
+defaults:
+  - override /dataset: multisource_ct_mri
+  - override /model: medverse
+  - override /augmentations: calibrated
+  - _self_
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0                      # real subjects only for this chain -- see 150's header
+  gpu_realize_max_native: 128
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [1.0, 0.0, 0.0]
+    eval_epoch_length: 800
+
+  # query_prior DISABLED for this arm (2026-09-25, confirmed by repro): data.query_prior
+  # is NOT an is_patchset-only no-op for medverse -- train.py:566-567 explicitly includes
+  # `cfg.get("model") == "medverse"` in qp_on, and Medverse's train_forward feeds it
+  # through its image_context_in/out NA-ICL channel (a second context-processing pass
+  # with its own internal torch.no_grad() block + a custom autograd.Function). Under
+  # `medverse.compile=true` on this node (Blackwell, torch 2.12.1+cu130) that second
+  # compiled subgraph reproducibly crashes loss.backward() with "RuntimeError: cannot
+  # enter context: <_contextvars.Context object> is already entered" -- isolated via a
+  # minimal repro: B=8 without query_prior backprops fine; B=2 WITH query_prior crashes
+  # on the very first step, identical stack trace to the real training run. This is a
+  # genuine deviation from "same training conditions" as 150/151 (which DO get a p=0.3
+  # GT query-prior injection via the is_patchset branch, a different code path unaffected
+  # by this bug) -- traded off in favor of an actually-runnable medverse arm.
+  query_prior:
+    modes: [none]
+    p: [1.0]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 400
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: false
+  drop_last: true
+
+  optimizer: adamw
+  weight_decay: 0.01
+  scheduler: cosine
+  lr: 1.0e-4
+  warmup_epochs: 10        # matches 150/151's cold-transformer ramp, for schedule parity
+
+  loss: bce_dice
+  dice_weight: 1.0
+  medverse_bounded_head: true   # see WHY above -- unlocks the shared adamw/bce_dice recipe
+  eval_autocast: true           # bf16 val forward, matching 150/151's default-on fast_eval
+  checkpoint: orig_weights      # released Medverse.ckpt -- see WHY above
+
+medverse:
+  compile: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 152_cascade_medverse_baseline
