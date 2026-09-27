@@ -23,6 +23,11 @@ _CONTINUOUS_RANGE = {
     ("splatter", "roughness"): "splatter_roughness_range",
     ("disk", "aspect_ratio"): "disk_aspect_ratio_range",
     ("cylinder", "length_mm"): "cylinder_length_mm_range",
+    ("scatter_field", "spread_mm"): "scatter_field_spread_mm_range",
+    ("scatter_field", "roughness"): "scatter_field_roughness_range",
+    ("vessel", "length_mm"): "vessel_trunk_length_mm_range",
+    ("vessel", "radius_falloff"): "vessel_radius_falloff_range",
+    ("torus", "ratio"): "torus_ratio_range",
 }
 
 
@@ -84,6 +89,27 @@ def draw_cohort_hyperparams(rng, spec):
             "azimuth": float(rng.uniform(0, 2 * np.pi)),
             "elevation": float(rng.uniform(-np.pi / 2, np.pi / 2)),
         }
+    elif family == "scatter_field":
+        lo, hi = spec.scatter_field_n_components_range
+        shape_params = {
+            "n_components": int(rng.integers(int(lo), int(hi) + 1)),
+            "spread_mm": float(rng.uniform(*spec.scatter_field_spread_mm_range)),
+            "roughness": float(rng.uniform(*spec.scatter_field_roughness_range)),
+        }
+    elif family == "vessel":
+        lo, hi = spec.vessel_branch_depth_range
+        shape_params = {
+            "length_mm": float(rng.uniform(*spec.vessel_trunk_length_mm_range)),
+            "azimuth": float(rng.uniform(0, 2 * np.pi)),
+            "elevation": float(rng.uniform(-np.pi / 2, np.pi / 2)),
+            "branch_depth": int(rng.integers(int(lo), int(hi) + 1)),
+            "radius_falloff": float(rng.uniform(*spec.vessel_radius_falloff_range)),
+        }
+    elif family == "torus":
+        shape_params = {
+            "ratio": float(rng.uniform(*spec.torus_ratio_range)),
+            "flatten_axis": int(rng.integers(0, 3)),
+        }
     else:
         raise ValueError(f"unknown shape family {family!r}")
 
@@ -116,7 +142,19 @@ def draw_member_shape(member_rng, cohort_hp, spec):
         shape_params["n_components"] = int(round(
             _blend(shape_params["n_components"], fresh_n, spec.shape_between_ratio)))
 
-    if family == "disk":
+    if family == "scatter_field":
+        lo, hi = spec.scatter_field_n_components_range
+        fresh_n = int(member_rng.integers(int(lo), int(hi) + 1))
+        shape_params["n_components"] = int(round(
+            _blend(shape_params["n_components"], fresh_n, spec.shape_between_ratio)))
+
+    if family == "vessel":
+        lo, hi = spec.vessel_branch_depth_range
+        fresh_depth = int(member_rng.integers(int(lo), int(hi) + 1))
+        shape_params["branch_depth"] = int(round(
+            _blend(shape_params["branch_depth"], fresh_depth, spec.shape_between_ratio)))
+
+    if family in ("disk", "torus"):
         # discrete param: the natural analog of "blend" is a probabilistic redraw
         # (shape_between_ratio=0 -> never redraw, =1 -> always redraw) -- a linear
         # blend doesn't make sense for a categorical axis choice. Drawn unconditionally
@@ -126,7 +164,7 @@ def draw_member_shape(member_rng, cohort_hp, spec):
         if redraw:
             shape_params["flatten_axis"] = fresh_axis
 
-    if family == "cylinder":
+    if family in ("cylinder", "vessel"):
         fresh_az = float(member_rng.uniform(0, 2 * np.pi))
         shape_params["azimuth"] = float(
             shape_params["azimuth"]
@@ -174,9 +212,9 @@ def rasterize_shape_in_crop(crop_lbl, shape_id, member_draw, mm_per_voxel, cente
 
     params = dict(member_draw.shape_params)
     params["size_vox"] = size_vox
-    if member_draw.family == "cylinder":
+    if member_draw.family in ("cylinder", "vessel"):
         params["length_vox"] = params.pop("length_mm") / mm_per_voxel_iso
-    if member_draw.family == "splatter":
+    if member_draw.family in ("splatter", "scatter_field"):
         params["spread_vox"] = params.pop("spread_mm") / mm_per_voxel_iso
 
     crop_shape = np.array(crop_lbl.shape, dtype=np.int64)

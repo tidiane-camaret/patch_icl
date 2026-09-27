@@ -166,6 +166,10 @@ def _build_registry() -> dict[str, ClassDef]:
     registry["shape_splatter"] = ClassDef("shape_splatter", "shape_splatter", 196, None, cat)
     registry["shape_disk"] = ClassDef("shape_disk", "shape_disk", 197, None, cat)
     registry["shape_cylinder"] = ClassDef("shape_cylinder", "shape_cylinder", 198, None, cat)
+    registry["shape_scatter_field"] = ClassDef(
+        "shape_scatter_field", "shape_scatter_field", 191, None, cat)
+    registry["shape_vessel"] = ClassDef("shape_vessel", "shape_vessel", 192, None, cat)
+    registry["shape_torus"] = ClassDef("shape_torus", "shape_torus", 193, None, cat)
 
     # === TOTALSEG-ONLY CLASSES (MRI, subtasks) ===
     cat = "TotalSeg-only"

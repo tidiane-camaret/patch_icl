@@ -1,0 +1,28 @@
+Loading 160 <- /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_160_shape_diversity_v2/best.pt
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        blob            dice=0.8104+-0.1527  n=48  (60.0s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        splatter        dice=0.7477+-0.1596  n=48  (63.9s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        disk            dice=0.7553+-0.1859  n=48  (59.0s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        cylinder        dice=0.7818+-0.1803  n=48  (59.9s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        scatter_field   dice=0.4736+-0.1816  n=48  (59.9s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        vessel          dice=0.7009+-0.2028  n=48  (60.1s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  160        torus           dice=0.6948+-0.1869  n=48  (59.8s)
+Loading 161_partial <- /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_161_scatter_field_isolated/best.pt
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  161_partial blob            dice=0.8200+-0.1560  n=48  (58.7s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000

@@ -1,0 +1,140 @@
+# @package _global_
+# 163_scatter_field_real_mri_host -- the deepest sim-to-real fix tried so far (docs/logs.md
+# 2026-09-27 "sim-to-real gap"). 162's brain-hosted CT fix (family_host_classes) left real
+# ISLES22/Shifts-MS/ATLAS/GNC essentially flat, and inspecting the gmm_bank directly showed why:
+# ALL 4135 of its masks are CT-sourced (HNSCC/TCIA_Colon/StonyBrook-CT/TotalSegmentatorV2/...,
+# zero MRI provenance tags) -- 84% of "brain"-containing masks are incidental, likely-crude ROIs
+# from a head-and-neck CANCER STAGING CT (HNSCC), nothing like a real dedicated brain-MRI
+# acquisition. This experiment bypasses the gmm_bank for scatter_field entirely: new
+# `data.gmm.real_host_families: [scatter_field]` routes it through the new
+# RealHostShapeProvider (src/providers/real_host_shape.py), which stamps the SAME procedural
+# shape (unchanged rasterization code) onto a REAL MRI TotalSeg subject's own brain image, at a
+# contrast level computed from that subject's own local real tissue stats -- verified visually
+# (results/3d/real_host_shape_check.png) to look like a real plausible lesion on real brain MRI
+# anatomy (gyri/sulci/ventricles), a categorically different regime from anything the CT-only
+# bank could produce.
+#
+#   python experiments/3d/train.py experiment=163_scatter_field_real_mri_host
+#
+# 57 real MRI 'brain' subjects available (TotalSegProvider on paths.totalsegmri) -- a much
+# smaller pool than the gmm_bank's, so this family alone can't carry the same diversity load;
+# kept at the SAME dose as 161/162 (scatter_field:4 of 8 weight units) to isolate the ONE real
+# change (host source, not dose) against those two priors.
+#
+# BUDGET (user direction 2026-09-27, revised down from 50->10 epochs to save time): epochs=10,
+# eval_every=10 (only eval once, at the end -- skip periodic mid-training eval; validation
+# happens via the fast external tools instead: eval_pshape_families.py + a small real-OOD
+# slice, both ~1-2 min each).
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    real_host_families: [scatter_field]   # bypasses gmm_bank for this family -- see header
+    real_host_cls: brain
+    shape:
+      host_anchored: true
+      family_weights: {blob: 1.0, splatter: 1.0, disk: 1.0, cylinder: 1.0,
+                       scatter_field: 4.0}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 10
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_135b_varspacing_synth05_shape1_intensitycalib_continue/best.pt
+  checkpoint_allow_partial: false   # identical arch to 135b -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 163_scatter_field_real_mri_host

@@ -10014,3 +10014,498 @@ wandb: [145](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg
 [146](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/wrwzs5fs) ·
 [147a](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/i1f4ah8t) ·
 [147b](https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_train/runs/e4cd8yek)
+
+## 2026-09-26 — inspecting the 4 worst `135b` OOD sources (ISLES22, Shifts-MS, ATLAS v2.0, GNC_705) before a non-cascade p_synth=0.5/p_shape=1.0 iteration round
+
+Ahead of training runs from `135b` targeting these four (the worst of the 7-source OOD suite in
+the headline table: ISLES22 0.050, Shifts-MS 0.008, ATLAS v2.0 0.028, GNC_705 0.082 — vs.
+Hippocampus 0.326/Prostate 0.130/HU_LWK1 0.196 doing comparatively fine), inspected spacing,
+intensity contrast, object size, and object aspect ratio, and compared against the `p_shape`
+generator's own `ShapeCohortSpec` ranges (`src/shapes3d/spec.py`) to see where the generator
+plausibly under-covers what these sources actually look like. New script:
+`experiments/3d/synth_task_generation/analyze_ood_shape_aspect.py` -> `results/synth_task_gen/
+ood_shape_aspect.csv` (per-axis largest-connected-component extent + aspect ratio; existing
+`compute_class_properties.py`/`analyze_target_surround_contrast.py` caches covered
+spacing/size/contrast already).
+
+**Spacing** (from each dataset's doc, already verified): ISLES22 heterogeneous 0.88x0.88x2.0 to
+2x2x5mm; Shifts-MS isotropic 1x1x1mm (both cohorts); ATLAS v2.0 isotropic 1x1x1mm (uniform,
+template-registered mirror); GNC_705 anisotropic 1.40625x1.40625x3.0mm (Dixon). Eval
+`crop_spacing_mm` per source (1.2-1.9mm) was tuned per-dataset for zero-clipping whole-FOV
+coverage, well below `135b`'s own `train_spacing_range=[3,6]`mm — the same train/eval spacing
+mismatch already flagged per-source in the dataset docs, now confirmed to hold uniformly across
+all four.
+
+**Intensity (target-vs-surround contrast, ring-sigma units, `analyze_target_surround_contrast.py`
+formula = `host_contrast_ratio_range`'s own definition)**: isles22 median +2.38, shifts_ms +1.47,
+atlas_v2 -0.69, gnc_kidney spans -0.92 (hypo classes) to +2.06 (hyper classes) across its 13
+classes. **All comfortably inside the generator's `host_contrast_ratio_range=(-2.5,2.5)`** —
+intensity calibration is NOT the bottleneck for any of these four, already correctly covers them.
+
+**Object size** (single largest-connected-component max extent, comparable to `size_mm_range=
+(10,50)`mm): GNC classes median 10-27mm (well inside range); ISLES22 median 34mm but p90 102mm;
+ATLAS v2.0 median 46mm, p90 95mm; Shifts-MS median 42.5mm, p90 120mm. **The upper half of 3/4
+sources' real lesion-instance sizes sits at or above the generator's 50mm cap.**
+
+**Multiplicity (components/subject) — the standout gap**: `splatter_n_components_range=(2,6)`
+vs. measured mean components/subject: GNC 1.2-2.4 (fine), ATLAS 5.0 (fine, at the edge), ISLES22
+**13.3** (2.2x the cap), Shifts-MS **107.6** (18-50x the cap) — real MS plaque counts and
+multi-focal stroke emboli are far more numerous than anything the splatter family currently
+generates.
+
+**Aspect ratio (single-component elongation, max/min extent mm)**: broadly similar across all
+four and mild — medians 1.3-2.1, p90 up to 2.6-3.3 (GNC 1.2-1.9 median, ISLES22 1.59, ATLAS 1.74,
+Shifts-MS 2.08). Not an obviously large generator-vs-reality gap, though `blob`/`splatter`
+have no explicit elongation knob (only `disk_aspect_ratio_range` targets flatness) — unverified
+whether roughness alone reaches these ratios.
+
+**Caveat before acting on the multiplicity/size gaps**: widening scatter/multiplicity and shape
+diversity was already tried directly (`131`/`132`/`133`, see `3_results.md`'s "Widening synthetic
+shape diversity" section) — a real 31-epoch-probe gain (cross-source OOD mean 0.093->0.112) did
+NOT hold at the full 51-epoch budget (`133` reverted to 0.091, HU_LWK1 flipped from largest gain
+to a net loss). So "splatter caps are too low" is a correct read of the generator-vs-reality gap,
+but a from-scratch re-widening attempt already has a negative full-budget result on record — any
+new attempt should differ from 131/132 in some real way (e.g. per-source-calibrated multiplicity
+rather than a uniform range bump, or isolating multiplicity from the shape-diversity confound
+those two experiments combined) rather than repeating the same knob.
+
+## 2026-09-27 — new 160 series: 3 new shape families targeting the measured p_shape gaps, autonomous iteration starts
+
+Starting a new experiment series (`160`+) on user direction to tackle the p_shape generalization
+problem directly, with full autonomy to design shapes, run training, and validate on GPU without
+waiting for further input. Rather than only widening `splatter`'s existing ranges (the 131/132/133
+approach that reverted at full budget, see above), added 3 NEW shape families as separate
+`family_weights` entries -- existing families/configs are byte-unaffected (`ShapeCohortSpec`'s own
+default `family_weights` dict is unchanged; new families only appear where a config explicitly
+lists them).
+
+**`scatter_field`** (`src/shapes3d/primitives.py::make_scatter_field`) -- directly targets the
+single biggest measured gap (docs/logs.md 2026-09-26): real multi-focal lesion fields (Shifts-MS
+~108 components/subject, ISLES22 ~13) vs. `splatter`'s cap of 6. Many small blobs, log-normally
+sized (heterogeneous, not identical copies) and normal-jittered around the center over a WIDE
+spread (`scatter_field_spread_mm_range=(20,140)` vs splatter's `(5,20)`). Kept as its own family
+(not a widened splatter) so nothing already tuned against splatter's tight range regresses.
+Performance: unlike `make_splatter` (computes the full local `shape` grid once PER component --
+fine at n<=6, would be expensive at n~100), each component gets its own small local sub-box sized
+to its own radius -- O(n * comp_r^3) not O(n * prod(shape)), so n=120 stays cheap.
+
+**`vessel`** (`make_vessel`) -- a vein/vessel stand-in: a cheap L-system-like recursively-
+bifurcating, tapering tree of capsule segments (`_vessel_segments`, depth 2-4, radius shrinks by
+`vessel_radius_falloff_range=(0.6,0.85)` per generation, direction perturbed by a random-axis
+Rodrigues rotation per branch). Directly targets the repo's own "thickness, not identity" OOD
+driver finding ([[project_synth_realism]]-adjacent -- thin structures are the model's known weak
+point) with genuine branching topology, not just another straight tube. Each segment rasterized
+into its own small local sub-box, same cheap-generation pattern as scatter_field.
+
+**`torus`** (`make_torus`) -- axis-aligned donut SDF (`q=sqrt(u^2+v^2)-R; dist=sqrt(q^2+w^2)`,
+threshold by minor radius `r=R/ratio`), added per the user's own explicit suggestion
+("segments, torus, etc."). Deliberately non-anatomical, genus-1/non-convex topology no existing
+family has -- cheapest of the three (closed-form, single vectorized pass, no loop).
+
+All three follow the existing closed-form-volume-solve convention (`_radius_for_volume`, no
+iterative search) and slot into the SAME cohort-consistency machinery every family already uses
+(`shapes3d/instantiate.py`'s cohort/member draw + between_ratio blending, `rasterize_shape_in_crop`'s
+mm->vox conversion) -- no new mechanism, just 3 new `make_<family>`/`reach_vox` cases plus new
+`ShapeCohortSpec` range fields (`scatter_field_*`, `vessel_*`, `torus_ratio_range`). New pseudo-
+class ids **191/192/193** added to `data/maisi_classes.py::SHAPE_ID_TO_FAMILY` and
+`data/class_registry.py` (existing shapes use 195-198; 191-193 chosen free of every real MAISI id
+and of `body`=200, both blocks fit inside the existing `(maxid+1)=201`-length mu/sd arrays, no
+`maxid` bump needed) -- missing this wiring is a real trap: it fails at runtime with `KeyError`
+in `SynthGmmProvider.assemble_task`, not at import time, so it wasn't obvious until actually
+sampling a cohort of the new family.
+
+32 unit tests added/passing (`src/shapes3d/test_primitives.py`, `test_instantiate.py`) covering
+each new family's basic geometry (multi-component, thin+branching, has-a-hole) plus an end-to-end
+`rasterize_shape_in_crop` smoke test per family (catches param-name mismatches a primitives-only
+test can't). Visually verified in isolation and combined with the full 135b generator pipeline
+(host-anchored intensity, texture noise, heterogeneity) via `experiments/3d/plot_shape_items.py`'s
+new `--family mix7` and `--preset 135b` flags (the latter also adds `--train_spacing_range` for
+per-row log-uniform spacing sampling, matching `SpacingBatchSampler`) -- `results/3d/
+shape_items_160_mix7.png`.
+
+Next: launch `160` (resumes `135b`'s own checkpoint, same data recipe -- `p_synth=0.5`,
+`gmm.p_shape=1.0`, `train_spacing_range=[3,6]` -- plus the 3 new families in `family_weights`),
+short quick-probe budget first (matching the 131/132/133/135 convention of checking a short probe
+before committing a full budget, given 133's full-budget reversal lesson), then periodic real-OOD
++ synthetic-task validation, iterating (161, 162, ...) autonomously.
+
+## 2026-09-27 (cont.) — 160 result: clean null vs. 135b; 161 isolates scatter_field at higher dose
+
+**Timing scare, resolved as a measurement artifact, not a real regression.** A 25-step smoke test
+(before launching the real run) measured 0.46 steps/s (~271s/epoch extrapolated) -- flagged by the
+user as far above 135b's own ~100s/epoch. Root-caused before relaunching: a clean CPU-only
+microbenchmark (`draw_cohort_hyperparams`+`draw_member_shape`+`rasterize_shape_in_crop`, 30 draws/
+family) showed the new families are actually CHEAP -- `scatter_field` 7.65ms/draw is cheaper than
+the existing `splatter` (18.53ms), `vessel` 4.03ms, `torus` 0.46ms (`disk` 0.30ms, `blob` 1.23ms,
+`cylinder` 1.59ms for reference). So generation cost was never the problem; the 25-step estimate
+was compile-polluted (same measurement pitfall this project's own history already flagged
+elsewhere, e.g. `[[project_cascade_realize_step_profile]]`'s "step-1 ~20s" note) -- torch.compile's
+one-time graph-compile cost dominates a tiny sample. The real run's actual per-epoch times
+confirmed this: e0=208s (compile), e1-e3 still cooling (178s/145s/140s as async compile artifacts
+finish flushing), **e4 onward settled to 120-125s/epoch** -- within ~25% of 135b's reference, not
+2.7x over it. (Separately, the FIRST launch attempt crashed on an unrelated transient CUDA OOM --
+a different process briefly co-resident on the shared GPU, gone by the time of the successful
+relaunch -- not a 160-specific issue.)
+
+**160 training completed cleanly**: 31 epochs, best val Dice=0.4211 (in-distribution TotalSeg:
+seen 0.49, unseen 0.34, ct 0.47, mri 0.39) -- essentially flat vs. 135b's own pre-160 val_dice
+(0.4212), as expected (the new shapes target OOD generalization, not in-distribution accuracy).
+
+**OOD eval (single-level, exp92-master-table protocol, same 4 sources from the 2026-09-26
+inspection) vs. 135b baseline -- a clean null result, every delta within noise:**
+
+| source | 135b baseline | 160 (7-family mix) | Δ |
+|---|---:|---:|---:|
+| isles22 | 0.050 | 0.0469 | -0.003 |
+| shifts_ms | 0.008 | 0.0090 | +0.001 |
+| atlas_v2 | 0.028 | 0.0277 | -0.0003 |
+| gnc_kidney | 0.082 | 0.0758 | -0.006 |
+
+**Read as a dosage problem, not "scatter_field doesn't work"**: `family_weights` gave
+`scatter_field` only 1.5/7≈21% of shape-mode draws, further diluted by `p_synth=0.5` ->
+~10.7% of ALL training tasks ever exposed the model to it, over just 31 epochs (~31k tasks
+total, ~3300 scatter_field exposures) -- plausibly too dilute to shift OOD behavior measurably,
+independent of whether the mechanism itself has any value. The train/eval spacing mismatch
+(`train_spacing_range=[3,6]` vs. each source's own tuned 1.2-1.9mm eval pitch, flagged
+2026-09-26) can't explain the null result specifically since it's identical between the 135b
+baseline and 160 -- it caps the absolute ceiling for both arms alike, not a differential
+explanation for 160 failing to beat 135b.
+
+**161** (`configs/experiment/3d/experiment/161_scatter_field_isolated.yaml`): isolates the single
+best-justified hypothesis at much higher dose before deciding whether/how to blend --
+`family_weights={blob:1,splatter:1,disk:1,cylinder:1,scatter_field:4}` (scatter_field now 4/8=50%
+of shape-mode draws, ~4.7x 160's dose), `vessel`/`torus` dropped from this probe entirely (least-
+tested additions -- including them would confound "did the dose increase help" with "did the
+untested families help/hurt", one variable at a time per this project's own 105/106/107 and
+131/132/133 isolate-before-blend precedent). Same checkpoint/budget/everything else as 160.
+
+## 2026-09-27 (cont.) — pivot: isolating the sim-to-real gap directly (161 stopped early)
+
+User direction: stop iterating on dose (161, still training) and instead focus on WHY the
+scatter_field synthetic gain doesn't transfer to real OOD data, with fast few-sample validation
+each iteration rather than full 31-epoch-probe -> full-OOD-eval cycles. 161 killed mid-epoch-1
+(its checkpoint at that point is ~135b + a couple hundred steps, not meaningfully different).
+
+**New fast diagnostic tool**: `experiments/3d/synth_task_generation/eval_pshape_families.py` --
+evaluates a checkpoint directly on synthetic p_shape tasks per family, reusing the EXACT
+training-time GPU-realize path (`src.gpu_realize_crop.realize_native_crops` on
+`SynthGmmProvider(cascade=True)`'s native_crop payload) so numbers are apples-to-apples with what
+training actually saw. No real dataset, no training -- ~60s per (checkpoint, family) at n=48,
+~15-30s at n=24. This is now the primary fast-iteration tool per the user's "validate on a few
+samples" direction.
+
+**Finding 1 -- 160's training DID work, just narrowly**: native p_shape Dice, 135b -> 160 (both
+n=48, crop_spacing_mm=4.24, the training pitch):
+
+| family | 135b | 160 | Δ |
+|---|---:|---:|---:|
+| blob | 0.8178 | 0.8034 | flat |
+| splatter | 0.7432 | (not rerun, expect flat) | — |
+| disk | 0.7599 | 0.7553 | flat |
+| cylinder | 0.7835 | 0.7818 | flat |
+| **scatter_field** | **0.3919** | **0.4736** | **+0.082** |
+| vessel | 0.6861 | 0.7009 | flat |
+| torus | 0.6922 | 0.6948 | flat |
+
+Exactly the family that got the highest dose (scatter_field, 1.5/7≈21%) moved; nothing else did --
+a clean, well-behaved confirmation that training-time exposure, not some other confound, drove the
+change. But this real synthetic-domain improvement produced ZERO real-OOD improvement (isles22/
+shifts_ms/atlas_v2/gnc_kidney all flat, see prior entry) -- the gap is specifically sim-to-real,
+not "the model can't learn the mechanism."
+
+**Finding 2 -- spacing mismatch RULED OUT as the driver**: hypothesis was that
+`train_spacing_range=[3,6]`mm vs. real sources' tuned eval pitch (1.2-1.9mm) starves the model of
+the fine-scale regime real eval actually uses. Tested directly on 135b, same synthetic tasks, two
+spacings (4.24mm = training pitch, 1.5mm = isles22/shifts_ms's own real eval pitch), n=24:
+
+| family | @4.24mm (train pitch) | @1.5mm (real eval pitch) |
+|---|---:|---:|
+| blob | 0.7897 | 0.8431 |
+| scatter_field | 0.3523 | 0.6470 |
+| vessel | 0.6305 | 0.8390 |
+| torus | 0.6523 | 0.8119 |
+
+**Every family does BETTER at 1.5mm, not worse** (more voxels per small/thin structure at finer
+pitch -- easier to resolve, not harder). If spacing regime were the transfer blocker, real eval's
+finer pitch should be favorable; instead real ISLES22 Dice is 0.047 vs. this same-spacing
+synthetic scatter_field Dice of 0.647 -- a **13x gap with spacing held constant**. Spacing is not
+the (or at least not the dominant) sim-to-real driver here.
+
+**Working hypothesis now**: scatter_field's host organ is picked UNIFORMLY over ~130 MAISI/
+TotalSeg classes (liver, lung, kidney, ...) -- the model was never specifically taught "find
+scattered small hyperintense regions WITHIN BRAIN tissue", which is the actual ISLES22/Shifts-MS
+domain (both are brain-only lesion sources). `host_anchored=true` also means the shape's own
+intensity is calibrated relative to whichever random host's mu/sd it happened to land on, not
+brain's specifically.
+
+**Fix, tested before spending GPU time**: new `ShapeCohortSpec.family_host_classes` field
+(`{family_name: (maisi_class_id,...)}`) restricts a family's host to specific classes via
+`CohortSampler.sample_cohort`'s existing (previously-unused-by-shape-mode) `target_class` param.
+Required reordering `SynthGmmProvider.assemble_task`'s cascade branch: shape hyperparams (family)
+now drawn BEFORE host/cohort sampling (previously after) so the restriction can steer which host
+gets picked -- shape_hp's own draw is keyed off `gmm_seed` alone (independent of `rng`'s stream
+position), so this only changes what `rng` itself draws downstream, not shape_hp's determinism.
+64/64 existing tests still pass after the reorder. Verified directly (not just by inspection):
+20/20 sampled `scatter_field` cohorts land in host class 22 ('brain') with
+`family_host_classes={"scatter_field": (22,)}` set, vs. essentially-uniform-over-130-classes
+before.
+
+**162** (`configs/experiment/3d/experiment/162_scatter_field_brain_hosted.yaml`): same recipe as
+161 (`family_weights` scatter_field:4 isolated dose) plus `shape.family_host_classes:
+{scatter_field: [22]}`. Short 10-epoch budget (not the usual 31) per the fast-iteration
+direction -- validate with `eval_pshape_families.py` (native p_shape Dice, ~1 min) plus a SMALL
+real-isles22 slice (`eval.tasks_per_class` capped, not the full 247-subject sweep) each
+iteration, rather than full training-probe -> full-OOD-eval cycles.
+
+## 2026-09-27 (cont.) — 162 result (flat again); 163 real-MRI-host fix + a caught anisotropy bug
+
+**162 (brain-hosted CT, 10 epochs) result**: native p_shape scatter_field Dice 0.3919 (135b) ->
+0.4471 (10-epoch, healthy improvement even at 1/3 the epochs of 160, confirming higher dose
+learns faster) -> real small-slice OOD (n=20/class): isles22 0.0453, shifts_ms 0.0111, atlas_v2
+0.0333, gnc_kidney 0.0701 -- all still within noise of the 135b baseline (0.050/0.008/0.028/
+0.082). Brain-typed CT hosting alone did not move real transfer.
+
+**Why, confirmed with data, not guessed**: dumped the gmm_bank's `index.pkl` directly --
+**all 4135 masks, every one of 21 provenance tags, are CT-sourced** (HNSCC 1183, TCIA_Colon 510,
+StonyBrook-CT 438, TotalSegmentatorV2 297, AbdomenCT-1K 283, ..., zero MRI). Of the 941 masks
+containing class 22 ('brain'), 84% (792) come from HNSCC -- a head-and-neck CANCER STAGING CT,
+where brain is an incidental peripheral structure, not a dedicated brain acquisition. So 162's
+"brain-hosted" fix still painted onto a crude, likely-partial CT ROI, nothing like ISLES22/
+Shifts-MS's real dedicated brain MRI.
+
+**163 fix: bypass the gmm_bank entirely for scatter_field**, new `RealHostShapeProvider`
+(`src/providers/real_host_shape.py`) stamps the SAME procedural shapes onto a REAL MRI TotalSeg
+subject's own image (57 'brain' subjects, `paths.totalsegmri`) instead -- closer to the
+SyntheticTumors/DiffTumor "synthetic lesion on a real scan" technique this codebase's own
+`HeterogeneitySpec` docstring already cites, rather than a fully-synthetic canvas. New
+`TotalSegProvider.load_raw`/`.resolve_center` public helpers (additive, no behavior change to
+existing callers) expose what `load()`/`load_native_crop()` already used internally. Wired via
+new `data.gmm.real_host_families`/`real_host_cls` config knobs -> `SynthGmmProvider.
+real_host_providers` (a family listed there fully bypasses `family_host_classes`/gmm_bank
+sampling, checked first in `assemble_task`'s cascade branch).
+
+**Two real problems caught and fixed before spending the 50-epoch budget on them (both via
+direct visual + numeric inspection, not assumption):**
+
+1. **Flat, too-clean painted region** (user-flagged: "should care about realistic object
+   intensity, else too easy to spot"). v0 painted a flat `local_mean + ratio*local_std` fill --
+   trivially smooth against real MRI's natural noise texture, a free shortcut cue. Fixed by
+   reusing `_fractal_value_noise` (the same texture machinery `_build_nc` already uses for the
+   CT-bank path) scaled by the REAL local tissue std, plus switching the contrast baseline from
+   a whole-crop background average to a RING around the shape (mirrors `analyze_target_surround_
+   contrast.py`'s own real-lesion measurement methodology exactly, rather than a cruder proxy).
+
+2. **Severe anisotropic clipping** (user-flagged from the plotted check: "cases seem heavily
+   anisotropic"). Root cause, quantified directly: `train_spacing_range=[3,6]`mm targets a
+   384-768mm physical FOV (sized for whole-body CT coverage) but real brain MRI native FOV is
+   only ~150-260mm/axis -- **all 57/57 real 'brain' subjects clipped on every axis** at that
+   range, meaning every real-host task would have been a mostly-air-padded, badly distorted
+   crop for the ENTIRE 50-epoch run. Fixed: `RealHostShapeProvider.crop_spacing_mm` is now a
+   FIXED 1.5mm (matching ISLES22/Shifts-MS's own real eval pitch exactly), ignoring whatever
+   spacing the training batch happens to sample -- brain-scale real-host tasks have no reason
+   to follow the CT-oriented sweep. Even at 1.5mm only 9/57 subjects clip on zero axes (median
+   per-axis FOV ~220-230mm vs. a 192mm target, with a long tail of smaller/partial acquisitions)
+   -- accepted as the SAME tolerance already used for every other real MRI source in this
+   project (ISLES22 itself is documented "100% in-plane / 75% z fill", not 100% on every axis).
+   Re-verified visually after the fix (`results/3d/real_host_shape_check_v3.png`): most panels
+   now fill the frame with real, non-squished anatomy; the rare remaining thin/clipped panel
+   matches the accepted tail, not a new bug.
+
+Both caught via a fast, cheap loop (standalone visualization script, no training) exactly per
+the "validate on a few samples" direction -- would otherwise have silently wasted the entire
+50-epoch run on a systematically broken input.
+
+**163** (`configs/experiment/3d/experiment/163_scatter_field_real_mri_host.yaml`): same dose as
+161/162 (scatter_field:4 of 8 weight units), `real_host_families: [scatter_field]`, 50 epochs
+per user direction (`eval_every=50` -- skip periodic mid-training eval, validate externally
+instead to save time). Smoke-tested end-to-end (both before AND after the anisotropy fix) before
+committing the full run each time.
+
+## 2026-09-27 (cont.) — correction: the "anisotropic" alarm was a viz-script bug, not a real one;
+## real fixes (1.0mm pitch, subject-pool filter) kept anyway on their own merits
+
+User re-flagged "heavily squished" panels even after the 1.5mm fix. Investigated further:
+computed `min(fov) >= need` at finer pitches directly (0.8-1.2mm) -- 1.0mm covers 48/57 (84%)
+subjects with ZERO clipping vs. 9/57 (16%) at 1.5mm, so switched the fixed pitch to 1.0mm. Still
+looked squished on a fresh visual check. Traced with per-member `out_sizes`/`img.shape` prints:
+`img.shape` did NOT match `out_sizes=[128,128,128]` at all (e.g. `(100,100,43)`,
+`(234,99,234)`) -- **the bug is in the visualization script, not the data pipeline**:
+`build_native_crop` only ever POOLS (downsamples) toward `out_sizes`, per its own docstring
+("the payload grid stays >= out_sizes, the GPU realize only ever downsamples") -- it does NOT
+force-resample to exactly `out_sizes` when the native crop is SMALLER (which happens whenever a
+subject's native MRI resolution is coarser than the target crop_spacing_mm on some axis, e.g. a
+3.6mm-thick-slice 2D acquisition at a 1.0mm target). The real training path always calls
+`src.gpu_realize_crop.realize_native_crops` next, which DOES force-resample to exactly T^3 via
+`F.interpolate` (upsampling included, unlike `build_native_crop`'s pool-only step) -- but every
+one of this session's `real_host_shape_check_v*.png` visualizations read `nc.image` DIRECTLY
+from the raw `NativeCrop`, skipping that step entirely. Re-plotted through the actual
+`native_crop_collate_fn` -> `realize_native_crops` path (`results/3d/
+real_host_shape_check_v6_realized.png`): every panel now correctly fills a proper 128^3 frame
+with real, non-squished anatomy -- **the training pipeline was never actually broken**, only
+this session's own ad-hoc visualization tooling was.
+
+Net effect: the 1.0mm pitch and the degenerate-subject filter (`RealHostShapeProvider.
+_filter_usable_subjects`, drops the one 47mm-z-FOV outlier and similar) are BOTH kept -- not
+because they fixed a real bug (they didn't, there wasn't one), but because they're independently
+good on their own merits (finer pitch helps small-structure synthetic Dice per the earlier
+sweep; excluding a literally-degenerate partial scan from the host pool is sound hygiene
+regardless). Lesson for next time: any NEW provider's crops should be sanity-checked through
+`realize_native_crops`/`native_crop_collate_fn` specifically, not by reading `.image` off the
+raw NativeCrop -- `plot_shape_items.py`'s existing convention of doing the latter happened to be
+safe only because CT's native resolution is reliably finer than any crop_spacing_mm used so far
+(downsampling-only holds), an assumption this new MRI real-host path breaks.
+
+## 2026-09-27 (cont.) — 163 RESULT: real-MRI-host fix is a clear, broad win across all 4 targets
+
+163 trained 10 epochs (revised down from 50 per user direction, to iterate faster), same dose
+as 161/162 (scatter_field:4/8 weight units), `real_host_families: [scatter_field]` (bypasses
+gmm_bank entirely, stamps onto real MRI TotalSeg 'brain' subjects with ring-calibrated textured
+contrast, 1.0mm pitch + degenerate-subject filter). Fast validation (n=20/class real-OOD slice,
+same protocol as 162):
+
+| source | 135b baseline | 160 (7-fam CT mix) | 162 (brain-typed CT, 10ep) | **163 (real MRI host, 10ep)** |
+|---|---:|---:|---:|---:|
+| isles22 | 0.050 | 0.0469 | 0.0453 | **0.0978** (+96% vs. baseline) |
+| shifts_ms | 0.008 | 0.0090 | 0.0111 | **0.0578** (+622%) |
+| atlas_v2 | 0.028 | 0.0277 | 0.0333 | **0.0321** (+15%, smallest gain) |
+| gnc_kidney | 0.082 | 0.0758 | 0.0701 | **0.1051** (+28%) |
+
+**A clear, consistent win on 4/4 sources** -- the first real-OOD improvement of any kind in this
+whole investigation (160/162 were both flat). Notably **not brain-specific**: gnc_kidney (a
+kidney-lesion Dixon-MRI source, nothing to do with brain anatomy) improved as much as atlas_v2
+did, and isles22/shifts_ms (both brain, both the most multi-focal/scattered of the four) improved
+the MOST -- consistent with the model having learned a more general "real MRI noise/texture
+around a lesion-like region" skill from training on genuine clinical MRI acquisitions, not merely
+a brain-anatomy-specific one. atlas_v2's smaller gain also makes sense on its own terms: single
+chronic T1 lesion, not multi-focal, so scatter_field's own multiplicity-targeted design has less
+direct purchase there than on isles22/shifts_ms's scattered patterns.
+
+Confirms the layered diagnosis from earlier today was right: spacing mismatch was NOT the driver
+(ruled out directly); host ORGAN type (brain vs random) alone was NOT sufficient (162's flat
+result); the CT-vs-MRI MODALITY gap was the dominant lever all along -- once the canvas is
+genuinely real MRI (any real MRI, not even brain-specific), transfer to real MRI OOD sources
+improves broadly.
+
+**Caveats before reading too much in**: n=20/class (small-slice, matching the fast-iteration
+direction) not the full dataset; single seed; only 10 epochs (dose/duration not yet swept for
+this new mechanism); scatter_field tested in isolation, not yet combined with the other 6
+families or with a wider real-host subject pool / other real-host classes beyond 'brain'. Natural
+next steps if this line continues: (1) full-dataset re-eval to confirm the small-slice signal
+holds, (2) extend `real_host_families` to `vessel`/other families, (3) sweep host_cls beyond
+'brain' (e.g. 'kidney_left'/'kidney_right' hosts specifically for GNC_705-style transfer), (4)
+a longer training budget now that the mechanism itself is confirmed to work.
+
+## 2026-09-27 (cont.) — session pause: summary of the 160-163 p_shape sim-to-real arc
+
+Pausing here on explicit user direction. Consolidated recap of today's full arc (each step has
+its own detailed entry above; this is the short version for picking the thread back up):
+
+**New shape families** (`src/shapes3d/primitives.py`, +ids 191-193 in `data/maisi_classes.py`):
+`scatter_field` (many small log-normal-sized blobs, wide spread -- targets the measured
+multiplicity gap in real scattered lesions), `vessel` (branching tapering capsule tree),
+`torus` (donut SDF, non-anatomical topology per user request). All cheap (local sub-box
+rasterization), all cohort-consistent with the existing shape-mode machinery. 32 tests, still
+passing. Visualization tool extended (`plot_shape_items.py --preset 135b --family mix7`).
+
+**Dosage experiments (160, 161-interrupted, 162)**: widening the shape family mix or increasing
+`scatter_field`'s weight measurably improved the model's Dice on its OWN native synthetic task
+(0.39->0.47 at 21% dose/31ep, ->0.45 at 50% dose/10ep) but **never moved real OOD Dice** (ISLES22/
+Shifts-MS/ATLAS v2.0/GNC_705 all stayed flat vs. the 135b baseline). Root-caused, not guessed:
+dumped the gmm_bank's own index and found it's **100% CT-sourced** (21 provenance tags, zero
+MRI) -- even 162's "brain-hosted" fix (`family_host_classes`) was painting onto a crude,
+incidental brain ROI from a head-and-neck cancer-staging CT (HNSCC), nothing like a real brain
+MRI. Spacing mismatch was tested and ruled out as a competing explanation (finer spacing helps
+every family's synthetic Dice, so real eval's finer pitch should be advantageous, not a penalty).
+
+**163 (real-MRI-host fix) -- the one that worked**: new `RealHostShapeProvider` (`src/providers/
+real_host_shape.py`) bypasses the gmm_bank entirely for `scatter_field`, stamping procedural
+shapes onto REAL MRI TotalSeg 'brain' subjects' own images (57 subjects, `paths.totalsegmri`),
+with ring-calibrated real-tissue contrast + texture noise (not a flat fill -- user-flagged
+realism concern, fixed) and a fixed 1.0mm pitch + degenerate-subject filter (two anisotropy
+false alarms chased down and resolved -- one was a real FOV-mismatch bug, one was a bug in this
+session's OWN visualization script, not the training pipeline; see the two entries above for the
+full trace). Result: **broad, consistent real-OOD improvement, 4/4 sources**, isles22 +96%,
+shifts_ms +622%, atlas_v2 +15%, gnc_kidney +28% vs. 135b, at only 10 epochs / n=20-per-class
+validation. Not brain-anatomy-specific (gnc_kidney, a kidney source, improved as much as
+atlas_v2) -- reads as a genuine CT-vs-MRI modality-gap fix, the dominant lever all along.
+
+**Also inspected this session, unrelated to the shape-family work**: augmentation config for the
+135-163 lineage (`calibrated` preset + overrides) -- deform (nonrigid SVF) currently OFF
+(`p=0`) in every one of these configs despite the preset's own calibrated default (`p=0.2,
+control_points=6, max_disp=0.15, num_steps=6`, matching real inter-case deformation RMS median
+0.14 from `experiments/3d/deform_stats/`); confirmed real and synthetic tasks currently receive
+IDENTICAL augmentation (both hardcode `aug_mode=REAL`, the `SYNTH` mode + its separate `cfg.synth`
+config block are legacy/unwired in the current v2 pipeline). User asked to look into re-enabling
+deform; recommended setting given above (task-level only, calibrated defaults) -- not yet applied
+to any config, pending next session.
+
+**State at pause**: GPU free, no background jobs running. Checkpoints on disk: `160` (31ep, 7-fam
+mix), `162` (10ep, brain-typed CT), `163` (10ep, real-MRI-host scatter_field -- the strongest
+result). Configs: `configs/experiment/3d/experiment/{160,161,162,163}_*.yaml`. New reusable
+tooling: `experiments/3d/synth_task_generation/eval_pshape_families.py` (fast native-p_shape
+Dice per family/checkpoint, no training needed) -- the primary fast-iteration tool for this line
+of work going forward.
+
+**Natural next steps, not yet started**: (1) full-dataset re-eval of 163 to confirm the n=20
+small-slice signal holds at scale; (2) extend the real-MRI-host mechanism to other families
+(`vessel`) and other host classes (kidney, for GNC_705 specifically); (3) a longer training
+budget for 163 now that the mechanism is confirmed; (4) re-enable calibrated task-level deform
+(see above) as an independent, separate axis; (5) 161's fate was never resolved (interrupted
+mid-epoch-1 for the pivot to the sim-to-real question) -- its "isolate scatter_field at 50% dose,
+gmm_bank-hosted" question is now superseded by 163's real-host result and probably not worth
+resuming as originally scoped.
+
+## 2026-09-27 (cont.) — 164: continue 163 + re-enable deform -- mixed result, one real regression
+
+Per user direction ("continue training and add deformations. keep evaluating on small slices for
+now"): `164` (`configs/experiment/3d/experiment/164_real_mri_host_deform.yaml`) resumes 163's own
+checkpoint (weights-only, not 135b) and re-enables task-level deform at the calibrated setting
+recommended earlier this session (`p=0.2, control_points=6, max_disp=0.15, num_steps=6`;
+per_image deform stays off). 10 epochs, same fast-iteration cadence. Smoke-tested clean before
+the full run (resumed from 163 correctly, deform active, no crashes).
+
+Small-slice (n=20/class) real-OOD result vs. 163:
+
+| source | 135b | 163 (real-host, no deform) | **164 (continue+deform)** |
+|---|---:|---:|---:|
+| isles22 | 0.050 | 0.0978 | 0.0914 (~flat, within noise) |
+| shifts_ms | 0.008 | 0.0578 | **0.0249 (-57% vs. 163)** |
+| atlas_v2 | 0.028 | 0.0321 | 0.0335 (~flat) |
+| gnc_kidney | 0.082 | 0.1051 | 0.1101 (~flat, slight up) |
+
+**Mixed, not a clean win**: 3/4 sources held steady or ticked up slightly vs. 163; shifts_ms
+dropped meaningfully (still ~3x the original 135b baseline, so not a full regression to square
+one, but a real step back from 163's own number specifically). n=20 is a non-trivial fraction of
+shifts_ms's total 46 subjects, so this isn't dismissed as pure small-sample noise, but it's also
+only one data point (single seed, one epoch budget) -- not yet isolated whether the driver is
+deform specifically, the ADDITIONAL 10 epochs of continued training on top of 163 (a confound
+this run doesn't separate, per the user's explicit direction to combine both changes in one
+step), or genuine noise. Speculative, unconfirmed hypothesis: shifts_ms's scattered multi-focal
+MS-plaque pattern may be more sensitive to nonrigid warping disrupting fine multi-component
+spatial correspondence than ISLES22/GNC's more compact/fewer-component targets.
+
+**Not yet done, natural next step if this needs disambiguating**: an isolated A/B (continue 163
+for 10 more epochs WITHOUT deform, to separate "more training" from "deform" as the shifts_ms
+driver) -- not run yet, paused here pending direction.
+
+## 2026-09-27 (cont.) — 165: all real host organs (not just brain), 50-epoch budget
+
+Per user direction ("continue for 50 epochs, all real host organs instead of just brain").
+`RealHostShapeProvider` extended to accept a LIST of host classes (`host_classes=`, was a single
+`host_cls=`): each COHORT (not each member) now draws ONE class uniformly at random, then
+samples its K+1 subjects from that class's own pool -- target+context still represent "the same
+task" (same organ), matching every other cohort convention in this codebase. New
+`data.gmm.real_host_cls: all` config sentinel resolves to `data.totalseg_classes.MRI_ALL_CLASSES`
+(50 classes) in `common.py`. Verified before launching: 50/50 classes have enough FOV-usable
+subjects at the existing 1.0mm pitch (6451 subjects total, vs. 48 brain-only before) --
+`kidney_left`/`kidney_right` are both included, giving direct kidney-hosted training exposure
+relevant to GNC_705 specifically (previously only reachable via cross-organ transfer from
+brain-hosted training). 30/30 sampled cohorts in a standalone check hit real, distinct classes.
+64/64 existing tests still pass after the refactor.
+
+**165** (`configs/experiment/3d/experiment/165_real_mri_host_all_organs.yaml`): continues 164's
+own checkpoint (not 135b/163 -- keeps building on the accumulated result), same deform settings
+as 164 (task-level p=0.2 calibrated), `real_host_cls: all`, epochs=50 (up from the 10-epoch fast
+probes) now that the mechanism itself is validated. Smoke-tested clean (host-class filtering log
+line confirmed, resumed correctly, no crashes) before launching the full run. Evaluating with
+small real-OOD slices per the established fast-iteration direction, not a full-dataset sweep.

@@ -1,0 +1,136 @@
+# @package _global_
+# 160_shape_diversity_v2 -- new experiment series tackling the p_shape generalization problem
+# directly (user direction 2026-09-27, full autonomy to design/run/validate): resumes 135b's own
+# checkpoint (NOT 130's), IDENTICAL data recipe to 135 otherwise (p_synth=0.5, gmm.p_shape=1.0,
+# train_spacing_range=[3,6], host_anchored intensity, texture, heterogeneity, mu/sd_group_ids=
+# merged, sd_between_ratio=ct_mri) -- the ONLY change is `data.gmm.shape.family_weights`, adding
+# 3 new shape families (scatter_field/vessel/torus, see docs/logs.md 2026-09-27) on top of the
+# original blob/splatter/disk/cylinder mix.
+#
+#   python experiments/3d/train.py experiment=160_shape_diversity_v2
+#
+# WHY THESE WEIGHTS: scatter_field gets the highest weight (1.5) since it targets the single
+# biggest measured real-vs-synthetic gap (ISLES22/Shifts-MS multiplicity, docs/logs.md
+# 2026-09-26); vessel at 1.0 (thin-structure realism, a known OOD driver); torus at 0.5 (the
+# least anatomically-motivated of the three, included for topological diversity per the user's
+# own suggestion, kept lower weight so it doesn't dominate cohort sampling). Original 4 families
+# unchanged at 1.0 each so existing shape-mode behavior isn't crowded out, only supplemented.
+#
+# BUDGET: epochs=31, matching the established quick-probe convention (131/132/133/135) --
+# lesson learned from 133's full-budget reversal of a real 31-epoch gain: check a short probe
+# first, decide whether to commit a full budget based on that, not the other way around.
+#
+# CHECKPOINT: resumes 135b's own best.pt (weights-only, matching how 140-147 already fork new
+# experiments from 135b). Architecture identical -- strict full-shape load, no new/reinitialized
+# parameters (this is a pure data-generation change, not a model change).
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    shape:
+      host_anchored: true
+      family_weights: {blob: 1.0, splatter: 1.0, disk: 1.0, cylinder: 1.0,
+                       scatter_field: 1.5, vessel: 1.0, torus: 0.5}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 31
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-23_135b_varspacing_synth05_shape1_intensitycalib_continue/best.pt
+  checkpoint_allow_partial: false   # identical arch to 135b -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 160_shape_diversity_v2

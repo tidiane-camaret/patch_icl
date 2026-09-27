@@ -136,6 +136,9 @@ MAISI_IDX_TO_CLASS = {
     196: 'shape_splatter',
     197: 'shape_disk',
     198: 'shape_cylinder',
+    191: 'shape_scatter_field',
+    192: 'shape_vessel',
+    193: 'shape_torus',
 }
 
 MAISI_CLASS_TO_IDX = {v: k for k, v in MAISI_IDX_TO_CLASS.items()}
@@ -143,5 +146,9 @@ MAISI_CLASSES = [MAISI_IDX_TO_CLASS[k] for k in sorted(MAISI_IDX_TO_CLASS)]
 
 # Shape-mode pseudo-class ids (docs/superpowers/specs/
 # 2026-09-14-cohort-consistent-synthetic-shapes-design.md) -> the bare family name
-# ShapeCohortSpec.family_weights and shapes3d.primitives.make_shape use.
-SHAPE_ID_TO_FAMILY = {195: 'blob', 196: 'splatter', 197: 'disk', 198: 'cylinder'}
+# ShapeCohortSpec.family_weights and shapes3d.primitives.make_shape use. 191-193 added
+# 2026-09-27 (scatter_field/vessel/torus, see docs/logs.md) -- ids chosen free of every
+# real MAISI class (1-128,132) and of 'body' (200); both blocks fit well within the
+# (maxid+1)=201-length mu/sd arrays (SynthGmmMaisiDataset default maxid=200).
+SHAPE_ID_TO_FAMILY = {195: 'blob', 196: 'splatter', 197: 'disk', 198: 'cylinder',
+                      191: 'scatter_field', 192: 'vessel', 193: 'torus'}

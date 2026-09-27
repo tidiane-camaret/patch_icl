@@ -159,3 +159,19 @@ def test_rasterize_shape_in_crop_is_physically_consistent_across_crop_resolution
     centroid_a_mm = np.argwhere(crop_a == 195).mean(0) * 1.0
     centroid_b_mm = np.argwhere(crop_b == 195).mean(0) * 2.0
     np.testing.assert_allclose(centroid_a_mm, centroid_b_mm, atol=3.0)   # within ~1.5 coarse voxels
+
+
+@pytest.mark.parametrize("family", ["scatter_field", "vessel", "torus"])
+def test_rasterize_shape_in_crop_stamps_each_new_family(family):
+    """End-to-end smoke test (cohort draw -> member draw -> rasterize) for each new
+    family -- catches param-name mismatches between instantiate.py's shape_params dict
+    and primitives.py's make_<family> signature that a primitives-only unit test
+    (fixed, already-correct param dict) can't."""
+    crop_lbl = np.zeros((80, 80, 80), dtype=np.uint8)
+    spec = ShapeCohortSpec(family_weights={family: 1.0})
+    cohort_hp = draw_cohort_hyperparams(np.random.default_rng(0), spec)
+    member = draw_member_shape(np.random.default_rng(1), cohort_hp, spec)
+    rasterize_shape_in_crop(crop_lbl, shape_id=195, member_draw=member,
+                            mm_per_voxel=(1.5, 1.5, 1.5), center_local=(40.0, 40.0, 40.0),
+                            rng=np.random.default_rng(2))
+    assert (crop_lbl == 195).any(), family

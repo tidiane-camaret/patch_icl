@@ -1,8 +1,9 @@
 import numpy as np
 import pytest
 
-from src.shapes3d.primitives import (make_blob, make_cylinder, make_disk, make_shape,
-                                     make_splatter, reach_vox)
+from src.shapes3d.primitives import (make_blob, make_cylinder, make_disk, make_scatter_field,
+                                     make_shape, make_splatter, make_torus, make_vessel,
+                                     reach_vox)
 
 SHAPE = (40, 40, 40)
 CENTER = (20.0, 20.0, 20.0)
@@ -84,6 +85,74 @@ def test_make_cylinder_is_elongated_along_its_axis():
     assert meta["family"] == "cylinder"
 
 
+def test_make_scatter_field_has_many_components():
+    from scipy.ndimage import label as cc_label
+    rng = np.random.default_rng(4)
+    mask, meta = make_scatter_field(
+        (100, 100, 100), (50.0, 50.0, 50.0),
+        {"size_vox": SIZE_VOX, "n_components": 40, "spread_vox": 30.0, "roughness": 0.15}, rng)
+    _, count = cc_label(mask.astype(bool))
+    assert count >= 10                      # many disjoint components, not a handful
+    assert meta["family"] == "scatter_field"
+    assert meta["n_components"] == 40
+
+
+def test_make_scatter_field_is_deterministic():
+    kwargs = dict(shape=(60, 60, 60), center=(30.0, 30.0, 30.0),
+                  params={"size_vox": SIZE_VOX, "n_components": 20, "spread_vox": 15.0})
+    mask1, _ = make_scatter_field(**kwargs, rng=np.random.default_rng(3))
+    mask2, _ = make_scatter_field(**kwargs, rng=np.random.default_rng(3))
+    np.testing.assert_array_equal(mask1, mask2)
+
+
+def test_make_vessel_is_thin_and_branching():
+    rng = np.random.default_rng(5)
+    mask, meta = make_vessel(
+        (100, 100, 100), (50.0, 50.0, 50.0),
+        {"size_vox": 400.0, "length_vox": 40.0, "azimuth": 0.3, "elevation": 0.2,
+         "branch_depth": 3, "radius_falloff": 0.75}, rng)
+    assert mask.astype(bool).sum() > 0
+    assert meta["family"] == "vessel"
+    assert meta["n_segments"] > 1           # actually branched, not just the trunk
+    # thin: total foreground volume should be much less than a sphere of the same
+    # bounding-box extent would need (a branching tube fills its bbox sparsely).
+    coords = np.argwhere(mask.astype(bool))
+    bbox_vol = np.prod(coords.max(0) - coords.min(0) + 1)
+    assert mask.astype(bool).sum() < 0.3 * bbox_vol
+
+
+def test_make_vessel_branch_depth_zero_is_just_the_trunk():
+    rng = np.random.default_rng(6)
+    mask, meta = make_vessel(
+        (60, 60, 60), (30.0, 30.0, 30.0),
+        {"size_vox": 400.0, "length_vox": 30.0, "azimuth": 0.0, "elevation": 0.0,
+         "branch_depth": 0, "radius_falloff": 0.75}, rng)
+    assert meta["n_segments"] == 1
+
+
+def test_make_torus_has_a_hole_in_the_middle():
+    rng = np.random.default_rng(7)
+    center = (50.0, 50.0, 50.0)
+    mask, meta = make_torus(
+        (100, 100, 100), center,
+        {"size_vox": SIZE_VOX, "ratio": 3.0, "flatten_axis": 0}, rng)
+    assert mask.astype(bool).sum() > 0
+    assert meta["family"] == "torus"
+    # the exact center voxel must be background -- that's the defining feature of a torus
+    assert not mask[int(center[0]), int(center[1]), int(center[2])]
+
+
+def test_make_torus_ring_lies_in_the_plane_perpendicular_to_flatten_axis():
+    rng = np.random.default_rng(8)
+    center = (50.0, 50.0, 50.0)
+    mask, _ = make_torus((100, 100, 100), center,
+                         {"size_vox": SIZE_VOX, "ratio": 4.0, "flatten_axis": 0}, rng)
+    coords = np.argwhere(mask.astype(bool))
+    extent = coords.max(0) - coords.min(0)
+    assert extent[0] < extent[1] * 0.6       # flattened along axis 0, same test as make_disk
+    assert extent[0] < extent[2] * 0.6
+
+
 def test_make_shape_dispatches_by_family_name():
     rng = np.random.default_rng(0)
     mask, meta = make_shape("disk", SHAPE, CENTER,
@@ -109,6 +178,11 @@ def test_reach_vox_bounds_every_foreground_voxel_for_each_family():
         ("disk", {"size_vox": SIZE_VOX, "aspect_ratio": 0.15, "flatten_axis": 1}),
         ("cylinder", {"size_vox": SIZE_VOX, "length_vox": 40.0, "azimuth": 0.7,
                       "elevation": 0.3}),
+        ("scatter_field", {"size_vox": SIZE_VOX, "n_components": 30, "spread_vox": 25.0,
+                           "roughness": 0.2}),
+        ("vessel", {"size_vox": 400.0, "length_vox": 30.0, "azimuth": 0.7, "elevation": 0.3,
+                   "branch_depth": 4, "radius_falloff": 0.8}),
+        ("torus", {"size_vox": SIZE_VOX, "ratio": 3.0, "flatten_axis": 1}),
     ]
     for family, params in cases:
         mask, _ = make_shape(family, big_shape, big_center, params, np.random.default_rng(0))

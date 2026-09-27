@@ -521,6 +521,35 @@ def build_dataset(cfg, split: str):
                                     if OmegaConf.is_config(heterogeneity_cfg)
                                     else dict(heterogeneity_cfg))
             heterogeneity_spec = HeterogeneitySpec(**heterogeneity_kwargs)
+            # real_host_families (docs/logs.md 2026-09-27 "sim-to-real gap"): the gmm_bank
+            # backing shape_spec's normal host sampling is 100% CT-sourced (verified: every
+            # provenance tag in it is a CT dataset) -- so a family listed here bypasses the
+            # bank entirely and is instead stamped onto a REAL MRI TotalSeg subject's own
+            # image (RealHostShapeProvider), for OOD sources (ISLES22/Shifts-MS) that are
+            # themselves MRI. Empty/absent (default) -> byte-identical to before this knob
+            # existed; every family not listed still uses the normal gmm_bank path.
+            real_host_families = list(g.get("real_host_families", []) or [])
+            real_host_providers = None
+            if real_host_families and shape_spec is not None:
+                from data.totalseg_classes import MRI_ALL_CLASSES
+                from src.providers.real_host_shape import RealHostShapeProvider
+                from src.providers.totalseg import TotalSegProvider
+                host_cls = g.get("real_host_cls", "brain")
+                # "all" -> every real MRI TotalSeg class (docs/logs.md 2026-09-27 "all real
+                # host organs instead of just brain") -- classes without enough FOV-usable
+                # subjects are dropped inside RealHostShapeProvider itself, not here.
+                host_classes = (MRI_ALL_CLASSES if host_cls == "all"
+                               else [host_cls] if isinstance(host_cls, str)
+                               else list(host_cls))
+                mri_provider = TotalSegProvider(
+                    root=cfg.paths.totalsegmri, classes=host_classes,
+                    image_size=tuple(d.image_size), split=split,
+                    modality="mri", native_crop_max_native=d.get("gpu_realize_max_native"))
+                real_host_provider = RealHostShapeProvider(
+                    mri_provider, shape_spec, host_classes=host_classes,
+                    context_size=d.context_size,
+                    max_native=d.get("gpu_realize_max_native"), texture_spec=texture_spec)
+                real_host_providers = {fam: real_host_provider for fam in real_host_families}
             # cascade=_realize (not hardcoded True): SynthGmmProvider.assemble_task branches
             # on this exactly like MultiSourceProvider already does on gpu_realize_crop=_realize
             # a few lines up -- when _realize is False (no cascade_spacings / gpu_realize_crop),
@@ -531,7 +560,8 @@ def build_dataset(cfg, split: str):
             synth_prov = SynthGmmProvider(synth_ds, cascade=_realize, p_shape=p_shape,
                                           shape_spec=shape_spec, texture_spec=texture_spec,
                                           p_heterogeneity=p_heterogeneity,
-                                          heterogeneity_spec=heterogeneity_spec)
+                                          heterogeneity_spec=heterogeneity_spec,
+                                          real_host_providers=real_host_providers)
             provider = TriSourceProvider(
                 provider, synth_prov, p_synth=p_synth,
                 epoch_length=_epoch_len, gpu_realize_crop=_realize)

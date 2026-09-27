@@ -184,7 +184,8 @@ class SynthGmmProvider:
     """Cohort-hook provider wrapping a SynthGmmMaisiDataset for InContextDataset."""
 
     def __init__(self, dataset, *, cascade=False, p_shape=0.0, shape_spec=None,
-                 texture_spec=None, p_heterogeneity=0.0, heterogeneity_spec=None):
+                 texture_spec=None, p_heterogeneity=0.0, heterogeneity_spec=None,
+                 real_host_providers=None):
         self.ds = dataset
         self.epoch_length = len(dataset)
         self.classes = [MAISI_IDX_TO_CLASS.get(c, str(c)) for c in dataset.cs.classes]
@@ -194,6 +195,11 @@ class SynthGmmProvider:
         self.texture_spec = texture_spec or TextureSpec()
         self.p_heterogeneity = float(p_heterogeneity)
         self.heterogeneity_spec = heterogeneity_spec or HeterogeneitySpec()
+        # real_host_providers: {family_name: RealHostShapeProvider} -- families listed here
+        # bypass the (100% CT-sourced) gmm_bank host entirely, stamped onto a real MRI
+        # subject's own image instead (docs/logs.md 2026-09-27 "sim-to-real gap"). None
+        # (default) -> every family uses the normal gmm_bank path, unchanged.
+        self.real_host_providers = real_host_providers or {}
         if cascade:
             self._entry_by_file = {e["file"]: e for e in dataset.cs.entries}
             from src.providers.totalseg import NativeCrop
@@ -379,12 +385,36 @@ class SynthGmmProvider:
         # cascade mode: return native_crop payload compatible with native_crop_collate_fn
         gmm_seed = rng.getrandbits(64)
         mu, sd = self._draw_gmm(gmm_seed)
-        host_cls_id, cohort = self.ds.cs.sample_cohort(rng)
 
+        # Shape hyperparams (family/size/etc.) are drawn from gmm_seed alone, independent of
+        # `rng`'s own stream position -- safe to draw BEFORE sample_cohort so a family's
+        # `family_host_classes` restriction (below) can steer which host organ this cohort
+        # lands in, before the host is actually picked.
         shape_hp, shape_id = None, None
         if self.p_shape > 0.0 and rng.random() < self.p_shape:
             shape_hp = draw_cohort_hyperparams(
                 np.random.default_rng([int(gmm_seed), _SHAPE_COHORT_HP_SEED_KEY]), self.shape_spec)
+
+        # real_host_providers (docs/logs.md 2026-09-27 "sim-to-real gap"): this family
+        # bypasses the (100% CT-sourced) gmm_bank entirely -- delegate the whole task to a
+        # RealHostShapeProvider stamping onto a real MRI subject's own image instead. Must
+        # happen before family_host_classes/sample_cohort below (this family never touches
+        # the gmm_bank's host pool at all).
+        if shape_hp is not None and shape_hp.family in self.real_host_providers:
+            return self.real_host_providers[shape_hp.family].assemble_task(rng, crop_spacing_mm)
+
+        # family_host_classes (docs/logs.md 2026-09-27 "sim-to-real gap"): restrict a shape
+        # family's host organ to a specific class (e.g. scatter_field -> brain only, matching
+        # ISLES22/Shifts-MS's real domain) instead of the default uniform-over-all-classes host.
+        # Every OTHER family (and non-shape cohorts) keeps the original unrestricted behavior.
+        target_class = None
+        if shape_hp is not None:
+            allowed = (self.shape_spec.family_host_classes or {}).get(shape_hp.family)
+            if allowed:
+                target_class = int(rng.choice(list(allowed)))
+        host_cls_id, cohort = self.ds.cs.sample_cohort(rng, target_class=target_class)
+
+        if shape_hp is not None:
             family_by_shape_name = {v: k for k, v in SHAPE_ID_TO_FAMILY.items()}
             shape_id = family_by_shape_name[shape_hp.family]
             _anchor_shape_mu(mu, sd, host_cls_id, shape_id, gmm_seed, self.shape_spec)

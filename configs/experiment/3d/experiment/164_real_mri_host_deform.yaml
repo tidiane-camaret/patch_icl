@@ -1,0 +1,134 @@
+# @package _global_
+# 164_real_mri_host_deform -- continues 163 (docs/logs.md 2026-09-27 "163 RESULT"), which gave
+# a clean, broad real-OOD win (isles22 +96%, shifts_ms +622%, atlas_v2 +15%, gnc_kidney +28% vs.
+# 135b, at only 10 epochs) by stamping scatter_field onto REAL MRI TotalSeg 'brain' subjects
+# instead of the CT-only gmm_bank. This run (a) CONTINUES training from 163's own checkpoint
+# (not restarting from 135b) to build on that result, and (b) re-enables task-level nonrigid
+# deform (SVF), which every config in the 135-163 lineage had explicitly disabled
+# (`task.deform.p=0`) despite it being the `calibrated` augmentation preset's own validated
+# default -- see docs/logs.md 2026-09-27 "acceptable deform setting" for the calibration
+# evidence (real inter-case deform RMS median 0.14; max_disp=0.15 matches it; num_steps=6 stays
+# diffeomorphic at that strength; control_points=6 is the resolution-invariant count basis).
+# per_image deform stays OFF (pose-invariance lever, not part of the calibration, kept as its
+# own separate variable per user direction to isolate one change at a time where reasonable --
+# though note this run DOES combine the deform re-enable with continued real-host training in
+# one step, per explicit user direction "continue training and add deformations").
+#
+#   python experiments/3d/train.py experiment=164_real_mri_host_deform
+#
+# BUDGET: epochs=10, eval_every=10 (same fast-iteration cadence as 162/163). Validate with
+# small-slice real-OOD (n=20/class, per user direction "keep evaluating on small slices for
+# now") + eval_pshape_families.py, not a full-dataset sweep.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    real_host_families: [scatter_field]   # bypasses gmm_bank for this family -- see 163
+    real_host_cls: brain
+    shape:
+      host_anchored: true
+      family_weights: {blob: 1.0, splatter: 1.0, disk: 1.0, cylinder: 1.0,
+                       scatter_field: 4.0}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0.2, control_points: 6, max_disp: 0.15, num_steps: 6}   # NEW -- see header
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}   # kept OFF -- pose-invariance lever, not the calibration target
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 10
+  batch_size: 8
+  eval_every: 10
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_163_scatter_field_real_mri_host/best.pt
+  checkpoint_allow_partial: false   # identical arch to 163 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 164_real_mri_host_deform

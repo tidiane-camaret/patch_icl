@@ -1,0 +1,123 @@
+{
+  "experiment": "2c_cascade_medverse",
+  "description": "Released-weights Medverse (no finetune) evaluated on the 7 held-out eval-expansion sources (docs/datasets/{isles22,shifts_ms,msd_hippocampus,msd_prostate,atlas_v2,gnc_kidney_lesions,hu_lwk1}.md) in 3 modes each -- harness coarse-to-fine cascade with data.cascade_query_prior=none, the same cascade with the default query_prior=pred (feeding Medverse's own prior-level prediction forward as its NA-ICL prior), and Medverse's native single-pass autoregressive predict() at data.image_size=[256,256,256] (no harness cascade at all) -- plus 2 more sources (flare22, nasalseg) added the next morning in native-AR mode only. 21+2 = 23 valid runs; a 24th run (hhtoi93b, msd_hippocampus prior=none) was killed mid-eval by a session interruption at 74% and is excluded, superseded by its resumed rerun (0nngi66g). Per-source cascade ladders: hu_lwk1 [6,3,1]mm, isles22 [3,1.5]mm, shifts_ms [6,3,1.5]mm, msd_hippocampus [6,3,0.5]mm, msd_prostate [6,3,0.75]mm, atlas_v2 [6,3,1.9]mm, gnc_kidney [6,3,1.2]mm. See docs/datasets/eval_expansion_status.md ('Medverse released-weights sweep') for the full writeup this export backs.",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {
+      "id": "fejkczs5",
+      "name": "(unnamed, first test run)",
+      "description": "hu_lwk1, harness cascade [6,3,1]mm, query_prior=pred (default, no override) -- ran before the naming convention below was established"
+    },
+    {
+      "id": "3v8hj3d8",
+      "name": "medverse_ar_hu_lwk1_256",
+      "description": "hu_lwk1, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "gwmn3gw1",
+      "name": "medverse_cascade_hu_lwk1",
+      "description": "hu_lwk1, harness cascade [6,3,1]mm, query_prior=none"
+    },
+    {
+      "id": "2ph2gp2a",
+      "name": "medverse_cascade_isles22",
+      "description": "isles22, harness cascade [3,1.5]mm, query_prior=none"
+    },
+    {
+      "id": "iguqh5rx",
+      "name": "medverse_cascade_isles22_pred",
+      "description": "isles22, harness cascade [3,1.5]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "ybw7n2fg",
+      "name": "medverse_ar_isles22",
+      "description": "isles22, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "4em5t7pm",
+      "name": "medverse_cascade_shifts_ms",
+      "description": "shifts_ms, harness cascade [6,3,1.5]mm, query_prior=none"
+    },
+    {
+      "id": "mjre4sdu",
+      "name": "medverse_cascade_shifts_ms_pred",
+      "description": "shifts_ms, harness cascade [6,3,1.5]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "50yzve84",
+      "name": "medverse_ar_shifts_ms",
+      "description": "shifts_ms, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "0nngi66g",
+      "name": "medverse_cascade_msd_hippocampus",
+      "description": "msd_hippocampus, harness cascade [6,3,0.5]mm, query_prior=none -- resumed rerun of hhtoi93b, which was killed mid-eval at 74% by a session interruption and is excluded"
+    },
+    {
+      "id": "wn0ssh6k",
+      "name": "medverse_cascade_msd_hippocampus_pred",
+      "description": "msd_hippocampus, harness cascade [6,3,0.5]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "md7oylwv",
+      "name": "medverse_ar_msd_hippocampus",
+      "description": "msd_hippocampus, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "5gn9dezh",
+      "name": "medverse_cascade_msd_prostate",
+      "description": "msd_prostate, harness cascade [6,3,0.75]mm, query_prior=none"
+    },
+    {
+      "id": "i4407vib",
+      "name": "medverse_cascade_msd_prostate_pred",
+      "description": "msd_prostate, harness cascade [6,3,0.75]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "d0h6c3x1",
+      "name": "medverse_ar_msd_prostate",
+      "description": "msd_prostate, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "pocaz24l",
+      "name": "medverse_cascade_atlas_v2",
+      "description": "atlas_v2, harness cascade [6,3,1.9]mm, query_prior=none"
+    },
+    {
+      "id": "b2lt9jwg",
+      "name": "medverse_cascade_atlas_v2_pred",
+      "description": "atlas_v2, harness cascade [6,3,1.9]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "8u6vcv4y",
+      "name": "medverse_ar_atlas_v2",
+      "description": "atlas_v2, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "rk14c1l3",
+      "name": "medverse_cascade_gnc_kidney",
+      "description": "gnc_kidney, harness cascade [6,3,1.2]mm, query_prior=none"
+    },
+    {
+      "id": "7g3zrglo",
+      "name": "medverse_cascade_gnc_kidney_pred",
+      "description": "gnc_kidney, harness cascade [6,3,1.2]mm, query_prior=pred (default)"
+    },
+    {
+      "id": "qk51kt87",
+      "name": "medverse_ar_gnc_kidney",
+      "description": "gnc_kidney, native autoregressive, image_size=256^3"
+    },
+    {
+      "id": "dy1z75fe",
+      "name": "medverse_ar_flare22",
+      "description": "flare22, native autoregressive, image_size=256^3 -- added the next morning, no cascade-mode counterpart run"
+    },
+    {
+      "id": "mk4qgt6c",
+      "name": "medverse_ar_nasalseg",
+      "description": "nasalseg, native autoregressive, image_size=256^3 -- added the next morning, no cascade-mode counterpart run"
+    }
+  ]
+}

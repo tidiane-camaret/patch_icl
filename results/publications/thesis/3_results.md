@@ -200,46 +200,79 @@ is evidence the compounding-error pattern is **generic to coarse-to-fine
 cascades**, not specific to this architecture, though it has not yet been
 isolated as a controlled ablation on our own query-prior design (gap G6).
 
-**Register carry hurts; a real predicted prior beats a perturbed-GT
-prior** — a completed, controlled 3-arm chain (`145`→`146`→`147`, all
-resuming checkpoint `135b` independently, `p_synth=0`, in-distribution
-TotalSegmentator, 119 classes / 800 fixed eval samples, macro Dice at
-epoch 59/60):
+**Ours vs. Medverse, six datasets, accuracy and compute.** "Ours" here is
+the predicted-prior checkpoint (the best-performing arm — see the
+query-prior ablation below); "Medverse" is released weights, native
+autoregressive inference, its own coarse-to-fine mechanism, depth
+level-matched to our own ladder per source (matching actually *hurts*
+Medverse, see finding below — reported anyway as the fairer, matched
+comparison). Four sources (ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705) are
+excluded — both models score too low there to be informative — and
+TotalSeg CT (in-distribution) is excluded for a different reason: its
+Medverse run was not completed (gap, not yet closed):
 
-| arm | config | macro Dice | Δ |
-|---|---|---:|---:|
-| 145 | GT-prior (perturbed), registers off | 0.499 | — |
-| 146 | pred-prior (real prev. pred), registers off | **0.525** | **+0.026** |
-| 147 | pred-prior, registers on | 0.505 | **−0.020** |
+| dataset | Ours | Medverse | latency (Ours) | latency (Medverse) |
+|---|---:|---:|---:|---:|
+| TotalSeg MRI | **0.506** | 0.038 | 306ms | 4842ms |
+| HU\_LWK1 | **0.152** | 0.020 | 439ms | 5336ms |
+| MSD Hippocampus | 0.303 | **0.686** | 99ms | 50ms |
+| MSD Prostate | **0.375** | 0.357 | 279ms | 5006ms |
+| FLARE22 | **0.751** | 0.359 | 311ms | 4894ms |
+| NasalSeg | 0.547 | **0.737** | 161ms | 1886ms |
+| mean | -- | -- | **266ms** | 3669ms |
 
-Two findings from one chain. First, feeding the model's own real previous
-prediction forward as the query prior beats a perturbed-GT prior on 90/119
-classes (median +0.026) — a *prior-source* ablation (real prediction vs.
-noisy synthetic), distinct from the Medverse finding above, which is a
-*prior-presence* one (real prediction vs. none); the two aren't in
-tension, but a true no-prior arm on our own architecture is still needed
-(gap G6) before claiming the full ablation. Second,
-`cascade_registers` regresses accuracy (77/119 classes, mean −0.020,
-worse on held-out classes than seen: −0.030 vs. −0.009) and adds ~2.5%
-latency for it. The regression concentrates structurally: the
-worst-hit classes are almost all repeated fine anatomy in the same volume
-(individual ribs, individual vertebral levels — worst case
-`brachiocephalic_vein_left`, which collapses to Dice 0.0 at every epoch
-under registers-on), while a smaller set of large, uniquely-shaped
-structures (lungs, skull, aorta) actually improve — consistent with
-registers interfering with instance disambiguation rather than uniformly
-degrading capacity. The region-restriction-margin Pareto sweep (gap G7)
-has not been run.
+Ours wins 4/6 (TotalSeg MRI, HU\_LWK1, MSD Prostate, FLARE22); Medverse
+wins 2/6 (MSD Hippocampus, NasalSeg) — both cases where the target is a
+single, large, well-defined structure Medverse's full-FOV multi-resolution
+pyramid suits well. Compute favors Ours by roughly 14$\times$ on mean
+latency, and this is *after* level-matching Medverse's own depth to ours;
+level-matching turned out to hurt Medverse's accuracy too (below), so an
+unmatched Medverse would lose by even more on both axes at once.
 
-**Neither in-distribution direction replicates on OOD.** The same three
-checkpoints (`145`/`146`/`147`), evaluated on 7 held-out sources
-(`2b_cascade_val`, each source's own cascade ladder), give a mixed
-picture: the pred-prior gain (145→146) helps 3/7 sources (`hu_lwk1`
-+0.053, `msd_prostate` +0.065) and hurts 4/7; the register regression
-(146→147) helps 2/7 (`hu_lwk1` flat, `msd_hippocampus` +0.097) and hurts
-5/7. Notably, `hu_lwk1`'s cascade does **not** regress under registers
-here (0.152→0.155) — superseding an earlier, mid-training OOD number
-(0.1287→0.0935) that should no longer be cited.
+**A real predicted prior beats a perturbed-GT prior.** Same checkpoint
+chain, in-distribution TotalSegmentator (`val_classes=all`, 1157 samples,
+3-level `[6,3,1.5]`mm ladder, 117 classes):
+
+| config | macro Dice | macro NSD |
+|---|---:|---:|
+| GT-prior (perturbed) | 0.543 | 0.576 |
+| **Predicted prior (real prev. pred)** | **0.586** | **0.631** |
+
+Feeding the model's own real previous prediction forward beats a
+perturbed-GT prior on 99/117 classes (median Δ +0.043) — a *prior-source*
+ablation (real vs. noisy synthetic), distinct from the Medverse
+*prior-presence* finding above; a true no-prior arm is still needed (gap
+G6). OOD (9 sources incl. FLARE22/NasalSeg): helps 5/9, hurts 4/9 —
+weaker than the clear in-distribution majority.
+
+**Cascade registers: inconsistent, kept off.** Adding cross-level register
+carry on top of the predicted-prior checkpoint is small and
+protocol-sensitive (−0.006 to −0.020 depending on eval protocol, no
+stable class-level pattern, OOD 3/9 help vs. 6/9 hurt) — not a settled
+finding, and not part of the default configuration. One OOD number worth
+keeping: `hu_lwk1` does **not** regress under registers (0.152→0.155),
+superseding an earlier mid-training number (0.1287→0.0935) that should no
+longer be cited.
+
+**Level-matching Medverse's AR depth to ours hurts it.** Medverse's AR
+level is set by `image_size` alone
+(`level = max(1, ceil(log2(max_axis/128)) + 1)`); unlike our cascade,
+which narrows field of view per level, Medverse's pyramid keeps the full
+volume in view throughout and only refines resolution. Matching its depth
+to our own per-source ladder:
+
+| dataset | level change | old AR | matched AR | Δ |
+|---|---|---:|---:|---:|
+| HU\_LWK1 | 2→3 | 0.071 | 0.020 | **−0.052** |
+| FLARE22 | 2→3 | 0.440 | 0.359 | **−0.082** |
+| MSD Prostate | 2→3 | 0.423 | 0.357 | **−0.065** |
+| MSD Hippocampus | 2→1 | 0.691 | 0.686 | ~flat |
+| NasalSeg | 2→2 | 0.735 | 0.737 | ~flat |
+
+Every source with a real depth increase regressed; the two unchanged
+stayed flat. Side effect: MSD Prostate's per-model winner flips (Medverse
+0.423 → Ours 0.375 once corrected) — the table above already uses the
+corrected number.
 
 ## Synthetic Task Generation (Axis 3)
 

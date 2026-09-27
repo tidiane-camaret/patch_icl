@@ -1,0 +1,137 @@
+# @package _global_
+# 165_real_mri_host_all_organs -- continues 164 (docs/logs.md 2026-09-27), per user direction
+# "continue for 50 epochs, all real host organs instead of just brain". Two changes vs. 164:
+#
+#   1. `data.gmm.real_host_cls: all` -- RealHostShapeProvider now draws scatter_field's host
+#      from ALL 50 usable real MRI TotalSeg classes (brain, kidney_left/right, liver, spleen,
+#      pancreas, lungs, bones, muscles, ... -- 6451 subjects total, up from 48 brain-only),
+#      one class per COHORT (verified: 30/30 sampled draws hit a real, distinct class, target+
+#      context always share the same class). Motivated by 163's own finding that the gain
+#      wasn't brain-anatomy-specific (gnc_kidney, a KIDNEY source, improved as much as
+#      atlas_v2's brain-lesion source did) -- training across many real organs should broaden
+#      the underlying "real MRI tissue/noise around a lesion-like region" skill further, and
+#      directly gives kidney-hosted training exposure for GNC_705 specifically.
+#   2. epochs=50 (up from 164's 10) -- a real budget now that the mechanism (163) and the
+#      deform re-enable (164, mixed but not clearly harmful except a shifts_ms wobble) are both
+#      already validated at short budget.
+#
+#   python experiments/3d/train.py experiment=165_real_mri_host_all_organs
+#
+# CHECKPOINT: continues 164's own best.pt (not 135b/163) -- keeps building on the accumulated
+# result rather than restarting, per user direction.
+#
+# Everything else (deform settings, scatter_field dose, texture/heterogeneity, non-real-host
+# families) unchanged from 164.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    real_host_families: [scatter_field]   # bypasses gmm_bank for this family -- see 163
+    real_host_cls: all                    # NEW -- all real MRI classes, was 'brain' (164)
+    shape:
+      host_anchored: true
+      family_weights: {blob: 1.0, splatter: 1.0, disk: 1.0, cylinder: 1.0,
+                       scatter_field: 4.0}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0.2, control_points: 6, max_disp: 0.15, num_steps: 6}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 50
+  batch_size: 8
+  eval_every: 50
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_164_real_mri_host_deform/best.pt
+  checkpoint_allow_partial: false   # identical arch to 164 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 165_real_mri_host_all_organs

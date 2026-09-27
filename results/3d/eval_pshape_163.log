@@ -1,0 +1,11 @@
+Loading 163 <- /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_163_scatter_field_real_mri_host/best.pt
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  163        blob            spacing=4.24  dice=0.8254+-0.0772  n=48  (63.3s)
+CohortSampler: dropping 6 masks with bad spacing (['m00733.npy', 'm02017.npy', 'm02883.npy', 'm03711.npy', 'm03870.npy', 'm04070.npy'])
+SynthGmmMaisiDataset: 4129 masks | 125 classes | K=2 | T=128 | crop=4.24mm | var_max=80.0 | mask=occupancy(thr=0.1) | class_balanced=True | realize=CPU | paint_align=True | mu_groups=[10, 8, 4, 4, 3, 3]@rho(0.72, 0.78, 0.85, 0.76, 0.81, 0.88) | between_ratio[0.00,1.72] | len=1000000000
+  163        scatter_field   spacing=4.24  dice=0.3677+-0.1613  n=48  (63.1s)
+
+family           spacing             163
+blob                4.24    0.8254±0.077
+scatter_field       4.24    0.3677±0.161

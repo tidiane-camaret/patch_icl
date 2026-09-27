@@ -282,6 +282,33 @@ class TotalSegProvider:
     def subjects_for(self, cls):
         return self._label_to_subjects.get(cls, [])
 
+    def load_raw(self, subject):
+        """(image_np, label_np, native_spacing, norm) for `subject` -- native-resolution,
+        read-only (mmap or RAM-cache view, caller must copy before writing). Exposes the
+        same arrays load()/load_native_crop() use internally, for callers (e.g.
+        src/providers/real_host_shape.py) that need to build their own crop rather than
+        request one of this provider's own classes."""
+        if getattr(self, "_ram", None) is not None and subject in self._ram:
+            image_np = self._ram[subject]["ct_raw"]
+            label_np = self._ram[subject]["label"]
+        else:
+            subj_dir = self.root / subject
+            label_np = np.load(subj_dir / "label.npy", mmap_mode="r")
+            image_np = np.load(subj_dir / f"{self._img_prefix}_raw.npy", mmap_mode="r")
+        native_sp = self._spacings.get(subject, (1.0, 1.0, 1.0))
+        norm = (self.ct_spec if self.modality == "ct"
+               else resolve_ct_norm(self._mri_stats[subject]))
+        return image_np, label_np, native_sp, norm
+
+    def resolve_center(self, subject, cls, req: LoadRequest, label_np):
+        """The same center-resolution `load()`/`load_native_crop()` use internally
+        (bbox-cache fallback + req.center_mode), exposed for callers building their own
+        crop via `load_raw` + `organ_crop_arrays` instead of one of this provider's own
+        `load*` methods."""
+        D, H, W = label_np.shape
+        fallback = self._bbox.get(subject, {}).get(cls, (D // 2, H // 2, W // 2))
+        return _resolve_center(req, label_np, _ALL_CLASSES_IDX.get(cls, -1), fallback)
+
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         subj_dir = self.root / subject
         # RAM cache (data.ram_cache): resident native ct_raw+label, preloaded in the main

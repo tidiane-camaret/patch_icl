@@ -1,154 +1,131 @@
 \subsection{Image--Label Fusion}\label{sec:results-fusion}
 
-\paragraph{Even a conservative fusion design beats the field's baseline, across held-out
-sources.} \autoref{tab:relatedwork} classifies Medverse's fusion strategy as early
+Two comparisons follow, each isolating one design choice. The first asks
+whether moving from Medverse's dual U-Net and cross-attention to a shared
+encoder with attention already helps, before anything else about this
+thesis's architecture is considered; the second asks whether keeping image
+and label evidence as separate streams -- dual attention -- helps further,
+within that same encoder-and-attention family.
+
+\paragraph{Setup.} \autoref{tab:relatedwork} classifies Medverse's fusion strategy as early
 concatenation: image and label channels are merged before a shared U-Net processes them,
-committing to a single fusion point at the very start of the network. This section asks
-whether that architectural difference, independent of every other design choice this
-thesis makes elsewhere, already produces a measurable difference in practice -- and does
-so at the most conservative point of comparison available, and across every dataset this
-thesis evaluates (\autoref{sec:results-setup}), not TotalSegmentator alone. The
-single-axis control introduced below collapses image and label evidence into one token per
-cell via a pixel shuffle--unshuffle operation \emph{before} the transformer; of every
-variant of our architecture, it is structurally the closest to Medverse's own commitment to
-early fusion. Comparing Medverse against this weaker control, rather than against the full
-dual-attention model, is the more conservative claim: if even the conservative variant wins, the
-win cannot be attributed to the modality axis alone. Medverse (released weights) and the
-single-axis control are trained under an identical data pipeline, augmentation recipe, and
-optimizer schedule, and evaluated with an identical protocol -- fixed 3\,mm single-level
-crops, fp32, each model's own best checkpoint (no epoch matching across arms; Medverse
-trained to full convergence, the patchset arms did not).
+committing to a single fusion point at the very start of the network. The single-axis
+control isolates the architectural family this comparison targets: it keeps the shared
+encoder and attention stack common to every architecture in this thesis, but collapses
+image and label evidence into one token per cell via a pixel shuffle--unshuffle operation
+\emph{before} the transformer -- echoing Iris's own fusion mechanism in spirit though not
+in implementation, and withholding dual attention until the next step of the staircase.
+
+Its transformer depth is raised from $l{=}4$ to $l{=}9$ specifically to compute-match the
+dual-attention arm (removing the modality axis also removes a large share of the model's
+compute; parameter count and compute could not be matched simultaneously, leaving
+parameters 52\% higher for the single-axis control). This adjustment is made relative to
+dual attention only, not to Medverse, so the Medverse comparison alone is not
+compute-matched.
+
+All three arms train under an identical recipe (\autoref{tab:fusion-trainsettings}), an
+identical data pipeline, and an identical augmentation recipe, but not an identical
+starting point: Medverse keeps its released initialization, while the single-axis and
+dual-attention arms warm-start only the encoder and decoder from a shared checkpoint, with
+the entire in-context reasoning core (transformer, image/label embeddings, context/query
+id, register tokens, cascade projection, pool projection) randomly initialized for both --
+so neither patchset arm starts from an already-trained transformer. Training uses real
+anatomy only ($p_\text{synth}{=}0$), CT only. The three arms also did not train to a
+matched stopping point: Medverse trained to full convergence, the patchset arms did not.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Training settings shared by Medverse, the single-axis control, and dual
+  attention (ours). Epoch count is a placeholder pending confirmation of the exact
+  per-arm value.}
+  \label{tab:fusion-trainsettings}
+  \begin{tabular}{ll}
+    \toprule
+    Optimizer & AdamW \\
+    Learning rate & $10^{-4}$ \\
+    Schedule & cosine decay, 10-epoch warmup \\
+    Weight decay & $10^{-2}$ \\
+    Batch size & 8 \\
+    Gradient clipping & 1.0 \\
+    Loss & BCE + Dice \\
+    Epochs & $\sim$250 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+All three arms are then evaluated with an identical protocol -- fixed 3\,mm single-level
+crops, fp32, each model's own best checkpoint -- across every dataset this thesis
+evaluates (\autoref{sec:results-setup}), not TotalSegmentator alone.
 
 Rows below are grouped by each dataset's relationship to the training vocabulary, not by
 how different the source otherwise looks: TotalSegmentator itself and FLARE22 both reuse
-the training vocabulary and so split into a genuine
-seen/unseen pair (\autoref{sec:results-setup}); MSD Prostate and MSD Hippocampus introduce
-organs with no vocabulary overlap at all, so every class in that pair is unseen by
-construction, not by a train/val split; HU\_LWK1's target is a HU-measurement region, not a
-segmentable anatomical object, a categorically different kind of ``unseen'' from a novel
-organ; TotalSegmentator's own MRI acquisition isolates a held-out \emph{modality} instead,
-over classes the vocabulary already contains.
+the training vocabulary and so split into a genuine seen/unseen pair
+(\autoref{sec:results-setup}); MSD Prostate and MSD Hippocampus introduce organs with no
+vocabulary overlap at all, so every class in that pair is unseen by construction, not by a
+train/val split; HU\_LWK1's target is a HU-measurement region, not a segmentable anatomical
+object, a categorically different kind of ``unseen'' from a novel organ; TotalSegmentator's
+own MRI acquisition isolates a held-out \emph{modality} instead, over classes the
+vocabulary already contains.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Medverse (released baseline) vs.\ the single-axis control, across all evaluation
-  datasets (\autoref{sec:results-setup}). Grouped by vocabulary relationship: in-vocabulary
-  seen/unseen, novel-vocabulary (unseen by construction), non-object, held-out modality.}
-  \label{tab:fusion-medverse}
-  \begin{tabular}{lccc}
+  \caption{Medverse, the single-axis control, and dual attention (ours), across all
+  evaluation datasets (\autoref{sec:results-setup}). Grouped by vocabulary relationship:
+  in-vocabulary seen/unseen, novel-vocabulary (unseen by construction), non-object,
+  held-out modality.}
+  \label{tab:fusion-staircase}
+  \begin{tabular}{lcccc}
     \toprule
-     & Medverse (baseline) & Single-axis (ours, conservative) & $n_\text{cls}$ \\
+     & Medverse & Single-axis & Dual attention (ours) & $n_\text{cls}$ \\
     \midrule
-    TotalSeg CT -- seen      & 0.348 & \textbf{0.574} & 61 \\
-    TotalSeg CT -- unseen    & 0.221 & \textbf{0.408} & 56 \\
-    FLARE22 -- seen          & 0.532 & \textbf{0.693} & 11 \\
-    FLARE22 -- unseen        & 0.443 & \textbf{0.632} & 2  \\
+    TotalSeg CT -- seen      & 0.348 & 0.574 & \textbf{0.582} & 61 \\
+    TotalSeg CT -- unseen    & 0.221 & 0.408 & \textbf{0.426} & 56 \\
+    FLARE22 -- seen          & 0.532 & 0.693 & \textbf{0.709} & 11 \\
+    FLARE22 -- unseen        & 0.443 & \textbf{0.632} & 0.604 & 2  \\
     \midrule
-    MSD Prostate (unseen)    & \textbf{0.377} & 0.205 & 2 \\
-    MSD Hippocampus (unseen) & 0.172 & \textbf{0.184} & 2 \\
+    MSD Prostate (unseen)    & \textbf{0.377} & 0.205 & 0.247 & 2 \\
+    MSD Hippocampus (unseen) & 0.172 & 0.122 & \textbf{0.184} & 2 \\
     \midrule
-    HU\_LWK1 (non-object)    & \textbf{0.146} & 0.079 & 1 \\
+    HU\_LWK1 (non-object)    & \textbf{0.146} & 0.079 & 0.102 & 1 \\
     \midrule
-    TotalSeg MRI (modality)  & 0.178 & \textbf{0.232} & 23 \\
+    TotalSeg MRI (modality)  & 0.178 & 0.232 & \textbf{0.259} & 23 \\
     \midrule
-    mean of 5 held-out sources & \textbf{0.278} & 0.264 & -- \\
+    mean of 5 held-out sources & 0.278 & 0.264 & \textbf{0.297} & -- \\
     \midrule
-    params    & \textbf{71.1M}  & 74.1M   & -- \\
-    GFLOPs    & \textbf{2362.6} & 3973.1  & -- \\
-    latency (fp32, per sample) & 73.2\,ms & 73.0\,ms & -- \\
+    $l$       & --     & 9      & 4       & -- \\
+    params    & 71.1M  & 74.1M  & \textbf{48.7M}  & -- \\
+    GFLOPs    & \textbf{2362.6} & 3973.1 & 3892.5 & -- \\
+    latency (fp32, per sample) & 73.2\,ms & 73.0\,ms & \textbf{72.5\,ms} & -- \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-The single-axis control wins the in-vocabulary group outright -- both TotalSegmentator
-splits and both FLARE22 splits -- and also wins the held-out-modality case. Medverse wins
-MSD Prostate and the non-object case (HU\_LWK1); the two are close on MSD Hippocampus. Averaged across the five held-out
-sources without weighting by class count, Medverse edges ahead (0.278 vs.\ 0.264) despite
-losing on more rows than it wins -- generalization here is source-dependent, not a single
-uniform gap. The two novel-vocabulary and the non-object rows rest on very few classes (1--2
-each) and should be read as directional, not conclusive. The compute picture is the honest
-opposite of a ``cheaper'' claim: the single-axis control's accuracy advantage where it holds
-costs roughly 68\% more GFLOPs, with parameter count roughly matched (+4\%) and latency
-essentially tied once both are measured at the same precision. Two caveats keep this from a
-single-variable ablation: Medverse retains its released initialization rather than the
-randomly-initialized reasoning core both patchset arms share, and does not receive the same
-query-conditioning signal the reference model does during training, so this is best read as
-``released baseline vs.\ our current recipe.'' \todo{Re-read once Medverse receives the same
-query-conditioning signal -- currently dropped due to a training instability under
-compilation.}
-
-\paragraph{Isolating the modality-axis effect, across the same sources.} Having shown that even
-the conservative variant is competitive with an external baseline, this ablation asks a
-narrower, fully controlled question: does keeping image and label as separate, repeatedly
-cross-attending streams (the modality axis, \autoref{sec:methodology-fusion}) buy anything
-\emph{on top of} an architecture that already competes, once every other confound is
-removed? The reference model (\texttt{arch.dual\_axis=true}) is compared against the
-single-axis control from above (\texttt{arch.dual\_axis=false}), which removes only the
-modality axis; the position axis (cross-context attention) is identical in both.
-
-Two adjustments relative to a naive dual-axis-flag toggle: (1) the single-axis control's
-transformer depth is raised from $l{=}4$ to $l{=}9$ so its transformer compute is within
-3\% of the reference model's -- removing the modality axis also removes a large share of the
-model's compute, and parameter count and compute could not be matched simultaneously by
-this route (matching compute instead leaves parameters 52\% higher for the single-axis
-control); (2) both runs warm-start \emph{only} the encoder and decoder from a shared
-checkpoint, with the entire in-context reasoning core (transformer, image/label embeddings,
-context/query id, register tokens, cascade projection, pool projection) randomly initialized
-for both arms, so neither model starts from an already-trained transformer. Both runs use
-real anatomy only ($p_\text{synth}{=}0$), CT only at train time, and the same evaluation
-protocol and dataset grouping as the table above.
-
-\begin{table}[t]
-  \centering
-  \small
-  \caption{Dual attention vs.\ the single-axis (early-fusion-style) control, at matched
-  compute, across all evaluation datasets. Same grouping as \autoref{tab:fusion-medverse}.}
-  \label{tab:fusion-axis}
-  \begin{tabular}{lccc}
-    \toprule
-     & Single-axis (control) & Dual attn. (ours) & $n_\text{cls}$ \\
-    \midrule
-    TotalSeg CT -- seen      & 0.574 & \textbf{0.582} & 61 \\
-    TotalSeg CT -- unseen    & 0.408 & \textbf{0.426} & 56 \\
-    FLARE22 -- seen          & 0.693 & \textbf{0.709} & 11 \\
-    FLARE22 -- unseen        & \textbf{0.632} & 0.604 & 2  \\
-    \midrule
-    MSD Prostate (unseen)    & 0.205 & \textbf{0.247} & 2 \\
-    MSD Hippocampus (unseen) & 0.122 & \textbf{0.184} & 2 \\
-    \midrule
-    HU\_LWK1 (non-object)    & 0.079 & \textbf{0.102} & 1 \\
-    \midrule
-    TotalSeg MRI (modality)  & 0.232 & \textbf{0.259} & 23 \\
-    \midrule
-    mean of 5 held-out sources & 0.264 & \textbf{0.297} & -- \\
-    \midrule
-    $l$       & 9      & 4       & -- \\
-    params    & 74.1M  & \textbf{48.7M}  & -- \\
-    GFLOPs    & 3973.1 & \textbf{3892.5} & -- \\
-    latency (fp32, per sample) & 73.0\,ms & \textbf{72.5\,ms} & -- \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-Dual attention wins every row except one: FLARE22's two unseen classes, where
-single-axis is ahead (0.632 vs.\ 0.604) on a two-class sample too small to weigh heavily.
-Everywhere else -- both TotalSegmentator splits, FLARE22's seen classes, both
-novel-vocabulary datasets, the non-object case, and the held-out modality -- dual attention wins,
-and it wins the five-source mean (0.297 vs.\ 0.264) despite the one exception. With every
-other confound this thesis can control for removed, this is the cleanest, most consistently
-generalizing result in the axis. Latency is close to tied once both are measured at the same
-(fp32) precision, unlike an earlier bf16 measurement of the same pair that showed a larger
-gap -- that gap looks like a precision/compilation artifact rather than a real cost of the
-modality axis, and is not reflected here.
+\paragraph{Results.} Single-axis alone already beats Medverse on five of the eight rows --
+both TotalSegmentator splits, both FLARE22 splits, and TotalSeg MRI -- while Medverse wins
+the three remaining rows: MSD Prostate, MSD Hippocampus, and HU\_LWK1. Restoring dual
+attention flips one of those three (MSD Hippocampus, 0.184 vs.\ 0.172) without touching the
+other two, bringing the full architecture to six wins out of eight against Medverse. The
+one aggregate number in the table -- mean of the five held-out sources -- shows why that
+flip matters: single-axis alone is a net regression against Medverse there (0.264 vs.\
+0.278), and only once dual attention restores the modality axis does the full architecture
+overtake Medverse (0.297). The architectural family change alone, in other words, is not
+what carries this result; dual attention is. The compute picture is mixed rather than
+uniformly favorable: dual attention has the fewest parameters and the lowest latency of the
+three, but not the fewest GFLOPs -- Medverse remains cheapest by that measure despite its
+lower accuracy, so no arm here is a strict win on both accuracy and compute at once. Two
+caveats keep this from a single-variable ablation: Medverse retains its released
+initialization rather than the randomly-initialized reasoning core the patchset arms
+share, and does not receive the same query-conditioning signal during training, so this is
+best read as ``released baseline vs.\ our current recipe.'' \todo{Re-read once Medverse
+receives the same query-conditioning signal -- currently dropped due to a training
+instability under compilation.}
 
 \paragraph{Status.} Neither patchset arm had reached its full training budget at the point
 these numbers were read, while Medverse had already converged -- so
-\autoref{tab:fusion-medverse} may understate Medverse's eventual ceiling more than it
-understates either patchset arm's. Both comparisons are N=1 seed per arm, and several rows
-above rest on very few classes (FLARE22's unseen split, both MSD sources, HU\_LWK1) --
-directional evidence, not settled effect sizes. The params mismatch (+52\% for single-axis)
-also leaves a residual capacity confound in \autoref{tab:fusion-axis} even after
-compute-matching.
-\todo{Re-read both tables once all three arms reach their full training budget; add
-$\geq 2$ seeds before citing either effect size as settled.}
+\autoref{tab:fusion-staircase} may understate Medverse's eventual ceiling more than either
+patchset arm's. All three arms are N=1 seed, and several rows rest on very few classes
+(FLARE22's unseen split, both MSD sources, HU\_LWK1) -- directional evidence, not settled
+effect sizes. \todo{Re-read once all three arms reach their full training budget; add
+$\geq 2$ seeds before citing any effect size as settled.}

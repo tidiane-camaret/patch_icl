@@ -67,3 +67,38 @@ class ShapeCohortSpec:
     splatter_roughness_range: tuple = (0.1, 0.2)
     disk_aspect_ratio_range: tuple = (0.15, 0.4)
     cylinder_length_mm_range: tuple = (30.0, 100.0)
+
+    # scatter_field: many-instance analog of splatter, added 2026-09-27 to close a
+    # measured gap -- real multi-focal lesion fields (Shifts-MS MS plaques, ISLES22
+    # multi-focal emboli) carry 10-100+ components/subject and span 20-150mm, far
+    # beyond splatter's (2-6, 5-20mm) design point (docs/logs.md 2026-09-26). Kept as
+    # its own family rather than widening splatter in place, so existing splatter-tuned
+    # configs/tests are unaffected.
+    scatter_field_n_components_range: tuple = (10, 120)
+    scatter_field_spread_mm_range: tuple = (20.0, 140.0)
+    scatter_field_roughness_range: tuple = (0.1, 0.3)
+
+    # vessel: thin branching tubular network (cheap L-system-like tapering capsule
+    # tree, see shapes3d/primitives.py::_vessel_segments) -- a vein/vessel stand-in
+    # targeting the repo's own "thickness, not identity" OOD driver finding (thin
+    # structures are the model's known weak point) with genuine branching topology
+    # rather than another straight tube.
+    vessel_trunk_length_mm_range: tuple = (40.0, 120.0)
+    vessel_branch_depth_range: tuple = (2, 4)
+    vessel_radius_falloff_range: tuple = (0.6, 0.85)
+
+    # torus: non-convex, genus-1 ring -- deliberately non-anatomical (per spec: shapes
+    # need not be plausible lesions), added per direct user request ("segments, torus,
+    # etc.") for topological diversity cheap SDF families don't otherwise cover.
+    # ratio = major/minor radius (>1 always; larger = thinner ring).
+    torus_ratio_range: tuple = (2.0, 5.0)
+
+    # family_host_classes: {family_name: (maisi_class_id, ...)} -- when a family has an
+    # entry here, its cohort's host organ is restricted to a uniform random choice among
+    # those ids (via CohortSampler.sample_cohort's target_class) instead of the default
+    # uniform-over-every-class host. Added 2026-09-27 to test the sim-to-real gap: a
+    # scattered lesion-field family stamped into a RANDOM organ (liver, lung, ...) never
+    # specifically taught the model "find scattered small hyperintense regions WITHIN
+    # BRAIN tissue", the actual real-world domain (ISLES22/Shifts-MS are brain-only)
+    # (docs/logs.md 2026-09-27 "sim-to-real gap"). Families with no entry are unaffected.
+    family_host_classes: dict = field(default_factory=dict)
