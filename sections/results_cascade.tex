@@ -1,8 +1,47 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:results-cascade}
 
-This section reports a controlled ablation of two of the cascade
-mechanisms introduced in \autoref{sec:methodology-cascade}: the query
-prior and the cross-level register tokens. A three-arm chain --
+This section asks four questions about the coarse-to-fine cascade
+introduced in \autoref{sec:methodology-cascade}, in order: whether it
+helps in-distribution at all; which of its mechanisms are responsible;
+whether that benefit survives a shift in modality and class vocabulary;
+and whether the individual mechanisms do too.
+
+\paragraph{Coarse-to-fine cascading improves accuracy in-distribution.}
+A spacing sweep from 4mm to 1.5mm crop resolution (117 classes, 3897
+samples) raises macro Dice from \textbf{0.361 to 0.538} (+0.177). The
+locator's containment of the target structure is already high at the
+coarse level (0.922 mean, vs.\ an oracle ceiling of 0.970 -- a 0.048 gap)
+and does not predict which classes gain the most at the fine level: once
+a class is roughly localized, the remaining error is dominated by
+segmentation quality at the fine crop, not by further localization
+failure. A second, independent measurement on the \texttt{exp92}
+checkpoint confirms the same monotonic pattern across a full three-level
+cascade (\autoref{tab:cascade-monotonic}).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Coarse-to-fine dice by cascade level, \texttt{exp92} checkpoint,
+  1157 samples, spacing ladder $[6,3,1.5]$mm.}
+  \label{tab:cascade-monotonic}
+  \begin{tabular}{lccc}
+    \toprule
+    Level & 6mm (coarsest) & 3mm & 1.5mm (finest) \\
+    \midrule
+    Dice & 0.3889 & 0.5088 & \textbf{0.5716} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\noindent Accuracy improves monotonically from coarsest to finest level,
+at a cost of 11673 GFLOPs and 666ms wall-clock for the full three-level
+pass.
+
+\paragraph{Which mechanisms drive that gain.} Having established that the
+cascade helps, this subsection isolates which of its design choices are
+responsible: a controlled ablation of two of the cascade mechanisms
+introduced in \autoref{sec:methodology-cascade}, the query prior and the
+cross-level register tokens. A three-arm chain --
 \texttt{145} $\to$ \texttt{146} $\to$ \texttt{147} -- resumes the same
 starting checkpoint independently for each arm and changes exactly one
 setting per step, evaluated in-distribution on TotalSegmentator (119
@@ -58,10 +97,55 @@ the register-carry effect size. Region-restriction margin is unablated
 here (\autoref{sec:methodology-cascade}); the accuracy/compute Pareto
 sweep as the margin is relaxed has not been run.}
 
-\paragraph{Neither effect replicates on held-out generalization sources.}
-The same three checkpoints, evaluated on the seven held-out sources of
-\autoref{tab:ood-sources} (each source's own cascade ladder;
-\texttt{msd\_hippocampus} single-level only), give a mixed picture.
+\paragraph{Generalization is modality- and quality-gated, not free.} The
+in-distribution gain above does not transfer unconditionally to held-out
+sources. Comparing single-level against cascaded prediction on the
+\texttt{exp92} checkpoint across three of the sources in
+\autoref{tab:ood-sources} (\autoref{tab:cascade-ood-headline}) shows a
+consistent pattern: the cascade helps when the coarse level's own
+single-level prediction is already reasonable and the modality matches
+training (HU\_LWK1, CT), and hurts -- badly, in one case -- when the
+coarse level is already failing (ISLES22, GNC\_705, both MRI, both
+lesion targets far outside TotalSegmentator's anatomical-organ training
+distribution).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Single-level vs.\ cascaded macro Dice, \texttt{exp92}
+  checkpoint, held-out sources.}
+  \label{tab:cascade-ood-headline}
+  \begin{tabular}{llccl}
+    \toprule
+    Source & Modality & Single-level & Cascade & Verdict \\
+    \midrule
+    HU\_LWK1 (L1 vertebra) & CT & 0.116 & \textbf{0.129} ($[6,3,1]$) & helps \\
+    ISLES22 & MRI DWI & 0.054 & 0.046 ($[3,1.5]$) & hurts \\
+    GNC\_705 (kidney lesion) & MRI Dixon & 0.059 & 0.019 ($[6,3,1.2]$) & hurts badly \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\noindent An independent, indirect check on a different architecture
+corroborates the same mechanism: feeding Medverse's own imperfect coarse
+prediction forward as a query prior hurts its cascade universally, across
+all 7 held-out sources tested, sometimes catastrophically (MSD
+Hippocampus 0.691 $\to$ 0.050). Taken together, this is evidence that
+compounding coarse-level error into the fine level is a property generic
+to coarse-to-fine cascades, not specific to this architecture's design.
+
+\paragraph{Neither in-distribution mechanism ablation replicates on held-out
+generalization sources either.} The modality-gated pattern above is about
+whether cascading at all helps or hurts; this second check asks whether
+the specific mechanisms ablated above (prior source, register carry) keep
+the same direction OOD. The same three checkpoints, evaluated on nine
+held-out sources -- the eight of \autoref{tab:ood-sources} plus NasalSeg
+(CT, sinus/nasal-cavity classes, not yet added to that table), added
+2026-09-26 (each source's own cascade ladder; \texttt{msd\_hippocampus}
+single-level only), give a mixed picture.
+\todo{Add NasalSeg to \autoref{tab:ood-sources} in
+\autoref{sec:results-setup} for consistency -- it is evaluated here but
+missing from that table.}
 
 \begin{table}[t]
   \centering
@@ -74,6 +158,8 @@ The same three checkpoints, evaluated on the seven held-out sources of
     Source & $n$ & 145 & 146 & 147 \\
     \midrule
     HU\_LWK1 (CT) & 36 & 0.099 & 0.152 & 0.155 \\
+    FLARE22 (CT) & 650 & 0.731 & 0.751 & 0.744 \\
+    NasalSeg (CT) & 535 & 0.399 & 0.547 & 0.608 \\
     MSD Prostate & 124 & 0.310 & 0.375 & 0.358 \\
     MSD Hippocampus & 520 & 0.319 & 0.302 & 0.400 \\
     ISLES22 & 247 & 0.067 & 0.069 & 0.060 \\
@@ -84,9 +170,22 @@ The same three checkpoints, evaluated on the seven held-out sources of
   \end{tabular}
 \end{table}
 
-The prior-source change (145 $\to$ 146) helps 3 of 7 sources and hurts 4;
-the register-carry change (146 $\to$ 147) helps 2 of 7 and hurts 5.
+The prior-source change (145 $\to$ 146) helps 5 of 9 sources and hurts 4 --
+close to an even split, notably weaker than the clear majority-positive
+direction seen in-distribution (90 of 119 classes). The register-carry
+change (146 $\to$ 147) helps 3 of 9 and hurts 6 -- a majority in the same
+direction as its in-distribution regression, though far from uniform:
 \texttt{HU\_LWK1}'s cascade does not regress under registers here
-(0.152 $\to$ 0.155).
-\todo{This table supersedes an earlier, mid-training OOD number for
-\texttt{HU\_LWK1} (0.1287 $\to$ 0.0935) -- do not cite that number.}
+(0.152 $\to$ 0.155), and two sources gain substantially instead --
+\texttt{MSD Hippocampus} ($+0.097$) and \texttt{NasalSeg} ($+0.061$).
+NasalSeg is the one source where both mechanism changes move in the same
+direction as their in-distribution counterparts (prior-source $+0.149$,
+registers $+0.061$); FLARE22 only partially agrees, gaining from the
+prior-source change ($+0.020$) but losing slightly to register carry
+($-0.007$).
+\todo{This table supersedes an earlier, mid-training \texttt{cascade\_registers}
+OOD number for \texttt{HU\_LWK1} (0.1287 $\to$ 0.0935, from an
+earlier-checkpoint state of this same 145/146/147 chain) -- do not cite
+that number. Not to be confused with \autoref{tab:cascade-ood-headline}'s
+0.129, which is a separate, still-valid single-level-vs-cascade
+measurement on the unrelated \texttt{exp92} checkpoint.}

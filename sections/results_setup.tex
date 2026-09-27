@@ -27,15 +27,19 @@ representative of a real $K{>}1$ eval run.
 
 \paragraph{Datasets.} In-distribution evaluation uses
 TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
-(117 classes, CT). Generalization is tested on seven held-out sources
-spanning CT and MRI and classes entirely outside the TotalSegmentator
-vocabulary (\autoref{tab:ood-sources}).
+(117 classes, CT). Generalization is tested on the held-out sources of
+\autoref{tab:ood-sources}, spanning CT and MRI; most introduce classes
+entirely outside the TotalSegmentator vocabulary, but not all --
+FLARE22's organs are a subset of the same vocabulary under a different
+dataset, so its classes split into a genuine seen/unseen pair the same
+way TotalSegmentator's own held-out classes do (\autoref{sec:results-fusion}).
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Held-out generalization sources. None of these classes or
-  modalities appear during training.}
+  \caption{Held-out generalization sources. Most introduce classes and/or
+  modalities absent from training; FLARE22 is the exception, reusing
+  TotalSegmentator's own vocabulary under a different dataset.}
   \label{tab:ood-sources}
   \begin{tabular}{llll}
     \toprule
@@ -48,6 +52,7 @@ vocabulary (\autoref{tab:ood-sources}).
     ATLAS v2.0$^{*}$ & MRI T1 & chronic stroke lesion & -- \\
     GNC\_705 & MRI Dixon & kidney lesion & -- \\
     HU\_LWK1 & CT & L1 vertebra ROI & 36 \\
+    FLARE22 & CT & 13 abdominal organs & -- \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -55,3 +60,10 @@ vocabulary (\autoref{tab:ood-sources}).
 independently confirmed.
 \todo{Fill in $n$ for the sources left blank; add citations for each source
 once confirmed (currently uncited).}
+
+A ninth check does not fit this table at all: TotalSegmentator's own
+subjects also ship an MRI acquisition, evaluated in
+\autoref{sec:results-fusion} to isolate a held-out \emph{modality} from a
+held-out \emph{dataset} or \emph{vocabulary} -- same classes, same subject
+population, same institution, only the scanner modality is absent from
+training.
