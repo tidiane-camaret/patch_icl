@@ -73,6 +73,30 @@ class RealHostShapeProvider:
         self.texture_spec = texture_spec or TextureSpec()
         self.classes = [f"shape_{f}" for f in shape_spec.family_weights]
 
+    def _subject_fov_cache(self):
+        """{subject: min-axis native FOV mm}, built from ONE `spacings.json` read (already
+        has both `shape` and `spacing` per subject -- see `providers/totalseg.py::
+        _load_spacings`, which only keeps `spacing`). Falls back to `load_raw` (an actual
+        mmap open) only for subjects missing from that file, if any.
+
+        Added 2026-09-27: the original per-(subject,class) `load_raw` call was fine for the
+        MRI pool (50 classes, 6451 total pairs) but pathological for CT (117 classes heavily
+        overlapping the SAME ~1228 subjects -- most CT subjects carry nearly every organ --
+        giving ~70k redundant mmap opens, each paying real NFS latency; the smoke test never
+        finished inside a 300s budget). FOV depends only on the SUBJECT's own scan geometry,
+        never the class, so computing it once per unique subject (not per pair) is both
+        correct and the actual fix, not just a cache-shaped workaround."""
+        import json
+        path = self.provider.root / "spacings.json"
+        cache = {}
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            for s, m in raw.items():
+                if "shape" in m and "spacing" in m:
+                    cache[s] = min(d * sp for d, sp in zip(m["shape"], m["spacing"]))
+        return cache
+
     def _filter_usable_subjects(self, host_classes):
         """Per host class, drop subjects whose native FOV is too small on any axis to cover
         this provider's own crop window at zero clipping -- a handful of genuinely degenerate/
@@ -83,16 +107,20 @@ class RealHostShapeProvider:
         picking a finer pitch alone did not visibly fix this in a second visual pass,
         2026-09-27 -- excluding the actual bad subjects does). Classes left with too few usable
         subjects for a full cohort are dropped entirely (not an error -- with many classes some
-        are expected to be too rare/small in this pool). One-time cost at init (one mmap
-        header read per candidate subject), not per-item."""
+        are expected to be too rare/small in this pool). One-time cost at init (see
+        `_subject_fov_cache`), not per-item."""
         need = self.crop_spacing_mm * self.provider.T
+        fov_cache = self._subject_fov_cache()
         by_class = {}
         for cls in host_classes:
             usable = []
             for s in self.provider.subjects_for(cls):
-                image_np, _, native_sp, _ = self.provider.load_raw(s)
-                fov = [d * sp for d, sp in zip(image_np.shape, native_sp)]
-                if min(fov) >= need:
+                if s in fov_cache:
+                    fov_min = fov_cache[s]
+                else:
+                    image_np, _, native_sp, _ = self.provider.load_raw(s)
+                    fov_min = min(d * sp for d, sp in zip(image_np.shape, native_sp))
+                if fov_min >= need:
                     usable.append(s)
             if len(usable) >= self.context_size + 1:
                 by_class[cls] = usable
@@ -153,7 +181,7 @@ class RealHostShapeProvider:
 
         return build_native_crop(crop_ct, crop_lbl, 1, out_sizes, pad_lo, geom,
                                  crop_spacing_mm=float(crop_spacing_mm), norm=norm,
-                                 modality="mri", max_native=None)
+                                 modality=self.provider.modality, max_native=None)
 
     def assemble_task(self, rng, crop_spacing_mm):
         # `crop_spacing_mm` (the caller's batch-sampled spacing, e.g. from train_spacing_range)
@@ -184,5 +212,32 @@ class RealHostShapeProvider:
             "context_subjects": [f"{s}|{gmm_seed}|{i + 1}" for i, s in enumerate(chosen[1:])],
             "label_name": f"shape_{family}",
             "aug_mode": torch.tensor(0, dtype=torch.long),
-            "tgt_modality": "mri", "ctx_modality": "mri",
+            "tgt_modality": self.provider.modality, "ctx_modality": self.provider.modality,
         }
+
+
+class MixtureShapeProvider:
+    """Cohort hook that delegates each `assemble_task` call to ONE child provider, drawn
+    per-COHORT (not per-member -- a cohort's target+context always come from the same child,
+    same "same task" convention every other cohort-consistency mechanism in this codebase
+    follows). Added 2026-09-27 (user direction: "include CT subjects for synthetic task
+    painting") to combine a REAL-MRI-hosted `RealHostShapeProvider` with a REAL-CT-hosted one
+    under a single `real_host_providers[family]` entry -- `SynthGmmProvider.assemble_task`
+    only ever calls one provider per family, so this is the seam that lets two (or more) real
+    hosts of different modalities share that one slot."""
+
+    def __init__(self, providers, weights=None):
+        self.providers = list(providers)
+        self.weights = list(weights) if weights is not None else [1.0] * len(self.providers)
+        assert len(self.providers) == len(self.weights) and self.providers
+        self.epoch_length = max(getattr(p, "epoch_length", 1000) for p in self.providers)
+        seen = []
+        for p in self.providers:
+            for c in getattr(p, "classes", []):
+                if c not in seen:
+                    seen.append(c)
+        self.classes = seen
+
+    def assemble_task(self, rng, crop_spacing_mm):
+        provider = rng.choices(self.providers, weights=self.weights)[0]
+        return provider.assemble_task(rng, crop_spacing_mm)

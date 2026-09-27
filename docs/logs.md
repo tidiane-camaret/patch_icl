@@ -10509,3 +10509,99 @@ as 164 (task-level p=0.2 calibrated), `real_host_cls: all`, epochs=50 (up from t
 probes) now that the mechanism itself is validated. Smoke-tested clean (host-class filtering log
 line confirmed, resumed correctly, no crashes) before launching the full run. Evaluating with
 small real-OOD slices per the established fast-iteration direction, not a full-dataset sweep.
+
+## 2026-09-27 (cont.) — 165 RESULT: GNC_705 breaks out (best of the session), brain sources dilute
+
+165 trained the full 50 epochs cleanly (val_dice=0.4225, in-distribution -- best of the whole
+135b-165 lineage there too). Small-slice (n=20/class) real-OOD result:
+
+| source | 135b | 163 (brain-only) | 164 (brain+deform) | **165 (all-organs+deform, 50ep)** |
+|---|---:|---:|---:|---:|
+| isles22 | 0.050 | 0.0978 | 0.0914 | 0.0668 |
+| shifts_ms | 0.008 | 0.0578 | 0.0249 | 0.0339 |
+| atlas_v2 | 0.028 | 0.0321 | 0.0335 | 0.0291 |
+| gnc_kidney | 0.082 | 0.1051 | 0.1101 | **0.1602** |
+
+**gnc_kidney jumped to 0.1602 -- the best result of the entire session** (+95% vs. 135b, +45%
+vs. the previous best of 0.1101), directly confirming the "all organs" hypothesis: adding
+`kidney_left`/`kidney_right` as real hosts gave the model DIRECT kidney-MRI exposure that
+brain-only training could only reach via cross-organ transfer. isles22/shifts_ms (both brain-
+lesion sources) came down somewhat from their 163/164 peaks, though still clearly above the
+original 135b baseline (isles22 +34%, shifts_ms +325%). atlas_v2 stayed flat.
+
+**Reads as a real trade-off, not a regression**: spreading scatter_field's host draws over 50
+classes means brain now gets only ~1/50 of the exposure per epoch it had at 100% before --
+diluting the brain-specific skill somewhat even as kidney (and presumably other newly-added
+organs) gained direct exposure. All 4 sources remain clearly above the 135b starting point; this
+is a broadening/redistribution of where the gains land, not a net loss. Whether a WEIGHTED host
+distribution (e.g. upweighting brain/kidney specifically, the two organs this project's OOD
+suite actually targets, over the other 46 incidental classes) would recover isles22/shifts_ms
+without giving up gnc_kidney's gain is the natural next question, not yet tested.
+
+State: GPU free, no background jobs running. Checkpoints on disk through 165 (the current best
+overall, and the best specifically for gnc_kidney); 163 remains the best specifically for isles22/
+shifts_ms if a source-specific checkpoint is ever wanted instead of one general one.
+
+## 2026-09-27 (cont.) — 166: real CT hosts added, overnight 250-epoch budget
+
+Per user direction ("we will run training for the night. can we include ct subjects for
+synthetic task painting?"). New `data.gmm.real_host_include_ct` knob: builds a SECOND
+`RealHostShapeProvider` over REAL CT TotalSeg subjects (`paths.totalseg`, `real_host_ct_cls: all`
+-> 117/122 CT classes usable, 72975 subjects -- lung_left/right, intervertebral_discs,
+vertebrae, hip_implant dropped for insufficient FOV, same mechanism as the MRI side), combined
+with the existing all-organ MRI provider via a new `MixtureShapeProvider` (`src/providers/
+real_host_shape.py`) that draws one modality's provider per COHORT (`real_host_ct_weight: 1.0`
+-> ~50/50). `RealHostShapeProvider._one_member` no longer hardcodes `modality="mri"` -- now
+reads `self.provider.modality`, so the same class serves both CT and MRI hosts correctly.
+
+**Performance bug caught before it could eat the whole night**: the first smoke test timed out
+past 300s with almost no output. Root cause: `_filter_usable_subjects` called `load_raw`
+(an mmap open) once per (subject, class) pair -- fine for MRI's 50 classes/6451 pairs, but
+CT's 117 classes heavily overlap the SAME ~1228 subjects (a "total" task volume carries nearly
+every organ), giving ~70k redundant mmap opens each paying real NFS latency. Fixed by computing
+each subject's FOV ONCE from `spacings.json` (already stores both `shape` and `spacing` per
+subject, just previously read-and-discarded by `TotalSegProvider._load_spacings` which only
+keeps `spacing`) instead of per (subject,class) pair -- FOV depends only on the subject's own
+scan geometry, never the class. Standalone check: >120s (untimed, would have taken several
+minutes) -> **4.8s**, identical result (117/122 classes, same 5 dropped, same subject counts).
+64/64 tests still pass; re-smoke-tested clean with the fix before launching.
+
+**166** (`configs/experiment/3d/experiment/166_real_host_mixed_ct_mri_overnight.yaml`): continues
+165's own checkpoint, same deform/dose settings, adds the CT mixture, **epochs=250** (an actual
+overnight commitment, up from the 10-50 epoch fast probes), `eval_every=50` for periodic
+in-training signal without much overhead. Will validate with the same small real-OOD slice
+protocol once checked on -- not necessarily waiting for the full 250 epochs before an interim
+look, per the established fast-iteration validation approach.
+
+## 2026-09-27/28 (cont.) — 166 stopped early for a control check; 167: all shapes + wide spacing
+
+166 was stopped by user request at epoch 6/250 ("Stop it. First, eval last checkpoint on
+synthetic shapes") to sanity-check the mixed CT+MRI setting before committing further. Eval on
+gmm_bank p_shape (blob/scatter_field, n=48): blob 0.822 (flat, as always); scatter_field 0.424 --
+above 163's 0.368, plausibly because the CT mixture reintroduces some visual overlap with the
+gmm_bank's own CT-based canvas. Also produced a visual control (`results/3d/
+real_host_166_control.png`, sent to user): 16 scatter_field cohorts through the real
+`native_crop_collate_fn`->`realize_native_crops` path (not the earlier-buggy raw-NativeCrop
+read), showing a healthy real mix of CT (iliac artery, vertebrae, rib, colon, gluteus maximus,
+pulmonary vein) and MRI (lung, intervertebral discs, gluteus minimus, hip, spinal cord,
+clavicula, gallbladder) hosts, each with scatter_field's characteristic multi-blob pattern
+correctly stamped, no anisotropy artifacts. Confirmed the mixed-CT/MRI setting itself is sound.
+
+**167** (`configs/experiment/3d/experiment/167_real_host_all_shapes_wide_spacing.yaml`), per user
+direction "add the other synthetic shapes, spacing 6 to 1.5, 400 epochs, eval every 20":
+continues 166's checkpoint (epoch 6, negligible drift from 165). Two changes:
+
+1. `data.gmm.real_host_families` now lists ALL 7 shape families (was `[scatter_field]` only) --
+   every shape-mode task, not just scatter_field, now bypasses the gmm_bank and stamps onto the
+   real CT+MRI mixed, all-organ host pool. `family_weights` unchanged (scatter_field still 4x
+   the others), so relative shape-type frequency is the same -- only the canvas changes for
+   blob/splatter/disk/cylinder/vessel/torus.
+2. `data.train_spacing_range: [1.5, 6]` (was `[3, 6]`) -- widens the per-batch spacing sweep for
+   the REAL (non-synth) organ tasks down to 1.5mm, matching ISLES22/Shifts-MS's own real eval
+   pitch directly. Doesn't affect shape-mode (RealHostShapeProvider ignores the passed spacing,
+   fixed at its own 1.0mm -- see its docstring). `crop_spacing_mm` updated to 3.0 (=sqrt(1.5*6),
+   matching the geometric-mean convention 135b's own 4.24=sqrt(3*6) already established).
+
+Smoke-tested clean (confirmed `crop=3.0mm` in the dataset log line, all 117/50 host classes
+still usable, resumed correctly, no crashes) before launching. Longest budget yet (400 epochs);
+will validate with small real-OOD slices per the established approach when checked on.

@@ -1,0 +1,148 @@
+# @package _global_
+# 166_real_host_mixed_ct_mri_overnight -- continues 165 (docs/logs.md 2026-09-27), per user
+# direction "we will run training for the night. can we include ct subjects for synthetic task
+# painting?". Adds REAL CT TotalSeg subjects as an additional host source alongside the real
+# MRI ones from 165, and commits a long (overnight) budget now that the mechanism itself is
+# validated (163/164/165 all gave clear real-OOD gains over 135b).
+#
+# `data.gmm.real_host_include_ct: true` -- new knob (`experiments/3d/common.py`, `src/providers/
+# real_host_shape.py::MixtureShapeProvider`): builds a SECOND RealHostShapeProvider over REAL CT
+# TotalSeg subjects (paths.totalseg, `real_host_ct_cls: all` -> 117/122 CT classes usable,
+# 72975 subjects -- lung_left/right, intervertebral_discs, vertebrae, hip_implant dropped for
+# insufficient FOV, same mechanism as the MRI side), and combines it with the existing all-organ
+# MRI provider via a new `MixtureShapeProvider` (50/50 by default, `real_host_ct_weight: 1.0`) --
+# one modality drawn per COHORT, matching every other "same task" cohort-consistency convention.
+# Verified standalone before wiring: 20/20 sampled cohorts correctly alternate modality
+# (12 mri / 8 ct in one run), `NativeCrop.modality` matches the drawn provider's own modality
+# (`_one_member` no longer hardcodes "mri" -- now reads `self.provider.modality`).
+#
+# Rationale: real CT pixel data + real anatomy is still a genuine improvement over the fully-
+# synthetic gmm_bank canvas for the CT side of training, same logic as the MRI fix, even though
+# it doesn't target the (all-MRI) 4-source OOD suite directly -- broadens the underlying "real
+# tissue/noise around a lesion-like region" skill to both modalities scatter_field trains
+# against, rather than leaving CT-side shape-mode fully synthetic while MRI-side is now real.
+#
+#   python experiments/3d/train.py experiment=166_real_host_mixed_ct_mri_overnight
+#
+# CHECKPOINT: continues 165's own best.pt.
+#
+# BUDGET: epochs=250 (overnight), eval_every=50 (periodic in-training signal without much
+# overhead -- 5 eval passes across the run, ~90s each). Validate with small real-OOD slices
+# + eval_pshape_families.py when checked on, not necessarily waiting for the full 250 epochs
+# before any interim look.
+
+defaults:
+  - /encoder: e4_plainconv_ts
+  - override /dataset: multisource_ct_mri
+  - override /model: m2_patchset_decoder
+  - override /augmentations: calibrated
+  - _self_
+
+arch:
+  plainconv_ts_features_per_stage: [32, 64, 256, 512]
+  nnunet_ts_stages: [2, 3]
+  encoder_input_norm: instance
+  encoder_spacing_aware: true
+  compile_dynamic: false
+  mask_slots: 1
+  decode_source: img
+  mask_embed: linear
+  cascade_registers: true
+  pool_token: true
+
+data:
+  train_spacing_range: [3, 6]
+  crop_spacing_mm: 4.24
+  gpu_realize_crop: true
+  ram_cache: true
+  p_synth: 0.5
+  gpu_realize_max_native: 128
+  gmm:
+    paint_mask_aligned: true
+    var_max: 80
+    background_mode: zero
+    mu_group_ids: merged
+    mu_group_rho: null
+    sd_between_ratio: ct_mri
+    sd_group_ids: merged
+    sd_group_rho: null
+    p_shape: 1.0
+    real_host_families: [scatter_field]   # bypasses gmm_bank for this family -- see 163
+    real_host_cls: all                    # MRI side -- all real MRI classes (165)
+    real_host_include_ct: true            # NEW -- also mix in real CT hosts
+    real_host_ct_cls: all                 # CT side -- all real CT classes
+    real_host_ct_weight: 1.0              # 1:1 with the MRI provider -> ~50/50 modality mix
+    shape:
+      host_anchored: true
+      family_weights: {blob: 1.0, splatter: 1.0, disk: 1.0, cylinder: 1.0,
+                       scatter_field: 4.0}
+    texture:
+      n_octaves: 4
+    p_heterogeneity: 0.3
+    heterogeneity:
+      core_fraction: 0.35
+      core_offset_ratio: 0.8
+      sigma1_range: [1.0, 4.0]
+      sigma2_range: [0.5, 2.0]
+  cohort:
+    w_by_class_size: 1
+    randomness: 1
+    by_class_size_common_frac: 0.75
+    by_class_size_mode: fraction
+    exclude_src: [TotalSegmentatorV2]
+  source_mix:
+    per_source_train_classes: [balanced, balanced]
+    regime_p: [0.5, 0.5, 0.0]
+    eval_epoch_length: 800
+
+  query_prior:
+    modes: [gt, none]
+    p: [0.3, 0.7]
+  prior_perturb:
+    p: 1.0
+    ball: false
+    dilate_mm: [2.0, 8.0]
+    erode_mm:  [2.0, 8.0]
+    erode_min_keep: 0.15
+    shift_mm:  [4.0, 12.0]
+    noise_std: [0.15, 0.4]
+
+augmentations:
+  task:
+    affine: {p: 0.5, scale_min: 1, scale_max: 1}
+    elastic: {p: 0}
+    deform: {p: 0.2, control_points: 6, max_disp: 0.15, num_steps: 6}
+    mask_interp: bilinear
+  per_image:
+    affine: {p: 0.2}
+    elastic: {p: 0}
+    deform: {p: 0}
+    mask_interp: bilinear
+  goal_mask:
+    p: 0.4
+    ops: [dilate, erode, boundary, sobel]
+
+train:
+  epochs: 250
+  batch_size: 8
+  eval_every: 50
+  workers: 12
+  grad_clip: 1.0
+  profile_timing: true
+  drop_last: true
+
+  lr: 1.0e-4
+  encoder_lr_scale: 1
+  warmup_epochs: 1
+  checkpoint: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-27_165_real_mri_host_all_organs/best.pt
+  checkpoint_allow_partial: false   # identical arch to 165 -- strict full-shape load
+  resume_weights_only: true
+
+eval:
+  split: val
+  n_subjects: null
+  tasks_per_class: 10
+  crop_jitter: 0
+
+wandb:
+  name: 166_real_host_mixed_ct_mri_overnight

@@ -531,24 +531,50 @@ def build_dataset(cfg, split: str):
             real_host_families = list(g.get("real_host_families", []) or [])
             real_host_providers = None
             if real_host_families and shape_spec is not None:
-                from data.totalseg_classes import MRI_ALL_CLASSES
-                from src.providers.real_host_shape import RealHostShapeProvider
+                from data.totalseg_classes import ALL_CLASSES, MRI_ALL_CLASSES
+                from src.providers.real_host_shape import MixtureShapeProvider, RealHostShapeProvider
                 from src.providers.totalseg import TotalSegProvider
+
+                def _resolve_host_classes(host_cls, all_classes):
+                    return (all_classes if host_cls == "all"
+                           else [host_cls] if isinstance(host_cls, str)
+                           else list(host_cls))
+
                 host_cls = g.get("real_host_cls", "brain")
                 # "all" -> every real MRI TotalSeg class (docs/logs.md 2026-09-27 "all real
                 # host organs instead of just brain") -- classes without enough FOV-usable
                 # subjects are dropped inside RealHostShapeProvider itself, not here.
-                host_classes = (MRI_ALL_CLASSES if host_cls == "all"
-                               else [host_cls] if isinstance(host_cls, str)
-                               else list(host_cls))
+                mri_classes = _resolve_host_classes(host_cls, MRI_ALL_CLASSES)
                 mri_provider = TotalSegProvider(
-                    root=cfg.paths.totalsegmri, classes=host_classes,
+                    root=cfg.paths.totalsegmri, classes=mri_classes,
                     image_size=tuple(d.image_size), split=split,
                     modality="mri", native_crop_max_native=d.get("gpu_realize_max_native"))
                 real_host_provider = RealHostShapeProvider(
-                    mri_provider, shape_spec, host_classes=host_classes,
+                    mri_provider, shape_spec, host_classes=mri_classes,
                     context_size=d.context_size,
                     max_native=d.get("gpu_realize_max_native"), texture_spec=texture_spec)
+
+                # real_host_include_ct (docs/logs.md 2026-09-27, "include CT subjects for
+                # synthetic task painting"): also stamp onto REAL CT TotalSeg subjects, not
+                # just MRI -- a MixtureShapeProvider draws one modality's provider per cohort
+                # (real_host_ct_weight : 1, e.g. 1.0 -> 50/50 with the MRI provider). Real CT
+                # pixel data + real anatomy is still a genuine improvement over the fully-
+                # synthetic gmm_bank canvas for the CT side of training, same rationale as the
+                # MRI fix, even though it doesn't target the (all-MRI) OOD suite directly.
+                if g.get("real_host_include_ct", False):
+                    ct_host_cls = g.get("real_host_ct_cls", host_cls)
+                    ct_classes = _resolve_host_classes(ct_host_cls, ALL_CLASSES)
+                    ct_provider = TotalSegProvider(
+                        root=cfg.paths.totalseg, classes=ct_classes,
+                        image_size=tuple(d.image_size), split=split,
+                        modality="ct", native_crop_max_native=d.get("gpu_realize_max_native"))
+                    ct_real_host_provider = RealHostShapeProvider(
+                        ct_provider, shape_spec, host_classes=ct_classes,
+                        context_size=d.context_size,
+                        max_native=d.get("gpu_realize_max_native"), texture_spec=texture_spec)
+                    real_host_provider = MixtureShapeProvider(
+                        [real_host_provider, ct_real_host_provider],
+                        weights=[1.0, float(g.get("real_host_ct_weight", 1.0))])
                 real_host_providers = {fam: real_host_provider for fam in real_host_families}
             # cascade=_realize (not hardcoded True): SynthGmmProvider.assemble_task branches
             # on this exactly like MultiSourceProvider already does on gpu_realize_crop=_realize
