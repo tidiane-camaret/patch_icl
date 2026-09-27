@@ -25,46 +25,48 @@ available; VRAM comes from a standalone $B{=}1,K{=}1$ inference benchmark
 rather than the evaluation loop itself, so it should not be read as
 representative of a real $K{>}1$ eval run.
 
-\paragraph{Datasets.} In-distribution evaluation uses
-TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
-(117 classes, CT). Generalization is tested on the held-out sources of
-\autoref{tab:ood-sources}, spanning CT and MRI; most introduce classes
-entirely outside the TotalSegmentator vocabulary, but not all --
-FLARE22's organs are a subset of the same vocabulary under a different
-dataset, so its classes split into a genuine seen/unseen pair the same
-way TotalSegmentator's own held-out classes do (\autoref{sec:results-fusion}).
+\paragraph{Datasets.} \autoref{tab:ood-sources} lists every evaluation source used in this
+thesis, grouped by relationship to the training vocabulary. TotalSegmentator (the
+in-distribution source) and FLARE22 both reuse the training
+vocabulary~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}, splitting into a genuine
+seen/unseen pair; the rest introduce a target, class, or scanner modality absent from
+training entirely.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Held-out generalization sources. Most introduce classes and/or
-  modalities absent from training; FLARE22 is the exception, reusing
-  TotalSegmentator's own vocabulary under a different dataset.}
+  \caption{Every evaluation source, grouped by relationship to the training vocabulary.
+  $n$ is subjects; $n_\text{cls}$ is evaluated classes.}
   \label{tab:ood-sources}
-  \begin{tabular}{llll}
+  \begin{tabular}{llllc}
     \toprule
-    Source & Modality & Target & $n$ \\
+    Source & Modality & Target & $n$ & $n_\text{cls}$ \\
     \midrule
-    ISLES22 & MRI DWI & stroke lesion & -- \\
-    Shifts-MS & MRI FLAIR & MS lesion & 46 \\
-    MSD Hippocampus & MRI T1 & hippocampus & -- \\
-    MSD Prostate & MRI T2+ADC & prostate zone & -- \\
-    ATLAS v2.0$^{*}$ & MRI T1 & chronic stroke lesion & -- \\
-    GNC\_705 & MRI Dixon & kidney lesion & -- \\
-    HU\_LWK1 & CT & L1 vertebra ROI & 36 \\
-    FLARE22 & CT & 13 abdominal organs & -- \\
-    NasalSeg & CT & 5 nasal/sinus cavities & 107 \\
+    \multicolumn{5}{l}{\itshape In-vocabulary (seen/unseen split)} \\
+    \midrule
+    TotalSegmentator & CT & 117 organs (61 seen / 56 unseen) & 89 & 117 \\
+    FLARE22 & CT & abdominal organs (11 seen / 2 unseen) & 50 & 13 \\
+    \midrule
+    \multicolumn{5}{l}{\itshape Novel vocabulary (unseen by construction)} \\
+    \midrule
+    ISLES22 & MRI DWI & stroke lesion & 250 & 1 \\
+    Shifts-MS & MRI FLAIR & MS lesion & 46 & 1 \\
+    MSD Hippocampus & MRI T1 & hippocampus & 260 & 2 \\
+    MSD Prostate & MRI T2+ADC & prostate zone & 64 (32 cases $\times$ 2 channels) & 2 \\
+    ATLAS v2.0$^{*}$ & MRI T1 & chronic stroke lesion & 654 & 1 \\
+    GNC\_705 & MRI Dixon & kidney lesion & 610 & 13 \\
+    NasalSeg & CT & nasal/sinus cavities & 107 & 5 \\
+    \midrule
+    \multicolumn{5}{l}{\itshape Non-object} \\
+    \midrule
+    HU\_LWK1 & CT & L1 vertebra ROI & 36 & 1 \\
+    \midrule
+    \multicolumn{5}{l}{\itshape Held-out modality} \\
+    \midrule
+    TotalSeg MRI & MRI & same classes as TotalSegmentator CT & 47 & 23 \\
     \bottomrule
   \end{tabular}
 \end{table}
 \noindent $^{*}$Sourced from an unofficial data mirror; provenance not yet
 independently confirmed.
-\todo{Fill in $n$ for the sources left blank; add citations for each source
-once confirmed (currently uncited).}
-
-A ninth check does not fit this table at all: TotalSegmentator's own
-subjects also ship an MRI acquisition, evaluated in
-\autoref{sec:results-fusion} to isolate a held-out \emph{modality} from a
-held-out \emph{dataset} or \emph{vocabulary} -- same classes, same subject
-population, same institution, only the scanner modality is absent from
-training.
+\todo{Add citations for each source once confirmed (currently uncited).}
