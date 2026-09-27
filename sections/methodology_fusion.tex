@@ -1,4 +1,4 @@
-\subsection{Bi-Axial Image--Label Fusion}\label{sec:methodology-fusion}
+\subsection{Dual Attention: Modality and Position Axes}\label{sec:methodology-fusion}
 
 How a model combines image and label evidence, and how context and target
 interact, are two related design choices this section addresses together.
@@ -16,21 +16,24 @@ across every query. Both commit every design choice -- fusion point and
 context--target interaction alike -- to a single, early step, computed
 once. We instead keep image tokens $z^{\text{img}}$ and label tokens
 $z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as separate streams
-throughout the network and let them exchange information repeatedly, over
-two attention axes applied at every layer, on the full, uncompressed token
-grid:
+throughout the network and let them exchange information repeatedly,
+through \emph{dual attention} -- following the general pattern of
+Fu et al.~\cite{fuDualAttentionNetwork2019}, who fuse a position-wise and a
+channel-wise attention branch at every layer of a scene-segmentation
+network -- with two attention axes applied at every layer, on the full,
+uncompressed token grid:
 
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
-  \item \textbf{Slot axis}: at each cell, the image and label token attend
-    to each other, letting label evidence sharpen the image representation
-    and vice versa, independently per cell.
-  \item \textbf{Row axis}: every cell of every volume -- context, target,
-    and the register tokens -- attends over the entire token sequence at
-    once, using 3D axial rotary position embeddings so attention is a
-    function of physical distance between cells rather than raw grid
-    index. This single joint attention performs within-volume
-    self-attention and cross-context matching together, since tokens from
-    every volume already share one sequence.
+  \item \textbf{Modality axis}: at each cell, the image and label token
+    attend to each other, letting label evidence sharpen the image
+    representation and vice versa, independently per cell.
+  \item \textbf{Position axis}: every cell of every volume -- context,
+    target, and the register tokens -- attends over the entire token
+    sequence at once, using 3D axial rotary position embeddings so
+    attention is a function of physical distance between cells rather
+    than raw grid index. This single joint attention performs
+    within-volume self-attention and cross-context matching together,
+    since tokens from every volume already share one sequence.
 \end{itemize}
 
 \autoref{fig:biaxial} illustrates both axes within a single layer.
@@ -38,10 +41,10 @@ grid:
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{arch_biaxial.pdf}
-  \caption{Bi-axial attention within one transformer layer, shown for a
+  \caption{Dual attention within one transformer layer, shown for a
   single context volume ($K{=}1$ for clarity) and 3 of its $N$ spatial
-  tokens per stream. Left: the slot axis -- image and label tokens
-  attend to each other within the same cell. Right: the row axis --
+  tokens per stream. Left: the modality axis -- image and label tokens
+  attend to each other within the same cell. Right: the position axis --
   tokens attend across cells and, for the target, across contexts. Green
   edges touch the target row, which cross-attends read-only into context
   and whose label-stream input is the query prior

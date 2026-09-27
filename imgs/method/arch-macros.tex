@@ -24,6 +24,31 @@
 \newcommand{\archdx}{0.30}
 \newcommand{\archdy}{0.20}
 
+% ---- shared text-role macros ----
+% Every arch_*.tex figure is compiled standalone at the SAME base size
+% (documentclass[tikz,border=4pt,12pt]{standalone}, matching the thesis
+% body's 12pt), so \normalsize etc. mean the same absolute point size in
+% every figure. Using these three named roles instead of ad hoc \Large /
+% \bfseries\normalsize / \scriptsize per figure keeps "a box title" (etc.)
+% the same size everywhere it appears, regardless of which figure it's in
+% or how that figure's canvas happens to be scaled by \includegraphics.
+%   \archtitle    -- figure/method/panel titles, the "xL" repeat marker
+%   \archboxlabel -- sub-block header labels (Fuse, Encoder, attention, ...)
+%   \archnote     -- small secondary annotations (placeholder captions)
+% Plain, unlabeled node text (cube/token labels, row/lane labels) stays at
+% the bare \normalsize default -- no macro needed for that role.
+%
+% DECLARATIONS, not argument-taking macros -- deliberately, so they can
+% precede a raw `\\` inside a tikz node's text (as `{\archboxlabel line
+% one\\line two}`) without hiding that `\\` one macro-expansion level deep.
+% A `\\` buried inside a wrapped {\archboxlabel{...}} argument breaks
+% TikZ's own align=center line-splitting (it scans for `\\` before the
+% argument expands) -- use these the same way `\bfseries`/`\Large` are
+% already used directly inline elsewhere in these figures.
+\newcommand{\archtitle}{\Large\bfseries}
+\newcommand{\archboxlabel}{\bfseries\normalsize}
+\newcommand{\archnote}{\scriptsize}
+
 % ---------------------------------------------------------------
 % \archvolcube{x}{y}{w}{h}{topcolor}{content}{label}
 %   content: ct | ctmask | predmask | <flat color name>

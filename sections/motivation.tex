@@ -23,9 +23,9 @@ each with its own mechanism:
     Concatenating image and mask channels before a shared encoder, or
     fusing them once through a single operation, commits to one fusion
     point before most of the network's capacity is applied.
-    \autoref{sec:methodology} proposes \emph{bi-axial image--label
-    attention}, keeping the two streams separate and letting them
-    exchange information repeatedly.
+    \autoref{sec:methodology} proposes \emph{dual attention}, keeping the
+    two streams separate and letting them exchange information
+    repeatedly over a modality axis and a position axis.
   \item \textbf{Where should compute be spent?} Re-scanning an entire
     volume with a sliding window at every processing step wastes compute
     on regions already known not to contain the structure of interest.
@@ -44,7 +44,7 @@ each with its own mechanism:
 
 \paragraph{Contributions.}
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
-  \item A bi-axial image--label attention mechanism for in-context 3D
+  \item A dual attention mechanism for in-context 3D
     segmentation, contrasted against early-concatenation
     (Medverse~\cite{huMedverseUniversalModel2025a}) and one-shot fusion
     (Iris~\cite{gaoShowSegmentUniversal2025}) baselines.

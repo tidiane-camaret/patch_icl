@@ -1,4 +1,4 @@
-\documentclass[tikz,border=4pt]{standalone}
+\documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
@@ -7,7 +7,7 @@
 \definecolor{archBrightBlue}{HTML}{3B82F6}
 
 % ---------------------------------------------------------------------------
-% Early feature fusion (baseline) vs. bi-axial attention (ours), placed side
+% Early feature fusion (baseline) vs. dual attention (ours), placed side
 % by side (not stacked) so the two pipelines read left-to-right in parallel.
 % Style follows TabPFN's Fig. 1 (Hollmann et al., Nature 2024): small token
 % grids connected by simple curved double-arrows rather than full
@@ -182,7 +182,7 @@
   \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
 
   % Title for Baseline (centered across both inner boxes)
-  \node[anchor=south,font=\bfseries\large] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY}) {Baseline: early fusion};
+  \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY}) {\archtitle Baseline: early fusion};
 
   % Baseline outer wrapper (Lx repetition marker)
   \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
@@ -194,11 +194,11 @@
   \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
     ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+\boxpad);
     
-  \node[anchor=south,font=\bfseries\normalsize] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {Fuse};
-  \node[anchor=south,font=\bfseries\normalsize] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {Patch axis};
+  \node[anchor=south] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
+  \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
   
   % "xL" placed in the top right corner of the wrapper
-  \node[anchor=north east,font=\bfseries\Large] at ({\outerRightBase-0.20},{\outerTop-0.20}) {$\times L$};
+  \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
   
   % Arch arrow connecting the two steps
   \archarrow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{black!30}
@@ -257,7 +257,7 @@
     \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
 
     % Title for Ours
-    \node[anchor=south,font=\bfseries\large] at ({\xC+(\xD+\boxw-\xC)/2},{\methodTitleY}) {Ours: bi-axial attn.};
+    \node[anchor=south] at ({\xC+(\xD+\boxw-\xC)/2},{\methodTitleY}) {\archtitle Ours: dual attn.};
 
     % Ours outer wrapper (Lx repetition marker)
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
@@ -269,11 +269,11 @@
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxw},\yTgt+\clusterhalf+\boxpad);
       
-    \node[anchor=south,font=\bfseries\normalsize] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {Image/label axis};
-    \node[anchor=south,font=\bfseries\normalsize] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {Patch axis};
+    \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Image/label axis};
+    \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
     
     % "xL" placed in the top right corner of the wrapper
-    \node[anchor=north east,font=\bfseries\Large] at ({\outerRight-0.20},{\outerTop-0.20}) {$\times L$};
+    \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
     % Arch arrow connecting the two steps inside the wrapper
     \archarrow{({\xC+\boxw+0.50},{\yMid})}{({\xD-0.50},{\yMid})}{black!30}

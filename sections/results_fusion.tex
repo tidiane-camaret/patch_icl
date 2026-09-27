@@ -12,8 +12,8 @@ single-axis control introduced below collapses image and label evidence into one
 cell via a pixel shuffle--unshuffle operation \emph{before} the transformer; of every
 variant of our architecture, it is structurally the closest to Medverse's own commitment to
 early fusion. Comparing Medverse against this weaker control, rather than against the full
-bi-axial model, is the more conservative claim: if even the conservative variant wins, the
-win cannot be attributed to the slot axis alone. Medverse (released weights) and the
+dual-attention model, is the more conservative claim: if even the conservative variant wins, the
+win cannot be attributed to the modality axis alone. Medverse (released weights) and the
 single-axis control are trained under an identical data pipeline, augmentation recipe, and
 optimizer schedule, and evaluated with an identical protocol -- fixed 3\,mm single-level
 crops, fp32, each model's own best checkpoint (no epoch matching across arms; Medverse
@@ -78,18 +78,18 @@ query-conditioning signal the reference model does during training, so this is b
 query-conditioning signal -- currently dropped due to a training instability under
 compilation.}
 
-\paragraph{Isolating the slot-axis effect, across the same sources.} Having shown that even
+\paragraph{Isolating the modality-axis effect, across the same sources.} Having shown that even
 the conservative variant is competitive with an external baseline, this ablation asks a
 narrower, fully controlled question: does keeping image and label as separate, repeatedly
-cross-attending streams (the slot axis, \autoref{sec:methodology-fusion}) buy anything
+cross-attending streams (the modality axis, \autoref{sec:methodology-fusion}) buy anything
 \emph{on top of} an architecture that already competes, once every other confound is
 removed? The reference model (\texttt{arch.dual\_axis=true}) is compared against the
 single-axis control from above (\texttt{arch.dual\_axis=false}), which removes only the
-slot axis; the row axis (cross-context attention) is identical in both.
+modality axis; the position axis (cross-context attention) is identical in both.
 
 Two adjustments relative to a naive dual-axis-flag toggle: (1) the single-axis control's
 transformer depth is raised from $l{=}4$ to $l{=}9$ so its transformer compute is within
-3\% of the reference model's -- removing the slot axis also removes a large share of the
+3\% of the reference model's -- removing the modality axis also removes a large share of the
 model's compute, and parameter count and compute could not be matched simultaneously by
 this route (matching compute instead leaves parameters 52\% higher for the single-axis
 control); (2) both runs warm-start \emph{only} the encoder and decoder from a shared
@@ -102,12 +102,12 @@ protocol and dataset grouping as the table above.
 \begin{table}[t]
   \centering
   \small
-  \caption{Bi-axial attention vs.\ the single-axis (early-fusion-style) control, at matched
+  \caption{Dual attention vs.\ the single-axis (early-fusion-style) control, at matched
   compute, across all evaluation datasets. Same grouping as \autoref{tab:fusion-medverse}.}
   \label{tab:fusion-axis}
   \begin{tabular}{lccc}
     \toprule
-     & Single-axis (control) & Bi-axial (ours) & $n_\text{cls}$ \\
+     & Single-axis (control) & Dual attn. (ours) & $n_\text{cls}$ \\
     \midrule
     TotalSeg CT -- seen      & 0.574 & \textbf{0.582} & 61 \\
     TotalSeg CT -- unseen    & 0.408 & \textbf{0.426} & 56 \\
@@ -131,16 +131,16 @@ protocol and dataset grouping as the table above.
   \end{tabular}
 \end{table}
 
-Bi-axial attention wins every row except one: FLARE22's two unseen classes, where
+Dual attention wins every row except one: FLARE22's two unseen classes, where
 single-axis is ahead (0.632 vs.\ 0.604) on a two-class sample too small to weigh heavily.
 Everywhere else -- both TotalSegmentator splits, FLARE22's seen classes, both
-novel-vocabulary datasets, the non-object case, and the held-out modality -- bi-axial wins,
+novel-vocabulary datasets, the non-object case, and the held-out modality -- dual attention wins,
 and it wins the five-source mean (0.297 vs.\ 0.264) despite the one exception. With every
 other confound this thesis can control for removed, this is the cleanest, most consistently
 generalizing result in the axis. Latency is close to tied once both are measured at the same
 (fp32) precision, unlike an earlier bf16 measurement of the same pair that showed a larger
 gap -- that gap looks like a precision/compilation artifact rather than a real cost of the
-slot axis, and is not reflected here.
+modality axis, and is not reflected here.
 
 \paragraph{Status.} Neither patchset arm had reached its full training budget at the point
 these numbers were read, while Medverse had already converged -- so
