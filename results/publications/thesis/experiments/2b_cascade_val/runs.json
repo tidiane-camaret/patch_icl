@@ -1,6 +1,6 @@
 {
   "experiment": "2b_cascade_val",
-  "description": "OOD eval-expansion sweep of the 2a_cascade checkpoints (145/146/147) on the 7 held-out 'val dataset' sources (docs/datasets/{isles22,shifts_ms,msd_hippocampus,msd_prostate,atlas_v2,gnc_kidney_lesions,hu_lwk1}.md). Per-source cascade ladder chosen from each dataset's own geometry (see those docs' 'crop_spacing_mm' sections): hu_lwk1/gnc_kidney reuse the exp92-era established ladder, isles22/shifts_ms/atlas_v2 use a whole-volume-coverage 2x ladder, msd_prostate uses a 3-level find-in-scene ladder, msd_hippocampus is single-level only (no cascade -- the native volumes are already pre-cropped to the ROI, so there is no wider context to localize against). All runs use eval.split=test, data.mask_downsample=occupancy, data.gpu_realize_crop=false (required overrides for these native-grid sources, which lack the totalseg-specific soft->occupancy eval remap). Run against ct_stats.json recomputed at pct_lo=2/pct_hi=98 (2026-09-24) to match the corresponding fix to totalsegmri's training-time mri_stats.json -- an earlier isles22 attempt (before this fix) was discarded, not included here.",
+  "description": "OOD eval-expansion sweep of the 2a_cascade checkpoints (145/146/147) on 9 held-out sources: the original 7 'val dataset' sources (docs/datasets/{isles22,shifts_ms,msd_hippocampus,msd_prostate,atlas_v2,gnc_kidney_lesions,hu_lwk1}.md), plus flare22 and nasalseg added 2026-09-26 (reusing the ladder/settings already validated for these two sources by the earlier, uncontrolled cascreg_e100 sweep -- see docs/logs.md 2026-09-15). Per-source cascade ladder chosen from each dataset's own geometry (see those docs' 'crop_spacing_mm' sections): hu_lwk1/gnc_kidney reuse the exp92-era established ladder, isles22/shifts_ms/atlas_v2 use a whole-volume-coverage 2x ladder, msd_prostate uses a 3-level find-in-scene ladder, msd_hippocampus is single-level only (no cascade -- the native volumes are already pre-cropped to the ROI, so there is no wider context to localize against), flare22 uses [6,3,2.5]mm, nasalseg uses [1.5,0.8]mm. All runs use eval.split=test, data.mask_downsample=occupancy, data.val_classes=all (or an explicit class list) (verified via experiments/3d/common.py: train_classes only affects the train split and eval.py's informational in_train flag, never which classes get evaluated). data.gpu_realize_crop=false for the original 7 sources (required override for these native-grid sources, which lack the totalseg-specific soft->occupancy eval remap); flare22/nasalseg use data.gpu_realize_crop=true instead (user-specified, matching flare22's own established precedent). Run against ct_stats.json recomputed at pct_lo=2/pct_hi=98 (2026-09-24) to match the corresponding fix to totalsegmri's training-time mri_stats.json -- an earlier isles22 attempt (before this fix) was discarded, not included here.",
   "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
   "wandb_project": "patchset_eval",
   "runs": [
@@ -108,6 +108,36 @@
       "id": "s6wpgy9a",
       "name": "147_cascade_randomfg_predprior_regon_gnc_kidney_ood",
       "description": "147 on gnc_kidney, cascade [6,3,1.2]mm"
+    },
+    {
+      "id": "g6boujlq",
+      "name": "145_cascade_randomfg_gtprior_regoff_flare22_ood",
+      "description": "145 (registers=off, prior=perturbed-GT) on flare22 (CT, 13 abdominal organs), cascade [6,3,2.5]mm, gpu_realize_crop=true"
+    },
+    {
+      "id": "cortgkql",
+      "name": "145_cascade_randomfg_gtprior_regoff_nasalseg_ood",
+      "description": "145 on nasalseg (CT, 5 sinus/nasal-cavity classes), cascade [1.5,0.8]mm, gpu_realize_crop=true"
+    },
+    {
+      "id": "u6itw8n8",
+      "name": "146_cascade_randomfg_predprior_regoff_flare22_ood",
+      "description": "146 (145 + prior=real prev.pred) on flare22, cascade [6,3,2.5]mm, gpu_realize_crop=true"
+    },
+    {
+      "id": "30w0q5t6",
+      "name": "146_cascade_randomfg_predprior_regoff_nasalseg_ood",
+      "description": "146 on nasalseg, cascade [1.5,0.8]mm, gpu_realize_crop=true"
+    },
+    {
+      "id": "zptlw9mr",
+      "name": "147_cascade_randomfg_predprior_regon_flare22_ood",
+      "description": "147 (146 + registers=on) on flare22, cascade [6,3,2.5]mm, gpu_realize_crop=true"
+    },
+    {
+      "id": "sdravjrx",
+      "name": "147_cascade_randomfg_predprior_regon_nasalseg_ood",
+      "description": "147 on nasalseg, cascade [1.5,0.8]mm, gpu_realize_crop=true"
     }
   ]
 }

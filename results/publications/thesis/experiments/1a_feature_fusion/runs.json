@@ -1,6 +1,6 @@
 {
   "experiment": "1a_feature_fusion",
-  "description": "Bi-axial cross-context/within-volume attention (dual_axis=True) vs early img-mask feature fusion (dual_axis=False, PixelShuffle fuse_conv pre-transformer, no column-axis attention) — thesis Methodology feature-fusion ablation. Compute-matched: 151's arch.l=9 gives gflops_transformer within 3% of 150's arch.l=4,dual_axis=True baseline (params are NOT matched: 151 is +52% over 150, since row-axis-only layers can't buy back column-axis compute per-param — see 151's own config header). Both runs warm-start ONLY encoder+decoder from a stripped 108 checkpoint (scripts/strip_checkpoint_encoder_decoder.py); the entire in-context reasoning core (transformer, img/mask embed, ctx/qry id, thinking rows, cascade_proj, pool_proj) is randomly initialized for BOTH arms, removing the asymmetric-warm-start confound the earlier 110-vs-120 pair had. data.p_synth=0 (real anatomy only), CT-only (data.source_mix.regime_p=[1,0,0]). train.epochs=400, but both runs are extracted at epoch 160 here for a fair matched-budget comparison (151 was still running past 160 at extraction time).",
+  "description": "Bi-axial cross-context/within-volume attention (dual_axis=True) vs early img-mask feature fusion (dual_axis=False, PixelShuffle fuse_conv pre-transformer, no column-axis attention) vs the released Medverse architecture (152) — thesis Methodology feature-fusion + architecture ablation. 150/151 compute-matched: 151's arch.l=9 gives gflops_transformer within 3% of 150's arch.l=4,dual_axis=True baseline (params are NOT matched: 151 is +52% over 150, since row-axis-only layers can't buy back column-axis compute per-param — see 151's own config header). 150/151 both warm-start ONLY encoder+decoder from a stripped 108 checkpoint (scripts/strip_checkpoint_encoder_decoder.py); the entire in-context reasoning core (transformer, img/mask embed, ctx/qry id, thinking rows, cascade_proj, pool_proj) is randomly initialized for both arms, removing the asymmetric-warm-start confound the earlier 110-vs-120 pair had. 152 (medverse) instead starts from the released Medverse.ckpt (checkpoint=orig_weights) — the fairest available starting point for that architecture, not a matched cold-init (see 152's own config header for why). data.p_synth=0 (real anatomy only), CT-only (data.source_mix.regime_p=[1,0,0]) for all three. train.epochs=400 for 150/151/152, but all three are extracted at epoch 250 here for a fair matched-budget comparison — 152 was manually stopped at epoch 250 (2026-09-26); 150/151 were still running past 250 at extraction time and are cut to match. NOTE: 152 has one deliberate recipe deviation from 150/151 — data.query_prior is disabled (modes=[none]) after a reproduced torch.compile/AOTAutograd backward crash specific to Medverse's image_context NA-ICL channel under medverse.compile=true on this node; 150/151 keep their p=0.3 GT query-prior injection. See 152's config header for the full repro.",
   "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
   "wandb_project": "patchset_train",
   "runs": [
@@ -13,6 +13,11 @@
       "id": "xs5933wt",
       "name": "151_cascade_coldtransformer_singleaxis_l9",
       "description": "dual_axis=False, l=9 — early img-mask fusion via PixelShuffle (axis_fuse_r=4) before a row-axis-only (cross-context) transformer, cold transformer, l=9 compute-matched vs 150"
+    },
+    {
+      "id": "9s7d69ca",
+      "name": "152_cascade_medverse_baseline",
+      "description": "model=medverse (released architecture) — released Medverse.ckpt start (checkpoint=orig_weights), medverse_bounded_head=true (sigmoid-appended head -> real logit -> shared bce_dice-with-logits recipe, matching 150/151's adamw/1e-4/bce_dice exactly), eval_autocast=true, medverse.compile=true. Same data/augmentation/schedule as 150/151 except data.query_prior disabled (see runs.json description)."
     }
   ]
 }

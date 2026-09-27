@@ -118,7 +118,7 @@
 \def\colpitch{2.4}     
 \def\panelgap{2.6}     
 \def\clusterhalf{1.10} 
-\def\pairpitch{1.1}    % <-- Reduced from 1.5 to bring bi-axial patch columns closer
+\def\pairpitch{1.1}    
 
 \def\xlab{-0.8}        
 \def\yTgt{\rowpitch}   
@@ -126,7 +126,7 @@
 
 \def\boxw{6.0}         
 \def\xA{-0.30}        
-\def\ximgTop{0.7}      
+\def\ximgTop{1.0}      % Adjusted from 0.7 to keep Baseline columns centered
 \def\boxpad{0.60}      
 
 \begin{document}
@@ -158,12 +158,12 @@
   \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}              
   
   % X placements for columns inside boxes
-  \pgfmathsetmacro{\xlblTop}{\ximgTop+\colpitch}
+  \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}     % Reduced gap for Baseline img and lbl columns
   \pgfmathsetmacro{\xFusedTop}{\xlblTop+2.0}
   
   % Fuse operator dynamically placed exactly between img and lbl columns
   \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
-  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.45}
+  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.35} % Adjusted for bare oplus node
   \pgfmathsetmacro{\yMid}{\rowpitch/2}
   
   \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
@@ -208,6 +208,22 @@
   \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {fused};
   \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {fused};
 
+  % Background columns for Fuse (Vertical grouping)
+  \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
+    \fill[black!15,rounded corners=3pt]
+      ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+  }
+
+  % Background rows for Patch axis (Horizontal grouping, single column)
+  \foreach \y in {\yTgt,\yCtx} {
+    \foreach \doff in {-\toff,0,\toff} {
+      \fill[black!15,rounded corners=3pt]
+        ({\xFusedPatchTop-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
+        ({\xFusedPatchTop+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
+    }
+  }
+
   \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/archTargetAccent,
                                      \yCtx/archContextPink/archContextAccent} {
     \tpcluster{\ximgTop}{\y}{\imgfill}{black!70}
@@ -216,8 +232,8 @@
     \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
   }
 
-  % Huge centered fuse operator
-  \node[draw,circle,inner sep=3pt,font=\huge,fill=white,line width=1.5pt] at ({\xFuseOp},{\yMid}) {$\oplus$};
+  % Centered fuse operator without the circle
+  \node[font=\huge] at ({\xFuseOp},{\yMid}) {$\oplus$};
   \fusearrow{({\xFuseArrowStart},{\yMid})}{({\xFusedTop-\tsz/2-0.18},{\yMid})}{black!55}
 
   % TabPFN-style attention routing for the Baseline
@@ -267,9 +283,17 @@
     \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.25) {img};
     \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.25) {lbl};
 
+    % Background columns for Image/label axis (Vertical grouping)
+    \fill[black!15,rounded corners=3pt]
+      ({\ximgBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\ximgBot+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+    \fill[black!15,rounded corners=3pt]
+      ({\xlblBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\xlblBot+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+
+    % Background rows for Patch axis (Horizontal grouping)
     \foreach \y in {\yTgt,\yCtx} {
       \foreach \doff in {-\toff,0,\toff} {
-        % Darker background (black!15) with tighter vertical padding (0.10) to prevent overlap
         \fill[black!15,rounded corners=3pt]
           ({\ximgPatchBot-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
           ({\xlblPatchBot+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});

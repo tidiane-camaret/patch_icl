@@ -45,9 +45,9 @@ being approximately correct.
 
 \paragraph{Cross-level training via register tokens.} Medverse and Iris
 connect levels only through the rendered prediction feeding the next
-step, with no gradient path between them. We add a small set of learned
-register tokens $\mathbf{r}_\ell$ that participate in level $\ell$'s
-attention alongside the image and label tokens; their final state is
+step, with no gradient path between them. The register tokens already
+introduced in \autoref{sec:methodology-overview} give this a second,
+learned path: their final state $\mathbf{r}_\ell$ at level $\ell$ is
 carried into level $\ell{+}1$ via a learned projection and a
 level-independent type embedding:
 %

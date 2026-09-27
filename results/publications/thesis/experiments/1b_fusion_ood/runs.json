@@ -1,0 +1,98 @@
+{
+  "experiment": "1b_fusion_ood",
+  "description": "Reframed as a single unified 6-DATASET sweep (2026-09-26): TotalSeg CT itself is now measured through the exact same eval.py / fixed-3mm / single-level / fp32 / test-split protocol as the 5 held-out sources below, instead of being reported separately via train.py's internal bf16 epoch-250 val-split eval (that older in-distribution table in 1a_feature_fusion / 3_results.md used a DIFFERENT tool, precision, spacing (4.24mm), split (val), and a matched-epoch snapshot rather than each run's own best.pt -- not directly comparable to the numbers here). TotalSeg CT here uses dataset=d2_varspacing_15_6 (CT-only, v2 loader, crop_spacing_mm=3 is its own default, val_classes=all so seen/unseen tagging comes free via resolve_classes, eval.split=test -- 89 subjects, a genuinely held-out slice distinct from the val split used for checkpoint selection during training). Trade-off of unifying onto real best.pt checkpoints: exact epoch-matching across the three arms is lost (150 stopped ~epoch 263, 151 ~epoch 260, 152 fully converged at epoch ~399) -- a minor caveat for 150/151 (3 epochs apart) but material for 152, which had far more training left to give.\n\nOriginal 5-source OOD sweep description (unchanged in scope, just no longer a separate protocol from TotalSeg CT): cold-transformer chain's three architecture arms (150=bi-axial, 151=single-axis fusion l=9, 152=medverse baseline -- see 1a_feature_fusion/runs.json for the superseded in-distribution comparison) across totalseg_mri (CT-trained models' first exposure to TotalSegmentator's own MRI-modality subjects -- these models saw data.source_mix.regime_p=[1,0,0], i.e. CT-only tasks during training despite the multisource_ct_mri dataset group nominally including MRI), hu_lwk1 (CT, L1 vertebra measurement ROI), msd_prostate (MRI T2+ADC, PZ/TZ zones), msd_hippocampus (MRI T1, ant/post), flare22 (CT, 13 abdominal organs). ALL SIX evaluated single-level (no cascade) at a FIXED data.crop_spacing_mm=3 (inside these checkpoints' own train_spacing_range=[3,6], deliberately uniform across sources rather than each source's own individually-tuned default spacing -- cross-source Dice differences reflect task difficulty at a held resolution, not each source's best-case setup; predictable consequence: small targets (msd_hippocampus, msd_prostate) score lower here than their own tuned-spacing numbers reported elsewhere). eval.split=test uniformly (a no-op for hu_lwk1/msd_prostate/msd_hippocampus/flare22 -- none of those providers implement train/val/test split filtering, every converted case is eval data; REQUIRED for totalseg_mri and totalseg, whose meta.csv splits are train/test and train/val/test respectively). eval.n_subjects=null (full coverage, no subsampling). fp32 eval (eval.autocast=false, the harness default) uniformly across all three models. This standalone eval.py run has no query_prior injection for any model (single-level eval never touches it), so this sweep has NO recipe asymmetry between the three arms -- the cleanest of the three-way comparisons run so far. Checkpoints are each run's best.pt as of 2026-09-26 (all three training runs had stopped; GPU idle, no active training process at sweep time).",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {
+      "id": "6wwh34fg",
+      "name": "150_dualaxis_totalseg_3mm",
+      "description": "150 (bi-axial) on TotalSeg CT (dataset=d2_varspacing_15_6, all 117 classes, test split), single-level 3mm -- the in-distribution arm of the unified 6-dataset sweep"
+    },
+    {
+      "id": "c6l5c9mm",
+      "name": "151_singleaxis_totalseg_3mm",
+      "description": "151 (single-axis fusion, l=9) on TotalSeg CT, single-level 3mm"
+    },
+    {
+      "id": "u304tqco",
+      "name": "152_medverse_totalseg_3mm",
+      "description": "152 (medverse baseline) on TotalSeg CT, single-level 3mm"
+    },
+    {
+      "id": "tt8ji8yt",
+      "name": "150_dualaxis_totalseg_mri_3mm",
+      "description": "150 (bi-axial) on totalseg_mri, single-level 3mm"
+    },
+    {
+      "id": "04or3o7f",
+      "name": "150_dualaxis_hu_lwk1_3mm",
+      "description": "150 (bi-axial) on hu_lwk1 (CT, L1 vertebra ROI), single-level 3mm"
+    },
+    {
+      "id": "86arai6t",
+      "name": "150_dualaxis_msd_prostate_3mm",
+      "description": "150 (bi-axial) on msd_prostate (MRI T2+ADC, PZ/TZ), single-level 3mm"
+    },
+    {
+      "id": "sl4xp6lq",
+      "name": "150_dualaxis_msd_hippocampus_3mm",
+      "description": "150 (bi-axial) on msd_hippocampus (MRI T1, ant/post), single-level 3mm"
+    },
+    {
+      "id": "uypf89tm",
+      "name": "150_dualaxis_flare22_3mm",
+      "description": "150 (bi-axial) on flare22 (CT, 13 abdominal organs), single-level 3mm"
+    },
+    {
+      "id": "wdmghtv4",
+      "name": "151_singleaxis_totalseg_mri_3mm",
+      "description": "151 (single-axis fusion, l=9) on totalseg_mri, single-level 3mm"
+    },
+    {
+      "id": "fbzhpif9",
+      "name": "151_singleaxis_hu_lwk1_3mm",
+      "description": "151 (single-axis fusion, l=9) on hu_lwk1, single-level 3mm"
+    },
+    {
+      "id": "xyiw8i7t",
+      "name": "151_singleaxis_msd_prostate_3mm",
+      "description": "151 (single-axis fusion, l=9) on msd_prostate, single-level 3mm"
+    },
+    {
+      "id": "0bxh8tya",
+      "name": "151_singleaxis_msd_hippocampus_3mm",
+      "description": "151 (single-axis fusion, l=9) on msd_hippocampus, single-level 3mm"
+    },
+    {
+      "id": "okt82okj",
+      "name": "151_singleaxis_flare22_3mm",
+      "description": "151 (single-axis fusion, l=9) on flare22, single-level 3mm"
+    },
+    {
+      "id": "it2ljw05",
+      "name": "152_medverse_totalseg_mri_3mm",
+      "description": "152 (medverse baseline) on totalseg_mri, single-level 3mm"
+    },
+    {
+      "id": "p96timgj",
+      "name": "152_medverse_hu_lwk1_3mm",
+      "description": "152 (medverse baseline) on hu_lwk1, single-level 3mm"
+    },
+    {
+      "id": "5jrewi7y",
+      "name": "152_medverse_msd_prostate_3mm",
+      "description": "152 (medverse baseline) on msd_prostate, single-level 3mm"
+    },
+    {
+      "id": "xblykijo",
+      "name": "152_medverse_msd_hippocampus_3mm",
+      "description": "152 (medverse baseline) on msd_hippocampus, single-level 3mm"
+    },
+    {
+      "id": "jc7euif8",
+      "name": "152_medverse_flare22_3mm",
+      "description": "152 (medverse baseline) on flare22, single-level 3mm"
+    }
+  ]
+}

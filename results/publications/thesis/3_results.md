@@ -49,6 +49,74 @@ HU_LWK1 (**CT**, vertebra measurement ROI — the only CT OOD source).
 
 ## Fusion (Axis 1)
 
+**Medverse vs. our architecture (single-axis fusion) across six datasets.** The
+cold-transformer chain (`150`/`151`/`152`) trains all three architectures under an
+identical data pipeline, augmentation recipe, and optimizer/schedule. Rather than
+in-distribution accuracy followed by a separate generalization check, all six evaluation
+datasets are reported together from one consistent protocol: `eval.py`, fixed 3mm
+single-level crops, fp32, `test` split, each model's own best checkpoint (no epoch
+matching across arms — `150`/`151` stopped within 3 epochs of each other, `152` trained
+to full convergence). Rows are ordered by distance from the training distribution
+(TotalSeg CT itself → held-out modality/dataset/vocabulary):
+
+| dataset | Medverse (`152`) | Ours — single-axis fusion (`151`) |
+|---|---:|---:|
+| TotalSeg CT — seen | 0.348 | **0.574** |
+| TotalSeg CT — unseen | 0.221 | **0.408** |
+| TotalSeg MRI | 0.178 | **0.232** |
+| FLARE22 | 0.518 | **0.684** |
+| HU_LWK1 | **0.146** | 0.079 |
+| MSD Prostate | **0.377** | 0.205 |
+| MSD Hippocampus | 0.172 | **0.184** |
+| mean of 5 OOD sources | **0.278** | 0.264 |
+| params | **71.1M** | 74.1M |
+| GFLOPs | **2362.6** | 3973.1 |
+| latency (per-sample, fp32) | 72.7 ms | 73.0 ms |
+
+Single-axis wins 4/6 datasets (both TotalSeg splits, TotalSeg MRI, FLARE22) but Medverse
+wins on HU_LWK1 and MSD Prostate, and the two are close on MSD Hippocampus — averaged
+across the 5 OOD sources (unweighted by class count), Medverse actually edges ahead
+(0.278 vs. 0.264). Latency and GFLOPs are both measured fp32 here, so they're internally
+consistent with each other but not with the bf16 numbers reported elsewhere in this
+chapter. This sweep carries no `query_prior` asymmetry between the two models (single-level
+eval never touches it), unlike the in-distribution-only comparisons in this project's
+earlier history.
+
+**Single-axis vs. bi-axial attention, same six datasets.** A direct ablation of the
+architecture's own bi-axial design (row-axis cross-context + column-axis within-volume
+img↔mask attention) against an IRIS-style early-fusion alternative: img and mask are
+merged into one token per cell via a PixelShuffle trick *before* the transformer
+(`arch.dual_axis=false`), with only row-axis (cross-context) attention remaining.
+Compute-matched (`151`'s transformer depth raised to `l=9`; params are +52% higher for
+single-axis since row-axis-only layers can't buy back column-axis compute per-parameter).
+Both arms warm-start only the encoder/decoder from a shared checkpoint, with the entire
+in-context reasoning core randomly initialized for both. Same protocol and dataset order
+as the table above:
+
+| dataset | single-axis fusion, l=9 (`151`) | bi-axial (`150`) |
+|---|---:|---:|
+| TotalSeg CT — seen | 0.574 | **0.582** |
+| TotalSeg CT — unseen | 0.408 | **0.426** |
+| TotalSeg MRI | 0.232 | **0.259** |
+| FLARE22 | 0.684 | **0.693** |
+| HU_LWK1 | 0.079 | **0.102** |
+| MSD Prostate | 0.205 | **0.247** |
+| MSD Hippocampus | 0.122 | **0.184** |
+| mean of 5 OOD sources | 0.264 | **0.297** |
+| params | 74.1M | **48.7M** |
+| GFLOPs | 3973.1 | **3892.5** |
+| latency (per-sample, fp32) | **73.0 ms** | 72.5 ms |
+
+Bi-axial wins all 6/6 datasets — the cleanest, most consistently-generalizing result in
+this axis. Not yet settled: neither arm has reached its full training budget, this is N=1
+seed per arm, and the params mismatch (+52% for single-axis) leaves a residual capacity
+confound even after compute-matching.
+
+*(The comparison below is from an older checkpoint lineage — `exp92`'s whole-body
+`use_crop=false` protocol — kept for the thickness-driver analysis and compute table that
+build on it; see Experimental Setup's gap G1 on which lineage "Ours" should mean for the
+final thesis.)*
+
 **Fixed-spacing accuracy vs. Medverse**, `use_crop=false` whole-body
 protocol, 3897 samples, matched checkpoints (`vc7kfdto` / `94nlx7yw`):
 
@@ -98,40 +166,6 @@ attention" (v2/101: 1230 vs 2363 GFLOPs, ~52%), not "smaller model."** At
 matched (bf16) precision the wall-clock advantage narrows to ~1.05–1.27×
 from the native-precision 1.6–1.9× — most of that gap is a precision
 artifact, not architecture.
-
-**Bi-axial attention vs. early feature fusion.** A direct ablation of the
-architecture's own bi-axial design (row-axis cross-context + column-axis
-within-volume img↔mask attention) against an IRIS-style early-fusion
-alternative: img and mask are merged into one token per cell via a
-PixelShuffle trick *before* the transformer (`arch.dual_axis=false`), and
-only row-axis (cross-context) attention remains. Compute-matched (the
-single-axis arm's transformer layer count is raised to `l=9` so its
-GFLOPs land within 3% of the bi-axial baseline's — params could not be
-matched simultaneously this way and are +52% higher for single-axis, since
-row-axis-only layers are a parameter-inefficient way to buy back the
-missing column-axis compute). Both arms warm-start *only* the encoder and
-decoder from a shared checkpoint; the entire in-context reasoning core
-(transformer, img/mask embed, context/query id, thinking rows, cascade
-projection, pool projection) is randomly initialized for **both** arms —
-removing the asymmetric-warm-start confound an earlier, uncontrolled
-version of this ablation had (one arm fine-tuning an already
-~200-epoch-trained transformer, the other only partially warm). Real
-anatomy only (`p_synth=0`), CT-only, TotalSeg val, both arms read at a
-matched epoch (160) since the single-axis run had not yet reached its full
-400-epoch budget at analysis time:
-
-| arm | val Dice | seen | unseen |
-|---|---:|---:|---:|
-| **bi-axial (dual_axis=true)** | **0.462** | **0.527** | **0.389** |
-| single-axis fusion (dual_axis=false, l=9) | 0.448 | 0.510 | 0.377 |
-
-Bi-axial attention wins on all three metrics at matched epoch, matched
-compute, and a from-scratch reasoning core — a smaller and better-controlled
-gap than the earlier uncontrolled comparison. Not yet a settled result:
-single-axis was still training toward its full budget (both arms were
-still climbing at epoch 160, neither converged), this is N=1 seed per arm,
-and the params mismatch (+52% for single-axis) means a residual capacity
-confound remains even after compute-matching.
 
 ## Cascade (Axis 2)
 
