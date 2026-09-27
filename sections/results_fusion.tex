@@ -94,7 +94,7 @@ model's compute, and parameter count and compute could not be matched simultaneo
 this route (matching compute instead leaves parameters 52\% higher for the single-axis
 control); (2) both runs warm-start \emph{only} the encoder and decoder from a shared
 checkpoint, with the entire in-context reasoning core (transformer, image/label embeddings,
-context/query id, thinking rows, cascade projection, pool projection) randomly initialized
+context/query id, register tokens, cascade projection, pool projection) randomly initialized
 for both arms, so neither model starts from an already-trained transformer. Both runs use
 real anatomy only ($p_\text{synth}{=}0$), CT only at train time, and the same evaluation
 protocol and dataset grouping as the table above.

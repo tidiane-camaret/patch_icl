@@ -17,9 +17,11 @@ applied once, with no iterative refinement across scales.
 next-scale autoregressive segmentation, inspired by next-scale image
 generation~\cite{tian2024visual}: at each step, the target and the
 previous step's (perturbed) prediction are concatenated and processed by
-a shared U-Net, together with the real context pairs. Every step still
-re-scans the \emph{entire} volume with a sliding window -- only the input
-changes with scale, not the spatial extent processed.
+a shared U-Net, together with the real context pairs, correlated via a
+blockwise cross-attention module that pools queries and keys to block
+resolution for efficiency (\autoref{sec:methodology-fusion}). Every step
+still re-scans the \emph{entire} volume with a sliding window -- only the
+input changes with scale, not the spatial extent processed.
 
 \paragraph{Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a}}
 stacks levels of increasing resolution for large-volume segmentation, but

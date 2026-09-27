@@ -1,22 +1,31 @@
 \subsection{Bi-Axial Image--Label Fusion}\label{sec:methodology-fusion}
 
-How a model combines image and label evidence is a central design choice.
+How a model combines image and label evidence, and how context and target
+interact, are two related design choices this section addresses together.
 Medverse~\cite{huMedverseUniversalModel2025a} concatenates image and label
-channels before a shared U-Net, merging the two streams before most of the
-network's capacity is applied. Iris~\cite{gaoShowSegmentUniversal2025}
-instead fuses image and label features once, through a pixel
-shuffle--unshuffle operation between context and target. Both commit to a
-single fusion point. We instead keep image tokens $z^{\text{img}}$ and
-label tokens $z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as
-separate streams throughout the network and let them exchange information
-repeatedly, over two attention axes applied at every layer:
+channels before a shared U-Net; context and target then interact through a
+Blockwise Cross-Attention Module (BAM) placed at two points in that network
+(once encoder-side, once decoder-side), which pools its queries and keys to
+block resolution before attending -- trading positional precision for a
+cheaper attention cost -- while its values stay at full resolution.
+Iris~\cite{gaoShowSegmentUniversal2025} fuses image and label features
+once, through a pixel shuffle--unshuffle operation, then lets context
+inform the target through a single bidirectional cross-attention step
+against a compressed, per-class task embedding computed once and reused
+across every query. Both commit every design choice -- fusion point and
+context--target interaction alike -- to a single, early step, computed
+once. We instead keep image tokens $z^{\text{img}}$ and label tokens
+$z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as separate streams
+throughout the network and let them exchange information repeatedly, over
+two attention axes applied at every layer, on the full, uncompressed token
+grid:
 
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
   \item \textbf{Slot axis}: at each cell, the image and label token attend
     to each other, letting label evidence sharpen the image representation
     and vice versa, independently per cell.
   \item \textbf{Row axis}: every cell of every volume -- context, target,
-    and the thinking rows -- attends over the entire token sequence at
+    and the register tokens -- attends over the entire token sequence at
     once, using 3D axial rotary position embeddings so attention is a
     function of physical distance between cells rather than raw grid
     index. This single joint attention performs within-volume
