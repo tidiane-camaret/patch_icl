@@ -14,7 +14,7 @@ rather than being silently reported as settled.
 separate (gap G1 — not yet resolved which one "Ours" means for the final
 thesis):
 
-- **`exp92_multisource_synth`** (bi-axial attention, query-prior init,
+- **`exp92_multisource_synth`** (dual attention, query-prior init,
   register carry gated off) — the source of every Fusion and Cascade
   number below. `PatchSetV2` (configs 100/101/103/104) is not converged
   (dice 0.006–0.235 at last check, well below `exp92`'s 0.43–0.58 range)
@@ -82,18 +82,18 @@ chapter. This sweep carries no `query_prior` asymmetry between the two models (s
 eval never touches it), unlike the in-distribution-only comparisons in this project's
 earlier history.
 
-**Single-axis vs. bi-axial attention, same six datasets.** A direct ablation of the
-architecture's own bi-axial design (row-axis cross-context + column-axis within-volume
-img↔mask attention) against an IRIS-style early-fusion alternative: img and mask are
+**Single-axis vs. dual attention, same six datasets.** A direct ablation of the
+architecture's own dual-attention design (position axis, cross-context + modality axis,
+within-cell img↔mask attention) against an IRIS-style early-fusion alternative: img and mask are
 merged into one token per cell via a PixelShuffle trick *before* the transformer
-(`arch.dual_axis=false`), with only row-axis (cross-context) attention remaining.
+(`arch.dual_axis=false`), with only the position axis (cross-context) attention remaining.
 Compute-matched (`151`'s transformer depth raised to `l=9`; params are +52% higher for
-single-axis since row-axis-only layers can't buy back column-axis compute per-parameter).
+single-axis since position-axis-only layers can't buy back modality-axis compute per-parameter).
 Both arms warm-start only the encoder/decoder from a shared checkpoint, with the entire
 in-context reasoning core randomly initialized for both. Same protocol and dataset order
 as the table above:
 
-| dataset | single-axis fusion, l=9 (`151`) | bi-axial (`150`) |
+| dataset | single-axis fusion, l=9 (`151`) | dual attention (`150`) |
 |---|---:|---:|
 | TotalSeg CT — seen | 0.574 | **0.582** |
 | TotalSeg CT — unseen | 0.408 | **0.426** |
@@ -107,7 +107,7 @@ as the table above:
 | GFLOPs | 3973.1 | **3892.5** |
 | latency (per-sample, fp32) | **73.0 ms** | 72.5 ms |
 
-Bi-axial wins all 6/6 datasets — the cleanest, most consistently-generalizing result in
+Dual attention wins all 6/6 datasets — the cleanest, most consistently-generalizing result in
 this axis. Not yet settled: neither arm has reached its full training budget, this is N=1
 seed per arm, and the params mismatch (+52% for single-axis) leaves a residual capacity
 confound even after compute-matching.

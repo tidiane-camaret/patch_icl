@@ -1,4 +1,4 @@
-\documentclass[tikz,border=4pt]{standalone}
+\documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
@@ -7,7 +7,7 @@
 \begin{tikzpicture}[x=1cm,y=1cm]
 
   % title
-  \node[anchor=west,font=\Large] at (0,7.6) {Medverse \textnormal{(Hu et al., 2025)}};
+  \node[anchor=west] at (0,7.6) {\archtitle Medverse \textnormal{(Hu et al., 2025)}};
   \draw[archContextPink!0,line width=0.8pt] (0,7.15) -- (12,7.15); % placeholder rule
 
   % ---- row 1: target ----

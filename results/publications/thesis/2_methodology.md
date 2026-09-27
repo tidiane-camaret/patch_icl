@@ -38,7 +38,7 @@ target's label token instead starts from either a neutral placeholder or
 the previous cascade level's prediction (see Cascade), since the target
 mask is exactly what is being predicted.
 
-## Fusion (bi-axial image–label attention) — Axis 1
+## Fusion (dual attention: modality axis + position axis) — Axis 1
 
 How a model combines image and label evidence is a central design choice.
 Medverse concatenates image and label channels before a shared U-Net,
@@ -47,13 +47,15 @@ Iris instead fuses image and label features once, through a pixel
 shuffle–unshuffle operation between context and target. Both commit to a
 single fusion point. We instead keep image tokens $z^{\text{img}}$ and
 label tokens $z^{\text{lbl}}$ as separate streams throughout the network
-and let them exchange information repeatedly, over two attention axes
-applied at every layer:
+and let them exchange information repeatedly, through dual attention (cf.
+Fu et al.'s Dual Attention Network, 2019, which fuses a position-wise and
+a channel-wise attention branch per layer for scene segmentation) — two
+attention axes applied at every layer:
 
-- **Slot axis**: at each cell, the image and label token attend to each
+- **Modality axis**: at each cell, the image and label token attend to each
   other, letting label evidence sharpen the image representation and vice
   versa, independently per cell.
-- **Row axis**: every cell of every volume — context, target, and the
+- **Position axis**: every cell of every volume — context, target, and the
   thinking rows — attends over the entire token sequence at once, using
   3D axial rotary position embeddings so attention is a function of
   physical distance between cells rather than raw grid index. This single
@@ -87,8 +89,8 @@ $$z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell
 where $\mathrm{Warp}$ resamples level $\ell{-}1$'s prediction onto level
 $\ell$'s crop grid, correcting for the two levels' different centers,
 field of view, and any augmentation applied independently to each. This
-makes the previous level's belief part of the same token stream that
-attends bi-axially with the image, rather than a separate side channel.
+makes the previous level's belief part of the same token stream processed
+by dual attention alongside the image, rather than a separate side channel.
 
 **Figure:** `imgs/method/arch_query_prior.pdf` — flow across two levels.
 

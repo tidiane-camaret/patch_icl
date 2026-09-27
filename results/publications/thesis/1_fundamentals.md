@@ -103,4 +103,4 @@ making a different choice on the three axes this thesis organizes around:
 | UniverSeg | dense cross-attention | no | no |
 | Iris | one-shot pixel shuffle | no | no |
 | Medverse | early concatenation | full-volume re-scan every step | no |
-| **Ours** | bi-axial (repeated exchange) | region-restricted + register-carried | GMM repaint + texture noise |
+| **Ours** | dual attention (repeated exchange) | region-restricted + register-carried | GMM repaint + texture noise |

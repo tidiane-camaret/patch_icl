@@ -1,4 +1,4 @@
-\documentclass[tikz,border=4pt]{standalone}
+\documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
@@ -43,13 +43,13 @@
   \archtokengrid{7.05}{1.3125}{3}{1}{0.875}{archContextPink}
   \archtokengrid{7.925}{1.3125}{3}{1}{0.875}{archContextAccent}
 
-  % ---- bi-axial attention block ----
+  % ---- dual attention block ----
   % Centered arrow entering the block
   \archarrow{(8.80,3.9375)}{(9.30,3.9375)}{archArrowPale}
   
   % Outer Attention wrapper
   \draw[archAttnBlue!70!black,thin,dashed] (9.30, 2.10) rectangle (14.80, 6.30);
-  \node[align=center] at (12.05,6.60) {bi-axial\\attention};
+  \node[align=center] at (12.05,6.60) {\archboxlabel dual\\attention};
 
   % --- Sub-block 1: Image/Label axis ---
   % Box width is 2.5

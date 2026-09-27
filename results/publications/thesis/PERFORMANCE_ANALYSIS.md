@@ -16,7 +16,7 @@ the thesis; port conclusions into `3_results.md` once resolved.
 
 **Scope note:** almost all usable numbers below come from the
 `exp92_multisource_synth` / cascade-`[6,3,1.5]` architecture line (the one
-described in `3_method.md`: bi-axial attention, query-prior init, register
+described in `3_method.md`: dual attention, query-prior init, register
 carry gated off by default). The newest `PatchSetV2` line (configs 100/101/103/104,
 git commit `970ab44`) is **not converged** (see §5) and should not be the
 source of any publication number yet — but it may be the actual target
@@ -66,7 +66,7 @@ what drives the gap:**
   (`[[project_patchset3d_vs_medverse_3d]]`) confirms it's *object thickness*,
   not object identity or contrast, that predicts the winner.
 
-**Hypothesis for why:** bi-axial image/label attention lets label evidence
+**Hypothesis for why:** dual attention's modality axis lets label evidence
 sharpen image features at every layer without needing a large convolutional
 receptive field, so it resolves thin/high-frequency shapes early. Thick,
 large-volume structures likely need appearance consistency aggregated over a

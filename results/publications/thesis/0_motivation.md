@@ -24,8 +24,8 @@ each with its own mechanism:
    image and mask channels before a shared encoder, or fusing them once
    through a single operation, commits to one fusion point before most of
    the network's capacity is applied. Chapter [Methodology] proposes
-   *bi-axial image--label attention*, keeping the two streams separate and
-   letting them exchange information repeatedly.
+   *dual attention*, keeping the two streams separate and letting them
+   exchange information repeatedly over a modality axis and a position axis.
 2. **Where should compute be spent?** Re-scanning an entire volume with a
    sliding window at every processing step wastes compute on regions
    already known not to contain the structure of interest. Chapter
@@ -42,7 +42,7 @@ each with its own mechanism:
 
 **Contributions.**
 
-- A bi-axial image--label attention mechanism for in-context 3D
+- A dual attention mechanism for in-context 3D
   segmentation, contrasted against early-concatenation (Medverse) and
   one-shot fusion (Iris) baselines.
 - A coarse-to-fine cascade in which the query prior, region-restricted

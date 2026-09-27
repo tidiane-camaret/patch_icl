@@ -17,10 +17,10 @@ label token directly from level $\ell{-}1$'s own prediction:
 where $\mathrm{Warp}$ resamples level $\ell{-}1$'s prediction onto level
 $\ell$'s crop grid, correcting for the two levels' different centers,
 field of view, and any augmentation applied independently to each. This
-makes the previous level's belief part of the same token stream that
-attends bi-axially with the image (\autoref{sec:methodology-fusion}), rather
-than a separate side channel. \autoref{fig:query-prior} shows this flow
-across two levels.
+makes the previous level's belief part of the same token stream processed
+by dual attention alongside the image (\autoref{sec:methodology-fusion}),
+rather than a separate side channel. \autoref{fig:query-prior} shows this
+flow across two levels.
 
 \begin{figure}[t]
   \centering

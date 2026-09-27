@@ -74,9 +74,9 @@ them and both names are already load-bearing in the draft.
         │  z^img, z^lbl : (T·N, e) each│
         ▼                              │
  ┌───────────────────────────┐         │
- │  l × bi-axial attention   │  (§3 / "sample-row attention")
- │   - slot axis  (img↔lbl)  │
- │   - row axis   (cell↔cell,│
+ │  l × dual attention       │  (§3 / "sample-row attention")
+ │   - modality axis (img↔lbl)│
+ │   - position axis (cell↔cell,│
  │     cross-volume, RoPE)   │
  └───────────────────────────┘         │
         │  q : (N, e)  query image slot│
@@ -141,9 +141,9 @@ fixed-size read/write scratch space untied to any single cell.
 ### 2.3 Attend
 
 $l$ stacked layers, each alternating two attention axes over the row/slot
-token grid — this *is* the paper's bi-axial design (§sec:biaxial), detailed in
-§3 below because it's the piece most worth pinning down precisely for the
-method section.
+token grid — this *is* the paper's dual attention design (§sec:biaxial),
+detailed in §3 below because it's the piece most worth pinning down precisely
+for the method section.
 
 ### 2.4 Decode
 
@@ -165,19 +165,19 @@ prediction, no final resize).
 
 ---
 
-## 3. Sample/row attention (the bi-axial mechanism)
+## 3. Sample/row attention (the dual attention mechanism)
 
 At any layer, the live token tensor is $X \in \mathbb R^{r \times c \times e}$:
 $r$ rows = ($n_t$ registers) $\cup$ ($K{\cdot}N$ support cells) $\cup$ ($N$
 query cells); $c=2$ columns = {img, lbl} slots. Each layer applies two
 attentions in sequence:
 
-**Slot axis** (fixed row, attend over $c$): the image and label tokens *at the
+**Modality axis** (fixed row, attend over $c$): the image and label tokens *at the
 same cell* attend to each other. This is a direct, literal implementation of
 `3_method.tex`'s "Image/label axis" — label evidence sharpens the image
 representation and vice versa, at every cell independently.
 
-**Row axis** (fixed slot, attend over $r$): every cell of every volume — support,
+**Position axis** (fixed slot, attend over $r$): every cell of every volume — support,
 query, and the registers — attends over the *entire* row sequence at once,
 using 3D-axial RoPE so relative attention is a function of physical
 $(i,j,k)$ distance (positions are scaled by `spacing / rope_train_mm`, so a
@@ -194,13 +194,14 @@ count). Masking variants (mutually exclusive):
 **[divergence]** `3_method.tex` §sec:backbone describes spatial self-attention
 ("Patch axis") and cross-context attention as two separate stages inherited
 from the ResEnc bottleneck design (within-volume self-attention, *then*
-read-only cross-attention into context). The row axis above does **not**
+read-only cross-attention into context). The position axis above does **not**
 separate these: one dense (or masked) attention jointly does spatial
 self-attention *and* cross-volume matching, because cells from every volume
 and every spatial position already live in the same flat $r$-length sequence —
 there is no separate "volume" tensor axis to stage a second attention over.
-`3_method.tex`'s "Patch axis" bullet should either be dropped (row axis already
-covers it) or rewritten to describe this one joint mechanism; picking one is a
+`3_method.tex`'s "Patch axis" bullet should either be dropped (position axis
+already covers it) or rewritten to describe this one joint mechanism; picking
+one is a
 prerequisite for closing the `\TODO` on Eq. factorization in §sec:biaxial.
 
 **Decode source.** Only the query row's **image** slot is read out for
@@ -288,7 +289,7 @@ instead of) the query-prior mask channel above:
 
 $$\mathbf r_{\ell+1,0} = W_r\,\mathbf r_{\ell,\text{final}} + \mathbf e_{\ell+1}$$
 
-Implementation: level $\ell$'s thinking rows, mean-pooled over the slot axis
+Implementation: level $\ell$'s thinking rows, mean-pooled over the modality axis
 $c$, are projected ($W_r$ = `cascade_proj`, a plain `Linear(e,e)`) and tagged
 with a learned, level-independent type vector (`cascade_type`) that marks them
 as *carried memory*, distinct from level $\ell{+}1$'s own **fresh** thinking
