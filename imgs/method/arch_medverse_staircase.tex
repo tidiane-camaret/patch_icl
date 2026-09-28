@@ -10,18 +10,22 @@
 % "Baseline: early fusion" and "Ours: dual attn." -- same box language,
 % same xL convention, so the reader compares shapes, not drawing styles.
 %
-% Four boxes: Fuse (context only, 1x -- same as the baseline panel's Fuse)
-% -> Separate encoders -> Cross-attn -> Separate encoders (xL). The
-% repeated pair mirrors one real stage block exactly: own conv (=
-% "Separate encoders" #1) -> cross-attention -> concat + 1x1 conv +
-% residual, which is ALSO separately-weighted per stream (=
-% "Separate encoders" #2) -- see arch_medverse_attn_detail.tex for the
-% literal per-block wiring this collapses. Fuse sits outside the xL
-% wrapper because it happens once, upstream, exactly like the baseline
+% Two boxes: Fuse (context only, 1x -- same as the baseline panel's Fuse)
+% -> Per-img conv block + cross-attn (xL). The second box holds BOTH
+% sub-steps together: each row's own conv (own_conv in
+% ConvBlock_context_t2c / target_conv in PairwiseConvAvgModelBlock_c2t),
+% drawn as a plain "CNN" block, feeds into that row's token column, and
+% the two token columns are then coupled by the same cross-attention fan
+% as before -- so the CNN blocks sit right next to what they feed,
+% instead of occupying their own upstream box. See
+% arch_medverse_attn_detail.tex for the full per-block wiring this
+% collapses (concat + 1x1 conv + residual after attention is folded back
+% into this one box rather than drawn separately). Fuse sits outside the
+% xL wrapper because it happens once, upstream, exactly like the baseline
 % panel's Fuse box; here L = U-Net stages, not transformer layers, and
 % (as in arch_medverse_biaxial.tex) the down-path/up-path attention
 % asymmetry is simplified to one generic coupling per repeat rather than
-% drawn twice -- see that figure's note for the full detail.
+% drawn twice.
 % ---------------------------------------------------------------------------
 
 \definecolor{archBrightBlue}{HTML}{3B82F6}
@@ -56,13 +60,12 @@
 \newcommand{\fusearrow}[3]{
   \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
 }
-% \encbox{x}{y}{color} -- colored outline around one row's cluster inside a
-% "Separate encoders" step, signaling "this stream's own weights, no
-% interaction here".
-\newcommand{\encbox}[3]{
-  \draw[#3,line width=1.2pt,rounded corners=3pt]
-    (#1-\tsz/2-0.15,#2-\toff-\tsz/2-0.12) rectangle
-    (#1+\tsz/2+0.15,#2+\toff+\tsz/2+0.12);
+% \cnnblock{x}{y}{fill}{draw} -- one row's own-weights conv block, drawn as
+% a plain labeled "CNN" rectangle rather than a token cluster.
+\newcommand{\cnnblock}[4]{
+  \draw[#4,fill=#3,line width=1.2pt,rounded corners=4pt]
+    (#1-\cnnw/2,#2-\cnnh/2) rectangle ++(\cnnw,\cnnh);
+  \node[align=center] at (#1,#2) {\archboxlabel CNN};
 }
 % \tabpfnattn{x} -- full target<->context attention fan at column x,
 % cascading opacity by token distance (style: TabPFN Fig. 1).
@@ -116,21 +119,26 @@
 \def\ximgTop{1.0}
 \def\boxpad{0.60}
 
+% ---- merged Encoder+Cross-attn box: wider than \boxw, it holds two
+% sub-columns (CNN block, token column) instead of one ----
+\def\boxwB{7.6}
+\def\cnnw{1.9}
+\def\cnnh{1.9}
+
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
-  \pgfmathsetmacro{\xEncA}{\xFuse+\boxw+\panelgap}
-  \pgfmathsetmacro{\xAttn}{\xEncA+\boxw+\panelgap}
-  \pgfmathsetmacro{\xEncB}{\xAttn+\boxw+\panelgap}
+  \pgfmathsetmacro{\xBlock}{\xFuse+\boxw+\panelgap}
 
   \pgfmathsetmacro{\boxFuseCenter}{\xFuse+\boxw/2}
-  \pgfmathsetmacro{\boxEncACenter}{\xEncA+\boxw/2}
-  \pgfmathsetmacro{\boxAttnCenter}{\xAttn+\boxw/2}
-  \pgfmathsetmacro{\boxEncBCenter}{\xEncB+\boxw/2}
+  \pgfmathsetmacro{\boxBlockCenter}{\xBlock+\boxwB/2}
+  \pgfmathsetmacro{\xCnnCol}{\xBlock+1.6}
+  \pgfmathsetmacro{\xTokCol}{\xBlock+\boxwB-1.6}
 
-  % xL wrapper spans all three repeated boxes -- Fuse happens once, upstream
-  \pgfmathsetmacro{\outerLeft}{\xEncA-0.50}
-  \pgfmathsetmacro{\outerRight}{\xEncB+\boxw+0.50}
+  % xL wrapper spans the merged Encoder+Cross-attn box only -- Fuse
+  % happens once, upstream
+  \pgfmathsetmacro{\outerLeft}{\xBlock-0.50}
+  \pgfmathsetmacro{\outerRight}{\xBlock+\boxwB+0.50}
   \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
   \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
   \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
@@ -145,7 +153,7 @@
   \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
 
   % ---- title ----
-  \node[anchor=south] at ({\xFuse+(\xEncB+\boxw-\xFuse)/2},{\methodTitleY})
+  \node[anchor=south] at ({\xFuse+(\xBlock+\boxwB-\xFuse)/2},{\methodTitleY})
     {\archtitle Medverse: context-fused, cross-attn.};
 
   % ---- xL wrapper ----
@@ -156,21 +164,14 @@
   \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
     (\xFuse,\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuse+\boxw},\yTgt+\clusterhalf+\boxpad);
   \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-    ({\xEncA},\yCtx-\clusterhalf-\boxpad) rectangle ({\xEncA+\boxw},\yTgt+\clusterhalf+\boxpad);
-  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-    ({\xAttn},\yCtx-\clusterhalf-\boxpad) rectangle ({\xAttn+\boxw},\yTgt+\clusterhalf+\boxpad);
-  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-    ({\xEncB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xEncB+\boxw},\yTgt+\clusterhalf+\boxpad);
+    ({\xBlock},\yCtx-\clusterhalf-\boxpad) rectangle ({\xBlock+\boxwB},\yTgt+\clusterhalf+\boxpad);
 
   \node[anchor=south] at ({\boxFuseCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse (context only)};
-  \node[anchor=south] at ({\boxEncACenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Separate encoders};
-  \node[anchor=south] at ({\boxAttnCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Cross-attn};
-  \node[anchor=south] at ({\boxEncBCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Separate encoders};
+  \node[anchor=south,align=center] at ({\boxBlockCenter},\yTgt+\clusterhalf+\boxpad+0.20)
+    {\archboxlabel Per-img conv block + cross-attn};
   \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
-  \archarrow{({\xFuse+\boxw+0.50},{\yMid})}{({\xEncA-0.50},{\yMid})}{black!30}
-  \archarrow{({\xEncA+\boxw+0.50},{\yMid})}{({\xAttn-0.50},{\yMid})}{black!30}
-  \archarrow{({\xAttn+\boxw+0.50},{\yMid})}{({\xEncB-0.50},{\yMid})}{black!30}
+  \archarrow{({\xFuse+\boxw+0.50},{\yMid})}{({\xBlock-0.50},{\yMid})}{black!30}
 
   % ---- column headers (Fuse box) ----
   \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
@@ -184,8 +185,14 @@
       ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
   }
 
-  % ---- target row: raw image tokens, unsplit fill, bypass the fuse ----
+  % ---- target row: raw image tokens, unsplit fill, bypass the fuse.
+  % Unlike the patchset arms (arch_biaxial.tex), target here has no label
+  % column at all -- not even a zero-mask placeholder, Medverse's
+  % TargetEncoder never receives one. The gray lbl token is kept anyway,
+  % purely for column alignment with the other panels; it is deliberately
+  % left with no arrows in or out, since it plays no role in the fuse ----
   \tpcluster{\ximgTop}{\yTgt}{archTargetGreen}{black!70}
+  \tpcluster{\xlblTop}{\yTgt}{black!8}{black!70}
   \tpcluster{\xFusedTop}{\yTgt}{archTargetGreen}{black!70}
   \fusearrow{({\ximgTop+\tsz/2+0.18},{\yTgt})}{({\xFusedTop-\tsz/2-0.18},{\yTgt})}{black!40}
 
@@ -196,35 +203,26 @@
   \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
   \fusearrow{({\xFuseArrowStart},{\yCtx})}{({\xFusedTop-\tsz/2-0.18},{\yCtx})}{black!55}
 
-  % ---- Separate encoders #1 (own conv, before attention): colored
-  % outlines -- not the neutral grey grouping used elsewhere -- signal
-  % "different weights"; deliberately no lines between rows ----
-  \encbox{\boxEncACenter}{\yTgt}{archTargetAccent}
-  \encbox{\boxEncACenter}{\yCtx}{archContextAccent}
-  \tpcluster{\boxEncACenter}{\yTgt}{archTargetGreen}{black!70}
-  \tpclustersplit{\boxEncACenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+  % ---- Per-img conv block + cross-attn: CNN block (own weights, no
+  % interaction) sits right next to the token column it feeds ----
+  \cnnblock{\xCnnCol}{\yTgt}{archTargetGreen!35}{archTargetAccent}
+  \cnnblock{\xCnnCol}{\yCtx}{archContextPink!35}{archContextAccent}
+  \fusearrow{({\xCnnCol+\cnnw/2+0.15},{\yTgt})}{({\xTokCol-\tsz/2-0.18},{\yTgt})}{black!40}
+  \fusearrow{({\xCnnCol+\cnnw/2+0.15},{\yCtx})}{({\xTokCol-\tsz/2-0.18},{\yCtx})}{black!40}
 
-  % ---- background row groupings (Cross-attn box) ----
+  % ---- background row groupings (token column) ----
   \foreach \y in {\yTgt,\yCtx} {
     \foreach \doff in {-\toff,0,\toff} {
       \fill[black!15,rounded corners=3pt]
-        ({\boxAttnCenter-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
-        ({\boxAttnCenter+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
+        ({\xTokCol-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
+        ({\xTokCol+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
     }
   }
 
-  % ---- Cross-attn: the only step where the two streams actually meet ----
-  \tpcluster{\boxAttnCenter}{\yTgt}{archTargetGreen}{black!70}
-  \tpclustersplit{\boxAttnCenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
-  \tabpfnattn{\boxAttnCenter}
-
-  % ---- Separate encoders #2 (concat + 1x1 conv + residual, after
-  % attention): same "own weights, no interaction" language as #1 --
-  % see arch_medverse_attn_detail.tex for what this box collapses ----
-  \encbox{\boxEncBCenter}{\yTgt}{archTargetAccent}
-  \encbox{\boxEncBCenter}{\yCtx}{archContextAccent}
-  \tpcluster{\boxEncBCenter}{\yTgt}{archTargetGreen}{black!70}
-  \tpclustersplit{\boxEncBCenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+  % ---- token column: the only place the two streams actually meet ----
+  \tpcluster{\xTokCol}{\yTgt}{archTargetGreen}{black!70}
+  \tpclustersplit{\xTokCol}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+  \tabpfnattn{\xTokCol}
 
 \end{tikzpicture}
 \end{document}
