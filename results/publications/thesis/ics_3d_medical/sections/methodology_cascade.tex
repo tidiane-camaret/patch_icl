@@ -43,20 +43,4 @@ then scales with the size of the structure rather than the size of the
 input volume, at the cost of depending on the coarse level's localization
 being approximately correct.
 
-\paragraph{Cross-level training via register tokens.} Medverse and Iris
-connect levels only through the rendered prediction feeding the next
-step, with no gradient path between them. The register tokens already
-introduced in \autoref{sec:methodology-overview} give this a second,
-learned path: their final state $\mathbf{r}_\ell$ at level $\ell$ is
-carried into level $\ell{+}1$ via a learned projection and a
-level-independent type embedding:
-%
-\begin{equation}
-  \mathbf{r}_{\ell+1,0} = W_r\, \mathbf{r}_{\ell,\text{final}} + \mathbf{e}_{\ell+1}.
-\end{equation}
-%
-Unlike the query prior, this path is not detached between levels: level
-$\ell{+}1$'s loss can backpropagate into level $\ell$'s own attention,
-giving the model a direct incentive to carry forward whatever helps the
-next level -- e.g.\ uncertainty or cues about neighboring structures --
-beyond what the rendered mask alone can encode.
+

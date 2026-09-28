@@ -7,10 +7,11 @@ thesis's architecture is considered; the second asks whether keeping image
 and label evidence as separate streams -- dual attention -- helps further,
 within that same encoder-and-attention family.
 
-\paragraph{Setup.} \autoref{tab:relatedwork} classifies Medverse's fusion strategy as early
-concatenation: image and label channels are merged before a shared U-Net processes them,
-committing to a single fusion point at the very start of the network. This arm is labeled
-\textbf{Early Concat} throughout, not Medverse: it starts from Medverse's released weights
+\paragraph{Setup.} \autoref{tab:relatedwork} classifies Medverse's fusion strategy as dual
+U-Net cross-attention: target and context are encoded by two separate U-Nets and fused via
+cross-attention between the two streams at every stage, rather than through a single shared
+encoder. This arm is labeled \textbf{Dual U-Net Cross-Attn} throughout, not Medverse: it
+starts from Medverse's released weights
 (the best available starting point for this architecture) but is then trained under the
 identical recipe as the other two arms for the same $\sim$250 epochs -- a different thing
 from the released, unmodified baseline evaluated elsewhere in this thesis
@@ -25,23 +26,23 @@ Its transformer depth is raised from $l{=}4$ to $l{=}9$ specifically to compute-
 dual-attention arm (removing the modality axis also removes a large share of the model's
 compute; parameter count and compute could not be matched simultaneously, leaving
 parameters 52\% higher for the single-axis control). This adjustment is made relative to
-dual attention only, not to Early Concat, so the Early Concat comparison alone is not
+dual attention only, not to Dual U-Net Cross-Attn, so the Dual U-Net Cross-Attn comparison alone is not
 compute-matched.
 
 All three arms train under an identical recipe (\autoref{tab:fusion-trainsettings}), an
 identical data pipeline, and an identical augmentation recipe, but not an identical
-starting point: Early Concat keeps its released initialization, while the single-axis and
+starting point: Dual U-Net Cross-Attn keeps its released initialization, while the single-axis and
 dual-attention arms warm-start only the encoder and decoder from a shared checkpoint, with
 the entire in-context reasoning core (transformer, image/label embeddings, context/query
 id, register tokens, cascade projection, pool projection) randomly initialized for both --
 so neither patchset arm starts from an already-trained transformer. Training uses real
 anatomy only ($p_\text{synth}{=}0$), CT only. The three arms also did not train to a
-matched stopping point: Early Concat trained to full convergence, the patchset arms did not.
+matched stopping point: Dual U-Net Cross-Attn trained to full convergence, the patchset arms did not.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Training settings shared by Early Concat, the single-axis control, and dual
+  \caption{Training settings shared by Dual U-Net Cross-Attn, the single-axis control, and dual
   attention (ours). Epoch count is a placeholder pending confirmation of the exact
   per-arm value.}
   \label{tab:fusion-trainsettings}
@@ -76,14 +77,14 @@ of ``unseen'' from a novel organ; TotalSegmentator's own MRI acquisition isolate
 \begin{table}[t]
   \centering
   \small
-  \caption{Early Concat, the single-axis control, and dual attention (ours), across all
+  \caption{Dual U-Net Cross-Attn, the single-axis control, and dual attention (ours), across all
   evaluation datasets (\autoref{sec:results-setup}). Grouped by vocabulary relationship:
   in-vocabulary seen/unseen, novel-vocabulary (unseen by construction), non-object,
   held-out modality.}
   \label{tab:fusion-staircase}
   \begin{tabular}{lccc}
     \toprule
-     & Early Concat & \multicolumn{2}{c}{Encoder + Attention} \\
+     & Dual U-Net Cross-Attn & \multicolumn{2}{c}{Encoder + Attention} \\
     \cmidrule(lr){3-4}
      & & Single-axis & Dual attention (ours) \\
     \midrule
@@ -109,29 +110,29 @@ of ``unseen'' from a novel organ; TotalSegmentator's own MRI acquisition isolate
   \end{tabular}
 \end{table}
 
-\paragraph{Results.} Single-axis alone already beats Early Concat on five of the eight rows --
-both TotalSegmentator splits, both FLARE22 splits, and TotalSeg MRI -- while Early Concat wins
+\paragraph{Results.} Single-axis alone already beats Dual U-Net Cross-Attn on five of the eight rows --
+both TotalSegmentator splits, both FLARE22 splits, and TotalSeg MRI -- while Dual U-Net Cross-Attn wins
 the three remaining rows: MSD Prostate, MSD Hippocampus, and HU\_LWK1. Restoring dual
 attention flips one of those three (MSD Hippocampus, 0.184 vs.\ 0.172) without touching the
-other two, bringing the full architecture to six wins out of eight against Early Concat. The
+other two, bringing the full architecture to six wins out of eight against Dual U-Net Cross-Attn. The
 one aggregate number in the table -- mean of the five held-out sources -- shows why that
-flip matters: single-axis alone is a net regression against Early Concat there (0.264 vs.\
+flip matters: single-axis alone is a net regression against Dual U-Net Cross-Attn there (0.264 vs.\
 0.278), and only once dual attention restores the modality axis does the full architecture
-overtake Early Concat (0.297). The architectural family change alone, in other words, is not
+overtake Dual U-Net Cross-Attn (0.297). The architectural family change alone, in other words, is not
 what carries this result; dual attention is. The compute picture is mixed rather than
 uniformly favorable: dual attention has the fewest parameters and the lowest latency of the
-three, but not the fewest GFLOPs -- Early Concat remains cheapest by that measure despite its
+three, but not the fewest GFLOPs -- Dual U-Net Cross-Attn remains cheapest by that measure despite its
 lower accuracy, so no arm here is a strict win on both accuracy and compute at once. Two
-caveats keep this from a single-variable ablation: Early Concat starts from a pretrained
+caveats keep this from a single-variable ablation: Dual U-Net Cross-Attn starts from a pretrained
 initialization rather than the randomly-initialized reasoning core the patchset arms share,
 and does not receive the same query-conditioning signal during training -- so this is best
-read as a comparison against Early Concat's strongest available starting point, not a fully
-symmetric ablation. \todo{Re-read once Early Concat receives the same query-conditioning
+read as a comparison against Dual U-Net Cross-Attn's strongest available starting point, not a fully
+symmetric ablation. \todo{Re-read once Dual U-Net Cross-Attn receives the same query-conditioning
 signal -- currently dropped due to a training instability under compilation.}
 
 \paragraph{Status.} Neither patchset arm had reached its full training budget at the point
-these numbers were read, while Early Concat had already converged -- so
-\autoref{tab:fusion-staircase} may understate Early Concat's eventual ceiling more than either
+these numbers were read, while Dual U-Net Cross-Attn had already converged -- so
+\autoref{tab:fusion-staircase} may understate Dual U-Net Cross-Attn's eventual ceiling more than either
 patchset arm's. All three arms are N=1 seed, and several rows rest on very few classes
 (FLARE22's unseen split, both MSD sources, HU\_LWK1) -- directional evidence, not settled
 effect sizes. \todo{Re-read once all three arms reach their full training budget; add
