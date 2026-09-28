@@ -1,13 +1,13 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:methodology-cascade}
 
-The cascade connects consecutive resolution levels through three
-mechanisms, each replacing a coarser design choice made by Medverse or
-Iris.
+The cascade connects consecutive resolution levels through two
+mechanisms: a query prior and region-restricted fine processing.
 
-\paragraph{Query prior.} Medverse~\cite{huMedverseUniversalModel2025a}
-feeds an upsampled, perturbed ground-truth mask into an extra U-Net branch
-at every step; Iris~\cite{gaoShowSegmentUniversal2025} uses no prior at
-all. At level $\ell > 1$, we instead initialize the target's
+\paragraph{Query prior.} Medverse passes the previous step's prediction, together with the target
+image, through a third U-Net branch that shares weights with its context
+branch; during training, this input is a downsampled ground-truth mask
+standing in for a coarse prediction. Iris has no multi-step inference
+and uses no prior. At level $\ell > 1$, we instead initialize the target's
 label token directly from level $\ell{-}1$'s own prediction:
 %
 \begin{equation}
@@ -19,7 +19,8 @@ $\ell$'s crop grid, correcting for the two levels' different centers,
 field of view, and any augmentation applied independently to each. This
 makes the previous level's belief part of the same token stream processed
 by dual attention alongside the image (\autoref{sec:methodology-fusion}),
-rather than a separate side channel. \autoref{fig:query-prior} shows this
+rather than a separate side channel. The previous level's prediction is detached before warping, so no
+gradient flows between levels through the prior. \autoref{fig:query-prior} shows this
 flow across two levels.
 
 \begin{figure}[t]
@@ -34,8 +35,8 @@ flow across two levels.
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
 
-\paragraph{Region-restricted fine processing.} Medverse and Iris re-scan
-the entire volume with a sliding window at every step. Once a coarse level
+\paragraph{Region-restricted fine processing.} Medverse processes the entire volume with a sliding window at every
+step after the first. Once a coarse level
 has localized the structure of interest, we instead restrict the sliding
 window at the next, finer level to the coarse prediction's foreground
 region, thresholded and padded by a fixed margin. Compute at fine levels

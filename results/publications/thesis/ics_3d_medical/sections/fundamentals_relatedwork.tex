@@ -9,28 +9,30 @@ target and context features at full resolution -- no coarse-to-fine
 structure, and no synthetic-task training.
 
 \paragraph{Iris~\cite{gaoShowSegmentUniversal2025}} encodes each context
-pair into a compact per-class task embedding and fuses it into the target
-through a pixel shuffle-unshuffle operation -- a single fusion step,
-applied once, with no iterative refinement across scales.
+pair once into a compact task embedding, using pixel shuffle operations
+in its context encoder. The target interacts with the context only
+through this embedding, in the mask decoder, and inference is a single
+pass with no refinement across scales.
 
-\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} encodes target
-and context with two separate U-Nets, fused via blockwise cross-attention
-between the two streams at every stage, pooling queries and keys to block
-resolution for efficiency (\autoref{sec:methodology-fusion}).
+\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} uses separate
+3D U-Nets for the target and the context and exchanges features between
+them at every stage: target-to-context in the encoder, context-to-target
+in the decoder. The exchange uses a Blockwise Cross-Attention Module
+(BAM), which mean-pools queries and keys over a $4^3$ block grid before
+attending, while values stay at full resolution.
 
 \paragraph{Hierarchical, coarse-to-fine approaches.} Deep Neural
 Patchworks~\cite{reisertDeepNeuralPatchworks2022a} stacks levels of
 increasing resolution for large-volume segmentation, but targets
 single-model supervised segmentation rather than in-context, few-shot
 prediction -- an architectural precedent for coarse-to-fine cascades
-outside the ICL setting. Medverse applies a similar idea within the ICL
-setting itself: it performs next-scale autoregressive segmentation,
-inspired by next-scale image generation~\cite{tian2024visual}, where at
-each step the previous step's (perturbed) prediction re-enters as an
-additional context pair, processed by the same context U-Net -- reused
-unchanged across scales. Every step still re-scans the \emph{entire}
-volume with a sliding window -- only the input changes with scale, not
-the spatial extent processed.
+outside the ICL setting. Medverse applies a similar idea within the ICL setting through
+next-scale autoregressive segmentation, inspired by next-scale image
+generation~\cite{tian2024visual}. The first step predicts the whole
+volume at low resolution. Each later step doubles the resolution and
+processes the entire volume with a sliding window, feeding the previous
+step's prediction into a third U-Net branch that shares weights with the
+context branch. 
 
 \begin{table}[t]
   \centering
@@ -44,7 +46,7 @@ the spatial extent processed.
     UniverSeg & dense cross-attn. & no & no \\
     Iris & one-shot pixel shuffle & no & no \\
     Medverse & dual U-Net cross-attn. & full-volume re-scan & no \\
-    \textbf{Ours} & dual attention (repeated) & region-restricted, register-carried & GMM repaint + texture \\
+    \textbf{Ours} & dual attention (repeated) & region-restricted, prediction-seeded & GMM repaint + texture \\
     \bottomrule
   \end{tabular}
 \end{table}

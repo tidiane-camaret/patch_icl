@@ -71,7 +71,10 @@ feeding its own imperfect coarse prediction forward as a query prior
 hurts its harness cascade universally, across all 7 OOD sources tested,
 sometimes catastrophically (MSD Hippocampus 0.691 $\to$ 0.050) --
 compounding coarse-level error appears to be a property generic to
-coarse-to-fine cascades, not specific to either architecture's design.
+coarse-to-fine cascades, not specific to either architecture's design. TotalSeg CT and TotalSeg MRI are in-distribution modalities for our
+model, which trains on both; Medverse's released weights were trained
+on [...]. The gap on these two rows therefore partly reflects training
+data rather than architecture alone.
 
 \paragraph{A real predicted prior beats a perturbed ground-truth prior.}
 Same checkpoint chain, same seven validation datasets as

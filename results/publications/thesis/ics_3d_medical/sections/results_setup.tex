@@ -1,15 +1,19 @@
 \subsection{Experimental Setup}\label{sec:results-setup}
 
-\paragraph{Model scope.} Two configurations of the architecture are
-reported in this chapter, kept explicitly separate. The reference
-configuration (dual attention, query-prior init, register carry gated
-off) is the source of every Fusion and Cascade number below. An extended
-configuration (adding cascade registers, a pooling token, and synthetic
-texture noise on top of it) is the source of every Synthetic Task
-Generation number. The two are trained independently and not directly
-comparable to each other -- the extended configuration is read as a
-promising newer result, not a replacement for the numbers reported above
-it. \todo{Resolve before submission: does the thesis report a single
+\paragraph{Training data and model scope.} All models are trained on
+the training cases of TotalSegmentator, restricted to its training
+classes; the remaining classes form the unseen split. Each results
+section uses its own training setup. The fusion comparison
+(\autoref{sec:results-fusion}) trains all three arms on the CT subset
+only, at a single resolution level. The cascade experiments
+(\autoref{sec:results-cascade}) train the reference configuration
+(dual attention with query-prior initialization) on both CT and MRI.
+The synthetic-task experiments (\autoref{sec:results-synth}) train an
+extended configuration, which adds cross-level register carry, a
+pooling token, and synthetic texture noise, also on CT and MRI.
+Numbers from different sections are therefore not directly
+comparable. In particular, TotalSeg MRI is a held-out modality only in
+the fusion section. \todo{Resolve before submission: does the thesis report a single
 ``Ours'' configuration, or keep this split?}
 
 \paragraph{Baselines.} Medverse~\cite{huMedverseUniversalModel2025a}
@@ -63,10 +67,16 @@ training entirely.
     \midrule
     \multicolumn{5}{l}{\itshape Held-out modality} \\
     \midrule
-    TotalSeg MRI & MRI & same classes as TotalSegmentator CT & 47 & 23 \\
+    TotalSeg MRI$^{\dagger}$ & MRI & 23 TotalSegmentator classes (?? seen / ?? unseen) & 47 & 23 \\
     \bottomrule
   \end{tabular}
+  \vspace{0.5em}
+  \raggedright\footnotesize
+  $^{*}$Sourced from an unofficial data mirror; provenance not yet
+  independently confirmed.\\
+  $^{\dagger}$Held-out modality in the fusion experiments, which train
+  on CT only; in-distribution in the cascade and synthetic-task
+  experiments.
 \end{table}
-\noindent $^{*}$Sourced from an unofficial data mirror; provenance not yet
-independently confirmed.
+
 \todo{Add citations for each source once confirmed (currently uncited).}

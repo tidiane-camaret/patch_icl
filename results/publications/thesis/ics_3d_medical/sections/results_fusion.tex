@@ -19,8 +19,7 @@ from the released, unmodified baseline evaluated elsewhere in this thesis
 control isolates the architectural family this comparison targets: it keeps the shared
 encoder and attention stack common to every architecture in this thesis, but collapses
 image and label evidence into one token per cell via a pixel shuffle--unshuffle operation
-\emph{before} the transformer -- echoing Iris's own fusion mechanism in spirit though not
-in implementation, and withholding dual attention until the next step of the staircase.
+\emph{before} the transformer, similar to the pixel shuffle Iris uses when encoding its context, and withholding dual attention until the next step of the staircase.
 
 Its transformer depth is raised from $l{=}4$ to $l{=}9$ specifically to compute-match the
 dual-attention arm (removing the modality axis also removes a large share of the model's
@@ -35,8 +34,8 @@ starting point: Dual U-Net Cross-Attn keeps its released initialization, while t
 dual-attention arms warm-start only the encoder and decoder from a shared checkpoint, with
 the entire in-context reasoning core (transformer, image/label embeddings, context/query
 id, register tokens, cascade projection, pool projection) randomly initialized for both --
-so neither patchset arm starts from an already-trained transformer. Training uses real
-anatomy only ($p_\text{synth}{=}0$), CT only. The three arms also did not train to a
+so neither patchset arm starts from an already-trained transformer. Training uses real anatomy only ($p_\text{synth}{=}0$), on
+TotalSegmentator CT training cases and classes only. The three arms also did not train to a
 matched stopping point: Dual U-Net Cross-Attn trained to full convergence, the patchset arms did not.
 
 \begin{table}[t]
@@ -72,7 +71,8 @@ MSD Hippocampus introduce organs with no vocabulary overlap at all, so every cla
 pair is unseen by construction, not by a train/val split; HU\_LWK1's target is a
 HU-measurement region, not a segmentable anatomical object, a categorically different kind
 of ``unseen'' from a novel organ; TotalSegmentator's own MRI acquisition isolates a held-out
-\emph{modality} instead, over classes the vocabulary already contains.
+\emph{modality}, since these models see no MRI during training, over
+classes the vocabulary already contains.
 
 \begin{table}[t]
   \centering

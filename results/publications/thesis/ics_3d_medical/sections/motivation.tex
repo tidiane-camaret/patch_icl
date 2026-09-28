@@ -31,8 +31,8 @@ each with its own mechanism:
     on regions already known not to contain the structure of interest.
     \autoref{sec:methodology} proposes a \emph{coarse-to-fine cascade}
     that restricts fine processing to the region a coarse pass has
-    already localized, connected across levels by a query prior and
-    register tokens that carry a gradient path between resolutions.
+    already localized, and passes each level's prediction to the next
+    level as a query prior.
   \item \textbf{Where does training signal come from beyond limited
     annotation?} Real (image, mask) pairs are limited to the classes and
     appearance distribution covered by the training cohort.
@@ -48,10 +48,10 @@ each with its own mechanism:
     segmentation, contrasted against early-concatenation
     (Medverse~\cite{huMedverseUniversalModel2025a}) and one-shot fusion
     (Iris~\cite{gaoShowSegmentUniversal2025}) baselines.
-  \item A coarse-to-fine cascade in which the query prior,
-    region-restricted fine processing, and cross-level register training
-    are evaluated against the sliding-window-over-the-whole-volume design
-    used by prior work.
+  \item A coarse-to-fine cascade that seeds each level    with the previous
+    level's prediction and restricts fine processing to the region it
+    localizes, compared against the full-volume autoregressive inference
+    used by Medverse.
   \item A GMM-based synthetic task generator with a texture-noise variant
     that better matches real tissue's spatial autocorrelation, evaluated
     against real-only and i.i.d.-noise training.

@@ -20,8 +20,7 @@ anatomical structures in the real training cohort do not exhibit.
 \paragraph{Canvas: synthetic bank vs.\ real subject.} Two canvas sources
 are available. The \emph{synthetic-bank} canvas draws a candidate
 mask/image region from a precomputed bank of segmented real scans and
-paints the shape into it. The \emph{real-host} canvas instead paints the
-same procedural shape directly onto a real training-cohort subject's own
-image (CT or MRI, any organ), bypassing the bank entirely: every volume
+paints the shape into it. The \emph{real-host} canvas instead paints the same procedural shape directly onto a real
+TotalSegmentator training case (CT or MRI, any organ) , bypassing the bank entirely: every volume
 in a task shares one real subject as its base image, differing only in
 the painted region.
