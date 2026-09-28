@@ -23,13 +23,19 @@ both our baseline and final design belong to.
   \includegraphics[width=\linewidth]{arch_fusion_family.pdf}
   \caption{Two families of context/target coupling, shown for a single
   context volume ($K{=}1$) and 3 of its $N$ tokens per stream. Top:
-  Medverse gives every row its own, separately-weighted convolutional
-  block, re-run at every step and coupled only through cross-attention
-  (blue fan). Bottom: the family both our baseline and final design
-  belong to instead pushes every row through one shared encoder, run
-  once, before any repeated cross-attention step --
-  \autoref{fig:biaxial} details the two ways we combine image and label
-  evidence within this shared-encoder family.}
+  Medverse channel-concatenates image and mask into one volume (context
+  only -- target gets no mask channel at all) and feeds each row through
+  its own, separately-weighted U-Net, coupled by cross-attention at
+  several stages: context queries target's encoder while narrowing,
+  target queries context's decoder while widening (blue arrows). Bottom:
+  the family both our baseline and final design belong to instead
+  passes only the image through one shared encoder (``Enc''), run once;
+  label evidence -- a placeholder prior for target, the real mask for
+  context -- re-enters at a Fuse step ($\oplus$) before the encoded
+  token attends across cells and contexts for $L$ layers (``Attn.'') and
+  a shared decoder (``Dec'') produces the mask. \autoref{fig:biaxial}
+  details the two ways we combine image and label evidence within this
+  shared-encoder family.}
   \label{fig:fusion-family}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
