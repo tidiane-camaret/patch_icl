@@ -39,9 +39,9 @@ flow across two levels.
 step after the first. Once a coarse level
 has localized the structure of interest, we instead restrict the sliding
 window at the next, finer level to the coarse prediction's foreground
-region, thresholded and padded by a fixed margin. Compute at fine levels
-then scales with the size of the structure rather than the size of the
-input volume, at the cost of depending on the coarse level's localization
-being approximately correct.
+region, thresholded and padded by a fixed margin. Fine-level compute then
+depends on the size of the structure rather than the size of the input
+volume. The cost is that fine levels depend on the coarse level
+localizing the structure approximately correctly.
 
 

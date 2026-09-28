@@ -1,10 +1,8 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:results-cascade}
 
-This section asks whether the coarse-to-fine cascade introduced in
-\autoref{sec:methodology-cascade} helps in-distribution at all; how the
-resulting design compares to Medverse's own coarse-to-fine mechanism, on
-accuracy and compute; and which of the cascade's own mechanisms are
-responsible for the in-distribution gain.
+This section compares our cascade against Medverse's coarse-to-fine
+inference on accuracy and latency, and tests which prior source (the
+model's own prediction or a perturbed ground-truth mask) works better.
 
 \paragraph{Coarse-to-fine cascading improves accuracy in-distribution.}
 A spacing sweep from 4mm to 1.5mm crop resolution (117 classes, 3897
@@ -98,7 +96,9 @@ Ours wins 5/7 (TotalSeg CT, FLARE22, MSD Prostate, HU\_LWK1, TotalSeg
 MRI); Medverse wins 2/7. Medverse wins on MSD Hippocampus, a structure in
 its own training vocabulary but unseen for ours, and on NasalSeg, which
 is held out for both models. Mean latency favors our
-model by roughly $14\times$. Level-matching reduces Medverse's accuracy
+model by roughly $14\times$. This difference reflects the full
+architecture and inference procedure, not region restriction alone.
+Level-matching reduces Medverse's accuracy
 relative to its native depth on 4 of the 5 sources where a native run
 exists (native Dice: FLARE22 0.440, MSD Prostate 0.423, MSD Hippocampus
 0.691, HU\_LWK1 0.071, NasalSeg 0.735 -- vs.\ the level-matched Dice
@@ -158,6 +158,6 @@ prior is better on four, worse only on MSD Hippocampus; including three
 further lesion sources not in the table (Shifts-MS, ATLAS v2.0,
 GNC\_705 -- all scoring below 0.1 for both variants), it is better on
 four of eight -- weaker than the clear in-distribution majority.
-\todo{Add a no-query-prior control arm to complete the ablation table
-promised in the methodology chapter (full model vs.\ $-$query-prior vs.\
-$-$region-restriction vs.\ $-$register-carry).}
+\todo{Planned ablations: $-$query-prior (no prior at all) and
+$-$region-restriction (full-volume sliding window at fine levels, same
+checkpoint).}

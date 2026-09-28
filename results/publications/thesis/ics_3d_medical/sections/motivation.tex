@@ -44,14 +44,14 @@ each with its own mechanism:
 
 \paragraph{Contributions.}
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
-  \item A dual attention mechanism for in-context 3D
-    segmentation, contrasted against early-concatenation
-    (Medverse~\cite{huMedverseUniversalModel2025a}) and one-shot fusion
-    (Iris~\cite{gaoShowSegmentUniversal2025}) baselines.
-  \item A coarse-to-fine cascade that seeds each level    with the previous
+  \item A dual attention mechanism that keeps image and label tokens
+    separate, compared against a single-token control of matched compute
+    and a dual U-Net cross-attention model initialized from Medverse.
+  \item A coarse-to-fine cascade that seeds each level with the previous
     level's prediction and restricts fine processing to the region it
-    localizes, compared against the full-volume autoregressive inference
-    used by Medverse.
+    localizes. We compare predicted and perturbed ground-truth priors, and
+    compare accuracy and latency against Medverse's native autoregressive
+    inference.
   \item A GMM-based synthetic task generator with a texture-noise variant
     that better matches real tissue's spatial autocorrelation, evaluated
     against real-only and i.i.d.-noise training.
