@@ -136,14 +136,36 @@ class RealHostShapeProvider:
               f"({sum(len(v) for v in by_class.values())} subjects total)", flush=True)
         return by_class
 
-    def _one_member(self, subject, host_cls, member_draw, crop_spacing_mm, rng, contrast_ratio):
+    def _one_member(self, subject, host_cls, cohort_hp, crop_spacing_mm, rng, contrast_ratio,
+                    gmm_seed, member_idx, center=None):
+        """Builds one member's NativeCrop. Fully reproducible from
+        (subject, host_cls, cohort_hp, gmm_seed, member_idx) alone -- `member_nrng` is
+        constructed fresh here (not passed in) so a cascade re-crop (`load_native_crop`,
+        different call, possibly a different `center`) draws the IDENTICAL member_draw/
+        rasterization/texture-noise as the original `assemble_task` call. Mirrors
+        `SynthGmmProvider._build_nc`'s own `member_nrng = default_rng([gmm_seed,
+        member_idx])` pattern exactly.
+
+        `center`: None (assemble_task, level-0) -> the crop window is centered on the
+        shape's own anchor (see below). An explicit value (load_native_crop, cascade
+        re-crop) -> the crop window looks there instead, but the shape's true position
+        does NOT move with it -- it stays anchored to the host class's own COM, always
+        resolved fresh with center_mode="com" regardless of `center`, exactly like
+        SynthGmmProvider's `fallback` anchor (see its _build_nc docstring). This is what
+        makes the shape the SAME physical object at every cascade level.
+        """
+        member_nrng = np.random.default_rng([int(gmm_seed), int(member_idx)])
+        member_draw = draw_member_shape(member_nrng, cohort_hp, self.shape_spec)
+
         image_np, label_np, native_sp, norm = self.provider.load_raw(subject)
-        req = LoadRequest(rng=rng, crop_spacing_mm=crop_spacing_mm, center_mode="com")
-        center = self.provider.resolve_center(subject, host_cls, req, label_np)
+        anchor_req = LoadRequest(rng=rng, crop_spacing_mm=crop_spacing_mm, center_mode="com")
+        shape_anchor = self.provider.resolve_center(subject, host_cls, anchor_req, label_np)
+        crop_center = center if center is not None else shape_anchor
+        jitter = 0 if center is not None else self.jitter   # exact predicted center on re-crop
         crop_ct_view, crop_lbl_view, out_sizes, pad_lo, geom = organ_crop_arrays(
-            image_np, label_np, center, list(native_sp),
+            image_np, label_np, crop_center, list(native_sp),
             image_size=(self.provider.T,) * 3, crop_mm=crop_spacing_mm,
-            jitter=self.jitter, rng=rng)
+            jitter=jitter, rng=rng)
 
         step = (1, 1, 1)
         if self.max_native and max(crop_lbl_view.shape) > self.max_native:
@@ -156,10 +178,12 @@ class RealHostShapeProvider:
         spacing = np.asarray(native_sp, dtype=np.float64)
         mm_per_voxel = tuple((spacing * np.asarray(step, dtype=np.float64)).tolist())
         starts = geom[0].numpy().astype(np.float64)
-        center_native = (np.asarray(center, dtype=np.float64)
+        # Anchored to shape_anchor (level-invariant), NOT crop_center (which moves with the
+        # cascade-predicted re-crop) -- see docstring above.
+        center_native = (np.asarray(shape_anchor, dtype=np.float64)
                          + np.asarray(member_draw.position_offset_mm, dtype=np.float64) / spacing)
         center_local = (center_native - starts) / np.asarray(step, dtype=np.float64)
-        rasterize_shape_in_crop(crop_lbl, 1, member_draw, mm_per_voxel, center_local, rng=np.random.default_rng(rng.getrandbits(64)))
+        rasterize_shape_in_crop(crop_lbl, 1, member_draw, mm_per_voxel, center_local, rng=member_nrng)
 
         shape_mask = crop_lbl == 1
         if shape_mask.any():
@@ -175,8 +199,8 @@ class RealHostShapeProvider:
             # Texture noise (scaled by the REAL local std, not painted flat) so the stamped
             # region isn't suspiciously smooth against real MRI's natural noise -- user-
             # flagged 2026-09-27 ("realistic object intensity, else too easy to spot").
-            noise = _fractal_value_noise(crop_ct.shape, np.random.default_rng(rng.getrandbits(64)),
-                                         mm_per_voxel, self.texture_spec)
+            # member_nrng (not a fresh ambient draw) -- reproducible across cascade levels.
+            noise = _fractal_value_noise(crop_ct.shape, member_nrng, mm_per_voxel, self.texture_spec)
             crop_ct[shape_mask] = local_mean + contrast_ratio * local_std + local_std * noise[shape_mask]
 
         return build_native_crop(crop_ct, crop_lbl, 1, out_sizes, pad_lo, geom,
@@ -199,21 +223,64 @@ class RealHostShapeProvider:
         # same task" (same organ), matching how every other cohort in this codebase works.
         host_cls = rng.choice(list(self.subjects_by_class))
         chosen = rng.sample(self.subjects_by_class[host_cls], self.context_size + 1)
-        ncs = []
-        for i, subj in enumerate(chosen):
-            member_nrng = np.random.default_rng([int(gmm_seed), i])
-            member_draw = draw_member_shape(member_nrng, cohort_hp, spec)
-            ncs.append(self._one_member(subj, host_cls, member_draw, crop_spacing_mm, rng,
-                                        contrast_ratio))
+        ncs = [self._one_member(subj, host_cls, cohort_hp, crop_spacing_mm, rng,
+                                contrast_ratio, gmm_seed, i)
+               for i, subj in enumerate(chosen)]
 
+        # subject strings: "<real subject id>|<gmm_seed>|<member_idx>|host<host_cls>|<modality>"
+        # -- EVERY member (target AND context) carries host_cls + modality (not just the
+        # target), fixed 5-field format, mirroring SynthGmmProvider's own `|host<id>` suffix
+        # convention -- required for load_native_crop (cascade re-crop) to reconstruct the
+        # exact same cohort/member draw for ANY member, not just the target.
+        tag = f"host{host_cls}|{self.provider.modality}"
         return {
             "native_crop": ncs,
-            "subject": f"{chosen[0]}|{gmm_seed}|realhost_{family}_{host_cls}",
-            "context_subjects": [f"{s}|{gmm_seed}|{i + 1}" for i, s in enumerate(chosen[1:])],
+            "subject": f"{chosen[0]}|{gmm_seed}|0|{tag}",
+            "context_subjects": [f"{s}|{gmm_seed}|{i + 1}|{tag}" for i, s in enumerate(chosen[1:])],
             "label_name": f"shape_{family}",
             "aug_mode": torch.tensor(0, dtype=torch.long),
-            "tgt_modality": self.provider.modality, "ctx_modality": self.provider.modality,
+            # "synth", NOT self.provider.modality ("mri"/"ct") -- tgt/ctx_modality's actual
+            # purpose is CASCADE RE-CROP ROUTING (totalseg_dataloader_incontext.py:1616,
+            # TriSourceProvider.load_native_crop), which branches purely on
+            # modality=="synth" -> self.synth (SynthGmmProvider, which dispatches into
+            # real_host_providers) vs anything else -> self.multi (the REAL totalseg
+            # provider, which has no idea what a real-host encoded subject string is).
+            # This task IS reached via that synth branch (TriSourceProvider.assemble_task's
+            # p_synth coin flip -> self.synth.assemble_task -> real_host_providers dispatch),
+            # so it must report itself the same way SynthGmmProvider's own tasks do, or
+            # every cascade re-crop of it gets routed to the wrong provider and crashes
+            # (confirmed: FileNotFoundError trying to open a literal encoded subject string
+            # as a directory). The REAL per-member modality isn't lost -- it's still on each
+            # NativeCrop.modality (build_native_crop, unchanged) and in the subject string's
+            # own trailing tag (MixtureShapeProvider.load_native_crop's dispatch key).
+            "tgt_modality": "synth", "ctx_modality": "synth",
         }
+
+    def load_native_crop(self, subject, cls, req):
+        """Cascade re-crop: re-derive the same cohort/member draw from the encoded subject
+        string (see assemble_task's tag format). `req.center` may be a cascade-predicted
+        center or None (same-level reconstruction) -- either way it only affects WHERE the
+        crop window looks; the shape's own position stays anchored to the host class's
+        fixed COM, independent of it -- see _one_member's docstring. Mirrors
+        SynthGmmProvider.load_native_crop's contract.
+
+        `req.crop_spacing_mm` (whatever the calling cascade level's own ladder pitch is,
+        e.g. 4mm/1.5mm) is IGNORED, same as assemble_task's own caller-spacing param --
+        see self.crop_spacing_mm's docstring. A real-host task always renders at this
+        provider's own fixed pitch regardless of which cascade level is re-cropping it."""
+        subj, gmm_seed_str, member_idx_str, host_part, modality = subject.split("|")
+        assert host_part.startswith("host"), f"malformed real-host subject string: {subject!r}"
+        host_cls = host_part[len("host"):]
+        gmm_seed = int(gmm_seed_str)
+        member_idx = int(member_idx_str)
+        family = cls[len("shape_"):] if cls.startswith("shape_") else cls
+
+        spec = self.shape_spec
+        family_spec = dataclasses.replace(spec, family_weights={family: 1.0})
+        cohort_hp = draw_cohort_hyperparams(np.random.default_rng([int(gmm_seed), 999]), family_spec)
+        contrast_ratio = random.Random(gmm_seed).uniform(*spec.host_contrast_ratio_range)
+        return self._one_member(subj, host_cls, cohort_hp, self.crop_spacing_mm, req.rng,
+                                contrast_ratio, gmm_seed, member_idx, center=req.center)
 
 
 class MixtureShapeProvider:
@@ -241,3 +308,15 @@ class MixtureShapeProvider:
     def assemble_task(self, rng, crop_spacing_mm):
         provider = rng.choices(self.providers, weights=self.weights)[0]
         return provider.assemble_task(rng, crop_spacing_mm)
+
+    def load_native_crop(self, subject, cls, req):
+        """Cascade re-crop: dispatch to whichever child provider originally produced this
+        member, recovered from the modality tag `assemble_task` embeds in every subject
+        string (last '|'-field, e.g. 'mri'/'ct') -- NOT re-drawn via `rng.choices` (that
+        would be a fresh, unrelated coin flip, not necessarily the same child)."""
+        modality = subject.rsplit("|", 1)[-1]
+        for p in self.providers:
+            if getattr(p.provider, "modality", None) == modality:
+                return p.load_native_crop(subject, cls, req)
+        raise ValueError(f"MixtureShapeProvider.load_native_crop: no child provider for "
+                         f"modality {modality!r} (subject={subject!r})")

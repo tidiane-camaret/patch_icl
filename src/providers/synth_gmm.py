@@ -452,6 +452,13 @@ class SynthGmmProvider:
         """Cascade re-crop: re-derive same GMM + member paint nrng from subject string."""
         if not self.cascade:
             raise RuntimeError("SynthGmmProvider.load_native_crop requires cascade=True")
+        # real_host_providers: this family's re-crops bypass the gmm_bank entirely, same as
+        # assemble_task's own dispatch above -- the subject string is real_host_shape.py's
+        # own format (real subject id, NOT a gmm_bank filename), which _entry_by_file below
+        # cannot resolve. Must check before anything gmm_bank-specific runs.
+        family = cls[len("shape_"):] if isinstance(cls, str) and cls.startswith("shape_") else None
+        if family is not None and family in self.real_host_providers:
+            return self.real_host_providers[family].load_native_crop(subject, cls, req)
         # Trailing fields (beyond the fixed filename|gmm_seed|member_idx) are optional
         # and order-independent markers: "host<id>" (shape mode) and "het" (this
         # provider's heterogeneity mode) -- either, both, or neither may be present.

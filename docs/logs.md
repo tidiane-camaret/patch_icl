@@ -10645,3 +10645,92 @@ best overall in-distribution AND current best for gnc_kidney specifically; 163 r
 best single checkpoint for isles22/shifts_ms if a source-specific choice is ever wanted over one
 general model.
 
+## 2026-09-28 (cont.) — fix: RealHostShapeProvider had no cascade re-crop support (would crash)
+
+Preparing `168_cascade_real_host_all_shapes` (switches the 160-167 lineage into cascade mode,
+resuming 167, keeping its real-host mechanism active per user direction) surfaced a real gap
+before any GPU time was spent: user asked to confirm drawn shapes and deform stay consistent
+across cascade levels. Deform: confirmed already correct (`cascade.py` reuses one `geo_gen`
+seed per task across every level -- level-invariant by construction). Shapes: **confirmed
+broken** -- `RealHostShapeProvider`/`MixtureShapeProvider` implemented `assemble_task` (level-0
+draw) but never `load_native_crop` (the method `cascade.py` calls for every level >=1 re-crop,
+`experiments/3d/cascade.py:289-290`). Calls fell through to `SynthGmmProvider.load_native_crop`,
+which parses the member's `subject` string as a gmm_bank filename lookup (`self._entry_by_file`)
+-- `RealHostShapeProvider`'s real TotalSeg subject IDs aren't in that index, so the very first
+cascade re-crop of any real-host shape task would `KeyError`. Since `p_shape=1.0` and all 7
+families are real-hosted in 167/168, this wasn't a rare edge case -- it would have crashed
+almost immediately.
+
+**Fix** (`src/providers/real_host_shape.py`, `src/providers/synth_gmm.py`):
+- `RealHostShapeProvider._one_member` now takes `gmm_seed`/`member_idx` and constructs its own
+  `member_nrng` internally (was: pre-drawn `member_draw` passed in, and separate ambient
+  `rng.getrandbits(64)`-seeded generators for rasterization/texture noise) -- mirrors
+  `SynthGmmProvider._build_nc`'s exact pattern so every random draw is reproducible from
+  `(gmm_seed, member_idx)` alone, regardless of which call (`assemble_task` or
+  `load_native_crop`) produces it.
+- Split the crop window's center from the shape's own anchor -- previously both used the same
+  `center` variable. Now: `shape_anchor` is ALWAYS resolved fresh via `center_mode="com"` with
+  no override (verified directly: logged every `resolve_center` call across both an
+  `assemble_task` and a `load_native_crop` call with an explicit, very different `center`
+  override -- identical anchor returned both times, unconditionally). The crop WINDOW uses the
+  cascade-predicted `center` when given, defaulting to `shape_anchor` otherwise (byte-identical
+  to the old single-call behavior). Mirrors `SynthGmmProvider._build_nc`'s own `fallback`-vs-
+  `center` split exactly (see its docstring, "world-space anchor... level-invariant").
+- `assemble_task` now embeds `host_cls` + modality into EVERY member's subject string (target
+  AND context -- was target-only), fixed 5-field format
+  `<subject>|<gmm_seed>|<member_idx>|host<host_cls>|<modality>`, replacing the old
+  target-only `realhost_<family>_<host_cls>` marker (grepped: not parsed anywhere else).
+- New `RealHostShapeProvider.load_native_crop` parses that string and re-derives the identical
+  `cohort_hp`/`contrast_ratio`, then calls `_one_member` with the cascade `req.center`. Ignores
+  `req.crop_spacing_mm` (uses `self.crop_spacing_mm` instead) -- same "caller's spacing is
+  ignored on purpose" rule `assemble_task` already documented; missing this on the first pass
+  caused a real bug (see below), not a hypothetical one.
+- New `MixtureShapeProvider.load_native_crop` dispatches to whichever child produced the
+  original draw, recovered from the subject string's modality tag -- NOT re-drawn via
+  `rng.choices` (that would be an unrelated fresh coin flip).
+- `SynthGmmProvider.load_native_crop` gets the same `real_host_providers` dispatch check
+  `assemble_task` already had, checked first (before any gmm_bank-specific parsing).
+
+**Caught by the smoke test, not by inspection**: the first implementation used
+`req.crop_spacing_mm` directly in `load_native_crop` instead of `self.crop_spacing_mm` --
+produced a real, large crop-geometry mismatch (out_sizes `[128,128,128]` vs `[127,109,72]`,
+different `decim`) between an `assemble_task` draw and its own `load_native_crop`
+reconstruction at the identical center. Root cause: my test constructed the provider without
+overriding `crop_spacing_mm` (defaults to 1.0mm) but called `load_native_crop` with a
+`LoadRequest(crop_spacing_mm=3.0, ...)`, and the first pass forwarded that 3.0 straight
+through -- exactly the bug this fix's spacing-override rule exists to prevent. Fixed, then
+verified: same-level reconstruction (target + both context members) now byte-identical
+(`image`/`label_frac`/`has_fg`/`class_idx` all match exactly); `MixtureShapeProvider` and
+`SynthGmmProvider` dispatch both verified end-to-end the same way. 64/64 existing tests still
+pass (`pytest src/shapes3d/ src/providers/test_synth_gmm.py`) -- no dedicated test file for
+`real_host_shape.py` exists yet (gap, not closed here).
+
+**Second bug, caught by actually launching, not by the smoke test**: 168 crashed on its first
+real cascade re-crop anyway -- `FileNotFoundError` trying to `np.load()` a literal encoded
+real-host subject string as a directory
+(`.../totalsegmri/s0176|9671659738588361885|0|hostiliopsoas_left|mri/label.npy`). Root cause,
+one layer ABOVE everything fixed above: cascade re-crop routing doesn't happen at
+`SynthGmmProvider` first -- `TriSourceProvider.load_native_crop` (`src/providers/
+tri_source.py`) branches on `tgt_modality`/`ctx_modality` BEFORE any of that: `"synth"` ->
+`self.synth.load_native_crop` (`SynthGmmProvider`, which THEN dispatches into
+`real_host_providers`); anything else -> `self.multi.load_native_crop` (the REAL CT/MRI
+totalseg providers, which have no notion of a real-host encoded string). `RealHostShapeProvider
+.assemble_task` was reporting `tgt_modality`/`ctx_modality` as `self.provider.modality`
+("mri"/"ct", the REAL host's own modality) instead of `"synth"` -- even though the task is
+ALWAYS reached via `TriSourceProvider`'s own `p_synth` coin flip into `self.synth.assemble_task`
+(confirmed: `totalseg_dataloader_incontext.py:1616`'s own comment names this field's purpose as
+"cascade re-crop routing"). Every real-host re-crop was silently mis-routed to the real-data
+provider, which crashes on ANY encoded subject string, not a rare one.
+
+**Fix**: `RealHostShapeProvider.assemble_task` now reports `tgt_modality`/`ctx_modality` as
+`"synth"`, matching `SynthGmmProvider`'s own convention exactly (both target and context).
+Confirmed this loses nothing: the REAL per-member modality is unaffected everywhere else it's
+used -- unchanged on each `NativeCrop.modality` (`build_native_crop`'s own param, used for
+normalization/reporting, not touched by this fix) and still recoverable from the subject
+string's own trailing tag (`MixtureShapeProvider.load_native_crop`'s dispatch key, added in the
+first fix above). Verified directly: `assemble_task` now returns `tgt_modality="synth"` while
+`native_crop[0].modality` still correctly reads `"mri"`; a stand-in for
+`TriSourceProvider.load_native_crop`'s exact branch now routes to the synth path instead of
+crashing on the real one. 64/64 tests still pass. Two real bugs in one previously-untested
+code path (cascade x real-host) is a reminder this combination needs its own dedicated test,
+not just a manual smoke check each time -- not yet added (gap).
