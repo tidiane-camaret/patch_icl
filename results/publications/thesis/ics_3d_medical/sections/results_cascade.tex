@@ -8,13 +8,18 @@ responsible for the in-distribution gain.
 
 \paragraph{Coarse-to-fine cascading improves accuracy in-distribution.}
 A spacing sweep from 4mm to 1.5mm crop resolution (117 classes, 3897
-samples) raises macro Dice from \textbf{0.361 to 0.538} (+0.177). The
-locator's containment of the target structure is already high at the
-coarse level (0.922 mean, vs.\ an oracle ceiling of 0.970 -- a 0.048 gap)
-and does not predict which classes gain the most at the fine level: once
-a class is roughly localized, the remaining error is dominated by
-segmentation quality at the fine crop, not by further localization
-failure.
+samples) raises macro Dice from \textbf{0.361 to 0.538} (+0.177).
+\todo{Add cascade vs.\ single-level at matched final spacing: the direct
+test of whether cascading, not just resolution, helps.}
+At the coarsest level, the fixed-margin box placed at the coarse
+prediction's centroid contains on average 92.2\% of the target
+structure's voxels (\emph{containment}), compared with 97.0\% for a box
+placed at the ground-truth centroid instead (\emph{oracle}). Containment
+is weakly anti-correlated with fine-level Dice gain across classes
+($r=-0.22$, $p=0.018$, $n=117$): classes localized less tightly at the
+coarse level tend to gain somewhat more from the fine pass, though the
+relationship is weak ($r^2\approx0.05$) and segmentation quality at the
+fine crop remains the larger source of remaining error.
 
 \paragraph{Ours vs.\ Medverse, seven datasets, accuracy and compute.}
 ``Ours'' here is the predicted-prior checkpoint (the best-performing
@@ -37,7 +42,8 @@ before citing.}
   \caption{Predicted-prior checkpoint vs.\ Medverse (native autoregressive,
   depth-matched), macro Dice and mean per-sample latency. Levels/spacing
   is our own cascade ladder for that dataset; Medverse's AR depth is
-  matched to the same level count.}
+  matched to the same level count. MSD Hippocampus runs a single level,
+  so its row compares the base models rather than the cascades.}
   \label{tab:cascade-medverse}
   \begin{tabular}{lccccccc}
     \toprule
@@ -45,7 +51,7 @@ before citing.}
     \cmidrule(lr){4-5} \cmidrule(lr){7-8}
     Dataset & Levels & Spacing (mm) & Ours & Medverse & & Ours & Medverse \\
     \midrule
-    TotalSeg CT & 3 & $[6,3,1.5]$ & \textbf{0.586} & 0.103 & & 278ms & 4978ms \\
+    TotalSeg CT & 3 & $[6,3,1.5]$ & \textbf{0.586} & 0.103 & & 278ms & 4978ms\footnotemark \\
     FLARE22 & 3 & $[6,3,2.5]$ & \textbf{0.751} & 0.359 & & 311ms & 4894ms \\
     MSD Prostate & 3 & $[3,1.5,0.75]$ & \textbf{0.375} & 0.357 & & 279ms & 5006ms \\
     MSD Hippocampus & 1 & $[0.5]$ & 0.303 & \textbf{0.686} & & 99ms & 50ms \\
@@ -57,29 +63,40 @@ before citing.}
     \bottomrule
   \end{tabular}
 \end{table}
+\footnotetext{Estimated, not measured, unlike every other latency figure
+in this table -- see the level-matching \texttt{todo} above.}
 
 Ours wins 5/7 (TotalSeg CT, FLARE22, MSD Prostate, HU\_LWK1, TotalSeg
-MRI); Medverse wins 2/7 (MSD Hippocampus, NasalSeg) -- both cases where
-the target is a single, large, well-defined structure that suits
-Medverse's full-FOV multi-resolution pyramid. Compute favors Ours by
-roughly $14\times$ on
-mean latency -- and this is \emph{after} level-matching Medverse's own
-depth to ours, which costs Medverse accuracy too, so an unmatched
-Medverse would lose by even more on both axes at once.
-Medverse's own coarse-to-fine mechanism is separately prior-sensitive:
-feeding its own imperfect coarse prediction forward as a query prior
-hurts its harness cascade universally, across all 7 OOD sources tested,
-sometimes catastrophically (MSD Hippocampus 0.691 $\to$ 0.050) --
-compounding coarse-level error appears to be a property generic to
-coarse-to-fine cascades, not specific to either architecture's design. TotalSeg CT and TotalSeg MRI are in-distribution modalities for our
+MRI); Medverse wins 2/7. Medverse wins on MSD Hippocampus, a structure in
+its own training vocabulary but unseen for ours, and on NasalSeg, which
+is held out for both models. Mean latency favors our
+model by roughly $14\times$. Level-matching reduces Medverse's accuracy
+relative to its native depth on 4 of the 5 sources where a native run
+exists (native Dice: FLARE22 0.440, MSD Prostate 0.423, MSD Hippocampus
+0.691, HU\_LWK1 0.071, NasalSeg 0.735 -- vs.\ the level-matched Dice
+above); NasalSeg is a near-tie ($+0.002$ favoring the matched run). No
+native run exists yet for TotalSeg MRI.
+Medverse's own coarse-to-fine mechanism is separately prior-sensitive.
+We ran Medverse inside our own cascade inference harness -- the
+coarse-to-fine pipeline of \autoref{sec:methodology-cascade}, substituting
+Medverse's checkpoint for ours -- with and without its own coarse
+prediction passed forward as a query prior, on the seven OOD sources
+that support this comparison (HU\_LWK1, ISLES22, Shifts-MS, MSD
+Hippocampus, MSD Prostate, ATLAS v2.0, GNC\_705). Passing the prior
+lowered Dice on six of the seven; the exception, HU\_LWK1, scores 0.0
+with or without it. The drop is sharpest on MSD Hippocampus (0.691
+without the prior vs.\ 0.050 with it) -- this run uses our harness, not
+Medverse's native AR inference reported in \autoref{tab:cascade-medverse}
+(0.686), so the two near-identical numbers are a coincidence, not the
+same measurement. Errors at the coarse level can therefore propagate
+through the prior in Medverse's own mechanism. TotalSeg CT and TotalSeg MRI are in-distribution modalities for our
 model, which trains on both; Medverse's released weights were trained
 on [...]. The gap on these two rows therefore partly reflects training
 data rather than architecture alone.
 
 \paragraph{A real predicted prior beats a perturbed ground-truth prior.}
-Same checkpoint chain, same seven validation datasets as
-\autoref{tab:cascade-medverse} plus in-distribution TotalSeg CT
-(\autoref{tab:cascade-ablation}):
+Same checkpoint chain, the same seven datasets as
+\autoref{tab:cascade-medverse} (\autoref{tab:cascade-ablation}):
 
 \begin{table}[t]
   \centering
@@ -105,10 +122,14 @@ Same checkpoint chain, same seven validation datasets as
 Feeding the model's own real previous prediction forward beats a
 perturbed ground-truth prior on 99 of 117 classes (median $\Delta+0.043$)
 -- a \emph{prior-source} ablation (real vs.\ noisy synthetic), distinct
-from the Medverse \emph{prior-presence} finding above; a true no-prior
-arm is still needed (gap G6). Out-of-distribution (9 held-out sources
-including FLARE22/NasalSeg): the prior-source gain helps 5/9 sources and
-hurts 4/9 -- weaker than the clear in-distribution majority.
+from the Medverse \emph{prior-presence} finding above. A comparison
+against no prior at all is still missing. On the six out-of-distribution
+sources in \autoref{tab:cascade-ablation} (all but TotalSeg CT), the
+predicted prior is better on five, worse only on MSD Hippocampus;
+including three further lesion sources not in the table (Shifts-MS,
+ATLAS v2.0, GNC\_705 -- all scoring below 0.1 for both variants), it is
+better on five of nine -- weaker than the clear in-distribution
+majority.
 \todo{Add a no-query-prior control arm to complete the ablation table
 promised in the methodology chapter (full model vs.\ $-$query-prior vs.\
 $-$region-restriction vs.\ $-$register-carry).}
