@@ -1,0 +1,126 @@
+\documentclass[tikz,border=4pt,12pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% ---------------------------------------------------------------------------
+% Zoomed detail of ONE cross-attention block, for both of the two real
+% events in arch_medverse_biaxial.tex's bowtie coupling (that figure draws
+% one generic waist-to-waist arrow; this one shows what each half of it
+% actually is). Neither event is "one encoder layer attends one decoder
+% layer" -- both pair same-role halves across the two streams:
+%
+%   Down-path (left panel)  -- ConvBlock_context_t2c +
+%     TargetToContextAttention3D. Context's OWN encoder stage queries
+%     TARGET's encoder shortcut at this resolution (Q = context, K/V =
+%     target). Feeds only context's own state; never reaches the output
+%     directly.
+%
+%   Up-path (right panel) -- PairwiseConvAvgModelBlock_c2t +
+%     MultiContextSpatialCrossAttention3D. Target's OWN decoder stage
+%     queries CONTEXT's decoder output at this resolution (Q = target,
+%     K/V = context). This is the event that actually shapes the final
+%     prediction.
+%
+% Both panels share one internal structure (own conv -> cross-attn ->
+% concat with own-conv output -> 1x1 conv -> residual add with own-conv
+% output -> GELU), which is exactly what the two code paths do -- they
+% differ only in which stream is "own" (updated) vs "other" (read-only
+% K/V source), so the panels are mirror images of each other by design,
+% not independently drawn.
+%
+% Simplified, not drawn: Q and K are computed from an AVERAGE-pooled patch
+% summary (avg_into_patches, channel width = C), while V keeps the full
+% per-patch detail (split_into_patches, channel width = C * num_patches)
+% -- attention weights are decided from a coarse summary but retrieve
+% full-detail content. Drawn here as one "cross-attn (N patch tokens)"
+% box; the pooling asymmetry is not shown.
+% ---------------------------------------------------------------------------
+
+\definecolor{archBrightBlue}{HTML}{3B82F6}
+
+\begin{document}
+\begin{tikzpicture}[
+  x=1cm,y=1cm,
+  every node/.style={font=\normalsize},
+  box/.style={draw=black!40,fill=white,rounded corners=3pt,line width=0.8pt,
+              minimum width=3.4cm,minimum height=0.85cm,align=center,inner sep=4pt},
+  op/.style={draw=black!40,fill=black!5,rounded corners=3pt,line width=0.8pt,
+             minimum width=3.4cm,minimum height=0.7cm,align=center,inner sep=3pt},
+  attnop/.style={draw=archBrightBlue,fill=archBrightBlue!10,rounded corners=3pt,
+                 line width=1.2pt,minimum width=3.4cm,minimum height=0.9cm,align=center,inner sep=4pt},
+  flow/.style={-{Latex[length=2.6mm,width=2.2mm]},line width=1.2pt,black!45},
+  sidef/.style={-{Latex[length=2.6mm,width=2.2mm]},line width=1.1pt,black!35},
+  node distance=7mm and 10mm
+]
+
+% =========================================================================
+% Left panel: down-path -- context queries target
+% =========================================================================
+\begin{scope}
+  \node[box,fill=archContextPink!35,draw=archContextAccent] (own1) {context[$i$]};
+  \node[box,fill=archTargetGreen!35,draw=archTargetAccent,right=18mm of own1] (other1) {target[$i$] shortcut};
+
+  \node[op,below=of own1] (conv1) {own conv};
+  \coordinate (mid1) at ($(conv1)!0.5!(other1)$);
+  \node[attnop,below=13mm of mid1] (attn1) {cross-attn\\{\archnote $N$ patch tokens}};
+  \node[op,below=of attn1] (concat1) {concat};
+  \node[op,below=of concat1] (mix1) {$1\times1$ conv};
+  \node[op,below=of mix1] (add1) {$+$ (residual)};
+  \node[op,below=of add1] (gelu1) {GELU};
+  \node[box,fill=archContextPink!35,draw=archContextAccent,below=of gelu1] (out1) {context[$i$] updated};
+
+  \draw[flow] (own1) -- (conv1);
+  \draw[flow] (conv1) -- (attn1) node[midway,left,font=\archnote] {Q};
+  \draw[flow] (other1) -- (attn1) node[midway,right,font=\archnote] {K, V};
+  \draw[flow] (attn1) -- (concat1);
+  \draw[sidef] (conv1) to[bend right=45] node[midway,left,font=\archnote] {own} (concat1);
+  \draw[flow] (concat1) -- (mix1);
+  \draw[flow] (mix1) -- (add1);
+  \draw[sidef] (conv1) to[bend left=65] node[midway,right,font=\archnote] {residual} (add1);
+  \draw[flow] (add1) -- (gelu1);
+  \draw[flow] (gelu1) -- (out1);
+
+  \node[anchor=south] at ($(own1)!0.5!(other1)+(0,1.0)$)
+    {\archtitle Down-path: context queries target};
+  \node[align=center] at ($(out1)-(0,1.1)$)
+    {\archnote ConvBlock\_context\_t2c + TargetToContextAttention3D\\
+     shapes context's own state only -- never reaches the output directly};
+\end{scope}
+
+% =========================================================================
+% Right panel: up-path -- target queries context
+% =========================================================================
+\begin{scope}[xshift=11.5cm]
+  \node[box,fill=archTargetGreen!35,draw=archTargetAccent] (own2) {target[$i$]};
+  \node[box,fill=archContextPink!35,draw=archContextAccent,right=18mm of own2] (other2) {context[$i$] decoder out};
+
+  \node[op,below=of own2] (conv2) {own conv};
+  \coordinate (mid2) at ($(conv2)!0.5!(other2)$);
+  \node[attnop,below=13mm of mid2] (attn2) {cross-attn\\{\archnote $N$ patch tokens}};
+  \node[op,below=of attn2] (concat2) {concat};
+  \node[op,below=of concat2] (mix2) {$1\times1$ conv};
+  \node[op,below=of mix2] (add2) {$+$ (residual)};
+  \node[op,below=of add2] (gelu2) {GELU};
+  \node[box,fill=archTargetGreen!35,draw=archTargetAccent,below=of gelu2] (out2) {target[$i$] updated};
+
+  \draw[flow] (own2) -- (conv2);
+  \draw[flow] (conv2) -- (attn2) node[midway,left,font=\archnote] {Q};
+  \draw[flow] (other2) -- (attn2) node[midway,right,font=\archnote] {K, V};
+  \draw[flow] (attn2) -- (concat2);
+  \draw[sidef] (conv2) to[bend right=45] node[midway,left,font=\archnote] {own} (concat2);
+  \draw[flow] (concat2) -- (mix2);
+  \draw[flow] (mix2) -- (add2);
+  \draw[sidef] (conv2) to[bend left=65] node[midway,right,font=\archnote] {residual} (add2);
+  \draw[flow] (add2) -- (gelu2);
+  \draw[flow] (gelu2) -- (out2);
+
+  \node[anchor=south] at ($(own2)!0.5!(other2)+(0,1.0)$)
+    {\archtitle Up-path: target queries context};
+  \node[align=center] at ($(out2)-(0,1.1)$)
+    {\archnote PairwiseConvAvgModelBlock\_c2t + MultiContextSpatialCrossAttention3D\\
+     the only event that shapes the final prediction};
+\end{scope}
+
+\end{tikzpicture}
+\end{document}
