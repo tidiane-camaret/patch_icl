@@ -14,7 +14,27 @@ inform the target through a single bidirectional cross-attention step
 against a compressed, per-class task embedding computed once and reused
 across every query. Both commit every design choice -- fusion point and
 context--target interaction alike -- to a single, early step, computed
-once. We instead keep image tokens $z^{\text{img}}$ and label tokens
+once. \autoref{fig:fusion-family} contrasts Medverse's dual,
+separately-weighted per-row encoders against the shared-encoder family
+both our baseline and final design belong to.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{arch_fusion_family.pdf}
+  \caption{Two families of context/target coupling, shown for a single
+  context volume ($K{=}1$) and 3 of its $N$ tokens per stream. Top:
+  Medverse gives every row its own, separately-weighted convolutional
+  block, re-run at every step and coupled only through cross-attention
+  (blue fan). Bottom: the family both our baseline and final design
+  belong to instead pushes every row through one shared encoder, run
+  once, before any repeated cross-attention step --
+  \autoref{fig:biaxial} details the two ways we combine image and label
+  evidence within this shared-encoder family.}
+  \label{fig:fusion-family}
+\end{figure}
+\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
+
+We instead keep image tokens $z^{\text{img}}$ and label tokens
 $z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as separate streams
 throughout the network and let them exchange information repeatedly,
 through \emph{dual attention} -- following the general pattern of
@@ -36,19 +56,26 @@ uncompressed token grid:
     since tokens from every volume already share one sequence.
 \end{itemize}
 
-\autoref{fig:biaxial} illustrates both axes within a single layer.
+\autoref{fig:biaxial} contrasts this dual attention against a
+single-fusion-step baseline within the same shared-encoder family.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{arch_biaxial.pdf}
-  \caption{Dual attention within one transformer layer, shown for a
-  single context volume ($K{=}1$ for clarity) and 3 of its $N$ spatial
-  tokens per stream. Left: the modality axis -- image and label tokens
-  attend to each other within the same cell. Right: the position axis --
-  tokens attend across cells and, for the target, across contexts. Green
-  edges touch the target row, which cross-attends read-only into context
-  and whose label-stream input is the query prior
-  (\autoref{sec:methodology-cascade}) rather than ground truth.}
+  \includegraphics[width=\linewidth]{arch_fusion_axis.pdf}
+  \caption{Two variants within the shared-encoder family
+  (\autoref{fig:fusion-family}), shown for a single context volume
+  ($K{=}1$ for clarity) and 3 of its $N$ spatial tokens per stream. Top:
+  early fusion (our baseline) -- image and label tokens are merged once
+  ($\oplus$), then the fused token grid attends across cells and
+  contexts for $L$ layers (the position axis). Bottom: dual attention
+  (ours) -- image and label tokens instead attend to each other directly
+  at every layer (the modality axis, blue double arrows), alongside the
+  same cross-cell/cross-context attention (the position axis), repeated
+  together for $L$ layers. In both, the target row (green image tokens)
+  cross-attends read-only into context (pink tokens); its label-stream
+  input is the query prior (\autoref{sec:methodology-cascade}) rather
+  than ground truth, which is why its label token is gray rather than a
+  role color.}
   \label{fig:biaxial}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
