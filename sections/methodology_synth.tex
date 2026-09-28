@@ -1,25 +1,27 @@
 \subsection{Synthetic Task Generation}\label{sec:methodology-synth}
 
-Real (image, mask) pairs are limited to the anatomical classes and
-appearance distribution covered by the training cohort. To broaden
-training beyond this, a fraction $p_{\text{synth}}$ of training tasks are
-drawn from a synthetic generator instead of real context/target subjects.
+A fraction $p_{\text{synth}}$ of training tasks are drawn from a synthetic
+generator instead of real context/target subjects, broadening training
+beyond the anatomical classes and appearance distribution the real
+cohort covers.
 
-\paragraph{Supervoxel repainting.} A real-anatomy volume is first
-oversegmented into supervoxels (unsupervised, appearance-agnostic
-regions). One supervoxel is treated as the target class, and its binary
-mask is label-perfect by construction. Each of the $K{+}1$ volumes needed
-for a task is then produced by repainting the same supervoxel geometry
-with independently sampled per-class Gaussian intensities (a Gaussian
-mixture over classes), giving $K{+}1$ (image, mask) pairs that share
-identical anatomy but differ in appearance -- no real cross-subject
-registration or annotation is required.
+\paragraph{Procedural shape generator.} Each synthetic task samples a
+binary target mask from one of seven procedural shape families (blob,
+splatter, disk, cylinder, scatter\_field, vessel, torus) and paints it
+onto a canvas image. Paint intensity is host-anchored -- drawn relative
+to the canvas region's own local mean/std rather than an absolute value
+-- and textured with multi-octave, spatially correlated noise (matching
+real tissue's autocorrelation, unlike flat i.i.d.\ paint), with an
+optional core/rim intensity blend for added heterogeneity.
+\emph{scatter\_field} specifically targets lesion \emph{multiplicity}
+(many small, spatially scattered components), a pattern most
+anatomical structures in the real training cohort do not exhibit.
 
-\paragraph{Paint noise.} The default painting noise is i.i.d.\ per voxel:
-it matches each class's target intensity variance but has near-zero
-spatial autocorrelation, unlike real CT/MRI tissue (measured
-$\approx 0.6$ autocorrelation at native resolution, versus $\approx 0.0$
-for i.i.d.\ paint). An optional multi-octave variant instead sums several
-coarse-to-fine random fields before painting, producing spatially
-correlated texture that better matches real tissue statistics while
-leaving the per-class intensity variance unchanged.
+\paragraph{Canvas: synthetic bank vs.\ real subject.} Two canvas sources
+are available. The \emph{synthetic-bank} canvas draws a candidate
+mask/image region from a precomputed bank of segmented real scans and
+paints the shape into it. The \emph{real-host} canvas instead paints the
+same procedural shape directly onto a real training-cohort subject's own
+image (CT or MRI, any organ), bypassing the bank entirely: every volume
+in a task shares one real subject as its base image, differing only in
+the painted region.
