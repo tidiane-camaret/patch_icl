@@ -9,20 +9,63 @@
 % ---------------------------------------------------------------------------
 % Figure A of the former arch_biaxial.tex: family-level contrast only, NOT
 % the fusion-axis detail (that split off into arch_fusion_axis.tex). Two
-% panels, stacked: Medverse (own-weight dual CNN, re-run every step) vs. a
-% single GENERIC "Shared encoder + cross-attn" panel standing in for the
-% whole family arch_fusion_axis.tex then splits into Baseline/Ours.
+% panels, stacked: Medverse (top) vs. a single GENERIC "Shared encoder +
+% cross-attn" panel standing in for the whole family arch_fusion_axis.tex
+% then splits into Baseline/Ours.
 %
-% The generic panel is deliberately abstracted: it shows img/lbl tokens
-% entering one shared box and a single "encoded" column leaving it, with NO
-% explicit fusion operator (no oplus) and no axis-specific attention drawn
-% between image and label -- that mechanism is exactly what
-% arch_fusion_axis.tex reveals next. Structurally it reuses the Baseline
-% panel's Fuse->Patch-axis skeleton (same box shapes/widths, same xL
-% convention) so the pairing with Medverse above reads as "same kind of
-% figure, one level of abstraction up": both panels here have a 1x box
-% (own-weight CNN vs. one shared encoder) feeding an xL box built around a
-% token column + cross-attention fan.
+% Medverse panel, verified against the released code
+% (medverse/models/Medverse.py, unet_backbone.py): image and mask are
+% channel-CONCATENATED into one volume before any conv
+% (`torch.cat([context_in, context_out], dim=2)` in ContextUNet.forward) --
+% never tokenized, and target gets no mask channel at all, not even a
+% zero placeholder (TargetEncoder takes target_in alone). This then feeds
+% a real U-Net (funnel, not a repeated xL block -- stages change
+% resolution and are NOT the same layer applied L times, so this panel
+% carries no xL marker at all, unlike every other panel in this figure
+% family). Cross-attention is asymmetric and stage-wise, not one fusion
+% event at the waist: each encoder (narrowing) stage has CONTEXT query
+% TARGET's shortcut at that resolution (ConvBlock_context_t2c); each
+% decoder (widening) stage -- including one event right at the
+% bottleneck, before any upsampling -- has TARGET query CONTEXT's feature
+% at that resolution (PairwiseConvAvgModelBlock_c2t). Drawn here as 2
+% down-path + 2 up-path coupling arrows (real stage count varies with
+% `stages`), single-headed to show the direction is NOT symmetric, unlike
+% Figure B's double-headed modality-axis arrows. See
+% arch_medverse_attn_detail.tex for the literal per-block wiring inside
+% each arrow, and arch_medverse_biaxial.tex for a single-waist-arrow
+% version of this same funnel.
+%
+% The generic panel below starts from the SAME kind of input cube as
+% Medverse above (parity), at the same x so the two line up across the
+% divider -- but only ONE cube, the image, since only the image goes
+% through the (shared, real, multi-stage) encoder; the label/prior/mask
+% never does -- it is a much simpler per-cell embedding, not something
+% worth drawing its own cube+encoder pipeline for. The encoder is a
+% funnel (\archfunnel), same visual language as arch_query_prior.tex's
+% Enc/Dec icons. Label evidence re-enters at a Fuse box right after the
+% encoder -- the SAME token-cluster + oplus element the original
+% arch_biaxial.tex Baseline panel used (img tokens, lbl tokens, oplus,
+% fused tokens), not a bespoke drawing: the encoder's single output
+% arrow becomes an "img" token cluster (\tpcluster) once inside the box,
+% a separate "lbl" cluster sits beside it (gray/content-free for
+% target's placeholder prior, solid archContextAccent for context's real
+% mask), and oplus feeds a split "fused" cluster (\tpclustersplit) --
+% the SAME cluster then reappears inside the "Attn." (cross-attention)
+% box, carried over by one more arrow, exactly like the old Fuse->Patch-
+% axis pair did. HOW exactly the combination happens (concat / sum / MLP
+% / attention) is deliberately left generic here -- that is exactly what
+% arch_fusion_axis.tex reveals next.
+%
+% Panels are stacked top (Medverse) over bottom (generic), with their
+% image-input cubes column-aligned (both at \xIn/\xCubeImg). Their
+% predicted-mask outputs are ALSO aligned, by construction rather than
+% accident: Medverse's U-Net is stretched wider than its natural
+% proportions (\bw, well beyond what its own content needs) and the
+% generic panel's Fuse/Attn. boxes and inter-stage gaps are tightened as
+% far as legibility allows (Attn. only needs room for its token column +
+% fan, not a full box's worth of padding) -- the two meet close to the
+% same column without literally matching every intermediate stage,
+% which the two families don't share.
 % ---------------------------------------------------------------------------
 
 % \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
@@ -55,15 +98,6 @@
 \newcommand{\fusearrow}[3]{
   \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
 }
-% \cnnblock{x}{y}{fill}{draw} -- one row's own-weights conv block (Medverse
-% panel only), drawn as a plain labeled "CNN" rectangle rather than a
-% token cluster.
-\newcommand{\cnnblock}[4]{
-  \draw[#4,fill=#3,line width=1.2pt,rounded corners=4pt]
-    (#1-\cnnw/2,#2-\cnnh/2) rectangle ++(\cnnw,\cnnh);
-  \node[align=center] at (#1,#2) {\archboxlabel CNN};
-}
-
 % \tabpfnattn{x} -- Fully connected, right-side routed attention with cascading transparency
 \newcommand{\tabpfnattn}[1]{
   \def\attnstyle{[{Latex[length=3.0mm,width=2.5mm]}-{Latex[length=3.0mm,width=2.5mm]}, line width=1.5pt, archBrightBlue]}
@@ -102,7 +136,6 @@
 \def\tsz{0.50}
 \def\toff{0.80}
 \def\rowpitch{2.40}
-\def\panelgap{2.6}
 \def\clusterhalf{1.10}
 
 \def\xlab{-0.8}
@@ -110,143 +143,164 @@
 \def\yCtx{0}
 \def\yMid{\rowpitch/2}
 
-\def\boxw{6.0}
-\def\xA{-0.30}
-\def\ximgTop{1.0}
 \def\boxpad{0.60}
-
-% ---- Medverse panel only: its second box is wider than \boxw, since it
-% holds two sub-columns (CNN block, token column) instead of one ----
-\def\boxwB{7.6}
-\def\cnnw{1.9}
-\def\cnnh{1.9}
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
-  \pgfmathsetmacro{\boxAcenter}{\xA+\boxw/2}
+  % ---- input-volume geometry, shared by BOTH panels for visual parity:
+  % the same cube size, and the same left-edge x (\xIn), so Medverse's
+  % image cube (below) and the generic panel's image cube (further below)
+  % line up across the divider ----
+  \pgfmathsetmacro{\cubew}{1.6}
+  \pgfmathsetmacro{\cubeh}{1.4}
+  \pgfmathsetmacro{\xIn}{0.2}
 
-  \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}
-  \pgfmathsetmacro{\xFusedTop}{\xlblTop+2.0}
-  \pgfmathsetmacro{\xFuseArrowStart}{\xlblTop+\tsz/2+0.18}
+  % ---- generic panel's geometry, computed here (top level) so the
+  % divider below can reference \xPredCube. Encoder/decoder are funnels
+  % (\archfunnel), same visual language as arch_query_prior.tex's Enc/Dec
+  % icons, in place of the old plain labeled boxes. Only ONE input cube
+  % (image) -- see the header comment for why the label/prior/mask has no
+  % cube of its own, and enters at the Fuse step (\xFuseOp) instead.
+  \pgfmathsetmacro{\xCubeImg}{\xIn}
+  \pgfmathsetmacro{\encw}{0.9}
+  \pgfmathsetmacro{\encwn}{0.55}
+  \pgfmathsetmacro{\ench}{\cubeh}
+  \pgfmathsetmacro{\xEnc}{\xCubeImg+\cubew+1.3}
+
+  % ---- Fuse box: the element from the original arch_biaxial.tex Baseline
+  % panel (img tokens, lbl tokens, oplus, fused tokens), reused as-is but
+  % tightened (spacing, not content) to help \xPredCube below line up
+  % with Medverse's own \xOut ----
+  \pgfmathsetmacro{\xFuseBoxLeft}{\xEnc+\encw+0.8}
+  \pgfmathsetmacro{\ximgTok}{\xFuseBoxLeft+0.8}
+  \pgfmathsetmacro{\xlblTok}{\ximgTok+1.1}
+  \pgfmathsetmacro{\xfusedTok}{\xlblTok+1.4}
+  \pgfmathsetmacro{\boxwFuse}{\xfusedTok+0.6-\xFuseBoxLeft}
+  \pgfmathsetmacro{\xFuseOp}{(\ximgTok+\xlblTok)/2}
+
+  % Cross-attention box: tightened the same way -- the token column + fan
+  % don't need much width, narrowing it makes room for the decoder +
+  % predicted-mask cube after it.
+  \pgfmathsetmacro{\boxwXattn}{2.9}
+  \pgfmathsetmacro{\xB}{\xFuseBoxLeft+\boxwFuse+0.9}
+  \pgfmathsetmacro{\boxBcenter}{\xB+\boxwXattn/2}
+
+  \pgfmathsetmacro{\decw}{0.9}
+  \pgfmathsetmacro{\decwn}{0.55}
+  \pgfmathsetmacro{\dech}{\cubeh}
+  \pgfmathsetmacro{\xDecLeft}{\xB+\boxwXattn+0.6}
+  \pgfmathsetmacro{\xPredCube}{\xDecLeft+\decw+0.8+\cubew/2}
 
   % =========================================================================
-  % Medverse: 1x Fuse (context only), then Lx Per-img conv block +
-  % cross-attn. Identical to the top panel of the former arch_biaxial.tex --
-  % see arch_medverse_staircase.tex for the standalone version this is
-  % lifted from, and arch_medverse_attn_detail.tex for the literal per-block
-  % wiring the second box collapses.
+  % Medverse: real dual U-Net, own weights per row, channel-concatenated
+  % VOLUME input (no tokenization). See the header comment above for the
+  % code this is checked against; arch_medverse_attn_detail.tex for the
+  % literal per-block wiring inside each coupling arrow drawn below.
   % =========================================================================
   \begin{scope}[yshift=0cm]
 
-    \pgfmathsetmacro{\xE}{\xA}
-    \pgfmathsetmacro{\xF}{\xE+\boxw+\panelgap}
-    \pgfmathsetmacro{\boxEcenter}{\xE+\boxw/2}
-    \pgfmathsetmacro{\boxFcenter}{\xF+\boxwB/2}
-    \pgfmathsetmacro{\xCnnCol}{\xF+1.6}
-    \pgfmathsetmacro{\xTokCol}{\xF+\boxwB-1.6}
+    % Wider than Medverse's own natural proportions -- stretched so this
+    % panel's \xOut lines up with the generic panel's \xPredCube below
+    % (both have image-input cubes at the same x already; this closes
+    % the gap on the output side without changing the coupling arrows'
+    % 4 fixed fractional positions, {0.20,0.40,0.50,0.75}).
+    \pgfmathsetmacro{\bw}{8.0}
+    \pgfmathsetmacro{\bh}{2.0}
+    \pgfmathsetmacro{\bpinch}{0.7}
+    \pgfmathsetmacro{\bcx}{\xIn+\cubew+1.3}
+    \pgfmathsetmacro{\waistX}{\bcx+\bw/2}
+    \pgfmathsetmacro{\bcyTgt}{\yTgt-\bh/2}
+    \pgfmathsetmacro{\bcyCtx}{\yCtx-\bh/2}
+    \pgfmathsetmacro{\xOutArrowStart}{\bcx+\bw+0.5}
+    \pgfmathsetmacro{\xOut}{\xOutArrowStart+1.3+\cubew/2}
 
-    \pgfmathsetmacro{\outerLeftMV}{\xF-0.50}
-    \pgfmathsetmacro{\outerRightMV}{\xF+\boxwB+0.50}
-    \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
-    \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
-    \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
+    \pgfmathsetmacro{\boxLeft}{\bcx-0.5}
+    \pgfmathsetmacro{\boxRight}{\bcx+\bw+0.5}
+    \pgfmathsetmacro{\outerTop}{\yTgt+\cubeh/2+0.85}
+    \pgfmathsetmacro{\outerBot}{\yCtx-\cubeh/2-0.40}
+    \pgfmathsetmacro{\methodTitleY}{\outerTop+0.85}
 
-    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
-    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context};
 
-    \node[anchor=south] at ({\xE+(\xF+\boxwB-\xE)/2},{\methodTitleY})
+    \node[anchor=south] at ({(\xIn+\xOut)/2},{\methodTitleY})
       {\archtitle Dual ConvNet \normalsize\normalfont(Medverse)};
 
-    \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
-      ({\outerLeftMV},{\outerBot}) rectangle ({\outerRightMV},{\outerTop});
-
+    % plain box, no xL marker: U-Net stages change resolution and are NOT
+    % the same layer applied L times, unlike the generic panel below
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      (\xE,\yCtx-\clusterhalf-\boxpad) rectangle ({\xE+\boxw},\yTgt+\clusterhalf+\boxpad);
-    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xF},\yCtx-\clusterhalf-\boxpad) rectangle ({\xF+\boxwB},\yTgt+\clusterhalf+\boxpad);
+      ({\boxLeft},{\outerBot}) rectangle ({\boxRight},{\outerTop});
+    \node[anchor=south,align=center] at ({(\boxLeft+\boxRight)/2},{\outerTop+0.20})
+      {\archboxlabel Dual U-Net (own weights per row)};
 
-    \node[anchor=south] at ({\boxEcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse (context only)};
-    \node[anchor=south,align=center] at ({\boxFcenter},\yTgt+\clusterhalf+\boxpad+0.20)
-      {\archboxlabel Per-img conv block + cross-attn};
+    % input VOLUMES, channel-concatenated before any conv -- not tokens.
+    % Context: image+mask, 2 input channels. Target: image alone --
+    % Medverse's TargetEncoder never receives a mask channel, not even a
+    % zero placeholder, which is why its cube uses the plain "ct" icon.
+    \archvolcube{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image (1ch)}
+    \archvolcube{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ctmask}{image$\,\oplus\,$mask (2ch)}
 
-    \node[anchor=north east] at ({\outerRightMV-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+    \archarrow{({\xIn+\cubew+0.15},{\yTgt})}{({\bcx-0.55},{\yTgt})}{black!30}
+    \archarrow{({\xIn+\cubew+0.15},{\yCtx})}{({\bcx-0.55},{\yCtx})}{black!30}
 
-    \archarrow{({\xE+\boxw+0.50},{\yMid})}{({\xF-0.50},{\yMid})}{black!30}
+    \archbowtie{\bcx}{\bcyTgt}{\bw}{\bh}{\bpinch}{archTargetGreen}{target U-Net}
+    \archbowtie{\bcx}{\bcyCtx}{\bw}{\bh}{\bpinch}{archContextPink}{context U-Net}
 
-    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.25) {lbl};
-    \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {fused};
-
-    \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
-      \fill[black!15,rounded corners=3pt]
-        ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
-        ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+    % Multiple DISCRETE stage couplings, not one generic waist arrow.
+    % Down-path (narrowing half, left of the waist): context's own
+    % encoder stage queries target's encoder shortcut at that resolution
+    % -- drawn target->context, since target is the read-only K/V source.
+    % Up-path (widening half, right of the waist): target's own decoder
+    % stage queries context's feature at that resolution -- drawn
+    % context->target. The first up-path arrow sits exactly at the waist:
+    % that is the real bottleneck-level event, before any upsampling.
+    \foreach \f in {0.20,0.40} {
+      \archarrow{({\bcx+\f*\bw},{\yTgt-0.35})}{({\bcx+\f*\bw},{\yCtx+0.35})}{archBrightBlue}
+    }
+    \foreach \f in {0.50,0.75} {
+      \archarrow{({\bcx+\f*\bw},{\yCtx+0.35})}{({\bcx+\f*\bw},{\yTgt-0.35})}{archBrightBlue}
     }
 
-    % target row: raw image tokens, unsplit fill, bypass the fuse -- target
-    % here has no label column at all, not even a zero-mask placeholder
-    \tpcluster{\ximgTop}{\yTgt}{archTargetGreen}{black!70}
-    \tpcluster{\xlblTop}{\yTgt}{black!8}{black!70}
-    \tpcluster{\xFusedTop}{\yTgt}{archTargetGreen}{black!70}
-    \fusearrow{({\ximgTop+\tsz/2+0.18},{\yTgt})}{({\xFusedTop-\tsz/2-0.18},{\yTgt})}{black!40}
-
-    % context row: img + lbl -> (+) -> fused
-    \tpcluster{\ximgTop}{\yCtx}{archContextPink}{black!70}
-    \tpcluster{\xlblTop}{\yCtx}{archContextAccent}{black!70}
-    \tpclustersplit{\xFusedTop}{\yCtx}{archContextPink}{archContextAccent}{black!70}
-    \node[font=\huge] at ({(\ximgTop+\xlblTop)/2},{\yCtx}) {$\oplus$};
-    \fusearrow{({\xFuseArrowStart},{\yCtx})}{({\xFusedTop-\tsz/2-0.18},{\yCtx})}{black!55}
-
-    % Per-img conv block + cross-attn: CNN block (own weights, no
-    % interaction) sits right next to the token column it feeds
-    \cnnblock{\xCnnCol}{\yTgt}{archTargetGreen!35}{archTargetAccent}
-    \cnnblock{\xCnnCol}{\yCtx}{archContextPink!35}{archContextAccent}
-    \fusearrow{({\xCnnCol+\cnnw/2+0.15},{\yTgt})}{({\xTokCol-\tsz/2-0.18},{\yTgt})}{black!40}
-    \fusearrow{({\xCnnCol+\cnnw/2+0.15},{\yCtx})}{({\xTokCol-\tsz/2-0.18},{\yCtx})}{black!40}
-
-    \foreach \y in {\yTgt,\yCtx} {
-      \foreach \doff in {-\toff,0,\toff} {
-        \fill[black!15,rounded corners=3pt]
-          ({\xTokCol-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
-          ({\xTokCol+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
-      }
-    }
-
-    \tpcluster{\xTokCol}{\yTgt}{archTargetGreen}{black!70}
-    \tpclustersplit{\xTokCol}{\yCtx}{archContextPink}{archContextAccent}{black!70}
-    \tabpfnattn{\xTokCol}
+    % predicted mask (target row only -- context's own decoder output is
+    % internal, never exposed)
+    \archarrow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{archTargetAccent}
+    \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
 
 
   % =========================================================================
-  % Divider between the two panels. Spans Medverse's wider extent so it
-  % lines up regardless of which panel is widest.
+  % Divider between the two panels -- horizontal, panels stacked top
+  % (Medverse) over bottom (generic). Spans the wider panel's extent
+  % (the generic panel's, since it has more stages: patchify, two boxes,
+  % decoder) so both panels' shared elements -- the input image cubes,
+  % aligned at \xIn/\xCubeImg -- line up in the same column top to bottom.
   % =========================================================================
-  \pgfmathsetmacro{\divY}{\yCtx-\clusterhalf-\boxpad-0.40 - 1.2}
-  \draw[black!20,dashed,line width=1pt] ({\xA-1.0},{\divY}) -- ({\xA+\boxw+\panelgap+\boxwB+1.0},{\divY});
+  \pgfmathsetmacro{\divY}{\yCtx-1.4/2-0.40-1.2}
+  \draw[black!20,dashed,line width=1pt] ({\xIn-1.0},{\divY}) -- ({\xPredCube+\cubew/2+1.0},{\divY});
 
 
   % =========================================================================
   % Generic "shared encoder + cross-attn" panel -- stands in for the whole
   % family arch_fusion_axis.tex splits into Baseline (early fusion) and
-  % Ours (dual attn). Deliberately abstracted: ONE box ("Shared Encoder")
-  % that BOTH rows pass through -- the point being that, unlike Medverse
-  % above, there is only one set of weights, not one per row -- feeding an
-  % xL box built around a single "encoded" token column + the same
-  % cross-attention fan. No oplus, no image/label attention drawn: HOW
-  % image and label evidence combine within this shared encoder is exactly
-  % what arch_fusion_axis.tex shows next.
+  % Ours (dual attn). Encoder/decoder drawn as funnels (\archfunnel), same
+  % visual language as arch_query_prior.tex's Enc/Dec icons, instead of
+  % plain labeled boxes -- ONE encoder funnel per row (same weights both
+  % rows, unlike Medverse's own-weight funnels above), feeding an xL
+  % cross-attention box built around a single "encoded" token column +
+  % the same cross-attention fan. No oplus, no image/label attention
+  % drawn: HOW image and label evidence combine within this shared
+  % encoder is exactly what arch_fusion_axis.tex shows next. Stacked below
+  % Medverse (yshift), with its own input cubes left-aligned at the same x
+  % as Medverse's (\xCubeImg = \xIn) for a shared reference column.
   % =========================================================================
   \begin{scope}[yshift=-10.3cm]
 
-    \pgfmathsetmacro{\xB}{\xA+\boxw+\panelgap}
-    \pgfmathsetmacro{\boxBcenter}{\xB+\boxw/2}
     \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
 
     \pgfmathsetmacro{\outerLeftBase}{\xB-0.50}
-    \pgfmathsetmacro{\outerRightBase}{\xB+\boxw+0.50}
+    \pgfmathsetmacro{\outerRightBase}{\xB+\boxwXattn+0.50}
     \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
     \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
     \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
@@ -254,35 +308,68 @@
     \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
     \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
 
-    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY})
+    \node[anchor=south] at ({(\xCubeImg+\xPredCube+\cubew/2)/2},{\methodTitleY})
       {\archtitle Shared encoder + cross-attn};
 
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeftBase},{\outerBot}) rectangle ({\outerRightBase},{\outerTop});
 
+    % ---- input VOLUME, for parity with Medverse's image cube above --
+    % only the image, since only the image is encoded (see header comment)
+    \archvolcube{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image}
+    \archvolcube{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ct}{image}
+
+    % ---- shared encoder: one funnel per row, same weights both rows --
+    % image only, matching arch_query_prior.tex's cube->funnel->attention
+    % routing
+    \archarrow{({\xCubeImg+\cubew+0.15},{\yTgt})}{({\xEnc-0.05},{\yTgt})}{black!30}
+    \archarrow{({\xCubeImg+\cubew+0.15},{\yCtx})}{({\xEnc-0.05},{\yCtx})}{black!30}
+    \archfunnel{\xEnc}{{\yTgt-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+    \archfunnel{\xEnc}{{\yCtx-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+
+    % ---- Fuse box: the SAME element the original arch_biaxial.tex
+    % Baseline panel used (img tokens, lbl tokens, oplus, fused tokens),
+    % reused as-is rather than a bespoke drawing. The encoder's single
+    % output arrow becomes an "img" token cluster once inside the box;
+    % the "lbl" cluster beside it is gray/content-free for target's
+    % placeholder prior, solid archContextAccent for context's real mask.
+    \archarrow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft-0.50},{\yTgt})}{black!30}
+    \archarrow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft-0.50},{\yCtx})}{black!30}
+
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      (\xA,\yCtx-\clusterhalf-\boxpad) rectangle ({\xA+\boxw},\yTgt+\clusterhalf+\boxpad);
-    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+\boxpad);
+      ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},\yTgt+\clusterhalf+\boxpad);
+    \node[anchor=south] at ({\xFuseBoxLeft+\boxwFuse/2},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
 
-    \node[anchor=south] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Shared Encoder};
-    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Cross-attention};
+    \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.25) {img};
+    \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.25) {lbl};
+    \node[anchor=south,font=\normalsize] at (\xfusedTok,\yTgt+\clusterhalf+0.25) {fused};
 
-    \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
-
-    \archarrow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{black!30}
-
-    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.25) {lbl};
-    \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {encoded};
-    \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {encoded};
-
-    \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
+    \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
       \fill[black!15,rounded corners=3pt]
         ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
         ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
     }
 
+    \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/black!8,
+                                       \yCtx/archContextPink/archContextAccent} {
+      \tpcluster{\ximgTok}{\y}{\imgfill}{black!70}
+      \tpcluster{\xlblTok}{\y}{\lblfill}{black!70}
+      \tpclustersplit{\xfusedTok}{\y}{\imgfill}{\lblfill}{black!70}
+    }
+    \node[font=\huge] at ({\xFuseOp},{\yTgt}) {$\oplus$};
+    \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
+    \fusearrow{({\xFuseOp+0.35},{\yTgt})}{({\xfusedTok-\tsz/2-0.18},{\yTgt})}{black!55}
+    \fusearrow{({\xFuseOp+0.35},{\yCtx})}{({\xfusedTok-\tsz/2-0.18},{\yCtx})}{black!55}
+
+    \archarrow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yTgt})}{({\xB-0.20},{\yTgt})}{black!55}
+    \archarrow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yCtx})}{({\xB-0.20},{\yCtx})}{black!55}
+
+    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+      ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxwXattn},\yTgt+\clusterhalf+\boxpad);
+    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Attn.};
+    \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+
+    \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {encoded};
     \foreach \y in {\yTgt,\yCtx} {
       \foreach \doff in {-\toff,0,\toff} {
         \fill[black!15,rounded corners=3pt]
@@ -290,22 +377,20 @@
           ({\xFusedPatchTop+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
       }
     }
-
-    % target's label column is gray, not a role color -- never real ground
-    % truth (a zero-mask placeholder here), unlike context's
-    \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/black!8,
-                                       \yCtx/archContextPink/archContextAccent} {
-      \tpcluster{\ximgTop}{\y}{\imgfill}{black!70}
-      \tpcluster{\xlblTop}{\y}{\lblfill}{black!70}
-      \tpclustersplit{\xFusedTop}{\y}{\imgfill}{\lblfill}{black!70}
-      \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
-    }
-
-    % Generic pass-through into the shared encoder -- no oplus: which
-    % operator combines img/lbl is exactly what arch_fusion_axis.tex shows
-    \fusearrow{({\xFuseArrowStart},{\yMid})}{({\xFusedTop-\tsz/2-0.18},{\yMid})}{black!55}
-
+    % target's encoded token is half-gray, not a role color -- never real
+    % ground truth (a placeholder prior here), unlike context's
+    \tpclustersplit{\xFusedPatchTop}{\yTgt}{archTargetGreen}{black!8}{black!70}
+    \tpclustersplit{\xFusedPatchTop}{\yCtx}{archContextPink}{archContextAccent}{black!70}
     \tabpfnattn{\xFusedPatchTop}
+
+    % ---- decoder, target row only (context's post-attn state is read-
+    % only and never decoded, exactly like Medverse's context decoder
+    % output above) -- OUTSIDE the xL wrapper, since decoding runs once,
+    % after L layers of cross-attention, not once per layer
+    \archarrow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{archTargetAccent}
+    \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
+    \archarrow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{archTargetAccent}
+    \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
 
