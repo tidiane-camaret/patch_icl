@@ -1,0 +1,230 @@
+\documentclass[tikz,border=4pt,12pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% ---------------------------------------------------------------------------
+% Medverse, single-level, drawn in the flat token-cluster vocabulary of
+% arch_biaxial.tex (not the funnel/bowtie of arch_medverse_biaxial.tex) so
+% it can sit as a directly comparable third panel next to that figure's
+% "Baseline: early fusion" and "Ours: dual attn." -- same box language,
+% same xL convention, so the reader compares shapes, not drawing styles.
+%
+% Four boxes: Fuse (context only, 1x -- same as the baseline panel's Fuse)
+% -> Separate encoders -> Cross-attn -> Separate encoders (xL). The
+% repeated pair mirrors one real stage block exactly: own conv (=
+% "Separate encoders" #1) -> cross-attention -> concat + 1x1 conv +
+% residual, which is ALSO separately-weighted per stream (=
+% "Separate encoders" #2) -- see arch_medverse_attn_detail.tex for the
+% literal per-block wiring this collapses. Fuse sits outside the xL
+% wrapper because it happens once, upstream, exactly like the baseline
+% panel's Fuse box; here L = U-Net stages, not transformer layers, and
+% (as in arch_medverse_biaxial.tex) the down-path/up-path attention
+% asymmetry is simplified to one generic coupling per repeat rather than
+% drawn twice -- see that figure's note for the full detail.
+% ---------------------------------------------------------------------------
+
+\definecolor{archBrightBlue}{HTML}{3B82F6}
+
+% \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
+\newcommand{\tpsq}[4]{
+  \fill[#3] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+  \draw[#4,line width=1.2pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpcluster{x}{y}{fill}{ring} -- 3 stacked tokens standing in for N tokens.
+\newcommand{\tpcluster}[4]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsq{#1}{#2+\doff}{#3}{#4}
+  }
+}
+% \tpsqsplit{x}{y}{fillImg}{fillLbl}{ring} -- one token, diagonally split.
+\newcommand{\tpsqsplit}[5]{
+  \begin{scope}
+    \clip (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+    \fill[#3] (#1-\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+    \fill[#4] (#1-\tsz/2,#2-\tsz/2) -- (#1-\tsz/2,#2+\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+  \end{scope}
+  \draw[#5,line width=1.2pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpclustersplit{x}{y}{fillImg}{fillLbl}{ring} -- 3 stacked split tokens.
+\newcommand{\tpclustersplit}[5]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsqsplit{#1}{#2+\doff}{#3}{#4}{#5}
+  }
+}
+% \fusearrow{p1}{p2}{color} -- straight single-headed merge/passthrough edge.
+\newcommand{\fusearrow}[3]{
+  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
+}
+% \encbox{x}{y}{color} -- colored outline around one row's cluster inside a
+% "Separate encoders" step, signaling "this stream's own weights, no
+% interaction here".
+\newcommand{\encbox}[3]{
+  \draw[#3,line width=1.2pt,rounded corners=3pt]
+    (#1-\tsz/2-0.15,#2-\toff-\tsz/2-0.12) rectangle
+    (#1+\tsz/2+0.15,#2+\toff+\tsz/2+0.12);
+}
+% \tabpfnattn{x} -- full target<->context attention fan at column x,
+% cascading opacity by token distance (style: TabPFN Fig. 1).
+\newcommand{\tabpfnattn}[1]{
+  \def\attnstyle{[{Latex[length=3.0mm,width=2.5mm]}-{Latex[length=3.0mm,width=2.5mm]}, line width=1.5pt, archBrightBlue]}
+  \def\ax{#1+\tsz/2+0.05}
+
+  \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=30] (\ax, \yTgt);
+  \draw\attnstyle (\ax, \yTgt)       to[bend left=30] (\ax, \yTgt-\toff);
+  \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=30] (\ax, \yCtx+\toff);
+  \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=30] (\ax, \yCtx);
+  \draw\attnstyle (\ax, \yCtx)       to[bend left=30] (\ax, \yCtx-\toff);
+
+  \begin{scope}[opacity=0.6]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=45] (\ax, \yTgt-\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=45] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=45] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=45] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.3]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=60] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=60] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=60] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.15]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=75] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=75] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.08]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=90] (\ax, \yCtx-\toff);
+  \end{scope}
+}
+
+% ---- dimensions, matched to arch_biaxial.tex ----
+\def\tsz{0.50}
+\def\toff{0.80}
+\def\rowpitch{2.40}
+\def\panelgap{2.6}
+\def\clusterhalf{1.10}
+
+\def\xlab{-0.8}
+\def\yTgt{\rowpitch}
+\def\yCtx{0}
+\def\yMid{\rowpitch/2}
+
+\def\boxw{6.0}
+\def\xFuse{-0.30}
+\def\ximgTop{1.0}
+\def\boxpad{0.60}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  \pgfmathsetmacro{\xEncA}{\xFuse+\boxw+\panelgap}
+  \pgfmathsetmacro{\xAttn}{\xEncA+\boxw+\panelgap}
+  \pgfmathsetmacro{\xEncB}{\xAttn+\boxw+\panelgap}
+
+  \pgfmathsetmacro{\boxFuseCenter}{\xFuse+\boxw/2}
+  \pgfmathsetmacro{\boxEncACenter}{\xEncA+\boxw/2}
+  \pgfmathsetmacro{\boxAttnCenter}{\xAttn+\boxw/2}
+  \pgfmathsetmacro{\boxEncBCenter}{\xEncB+\boxw/2}
+
+  % xL wrapper spans all three repeated boxes -- Fuse happens once, upstream
+  \pgfmathsetmacro{\outerLeft}{\xEncA-0.50}
+  \pgfmathsetmacro{\outerRight}{\xEncB+\boxw+0.50}
+  \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
+  \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
+  \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
+
+  \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}
+  \pgfmathsetmacro{\xFusedTop}{\xlblTop+2.0}
+  \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
+  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.35}
+
+  % ---- row labels ----
+  \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
+  \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+
+  % ---- title ----
+  \node[anchor=south] at ({\xFuse+(\xEncB+\boxw-\xFuse)/2},{\methodTitleY})
+    {\archtitle Medverse: context-fused, cross-attn.};
+
+  % ---- xL wrapper ----
+  \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
+    ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
+
+  % ---- inner step boxes ----
+  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+    (\xFuse,\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuse+\boxw},\yTgt+\clusterhalf+\boxpad);
+  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+    ({\xEncA},\yCtx-\clusterhalf-\boxpad) rectangle ({\xEncA+\boxw},\yTgt+\clusterhalf+\boxpad);
+  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+    ({\xAttn},\yCtx-\clusterhalf-\boxpad) rectangle ({\xAttn+\boxw},\yTgt+\clusterhalf+\boxpad);
+  \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+    ({\xEncB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xEncB+\boxw},\yTgt+\clusterhalf+\boxpad);
+
+  \node[anchor=south] at ({\boxFuseCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse (context only)};
+  \node[anchor=south] at ({\boxEncACenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Separate encoders};
+  \node[anchor=south] at ({\boxAttnCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Cross-attn};
+  \node[anchor=south] at ({\boxEncBCenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Separate encoders};
+  \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+
+  \archarrow{({\xFuse+\boxw+0.50},{\yMid})}{({\xEncA-0.50},{\yMid})}{black!30}
+  \archarrow{({\xEncA+\boxw+0.50},{\yMid})}{({\xAttn-0.50},{\yMid})}{black!30}
+  \archarrow{({\xAttn+\boxw+0.50},{\yMid})}{({\xEncB-0.50},{\yMid})}{black!30}
+
+  % ---- column headers (Fuse box) ----
+  \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
+  \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.25) {lbl};
+  \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {fused};
+
+  % ---- background column groupings (Fuse box) ----
+  \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
+    \fill[black!15,rounded corners=3pt]
+      ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+  }
+
+  % ---- target row: raw image tokens, unsplit fill, bypass the fuse ----
+  \tpcluster{\ximgTop}{\yTgt}{archTargetGreen}{black!70}
+  \tpcluster{\xFusedTop}{\yTgt}{archTargetGreen}{black!70}
+  \fusearrow{({\ximgTop+\tsz/2+0.18},{\yTgt})}{({\xFusedTop-\tsz/2-0.18},{\yTgt})}{black!40}
+
+  % ---- context row: img + lbl -> (+) -> fused ----
+  \tpcluster{\ximgTop}{\yCtx}{archContextPink}{black!70}
+  \tpcluster{\xlblTop}{\yCtx}{archContextAccent}{black!70}
+  \tpclustersplit{\xFusedTop}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+  \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
+  \fusearrow{({\xFuseArrowStart},{\yCtx})}{({\xFusedTop-\tsz/2-0.18},{\yCtx})}{black!55}
+
+  % ---- Separate encoders #1 (own conv, before attention): colored
+  % outlines -- not the neutral grey grouping used elsewhere -- signal
+  % "different weights"; deliberately no lines between rows ----
+  \encbox{\boxEncACenter}{\yTgt}{archTargetAccent}
+  \encbox{\boxEncACenter}{\yCtx}{archContextAccent}
+  \tpcluster{\boxEncACenter}{\yTgt}{archTargetGreen}{black!70}
+  \tpclustersplit{\boxEncACenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+
+  % ---- background row groupings (Cross-attn box) ----
+  \foreach \y in {\yTgt,\yCtx} {
+    \foreach \doff in {-\toff,0,\toff} {
+      \fill[black!15,rounded corners=3pt]
+        ({\boxAttnCenter-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
+        ({\boxAttnCenter+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
+    }
+  }
+
+  % ---- Cross-attn: the only step where the two streams actually meet ----
+  \tpcluster{\boxAttnCenter}{\yTgt}{archTargetGreen}{black!70}
+  \tpclustersplit{\boxAttnCenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+  \tabpfnattn{\boxAttnCenter}
+
+  % ---- Separate encoders #2 (concat + 1x1 conv + residual, after
+  % attention): same "own weights, no interaction" language as #1 --
+  % see arch_medverse_attn_detail.tex for what this box collapses ----
+  \encbox{\boxEncBCenter}{\yTgt}{archTargetAccent}
+  \encbox{\boxEncBCenter}{\yCtx}{archContextAccent}
+  \tpcluster{\boxEncBCenter}{\yTgt}{archTargetGreen}{black!70}
+  \tpclustersplit{\boxEncBCenter}{\yCtx}{archContextPink}{archContextAccent}{black!70}
+
+\end{tikzpicture}
+\end{document}
