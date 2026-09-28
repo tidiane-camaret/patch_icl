@@ -13,21 +13,24 @@ pair into a compact per-class task embedding and fuses it into the target
 through a pixel shuffle-unshuffle operation -- a single fusion step,
 applied once, with no iterative refinement across scales.
 
-\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} performs
-next-scale autoregressive segmentation, inspired by next-scale image
-generation~\cite{tian2024visual}: at each step, the target and the
-previous step's (perturbed) prediction are concatenated and processed by
-a shared U-Net, together with the real context pairs, correlated via a
-blockwise cross-attention module that pools queries and keys to block
-resolution for efficiency (\autoref{sec:methodology-fusion}). Every step
-still re-scans the \emph{entire} volume with a sliding window -- only the
-input changes with scale, not the spatial extent processed.
+\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} encodes target
+and context with two separate U-Nets, fused via blockwise cross-attention
+between the two streams at every stage, pooling queries and keys to block
+resolution for efficiency (\autoref{sec:methodology-fusion}).
 
-\paragraph{Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a}}
-stacks levels of increasing resolution for large-volume segmentation, but
-targets single-model supervised segmentation rather than in-context,
-few-shot prediction -- an architectural precedent for coarse-to-fine
-cascades outside the ICL setting.
+\paragraph{Hierarchical, coarse-to-fine approaches.} Deep Neural
+Patchworks~\cite{reisertDeepNeuralPatchworks2022a} stacks levels of
+increasing resolution for large-volume segmentation, but targets
+single-model supervised segmentation rather than in-context, few-shot
+prediction -- an architectural precedent for coarse-to-fine cascades
+outside the ICL setting. Medverse applies a similar idea within the ICL
+setting itself: it performs next-scale autoregressive segmentation,
+inspired by next-scale image generation~\cite{tian2024visual}, where at
+each step the previous step's (perturbed) prediction re-enters as an
+additional context pair, processed by the same context U-Net -- reused
+unchanged across scales. Every step still re-scans the \emph{entire}
+volume with a sliding window -- only the input changes with scale, not
+the spatial extent processed.
 
 \begin{table}[t]
   \centering
@@ -40,7 +43,7 @@ cascades outside the ICL setting.
     \midrule
     UniverSeg & dense cross-attn. & no & no \\
     Iris & one-shot pixel shuffle & no & no \\
-    Medverse & early concatenation & full-volume re-scan & no \\
+    Medverse & dual U-Net cross-attn. & full-volume re-scan & no \\
     \textbf{Ours} & dual attention (repeated) & region-restricted, register-carried & GMM repaint + texture \\
     \bottomrule
   \end{tabular}
