@@ -1,15 +1,17 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-On four held-out sources with no anatomical overlap with training
-(ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705 -- lesion targets on MRI, one
-Dixon), the baseline checkpoint scores Dice 0.008--0.082. Widening the
+The baseline is the same configuration trained with
+$p_\text{synth}{=}0.5$ and the synthetic-bank canvas. On four held-out
+sources with no anatomical overlap with training (ISLES22, Shifts-MS,
+ATLAS v2.0, GNC\_705 -- lesion targets on MRI, one Dixon), the baseline
+checkpoint scores Dice 0.008--0.082. Widening the
 shape generator's family mix or dosage on the synthetic-bank canvas
 (\autoref{sec:methodology-synth}) left every source within noise of
 baseline. The bank turned out to be built entirely from CT scans, while
 every target source here is MRI -- a canvas-modality mismatch, not a
 shape-diversity problem.
 
-\paragraph{Swapping the canvas closes the gap.} A matched pair isolates
+\paragraph{Canvas source.} A matched pair isolates
 the fix: identical checkpoint, shape family (scatter\_field), dose, and
 training budget, only the canvas source changes from the synthetic bank to a real
 MRI training case from TotalSegmentator. Every source improves except ATLAS v2.0, a
@@ -43,7 +45,7 @@ budget keeps compounding on GNC\_705 -- the best result of the whole
 progression -- while easing back slightly on the two brain-lesion
 sources from stage 2's peak.
 
-\paragraph{No in-distribution cost.} The same checkpoints' own periodic
+\paragraph{In-distribution accuracy.} The same checkpoints' own periodic
 TotalSegmentator validation shows the OOD gain is additive, not traded
 against in-distribution accuracy:
 
@@ -70,7 +72,7 @@ The seen/unseen and MRI/CT gaps hold at roughly the same size at every
 stage; stage 3's longer budget lifts all five numbers together rather
 than trading one for another.
 
-\paragraph{The gain survives cascading.} Resuming the stage-3 checkpoint
+\paragraph{Cascade inference.} Resuming the stage-3 checkpoint
 into coarse-to-fine cascade training (\autoref{sec:methodology-cascade})
 and re-evaluating the same nine OOD sources tests whether the real-host
 canvas helps under a different training and inference regime, not only
@@ -79,15 +81,17 @@ the single-level one it was found under.
 \begin{table}[t]
   \centering
   \small
-  \caption{OOD Dice under cascade inference. 146: cascade baseline,
-  synthetic-bank canvas. 168: 146 resumed with the real-host canvas
-  (stage 3 above). Medverse: released weights, depth-matched native
-  autoregressive inference (\autoref{sec:results-cascade}); omitted for
-  four sources where both models score too low to be informative.}
+  \caption{OOD Dice under cascade inference. No synth (146): the
+  reference cascade model of \autoref{sec:results-cascade}, trained with
+  no synthetic tasks at all. Real-host canvas (168): the stage-3 model
+  above resumed into cascade training for 20 epochs. Medverse: released
+  weights, depth-matched native autoregressive inference
+  (\autoref{sec:results-cascade}); omitted for four sources where both
+  models score too low to be informative.}
   \label{tab:synth-cascade-realhost}
   \begin{tabular}{lccc}
     \toprule
-    Dataset & 146 & 168 (real-host) & Medverse \\
+    Dataset & No synth (146) & Real-host canvas (168) & Medverse \\
     \midrule
     HU\_LWK1 & \textbf{0.152} & 0.124 & 0.020 \\
     ISLES22 & 0.069 & \textbf{0.070} & -- \\
@@ -102,10 +106,20 @@ the single-level one it was found under.
   \end{tabular}
 \end{table}
 
-The real-host canvas still wins or ties on five of nine sources under
-cascade inference, including a 0.21 gain on MSD Hippocampus, without
-closing the gap to Medverse on the two sources where Medverse's
-full-FOV pyramid already dominates.
+Under cascade inference, the real-host canvas gains substantially on
+MSD Hippocampus ($+0.215$) and NasalSeg ($+0.097$), loses on HU\_LWK1
+($-0.028$) and Shifts-MS ($-0.012$), and changes Dice by about 0.01 or
+less elsewhere. It does not close the gap to Medverse on either source
+where Medverse leads. The largest single-level gain, on GNC\_705
+(0.223, \autoref{tab:synth-realhost-ood}), does not carry over: under
+cascade inference both models score below 0.04 there. A likely cause:
+the coarse level's prediction on this source is dominated by an
+intensity-brightness confound rather than real segmentation (its
+qualitative failure mode is documented in
+\texttt{docs/datasets/gnc\_kidney\_lesions.md}), so the imprecise coarse
+centroid misdirects the fine level's region-restricted re-crop away from
+the lesion entirely -- a real limitation of region restriction on small,
+easily-mislocalized targets, not just a canvas-source effect.
 \todo{Stage 2$\to$3 changes several axes at once (family count, host
 pool, training budget); only stage 1$\to$2 is a controlled ablation.
 N=1 seed throughout, including the cascade re-run above.}
