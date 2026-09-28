@@ -1,0 +1,255 @@
+=== isles22 ===
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/dpxuser/.netrc.
+wandb: Currently logged in as: tidiane-camaret-ndir (tidiane-camaret-ndir-universit-tsklinikum-freiburg) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run 1i8hvqiu
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in /home/dpxuser/dev/patch_icl/wandb/run-20260928_105340-1i8hvqiu
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run fragrant-forest-272
+wandb: ⭐️ View project at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: 🚀 View run at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/1i8hvqiu
+Device      : cuda
+Model       : patchset3d
+Data root   : /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/isles22/npy  (source=isles22, split=test)
+Classes (1): stroke_lesion
+K=1  image_size=(128, 128, 128)  n_subjects<=50
+
+  [warn] eval data config NOT inherited from the checkpoint (only `arch` is); these differ from training and change what the model sees:
+         - crop_spacing_mm: train=3.0  eval=1.5
+         - use_crop: train=None  eval=True
+         - mask_downsample: train='soft'  eval='occupancy'
+         - source: train='multisource'  eval='isles22'
+         Re-supply matching data.* overrides for a faithful eval.
+
+  Loaded patchset3d from /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-28_167_real_host_all_shapes_wide_spacing/best.pt (arch l=4)
+  Measuring FLOPs (K=1, size=(128, 128, 128))...
+  GFLOPs: 3892.50  [encoder=876.98  transformer=2737.35  other=278.17]
+
+  [warn] could not resolve train_classes for the `in_train` flag ('NoneType' object is not iterable); leaving it unset.
+eval:   0%|          | 0/31 [00:00<?, ?it/s]eval:   3%|▎         | 1/31 [01:18<39:15, 78.52s/it]eval:   6%|▋         | 2/31 [01:19<15:52, 32.84s/it]eval:  10%|▉         | 3/31 [01:20<08:27, 18.14s/it]eval:  13%|█▎        | 4/31 [01:20<05:03, 11.23s/it]eval:  16%|█▌        | 5/31 [01:21<03:12,  7.41s/it]eval:  19%|█▉        | 6/31 [01:21<02:07,  5.11s/it]eval:  23%|██▎       | 7/31 [01:22<01:27,  3.64s/it]eval:  26%|██▌       | 8/31 [01:23<01:01,  2.69s/it]eval:  29%|██▉       | 9/31 [01:23<00:45,  2.07s/it]eval:  32%|███▏      | 10/31 [01:24<00:34,  1.63s/it]eval:  35%|███▌      | 11/31 [01:25<00:26,  1.32s/it]eval:  39%|███▊      | 12/31 [01:25<00:21,  1.11s/it]eval:  42%|████▏     | 13/31 [01:26<00:17,  1.03it/s]eval:  45%|████▌     | 14/31 [01:27<00:14,  1.15it/s]eval:  48%|████▊     | 15/31 [01:27<00:12,  1.25it/s]eval:  52%|█████▏    | 16/31 [01:28<00:11,  1.34it/s]eval:  55%|█████▍    | 17/31 [01:29<00:09,  1.40it/s]eval:  58%|█████▊    | 18/31 [01:29<00:08,  1.45it/s]eval:  61%|██████▏   | 19/31 [01:30<00:08,  1.48it/s]eval:  65%|██████▍   | 20/31 [01:30<00:07,  1.51it/s]eval:  68%|██████▊   | 21/31 [01:31<00:06,  1.53it/s]eval:  71%|███████   | 22/31 [01:32<00:05,  1.54it/s]eval:  74%|███████▍  | 23/31 [01:32<00:05,  1.55it/s]eval:  77%|███████▋  | 24/31 [01:33<00:04,  1.56it/s]eval:  81%|████████  | 25/31 [01:34<00:03,  1.57it/s]eval:  84%|████████▍ | 26/31 [01:34<00:03,  1.57it/s]eval:  87%|████████▋ | 27/31 [01:35<00:02,  1.57it/s]eval:  90%|█████████ | 28/31 [01:35<00:01,  1.57it/s]eval:  94%|█████████▎| 29/31 [01:36<00:01,  1.57it/s]eval:  97%|█████████▋| 30/31 [01:37<00:00,  1.57it/s]eval: 100%|██████████| 31/31 [01:40<00:00,  1.50s/it]                                                     wandb: uploading artifact run-1i8hvqiu-cases; updating run metadata
+wandb: uploading artifact run-1i8hvqiu-cases
+wandb: uploading history steps 0-2, summary, console lines 1-5; uploading config.yaml; uploading media/table/cases_2_851aaa2f665fe772cad3.table.json; uploading output.log; uploading wandb-summary.json
+wandb: uploading output.log; uploading wandb-summary.json
+wandb: 
+wandb: Run history:
+wandb: class/stroke_lesion/mean_dice ▁
+wandb:  class/stroke_lesion/mean_nsd ▁
+wandb:                        gflops ▁
+wandb:                     mean_dice ▁
+wandb:                      mean_nsd ▁
+wandb:                  mean_time_ms ▁
+wandb: 
+wandb: Run summary:
+wandb: class/stroke_lesion/mean_dice 0.0873
+wandb:  class/stroke_lesion/mean_nsd 0.1065
+wandb:                        gflops 3892.5
+wandb:                     mean_dice 0.0873
+wandb:                      mean_nsd 0.1065
+wandb:                  mean_time_ms 106.2
+wandb: 
+wandb: 🚀 View run fragrant-forest-272 at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/1i8hvqiu
+wandb: ⭐️ View project at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: Synced 5 W&B file(s), 1 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260928_105340-1i8hvqiu/logs
+  stroke_lesion                        dice=0.087 ± 0.138  nsd=0.106  106ms/sample  n=247
+
+  Mean Dice: 0.0873  |  Mean NSD: 0.1065  |  Mean time: 106.2 ms/sample  |  GFLOPs: 3892.50
+  Saved -> /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_eval/2026-09-28_fragrant-forest-272
+=== isles22 DONE ===
+=== shifts_ms ===
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/dpxuser/.netrc.
+wandb: Currently logged in as: tidiane-camaret-ndir (tidiane-camaret-ndir-universit-tsklinikum-freiburg) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run d4mz4owc
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in /home/dpxuser/dev/patch_icl/wandb/run-20260928_105543-d4mz4owc
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run genial-wildflower-273
+wandb: ⭐️ View project at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: 🚀 View run at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/d4mz4owc
+Device      : cuda
+Model       : patchset3d
+Data root   : /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/shifts_ms/npy  (source=shifts_ms, split=test)
+Classes (1): ms_lesion
+K=1  image_size=(128, 128, 128)  n_subjects<=50
+
+  [warn] eval data config NOT inherited from the checkpoint (only `arch` is); these differ from training and change what the model sees:
+         - crop_spacing_mm: train=3.0  eval=1.5
+         - use_crop: train=None  eval=True
+         - mask_downsample: train='soft'  eval='occupancy'
+         - source: train='multisource'  eval='shifts_ms'
+         Re-supply matching data.* overrides for a faithful eval.
+
+  Loaded patchset3d from /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-28_167_real_host_all_shapes_wide_spacing/best.pt (arch l=4)
+  Measuring FLOPs (K=1, size=(128, 128, 128))...
+  GFLOPs: 3892.50  [encoder=876.98  transformer=2737.35  other=278.17]
+
+  [warn] could not resolve train_classes for the `in_train` flag ('NoneType' object is not iterable); leaving it unset.
+eval:   0%|          | 0/6 [00:00<?, ?it/s]eval:  17%|█▋        | 1/6 [00:14<01:12, 14.56s/it]eval:  33%|███▎      | 2/6 [00:15<00:25,  6.38s/it]eval:  50%|█████     | 3/6 [00:15<00:11,  3.77s/it]eval:  67%|██████▋   | 4/6 [00:16<00:05,  2.54s/it]eval:  83%|████████▎ | 5/6 [00:17<00:01,  1.86s/it]eval: 100%|██████████| 6/6 [00:20<00:00,  2.30s/it]                                                   wandb: uploading artifact run-d4mz4owc-cases; updating run metadata
+wandb: uploading artifact run-d4mz4owc-cases
+wandb: uploading config.yaml
+wandb: 
+wandb: Run history:
+wandb: class/ms_lesion/mean_dice ▁
+wandb:  class/ms_lesion/mean_nsd ▁
+wandb:                    gflops ▁
+wandb:                 mean_dice ▁
+wandb:                  mean_nsd ▁
+wandb:              mean_time_ms ▁
+wandb: 
+wandb: Run summary:
+wandb: class/ms_lesion/mean_dice 0.0507
+wandb:  class/ms_lesion/mean_nsd 0.1217
+wandb:                    gflops 3892.5
+wandb:                 mean_dice 0.0507
+wandb:                  mean_nsd 0.1217
+wandb:              mean_time_ms 191.6
+wandb: 
+wandb: 🚀 View run genial-wildflower-273 at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/d4mz4owc
+wandb: ⭐️ View project at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: Synced 5 W&B file(s), 1 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260928_105543-d4mz4owc/logs
+  ms_lesion                            dice=0.051 ± 0.047  nsd=0.122  192ms/sample  n=46
+
+  Mean Dice: 0.0507  |  Mean NSD: 0.1217  |  Mean time: 191.6 ms/sample  |  GFLOPs: 3892.50
+  Saved -> /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_eval/2026-09-28_genial-wildflower-273
+=== shifts_ms DONE ===
+=== atlas_v2 ===
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/dpxuser/.netrc.
+wandb: Currently logged in as: tidiane-camaret-ndir (tidiane-camaret-ndir-universit-tsklinikum-freiburg) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in /home/dpxuser/dev/patch_icl/wandb/run-20260928_105621-gwbpbkb4
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run frosty-sound-274
+wandb: ⭐️ View project at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: 🚀 View run at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/gwbpbkb4
+Device      : cuda
+Model       : patchset3d
+Data root   : /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/atlas_v2/npy  (source=atlas_v2, split=test)
+Classes (1): stroke_lesion
+K=1  image_size=(128, 128, 128)  n_subjects<=50
+
+  [warn] eval data config NOT inherited from the checkpoint (only `arch` is); these differ from training and change what the model sees:
+         - crop_spacing_mm: train=3.0  eval=1.9
+         - use_crop: train=None  eval=True
+         - mask_downsample: train='soft'  eval='occupancy'
+         - source: train='multisource'  eval='atlas_v2'
+         Re-supply matching data.* overrides for a faithful eval.
+
+  Loaded patchset3d from /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-28_167_real_host_all_shapes_wide_spacing/best.pt (arch l=4)
+  Measuring FLOPs (K=1, size=(128, 128, 128))...
+  GFLOPs: 3892.50  [encoder=876.98  transformer=2737.35  other=278.17]
+
+  [warn] could not resolve train_classes for the `in_train` flag ('NoneType' object is not iterable); leaving it unset.
+eval:   0%|          | 0/82 [00:00<?, ?it/s]eval:   1%|          | 1/82 [01:24<1:54:27, 84.78s/it]eval:   2%|▏         | 2/82 [01:25<47:11, 35.39s/it]  eval:   4%|▎         | 3/82 [01:26<25:43, 19.54s/it]eval:   5%|▍         | 4/82 [01:26<15:42, 12.08s/it]eval:   6%|▌         | 5/82 [01:27<10:12,  7.96s/it]eval:   7%|▋         | 6/82 [01:28<06:58,  5.51s/it]eval:   9%|▊         | 7/82 [01:28<04:53,  3.92s/it]eval:  10%|▉         | 8/82 [01:29<03:32,  2.87s/it]eval:  11%|█         | 9/82 [01:30<02:38,  2.18s/it]eval:  12%|█▏        | 10/82 [01:30<02:02,  1.70s/it]eval:  13%|█▎        | 11/82 [01:31<01:38,  1.38s/it]eval:  15%|█▍        | 12/82 [01:32<01:20,  1.16s/it]eval:  16%|█▌        | 13/82 [01:32<01:08,  1.00it/s]eval:  17%|█▋        | 14/82 [01:33<01:00,  1.12it/s]eval:  18%|█▊        | 15/82 [01:34<00:54,  1.22it/s]eval:  20%|█▉        | 16/82 [01:34<00:50,  1.31it/s]eval:  21%|██        | 17/82 [01:35<00:47,  1.37it/s]eval:  22%|██▏       | 18/82 [01:36<00:45,  1.42it/s]eval:  23%|██▎       | 19/82 [01:36<00:43,  1.46it/s]eval:  24%|██▍       | 20/82 [01:37<00:41,  1.49it/s]eval:  26%|██▌       | 21/82 [01:37<00:40,  1.51it/s]eval:  27%|██▋       | 22/82 [01:38<00:39,  1.53it/s]eval:  28%|██▊       | 23/82 [01:39<00:39,  1.48it/s]eval:  29%|██▉       | 24/82 [01:39<00:38,  1.51it/s]eval:  30%|███       | 25/82 [01:40<00:38,  1.49it/s]eval:  32%|███▏      | 26/82 [01:41<00:37,  1.50it/s]eval:  33%|███▎      | 27/82 [01:41<00:36,  1.52it/s]eval:  34%|███▍      | 28/82 [01:42<00:35,  1.53it/s]eval:  35%|███▌      | 29/82 [01:43<00:34,  1.54it/s]eval:  37%|███▋      | 30/82 [01:43<00:34,  1.51it/s]eval:  38%|███▊      | 31/82 [01:44<00:33,  1.52it/s]eval:  39%|███▉      | 32/82 [01:45<00:32,  1.53it/s]eval:  40%|████      | 33/82 [01:45<00:31,  1.54it/s]eval:  41%|████▏     | 34/82 [01:46<00:31,  1.53it/s]eval:  43%|████▎     | 35/82 [01:47<00:30,  1.54it/s]eval:  44%|████▍     | 36/82 [01:47<00:29,  1.55it/s]eval:  45%|████▌     | 37/82 [01:48<00:29,  1.54it/s]eval:  46%|████▋     | 38/82 [01:49<00:28,  1.55it/s]eval:  48%|████▊     | 39/82 [01:49<00:27,  1.55it/s]eval:  49%|████▉     | 40/82 [01:50<00:27,  1.55it/s]eval:  50%|█████     | 41/82 [01:51<00:27,  1.47it/s]eval:  51%|█████     | 42/82 [01:51<00:26,  1.49it/s]eval:  52%|█████▏    | 43/82 [01:52<00:25,  1.50it/s]eval:  54%|█████▎    | 44/82 [01:53<00:25,  1.52it/s]eval:  55%|█████▍    | 45/82 [01:53<00:24,  1.53it/s]eval:  56%|█████▌    | 46/82 [01:54<00:23,  1.53it/s]eval:  57%|█████▋    | 47/82 [01:55<00:22,  1.53it/s]eval:  59%|█████▊    | 48/82 [01:55<00:22,  1.52it/s]eval:  60%|█████▉    | 49/82 [01:56<00:21,  1.53it/s]eval:  61%|██████    | 50/82 [01:56<00:20,  1.53it/s]eval:  62%|██████▏   | 51/82 [01:57<00:20,  1.50it/s]eval:  63%|██████▎   | 52/82 [01:58<00:19,  1.51it/s]eval:  65%|██████▍   | 53/82 [01:58<00:19,  1.52it/s]eval:  66%|██████▌   | 54/82 [01:59<00:18,  1.53it/s]eval:  67%|██████▋   | 55/82 [02:00<00:17,  1.52it/s]eval:  68%|██████▊   | 56/82 [02:01<00:17,  1.47it/s]eval:  70%|██████▉   | 57/82 [02:01<00:16,  1.49it/s]eval:  71%|███████   | 58/82 [02:02<00:16,  1.50it/s]eval:  72%|███████▏  | 59/82 [02:03<00:15,  1.51it/s]eval:  73%|███████▎  | 60/82 [02:03<00:14,  1.51it/s]eval:  74%|███████▍  | 61/82 [02:04<00:14,  1.49it/s]eval:  76%|███████▌  | 62/82 [02:05<00:13,  1.50it/s]eval:  77%|███████▋  | 63/82 [02:05<00:12,  1.52it/s]eval:  78%|███████▊  | 64/82 [02:06<00:11,  1.53it/s]eval:  79%|███████▉  | 65/82 [02:06<00:11,  1.53it/s]eval:  80%|████████  | 66/82 [02:07<00:10,  1.50it/s]eval:  82%|████████▏ | 67/82 [02:08<00:09,  1.52it/s]eval:  83%|████████▎ | 68/82 [02:08<00:09,  1.53it/s]eval:  84%|████████▍ | 69/82 [02:09<00:08,  1.54it/s]eval:  85%|████████▌ | 70/82 [02:10<00:07,  1.50it/s]eval:  87%|████████▋ | 71/82 [02:10<00:07,  1.51it/s]eval:  88%|████████▊ | 72/82 [02:11<00:06,  1.52it/s]eval:  89%|████████▉ | 73/82 [02:12<00:05,  1.53it/s]eval:  90%|█████████ | 74/82 [02:12<00:05,  1.52it/s]eval:  91%|█████████▏| 75/82 [02:13<00:04,  1.53it/s]eval:  93%|█████████▎| 76/82 [02:14<00:04,  1.46it/s]eval:  94%|█████████▍| 77/82 [02:14<00:03,  1.48it/s]eval:  95%|█████████▌| 78/82 [02:15<00:02,  1.49it/s]eval:  96%|█████████▋| 79/82 [02:16<00:02,  1.49it/s]eval:  98%|█████████▊| 80/82 [02:16<00:01,  1.51it/s]eval:  99%|█████████▉| 81/82 [02:17<00:00,  1.52it/s]eval: 100%|██████████| 82/82 [02:20<00:00,  1.43s/it]                                                     wandb: uploading artifact run-gwbpbkb4-cases; updating run metadata
+wandb: uploading artifact run-gwbpbkb4-cases
+wandb: uploading wandb-summary.json; uploading config.yaml; uploading media/table/cases_2_e7915f7ae159bbef502a.table.json; uploading output.log
+wandb: uploading config.yaml; uploading media/table/cases_2_e7915f7ae159bbef502a.table.json; uploading output.log
+wandb: uploading history steps 0-2, summary, console lines 1-5
+wandb: 
+wandb: Run history:
+wandb: class/stroke_lesion/mean_dice ▁
+wandb:  class/stroke_lesion/mean_nsd ▁
+wandb:                        gflops ▁
+wandb:                     mean_dice ▁
+wandb:                      mean_nsd ▁
+wandb:                  mean_time_ms ▁
+wandb: 
+wandb: Run summary:
+wandb: class/stroke_lesion/mean_dice 0.0271
+wandb:  class/stroke_lesion/mean_nsd 0.037
+wandb:                        gflops 3892.5
+wandb:                     mean_dice 0.0271
+wandb:                      mean_nsd 0.037
+wandb:                  mean_time_ms 83.4
+wandb: 
+wandb: 🚀 View run frosty-sound-274 at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/gwbpbkb4
+wandb: ⭐️ View project at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: Synced 5 W&B file(s), 1 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260928_105621-gwbpbkb4/logs
+  stroke_lesion                        dice=0.027 ± 0.067  nsd=0.037  83ms/sample  n=654
+
+  Mean Dice: 0.0271  |  Mean NSD: 0.0370  |  Mean time: 83.4 ms/sample  |  GFLOPs: 3892.50
+  Saved -> /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_eval/2026-09-28_frosty-sound-274
+=== atlas_v2 DONE ===
+=== gnc_kidney ===
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/dpxuser/.netrc.
+wandb: Currently logged in as: tidiane-camaret-ndir (tidiane-camaret-ndir-universit-tsklinikum-freiburg) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run aokrbsul
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in /home/dpxuser/dev/patch_icl/wandb/run-20260928_105911-aokrbsul
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run neat-pine-275
+wandb: ⭐️ View project at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: 🚀 View run at https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/aokrbsul
+Device      : cuda
+Model       : patchset3d
+Data root   : /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/gnc_kidney/npy  (source=gnc_kidney, split=test)
+Classes (13): hyper_r, hyper_l, hypo_r, hypo_l, complex_r, complex_l, hyper_cyst_r, hyper_cyst_l, hyper_mask_l, hypo_mask_r, hypo_mask_l, complex_cyst_r, complex_cyst_l
+K=1  image_size=(128, 128, 128)  n_subjects<=50
+
+  [warn] eval data config NOT inherited from the checkpoint (only `arch` is); these differ from training and change what the model sees:
+         - crop_spacing_mm: train=3.0  eval=1.2
+         - use_crop: train=None  eval=True
+         - mask_downsample: train='soft'  eval='occupancy'
+         - source: train='multisource'  eval='gnc_kidney'
+         Re-supply matching data.* overrides for a faithful eval.
+
+  Loaded patchset3d from /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_train/2026-09-28_167_real_host_all_shapes_wide_spacing/best.pt (arch l=4)
+  Measuring FLOPs (K=1, size=(128, 128, 128))...
+  GFLOPs: 3892.50  [encoder=876.98  transformer=2737.35  other=278.17]
+
+  [warn] could not resolve train_classes for the `in_train` flag ('NoneType' object is not iterable); leaving it unset.
+eval:   0%|          | 0/187 [00:00<?, ?it/s]eval:   1%|          | 1/187 [01:23<4:17:55, 83.20s/it]eval:   1%|          | 2/187 [01:23<1:46:56, 34.68s/it]eval:   2%|▏         | 3/187 [01:24<58:42, 19.14s/it]  eval:   2%|▏         | 4/187 [01:25<36:12, 11.87s/it]eval:   3%|▎         | 5/187 [01:26<23:48,  7.85s/it]eval:   3%|▎         | 6/187 [01:26<16:16,  5.40s/it]eval:   4%|▎         | 7/187 [01:27<12:06,  4.04s/it]eval:   4%|▍         | 8/187 [01:28<08:55,  2.99s/it]eval:   5%|▍         | 9/187 [01:29<06:41,  2.25s/it]eval:   5%|▌         | 10/187 [01:29<05:10,  1.76s/it]eval:   6%|▌         | 11/187 [01:30<04:09,  1.42s/it]eval:   6%|▋         | 12/187 [01:31<03:26,  1.18s/it]eval:   7%|▋         | 13/187 [01:31<02:56,  1.02s/it]eval:   7%|▋         | 14/187 [01:32<02:36,  1.11it/s]eval:   8%|▊         | 15/187 [01:33<02:41,  1.07it/s]eval:   9%|▊         | 16/187 [01:34<02:24,  1.18it/s]eval:   9%|▉         | 17/187 [01:34<02:13,  1.28it/s]eval:  10%|▉         | 18/187 [01:35<02:04,  1.35it/s]eval:  10%|█         | 19/187 [01:36<01:59,  1.41it/s]eval:  11%|█         | 20/187 [01:36<01:54,  1.46it/s]eval:  11%|█         | 21/187 [01:37<01:51,  1.49it/s]eval:  12%|█▏        | 22/187 [01:37<01:49,  1.51it/s]eval:  12%|█▏        | 23/187 [01:38<01:51,  1.47it/s]eval:  13%|█▎        | 24/187 [01:39<01:52,  1.45it/s]eval:  13%|█▎        | 25/187 [01:40<01:48,  1.49it/s]eval:  14%|█▍        | 26/187 [01:40<01:46,  1.51it/s]eval:  14%|█▍        | 27/187 [01:41<01:44,  1.53it/s]eval:  15%|█▍        | 28/187 [01:41<01:43,  1.54it/s]eval:  16%|█▌        | 29/187 [01:42<01:44,  1.52it/s]eval:  16%|█▌        | 30/187 [01:43<01:52,  1.40it/s]eval:  17%|█▋        | 31/187 [01:44<01:55,  1.35it/s]eval:  17%|█▋        | 32/187 [01:44<01:49,  1.41it/s]eval:  18%|█▊        | 33/187 [01:45<01:45,  1.46it/s]eval:  18%|█▊        | 34/187 [01:46<02:02,  1.25it/s]eval:  19%|█▊        | 35/187 [01:47<01:53,  1.33it/s]eval:  19%|█▉        | 36/187 [01:47<01:48,  1.40it/s]eval:  20%|█▉        | 37/187 [01:48<01:43,  1.45it/s]eval:  20%|██        | 38/187 [01:49<01:45,  1.41it/s]eval:  21%|██        | 39/187 [01:49<01:41,  1.45it/s]eval:  21%|██▏       | 40/187 [01:50<01:45,  1.40it/s]eval:  22%|██▏       | 41/187 [01:51<01:41,  1.43it/s]eval:  22%|██▏       | 42/187 [01:51<01:38,  1.47it/s]eval:  23%|██▎       | 43/187 [01:52<01:42,  1.41it/s]eval:  24%|██▎       | 44/187 [01:53<01:38,  1.46it/s]eval:  24%|██▍       | 45/187 [01:53<01:35,  1.49it/s]eval:  25%|██▍       | 46/187 [01:54<01:33,  1.51it/s]eval:  25%|██▌       | 47/187 [01:55<01:31,  1.53it/s]eval:  26%|██▌       | 48/187 [01:55<01:30,  1.54it/s]eval:  26%|██▌       | 49/187 [01:56<01:32,  1.50it/s]eval:  27%|██▋       | 50/187 [01:57<01:30,  1.52it/s]eval:  27%|██▋       | 51/187 [01:57<01:28,  1.54it/s]eval:  28%|██▊       | 52/187 [01:58<01:30,  1.49it/s]eval:  28%|██▊       | 53/187 [01:59<01:28,  1.52it/s]eval:  29%|██▉       | 54/187 [02:00<01:32,  1.45it/s]eval:  29%|██▉       | 55/187 [02:00<01:29,  1.48it/s]eval:  30%|██▉       | 56/187 [02:01<01:38,  1.33it/s]eval:  30%|███       | 57/187 [02:02<01:55,  1.12it/s]eval:  31%|███       | 58/187 [02:03<01:44,  1.23it/s]eval:  32%|███▏      | 59/187 [02:04<01:49,  1.17it/s]eval:  32%|███▏      | 60/187 [02:05<01:40,  1.27it/s]eval:  33%|███▎      | 61/187 [02:05<01:33,  1.34it/s]eval:  33%|███▎      | 62/187 [02:06<01:28,  1.41it/s]eval:  34%|███▎      | 63/187 [02:07<01:28,  1.40it/s]eval:  34%|███▍      | 64/187 [02:07<01:25,  1.44it/s]eval:  35%|███▍      | 65/187 [02:08<01:26,  1.40it/s]eval:  35%|███▌      | 66/187 [02:09<01:23,  1.45it/s]eval:  36%|███▌      | 67/187 [02:09<01:21,  1.48it/s]eval:  36%|███▋      | 68/187 [02:10<01:30,  1.32it/s]eval:  37%|███▋      | 69/187 [02:11<01:25,  1.38it/s]eval:  37%|███▋      | 70/187 [02:11<01:23,  1.40it/s]eval:  38%|███▊      | 71/187 [02:12<01:25,  1.36it/s]eval:  39%|███▊      | 72/187 [02:13<01:21,  1.41it/s]eval:  39%|███▉      | 73/187 [02:14<01:18,  1.45it/s]eval:  40%|███▉      | 74/187 [02:14<01:16,  1.48it/s]eval:  40%|████      | 75/187 [02:15<01:15,  1.49it/s]eval:  41%|████      | 76/187 [02:16<01:17,  1.43it/s]eval:  41%|████      | 77/187 [02:18<01:59,  1.09s/it]eval:  42%|████▏     | 78/187 [02:18<01:45,  1.03it/s]eval:  42%|████▏     | 79/187 [02:19<01:33,  1.15it/s]eval:  43%|████▎     | 80/187 [02:20<01:29,  1.20it/s]eval:  43%|████▎     | 81/187 [02:20<01:22,  1.28it/s]eval:  44%|████▍     | 82/187 [02:21<01:17,  1.36it/s]eval:  44%|████▍     | 83/187 [02:22<01:13,  1.42it/s]eval:  45%|████▍     | 84/187 [02:22<01:14,  1.39it/s]eval:  45%|████▌     | 85/187 [02:23<01:10,  1.44it/s]eval:  46%|████▌     | 86/187 [02:24<01:08,  1.47it/s]eval:  47%|████▋     | 87/187 [02:24<01:06,  1.50it/s]eval:  47%|████▋     | 88/187 [02:25<01:06,  1.48it/s]eval:  48%|████▊     | 89/187 [02:26<01:05,  1.49it/s]eval:  48%|████▊     | 90/187 [02:26<01:04,  1.51it/s]eval:  49%|████▊     | 91/187 [02:27<01:06,  1.44it/s]eval:  49%|████▉     | 92/187 [02:28<01:05,  1.45it/s]eval:  50%|████▉     | 93/187 [02:28<01:03,  1.48it/s]eval:  50%|█████     | 94/187 [02:29<01:01,  1.51it/s]eval:  51%|█████     | 95/187 [02:30<01:00,  1.53it/s]eval:  51%|█████▏    | 96/187 [02:30<01:02,  1.46it/s]eval:  52%|█████▏    | 97/187 [02:31<01:03,  1.42it/s]eval:  52%|█████▏    | 98/187 [02:32<01:00,  1.46it/s]eval:  53%|█████▎    | 99/187 [02:32<01:01,  1.44it/s]eval:  53%|█████▎    | 100/187 [02:33<00:58,  1.48it/s]eval:  54%|█████▍    | 101/187 [02:34<01:00,  1.41it/s]eval:  55%|█████▍    | 102/187 [02:35<00:58,  1.46it/s]eval:  55%|█████▌    | 103/187 [02:35<00:58,  1.43it/s]eval:  56%|█████▌    | 104/187 [02:36<00:56,  1.47it/s]eval:  56%|█████▌    | 105/187 [02:37<00:54,  1.50it/s]eval:  57%|█████▋    | 106/187 [02:37<00:53,  1.51it/s]eval:  57%|█████▋    | 107/187 [02:38<00:52,  1.53it/s]eval:  58%|█████▊    | 108/187 [02:38<00:51,  1.54it/s]eval:  58%|█████▊    | 109/187 [02:39<00:52,  1.47it/s]eval:  59%|█████▉    | 110/187 [02:40<00:53,  1.44it/s]eval:  59%|█████▉    | 111/187 [02:41<00:54,  1.41it/s]eval:  60%|█████▉    | 112/187 [02:41<00:52,  1.44it/s]eval:  60%|██████    | 113/187 [02:42<00:50,  1.48it/s]eval:  61%|██████    | 114/187 [02:43<01:01,  1.19it/s]eval:  61%|██████▏   | 115/187 [02:44<00:55,  1.29it/s]eval:  62%|██████▏   | 116/187 [02:44<00:52,  1.36it/s]eval:  63%|██████▎   | 117/187 [02:45<00:49,  1.42it/s]eval:  63%|██████▎   | 118/187 [02:46<00:47,  1.46it/s]eval:  64%|██████▎   | 119/187 [02:46<00:46,  1.46it/s]eval:  64%|██████▍   | 120/187 [02:47<00:44,  1.49it/s]eval:  65%|██████▍   | 121/187 [02:48<00:43,  1.52it/s]eval:  65%|██████▌   | 122/187 [02:48<00:42,  1.53it/s]eval:  66%|██████▌   | 123/187 [02:49<00:43,  1.47it/s]eval:  66%|██████▋   | 124/187 [02:50<00:42,  1.49it/s]eval:  67%|██████▋   | 125/187 [02:50<00:42,  1.45it/s]eval:  67%|██████▋   | 126/187 [02:51<00:41,  1.48it/s]eval:  68%|██████▊   | 127/187 [02:52<00:39,  1.51it/s]eval:  68%|██████▊   | 128/187 [02:52<00:38,  1.52it/s]eval:  69%|██████▉   | 129/187 [02:53<00:37,  1.54it/s]eval:  70%|██████▉   | 130/187 [02:54<00:36,  1.55it/s]eval:  70%|███████   | 131/187 [02:54<00:35,  1.56it/s]eval:  71%|███████   | 132/187 [02:55<00:35,  1.56it/s]eval:  71%|███████   | 133/187 [02:56<00:34,  1.56it/s]eval:  72%|███████▏  | 134/187 [02:56<00:33,  1.57it/s]eval:  72%|███████▏  | 135/187 [02:57<00:33,  1.55it/s]eval:  73%|███████▎  | 136/187 [02:58<00:34,  1.47it/s]eval:  73%|███████▎  | 137/187 [02:58<00:33,  1.50it/s]eval:  74%|███████▍  | 138/187 [02:59<00:32,  1.52it/s]eval:  74%|███████▍  | 139/187 [03:00<00:31,  1.53it/s]eval:  75%|███████▍  | 140/187 [03:00<00:30,  1.55it/s]eval:  75%|███████▌  | 141/187 [03:01<00:29,  1.55it/s]eval:  76%|███████▌  | 142/187 [03:01<00:28,  1.56it/s]eval:  76%|███████▋  | 143/187 [03:02<00:28,  1.56it/s]eval:  77%|███████▋  | 144/187 [03:03<00:27,  1.56it/s]eval:  78%|███████▊  | 145/187 [03:04<00:28,  1.47it/s]eval:  78%|███████▊  | 146/187 [03:04<00:27,  1.50it/s]eval:  79%|███████▊  | 147/187 [03:05<00:28,  1.41it/s]eval:  79%|███████▉  | 148/187 [03:06<00:26,  1.46it/s]eval:  80%|███████▉  | 149/187 [03:06<00:25,  1.49it/s]eval:  80%|████████  | 150/187 [03:07<00:24,  1.51it/s]eval:  81%|████████  | 151/187 [03:07<00:23,  1.53it/s]eval:  81%|████████▏ | 152/187 [03:08<00:22,  1.54it/s]eval:  82%|████████▏ | 153/187 [03:09<00:21,  1.55it/s]eval:  82%|████████▏ | 154/187 [03:09<00:21,  1.56it/s]eval:  83%|████████▎ | 155/187 [03:10<00:20,  1.56it/s]eval:  83%|████████▎ | 156/187 [03:11<00:19,  1.57it/s]eval:  84%|████████▍ | 157/187 [03:11<00:19,  1.57it/s]eval:  84%|████████▍ | 158/187 [03:12<00:18,  1.57it/s]eval:  85%|████████▌ | 159/187 [03:13<00:17,  1.57it/s]eval:  86%|████████▌ | 160/187 [03:13<00:17,  1.57it/s]eval:  86%|████████▌ | 161/187 [03:14<00:16,  1.57it/s]eval:  87%|████████▋ | 162/187 [03:15<00:18,  1.37it/s]eval:  87%|████████▋ | 163/187 [03:15<00:16,  1.42it/s]eval:  88%|████████▊ | 164/187 [03:16<00:15,  1.46it/s]eval:  88%|████████▊ | 165/187 [03:17<00:14,  1.49it/s]eval:  89%|████████▉ | 166/187 [03:17<00:14,  1.45it/s]eval:  89%|████████▉ | 167/187 [03:18<00:13,  1.48it/s]eval:  90%|████████▉ | 168/187 [03:19<00:12,  1.47it/s]eval:  90%|█████████ | 169/187 [03:19<00:12,  1.50it/s]eval:  91%|█████████ | 170/187 [03:20<00:11,  1.52it/s]eval:  91%|█████████▏| 171/187 [03:21<00:10,  1.53it/s]eval:  92%|█████████▏| 172/187 [03:21<00:09,  1.54it/s]eval:  93%|█████████▎| 173/187 [03:22<00:10,  1.29it/s]eval:  93%|█████████▎| 174/187 [03:23<00:09,  1.36it/s]eval:  94%|█████████▎| 175/187 [03:24<00:08,  1.42it/s]eval:  94%|█████████▍| 176/187 [03:24<00:07,  1.46it/s]eval:  95%|█████████▍| 177/187 [03:25<00:06,  1.49it/s]eval:  95%|█████████▌| 178/187 [03:26<00:05,  1.51it/s]eval:  96%|█████████▌| 179/187 [03:26<00:05,  1.53it/s]eval:  96%|█████████▋| 180/187 [03:27<00:04,  1.54it/s]eval:  97%|█████████▋| 181/187 [03:28<00:03,  1.55it/s]eval:  97%|█████████▋| 182/187 [03:28<00:03,  1.56it/s]eval:  98%|█████████▊| 183/187 [03:29<00:02,  1.56it/s]eval:  98%|█████████▊| 184/187 [03:29<00:01,  1.56it/s]eval:  99%|█████████▉| 185/187 [03:30<00:01,  1.57it/s]eval:  99%|█████████▉| 186/187 [03:31<00:00,  1.57it/s]eval: 100%|██████████| 187/187 [03:32<00:00,  1.20it/s]                                                       wandb: uploading artifact run-aokrbsul-cases; updating run metadata
+wandb: uploading artifact run-aokrbsul-cases
+wandb: uploading artifact run-aokrbsul-cases; uploading history steps 0-26, summary, console lines 1-17
+wandb: uploading media/table/cases_26_ae02e566172d01e261ec.table.json; uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: uploading data
+wandb: 
+wandb: Run history:
+wandb: class/complex_cyst_l/mean_dice ▁
+wandb:  class/complex_cyst_l/mean_nsd ▁
+wandb: class/complex_cyst_r/mean_dice ▁
+wandb:  class/complex_cyst_r/mean_nsd ▁
+wandb:      class/complex_l/mean_dice ▁
+wandb:       class/complex_l/mean_nsd ▁
+wandb:      class/complex_r/mean_dice ▁
+wandb:       class/complex_r/mean_nsd ▁
+wandb:   class/hyper_cyst_l/mean_dice ▁
+wandb:    class/hyper_cyst_l/mean_nsd ▁
+wandb:                            +20 ...
+wandb: 
+wandb: Run summary:
+wandb: class/complex_cyst_l/mean_dice 0.211
+wandb:  class/complex_cyst_l/mean_nsd 0.2813
+wandb: class/complex_cyst_r/mean_dice 0.2503
+wandb:  class/complex_cyst_r/mean_nsd 0.3288
+wandb:      class/complex_l/mean_dice 0.166
+wandb:       class/complex_l/mean_nsd 0.1695
+wandb:      class/complex_r/mean_dice 0.1553
+wandb:       class/complex_r/mean_nsd 0.174
+wandb:   class/hyper_cyst_l/mean_dice 0.3048
+wandb:    class/hyper_cyst_l/mean_nsd 0.4032
+wandb:                            +20 ...
+wandb: 
+wandb: 🚀 View run neat-pine-275 at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval/runs/aokrbsul
+wandb: ⭐️ View project at: https://wandb.ai/tidiane-camaret-ndir-universit-tsklinikum-freiburg/patchset_eval
+wandb: Synced 5 W&B file(s), 1 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260928_105911-aokrbsul/logs
+  hyper_r                              dice=0.225 ± 0.257  nsd=0.340  164ms/sample  n=53
+  hyper_l                              dice=0.307 ± 0.276  nsd=0.409  72ms/sample  n=60
+  hypo_r                               dice=0.110 ± 0.164  nsd=0.149  72ms/sample  n=152
+  hypo_l                               dice=0.089 ± 0.144  nsd=0.117  73ms/sample  n=176
+  complex_r                            dice=0.155 ± 0.216  nsd=0.174  72ms/sample  n=12
+  complex_l                            dice=0.166 ± 0.204  nsd=0.170  72ms/sample  n=18
+  hyper_cyst_r                         dice=0.276 ± 0.325  nsd=0.366  73ms/sample  n=68
+  hyper_cyst_l                         dice=0.305 ± 0.317  nsd=0.403  72ms/sample  n=73
+  hyper_mask_l                         dice=0.559 ± 0.095  nsd=0.854  72ms/sample  n=2
+  hypo_mask_r                          dice=0.125 ± 0.196  nsd=0.159  72ms/sample  n=292
+  hypo_mask_l                          dice=0.114 ± 0.179  nsd=0.151  72ms/sample  n=387
+  complex_cyst_r                       dice=0.250 ± 0.265  nsd=0.329  72ms/sample  n=83
+  complex_cyst_l                       dice=0.211 ± 0.250  nsd=0.281  80ms/sample  n=114
+
+  Mean Dice: 0.2225  |  Mean NSD: 0.3001  |  Mean time: 79.7 ms/sample  |  GFLOPs: 3892.50
+  Saved -> /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/patch_icl/3d_eval/2026-09-28_neat-pine-275
+=== gnc_kidney DONE ===
+=== ALL DONE ===

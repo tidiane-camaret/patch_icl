@@ -10605,3 +10605,43 @@ continues 166's checkpoint (epoch 6, negligible drift from 165). Two changes:
 Smoke-tested clean (confirmed `crop=3.0mm` in the dataset log line, all 117/50 host classes
 still usable, resumed correctly, no crashes) before launching. Longest budget yet (400 epochs);
 will validate with small real-OOD slices per the established approach when checked on.
+
+## 2026-09-28 (cont.) — 167 stopped at e321/400 per user direction; RESULT: gnc_kidney's best yet
+
+Prior session became unresponsive (context-overflow loop, unrecoverable via `/compact`) right
+after issuing "Stop run 167, validate on the same slices" -- the instruction was never executed
+and the run kept training untouched for ~2.5h. Picked up in a fresh session: confirmed 167 was
+still healthy (no errors, val_dice still climbing, `seen`/`unseen`/`mri`/`ct` all still improving,
+`enc_drift` rising smoothly) before acting. Stopped cleanly at e321/400 (best checkpoint saved at
+**e320: val_dice=0.4902**, in-distribution -- the best of the entire 135b-167 lineage, up from
+165's own previous-best 0.4225) via the established `pkill -9 -f "train.py experiment=167..."` +
+forkserver/compile_worker cleanup; GPU confirmed fully free after.
+
+Small-slice (n=20/class) real-OOD eval, same protocol as every prior checkpoint in this arc:
+
+| source | 135b | 163 (brain, 10ep) | 164 (+deform) | 165 (all-organs, 50ep) | **167 (all-shapes+wide-spacing, e320/400)** |
+|---|---:|---:|---:|---:|---:|
+| isles22 | 0.050 | **0.0978** | 0.0914 | 0.0668 | 0.0873 |
+| shifts_ms | 0.008 | **0.0578** | 0.0249 | 0.0339 | 0.0507 |
+| atlas_v2 | 0.028 | 0.0321 | 0.0335 | 0.0291 | 0.0271 (flat vs. baseline) |
+| gnc_kidney | 0.082 | 0.1051 | 0.1101 | 0.1602 | **0.2225 (best of the whole session, +39% vs. 165, +171% vs. 135b)** |
+
+**Reads as a broad, real continuation of the arc, not a new mechanism**: gnc_kidney keeps
+compounding as training accrues more real-kidney-hosted exposure (165->167 at 50ep->321ep, same
+direction as 165's own "all organs" jump). isles22/shifts_ms partially recovered from 165's
+brain-dilution dip (both up vs. 165, though neither reclaims 163's brain-only-hosted peak --
+consistent with the same organ-count dilution trade-off 165 already diagnosed, now spread over
+417 epochs instead of 50). atlas_v2 remains the one source this whole arc has never moved --
+single chronic T1 lesion, least like scatter_field/multiplicity-style shapes, so still the
+natural candidate for a source-specific investigation if it's ever prioritized.
+
+**Caveats unchanged from the rest of this arc**: n=20/class small-slice, single seed, checkpoint
+taken mid-run at e321/400 (not the full committed budget) since the stop was intentional, not a
+completion.
+
+State: GPU free, no background jobs running. Checkpoint:
+`.../2026-09-28_167_real_host_all_shapes_wide_spacing/best.pt` (e320, val_dice=0.4902) -- current
+best overall in-distribution AND current best for gnc_kidney specifically; 163 remains the
+best single checkpoint for isles22/shifts_ms if a source-specific choice is ever wanted over one
+general model.
+
