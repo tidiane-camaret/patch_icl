@@ -1,0 +1,28 @@
+{
+  "experiment": "3b_synthetic_tasks_train",
+  "description": "In-distribution TotalSeg periodic validation curves (train.py's own val_loader, logged every eval_every epochs) for the same 4 training runs behind 3a_synthetic_tasks' checkpoints: 0_baseline_135b (the checkpoint itself -- full training history, not just the sweep's own continuation), 1_gmm_bank_162, 2_scatter_field_real_163, 3_all_families_real_167. Per-sample rows carry `in_train` (seen/unseen class) and `detail` (target modality, 'ct ct<-ct' / 'mri mri<-mri'), matching train.py's own two aggregate breakdowns exactly: seen/unseen = macro (mean of per-class mean_dice, over classes grouped by in_train), mri/ct = micro (flat mean of per-sample dice, grouped by target modality) -- verified against train.py:1543-1559 and the printed [e<N>] log lines for e320 (seen=0.5791/unseen=0.3966/mri=0.4741/ct=0.5340, exact match both ways). NOT the same eval as 3a (that's the 4 real OOD sources); this is the in-distribution TotalSeg val split each run trained against, used only to check the sweep didn't regress in-distribution accuracy while chasing OOD transfer -- see docs/logs.md 2026-09-27/28.",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_train",
+  "runs": [
+    {
+      "id": "97al5lsq",
+      "name": "0_baseline_135b_train",
+      "description": "135b's own training run (full history) -- the checkpoint every sweep arm (160-167) resumes from"
+    },
+    {
+      "id": "r5wi89w9",
+      "name": "1_gmm_bank_162_train",
+      "description": "162: scatter_field isolated dose, gmm_bank CT canvas, brain-restricted host, 10ep from 135b"
+    },
+    {
+      "id": "dw2346gs",
+      "name": "2_scatter_field_real_163_train",
+      "description": "163: same lineage/dose/budget as 162, real MRI host canvas instead of gmm_bank, 10ep from 135b"
+    },
+    {
+      "id": "rt6rhqjq",
+      "name": "3_all_families_real_167_train",
+      "description": "167: all 7 shape families, real CT+MRI mixed hosts, all organs, continues 166->165->164->163; stopped at e321/400"
+    }
+  ]
+}

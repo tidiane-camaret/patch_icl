@@ -1,0 +1,33 @@
+{
+  "experiment": "3c_synthetic_cascade",
+  "description": "Cascade OOD eval on 9 held-out sources, comparing our own cascade checkpoint WITHOUT real-host synthetic training (146_cascade_randomfg_predprior_regoff, from 2b_cascade_val) against WITH real-host synthetic training (168_cascade_real_host_all_shapes, resumed from 167's real-host checkpoint into cascade mode -- see docs/logs.md 2026-09-28), plus Medverse released weights at depth-matched native-AR inference (from 2c_cascade_medverse's own wandb runs, re-verified against results_cascade.tex's tab:cascade-medverse: all 5 available sources reproduce the paper's cited macro Dice to 3 decimal places once aggregated as macro, not micro). All three stages use eval.split=test, data.mask_downsample=occupancy, macro Dice (mean of per-class means). 168's eval.tasks_per_class=20 override was a no-op for every one of these 9 native-grid sources (same known bug as the 160-167 sweep, confirmed here by sample counts matching 146's full-test-set counts exactly for all 9 sources) -- so despite the 'smallslice' wandb.name suffix, 168's numbers here are full-dataset, directly comparable to 146's. isles22/shifts_ms/atlas_v2/gnc_kidney have no Medverse row: the paper deliberately excludes them ('both models score too low to be informative'), and no depth-matched Medverse attempt was ever launched for them (verified: no matching wandb runs found, not a crash). TotalSeg CT/MRI are out of scope for this OOD comparison (146/168 are eval'd on the 9 held-out sources only).",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {"id": "q536o3ez", "name": "146_ours_hu_lwk1", "description": "146 (registers=off, prior=pred) on hu_lwk1, cascade [6,3,1]mm" , "stage": "146_ours"},
+    {"id": "u6ibrmzm", "name": "146_ours_isles22", "description": "146 on isles22, cascade [3,1.5]mm", "stage": "146_ours"},
+    {"id": "zywis70g", "name": "146_ours_shifts_ms", "description": "146 on shifts_ms, cascade [3,1.5]mm", "stage": "146_ours"},
+    {"id": "km2sskse", "name": "146_ours_atlas_v2", "description": "146 on atlas_v2, cascade [3.8,1.9]mm", "stage": "146_ours"},
+    {"id": "u0mrm9zi", "name": "146_ours_msd_prostate", "description": "146 on msd_prostate, cascade [3,1.5,0.75]mm", "stage": "146_ours"},
+    {"id": "p3r1hn7g", "name": "146_ours_msd_hippocampus", "description": "146 on msd_hippocampus, single-level 0.5mm", "stage": "146_ours"},
+    {"id": "dx8w1ug1", "name": "146_ours_gnc_kidney", "description": "146 on gnc_kidney, cascade [6,3,1.2]mm", "stage": "146_ours"},
+    {"id": "u6itw8n8", "name": "146_ours_flare22", "description": "146 on flare22, cascade [6,3,2.5]mm", "stage": "146_ours"},
+    {"id": "30w0q5t6", "name": "146_ours_nasalseg", "description": "146 on nasalseg, cascade [1.5,0.8]mm", "stage": "146_ours"},
+
+    {"id": "e3iqmo59", "name": "168_ours_realhost_hu_lwk1", "description": "168 (146 + real-host synth resumed from 167) on hu_lwk1, cascade [6,3,1]mm", "stage": "168_ours_realhost"},
+    {"id": "io7soccg", "name": "168_ours_realhost_isles22", "description": "168 on isles22, cascade [3,1.5]mm", "stage": "168_ours_realhost"},
+    {"id": "g501tvh9", "name": "168_ours_realhost_shifts_ms", "description": "168 on shifts_ms, cascade [3,1.5]mm", "stage": "168_ours_realhost"},
+    {"id": "swxna5o8", "name": "168_ours_realhost_atlas_v2", "description": "168 on atlas_v2, cascade [3.8,1.9]mm", "stage": "168_ours_realhost"},
+    {"id": "axe1b36l", "name": "168_ours_realhost_msd_prostate", "description": "168 on msd_prostate, cascade [3,1.5,0.75]mm", "stage": "168_ours_realhost"},
+    {"id": "zayn3tes", "name": "168_ours_realhost_msd_hippocampus", "description": "168 on msd_hippocampus, single-level 0.5mm", "stage": "168_ours_realhost"},
+    {"id": "6vmfdttm", "name": "168_ours_realhost_gnc_kidney", "description": "168 on gnc_kidney, cascade [6,3,1.2]mm", "stage": "168_ours_realhost"},
+    {"id": "s34cd54d", "name": "168_ours_realhost_flare22", "description": "168 on flare22, cascade [6,3,2.5]mm", "stage": "168_ours_realhost"},
+    {"id": "nzb2wuov", "name": "168_ours_realhost_nasalseg", "description": "168 on nasalseg, cascade [1.5,0.8]mm", "stage": "168_ours_realhost"},
+
+    {"id": "dhcqbyr0", "name": "medverse_depthmatched_hu_lwk1", "description": "Medverse released weights, native AR, image_size=384 (depth-matched to our 3-level hu_lwk1 ladder)", "stage": "medverse_depthmatched"},
+    {"id": "qtrqoqmr", "name": "medverse_depthmatched_msd_prostate", "description": "Medverse native AR, image_size=384 (depth-matched to our 3-level msd_prostate ladder)", "stage": "medverse_depthmatched"},
+    {"id": "0mbk5mi3", "name": "medverse_depthmatched_msd_hippocampus", "description": "Medverse native AR, image_size=128 (depth-matched to our 1-level msd_hippocampus setting)", "stage": "medverse_depthmatched"},
+    {"id": "vhan9irc", "name": "medverse_depthmatched_flare22", "description": "Medverse native AR, image_size=384 (depth-matched to our 3-level flare22 ladder)", "stage": "medverse_depthmatched"},
+    {"id": "yxbrv35m", "name": "medverse_depthmatched_nasalseg", "description": "Medverse native AR, image_size=256 (depth-matched to our 2-level nasalseg ladder)", "stage": "medverse_depthmatched"}
+  ]
+}

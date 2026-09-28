@@ -1,0 +1,88 @@
+{
+  "experiment": "3a_synthetic_tasks",
+  "description": "Sim-to-real progression for synthetic p_shape lesion tasks, evaluated on 4 real OOD sources (isles22, shifts_ms, atlas_v2, gnc_kidney) all Dice ~0-0.08 on the pre-sweep checkpoint. Three stages, holding the pairwise-cleanest checkpoints from docs/logs.md's 2026-09-27/28 sweep (160-167): 0) baseline (135b, no shape-family training at all); 1) gmm_bank -- scatter_field painted onto the synthetic gmm_bank canvas (100% CT-sourced), isolated at 50% family-weight dose, brain-class-restricted host (checkpoint 162, 10 epochs from 135b); 2) scatter_field_real -- identical checkpoint lineage/dose/epoch-budget as 162, but the canvas swapped to a genuine real MRI TotalSeg subject via RealHostShapeProvider instead of the gmm_bank (checkpoint 163, 10 epochs from 135b) -- the one clean single-variable A/B in the whole sweep; 3) all_families_real -- the real-host mechanism extended from scatter_field alone to all 7 shape families, real CT+MRI mixed hosts, all organs (checkpoint 167, continues 166->165->164->163's own lineage, evaluated at epoch 320/400 where it was stopped). Confounds (epoch budget, deform, spacing range, CT-host mixing) are NOT controlled between stage 2 and 3 -- this experiment shows the progression, not an isolated ablation (that's 1_gmm_bank vs 2_scatter_field_real specifically, which IS a clean single-variable pair). All eval runs: experiments/3d/eval.py dataset=<ds> eval.model=patchset3d eval.checkpoint=<ckpt>, full deterministic dataset each time (the '+eval.tasks_per_class=20' flag present in some run args is a no-op for these 4 sources -- they route through build_dataset() in common.py, which never reads eval.tasks_per_class; verified n_samples is identical with/without the flag across every run here).",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {
+      "id": "q8gt7eh4",
+      "name": "0_baseline_135b_isles22_ood",
+      "description": "135b baseline (pre-sweep, no shape-family training) on isles22"
+    },
+    {
+      "id": "ul9ecbrh",
+      "name": "0_baseline_135b_shifts_ms_ood",
+      "description": "135b baseline on shifts_ms"
+    },
+    {
+      "id": "4m2wn8pd",
+      "name": "0_baseline_135b_atlas_v2_ood",
+      "description": "135b baseline on atlas_v2"
+    },
+    {
+      "id": "vi7kaeph",
+      "name": "0_baseline_135b_gnc_kidney_ood",
+      "description": "135b baseline on gnc_kidney"
+    },
+    {
+      "id": "1sha088p",
+      "name": "1_gmm_bank_162_isles22_ood",
+      "description": "162: scatter_field isolated dose, gmm_bank CT canvas, brain-class-restricted host, 10ep from 135b -- isles22"
+    },
+    {
+      "id": "t9cef2go",
+      "name": "1_gmm_bank_162_shifts_ms_ood",
+      "description": "162 on shifts_ms"
+    },
+    {
+      "id": "w3k7m1jo",
+      "name": "1_gmm_bank_162_atlas_v2_ood",
+      "description": "162 on atlas_v2"
+    },
+    {
+      "id": "jl253r8w",
+      "name": "1_gmm_bank_162_gnc_kidney_ood",
+      "description": "162 on gnc_kidney"
+    },
+    {
+      "id": "w3jxuu3z",
+      "name": "2_scatter_field_real_163_isles22_ood",
+      "description": "163: same checkpoint lineage/dose/epoch-budget as 162, real MRI host canvas instead of gmm_bank -- isles22"
+    },
+    {
+      "id": "emag5ian",
+      "name": "2_scatter_field_real_163_shifts_ms_ood",
+      "description": "163 on shifts_ms"
+    },
+    {
+      "id": "arbpre4s",
+      "name": "2_scatter_field_real_163_atlas_v2_ood",
+      "description": "163 on atlas_v2"
+    },
+    {
+      "id": "r3px8jxs",
+      "name": "2_scatter_field_real_163_gnc_kidney_ood",
+      "description": "163 on gnc_kidney"
+    },
+    {
+      "id": "1i8hvqiu",
+      "name": "3_all_families_real_167_isles22_ood",
+      "description": "167: all 7 shape families, real CT+MRI mixed hosts, all organs, e320/400 -- isles22"
+    },
+    {
+      "id": "d4mz4owc",
+      "name": "3_all_families_real_167_shifts_ms_ood",
+      "description": "167 on shifts_ms"
+    },
+    {
+      "id": "gwbpbkb4",
+      "name": "3_all_families_real_167_atlas_v2_ood",
+      "description": "167 on atlas_v2"
+    },
+    {
+      "id": "aokrbsul",
+      "name": "3_all_families_real_167_gnc_kidney_ood",
+      "description": "167 on gnc_kidney"
+    }
+  ]
+}

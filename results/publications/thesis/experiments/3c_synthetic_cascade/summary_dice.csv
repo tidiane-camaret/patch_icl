@@ -1,0 +1,10 @@
+dataset,146_ours,168_ours_realhost,medverse_depthmatched
+hu_lwk1,0.1522,0.1244,0.0196
+isles22,0.0686,0.0701,
+shifts_ms,0.0307,0.0188,
+atlas_v2,0.0262,0.0316,
+msd_prostate,0.3745,0.3723,0.3574
+msd_hippocampus,0.3025,0.5175,0.6861
+gnc_kidney,0.0236,0.0352,
+flare22,0.7508,0.7426,0.3586
+nasalseg,0.5474,0.6438,0.737

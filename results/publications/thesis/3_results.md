@@ -276,6 +276,18 @@ corrected number.
 
 ## Synthetic Task Generation (Axis 3)
 
+> **⚠️ OUTDATED (as of 2026-09-28).** Everything in this axis predates a
+> newer checkpoint lineage (`160`→`167`, continuing directly from `135b`)
+> that found and fixed a much larger effect on the same 4 weakest OOD
+> sources (ISLES22, Shifts-MS, ATLAS v2.0, GNC_705): the synthetic canvas
+> itself (`gmm_bank`) was 100% CT-sourced, mismatched to targets that are
+> mostly MRI. That supersedes the shape-diversity conclusions below on
+> those 4 sources specifically — see "**The sim-to-real canvas fix**"
+> below, which replaces them. The texture-noise (105/106/107) and
+> CT+MRI-modality-mix (110/130) findings, and the intensity-realism
+> calibration methodology, are a different axis of evidence and are
+> unaffected — kept as-is.
+
 **Texture noise beats flat noise beats real-only**, TotalSeg val Dice, a
 controlled 3-arm chain sharing one starting checkpoint (105 = real-only,
 $p_\text{synth}{=}0$; 106 = flat i.i.d. synth noise, $p_\text{synth}{=}0.3$;
@@ -371,3 +383,62 @@ sources outright — most notably MSD Prostate (>1.6$\times$ the previous
 best), the one source that had regressed under every earlier shape
 intervention. Still improving on its own in-domain validation metric when
 stopped, so this is a snapshot, not a confirmed ceiling (gap G9).
+
+**The sim-to-real canvas fix.** Continuing from `135b`, the same
+shape-diversity direction above was pushed further (`160`–`167`) on the
+four sources it had never moved: ISLES22, Shifts-MS, ATLAS v2.0, GNC_705
+(Dice 0.008–0.082 on `135b`). Widening the shape-family mix and isolating
+the highest-signal family (`scatter_field`) at higher dose both landed as
+clean nulls — every source stayed within noise of `135b`. The cause,
+found directly rather than assumed: the synthetic canvas (`gmm_bank`) the
+shapes were painted onto is 100% CT-sourced, while every one of these
+four targets is MRI (or Dixon-MRI). The fix swaps the canvas to a real
+MRI TotalSegmentator subject's own image (`RealHostShapeProvider`)
+instead of the synthetic bank, holding shape family, dose, checkpoint,
+and epoch budget fixed — the one single-variable A/B in this whole
+progression:
+
+| stage | checkpoint | ISLES22 | Shifts-MS | ATLAS v2.0 | GNC_705 |
+|---|---|---:|---:|---:|---:|
+| baseline | `135b` | 0.050 | 0.008 | 0.028 | 0.082 |
+| 1) synthetic canvas (`gmm_bank`) | `162` | 0.045 | 0.011 | 0.033 | 0.070 |
+| 2) real canvas, one family (`scatter_field`) | `163` | **0.098** | **0.058** | 0.032 | 0.105 |
+| 3) real canvas, all 7 families | `167` | 0.087 | 0.051 | 0.027 | **0.223** |
+
+Stage 1→2 (`162`→`163`) is the controlled comparison: identical
+checkpoint, dose, and epoch budget, only the canvas modality changes.
+Every source moves except ATLAS v2.0 (a single, compact, chronic
+lesion — the only non-multi-focal target of the four, plausibly outside
+what a multiplicity-targeted shape family like `scatter_field` can reach).
+Extending the same real-canvas mechanism to all 7 shape families and a
+much longer budget (stage 3, `167`, all real CT+MRI hosts across every
+organ, stopped at epoch 320/400) keeps compounding on GNC_705
+(0.070→0.105→**0.223**, the best result of the whole progression) while
+easing back slightly on the two brain-lesion sources from stage 2's peak.
+
+**This did not come at the cost of in-distribution accuracy.** TotalSeg
+val Dice (own periodic validation, same checkpoints, `seen`/`unseen` =
+macro Dice by trained-class membership, `mri`/`ct` = micro Dice by target
+modality):
+
+| stage | val Dice | seen | unseen | MRI | CT |
+|---|---:|---:|---:|---:|---:|
+| baseline (`135b`, e170) | 0.418 | 0.489 | 0.344 | 0.390 | 0.468 |
+| 1) synthetic canvas (`162`, e9) | 0.422 | 0.485 | 0.356 | 0.385 | 0.470 |
+| 2) real canvas, one family (`163`, e9) | 0.417 | 0.483 | 0.348 | 0.384 | 0.467 |
+| 3) real canvas, all families (`167`, e320) | **0.490** | **0.579** | **0.397** | **0.474** | **0.534** |
+
+In-distribution Dice tracks flat-to-improving throughout — the seen/CT
+lead over unseen/MRI persists at roughly the same size at every stage,
+and stage 3's much longer budget lifts every one of these five numbers
+together. The OOD gains above are additive transfer improvement, not a
+trade against in-distribution accuracy.
+
+*(Confounds not controlled in stage 2→3 specifically — epoch budget,
+task-level deform, spacing range, added CT hosts all change together
+alongside the family-count widening — so that step should be read as "the
+mechanism keeps paying off when pushed further," not as its own isolated
+ablation; stage 1→2 is the one variable-isolated result. Single seed
+throughout, as elsewhere in this chapter. Source data:
+`results/publications/thesis/experiments/{3a_synthetic_tasks,
+3b_synthetic_tasks_train}/`.)*

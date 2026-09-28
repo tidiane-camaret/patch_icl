@@ -1,89 +1,74 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-This section isolates the effect of the synthetic generator itself
-(\autoref{sec:methodology-synth}) -- paint noise texture and
-shape/intensity calibration -- from the model's training data mix.
-All runs below are trained on CT only; the separate question of what
-adding MRI training data does to generalization is a training-regime
-choice, not a property of the synthetic generator, and is reported
-elsewhere rather than folded into these numbers.
+On four held-out sources with no anatomical overlap with training
+(ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705 -- lesion targets on MRI, one
+Dixon), the baseline checkpoint scores Dice 0.008--0.082. Widening the
+shape generator's family mix or dosage on the synthetic-bank canvas
+(\autoref{sec:methodology-synth}) left every source within noise of
+baseline. The bank turned out to be built entirely from CT scans, while
+every target source here is MRI -- a canvas-modality mismatch, not a
+shape-diversity problem.
 
-\paragraph{Texture noise beats flat noise beats real-only.} A
-controlled three-arm chain shares one starting checkpoint and varies
-only the paint-noise mechanism: real-only ($p_{\text{synth}}{=}0$),
-synthetic with i.i.d.\ paint noise ($p_{\text{synth}}{=}0.3$), and
-synthetic with multi-octave correlated texture noise (same
-$p_{\text{synth}}$). Metric: TotalSegmentator validation Dice, seen and
-unseen class macro splits, at a shared epoch-50 cutoff.
-
-\begin{table}[t]
-  \centering
-  \small
-  \caption{Paint-noise ablation, TotalSegmentator validation Dice,
-  epoch 50. Neither synthetic arm had converged at this cutoff (both
-  still rising); the real-only arm had already plateaued.}
-  \label{tab:synth-texture}
-  \begin{tabular}{lccc}
-    \toprule
-    Arm & Dice & seen & unseen \\
-    \midrule
-    Real-only & 0.4868 & 0.5737 & 0.3886 \\
-    Flat i.i.d.\ noise & 0.4899 & 0.5676 & 0.4022 \\
-    \textbf{Multi-octave texture} & \textbf{0.4955} & \textbf{0.5748} & 0.4059 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-Texture noise wins on all three metrics -- notably it recovers the
-seen-class cost that flat noise alone pays (narrowly beating even the
-real-only arm), while matching flat noise's unseen-class gain.
-
-\paragraph{Shape and intensity realism, calibrated against measurement.}
-The procedural shape-mode generator's host-anchored intensity
-contrast (\autoref{sec:methodology-synth}) was calibrated against a
-fresh measurement of real target-vs-surrounding-tissue contrast, taken
-directly on the same held-out sources used for generalization testing
-(749 cases, effect size in ring-standard-deviation units) rather than
-guessed.
+\paragraph{Swapping the canvas closes the gap.} A matched pair isolates
+the fix: identical checkpoint, shape family (scatter\_field), dose, and
+training budget, only the canvas source changes from the synthetic bank
+to a real MRI subject. Every source improves except ATLAS v2.0, a
+single compact chronic lesion -- the only non-multi-focal target of the
+four, plausibly outside what a multiplicity-targeted family like
+scatter\_field can reach.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Measured target-vs-surrounding-tissue contrast, used to set
-  the shape generator's calibration range. Sign and magnitude match
-  each source's known imaging contrast pattern.}
-  \label{tab:contrast-calibration}
-  \begin{tabular}{llr}
+  \caption{OOD Dice, real-host canvas progression. Stage 1$\to$2 is a
+  single-variable comparison (canvas only); stage 2$\to$3 additionally
+  extends to all shape families, a wider real-subject pool, and a longer
+  budget.}
+  \label{tab:synth-realhost-ood}
+  \begin{tabular}{lcccc}
     \toprule
-    Source & Known pattern & Contrast (ring-$\sigma$) \\
+    Stage & ISLES22 & Shifts-MS & ATLAS v2.0 & GNC\_705 \\
     \midrule
-    ISLES22 (DWI, acute stroke) & hyperintense & $+2.42$ \\
-    Shifts-MS (FLAIR, MS lesion) & hyperintense & $+1.49$ \\
-    GNC\_705 (kidney lesion) & mixed cyst/complex & $+0.49$ \\
-    MSD Prostate (zones) & -- & $+0.35$ \\
-    HU\_LWK1 (vertebra ROI, CT) & $\approx 0$ expected & $-0.07$ \\
-    MSD Hippocampus & -- & $-0.51$ \\
-    ATLAS v2.0 (T1, chronic stroke) & hypointense & $-0.59$ \\
+    Baseline & 0.050 & 0.008 & 0.028 & 0.082 \\
+    1) Synthetic-bank canvas & 0.045 & 0.011 & 0.033 & 0.070 \\
+    2) Real canvas, one family & \textbf{0.098} & \textbf{0.058} & 0.032 & 0.105 \\
+    3) Real canvas, all families & 0.087 & 0.051 & 0.027 & \textbf{0.223} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Every source's sign and rough magnitude matches its known radiological
-contrast direction, validating the measurement before it was used to
-set the generator's calibration range. The measurement also caught a
-design error: an initial \emph{absolute}-offset version of this
-calibration was, by this same measurement, roughly 7--12$\times$ too
-extreme relative to the generator's own per-class variance scale --
-corrected to a ratio-of-host-variance design before any reported
-checkpoint used it.
+Extending the real-host canvas from one shape family to all seven, a
+wider real-subject pool (every organ, CT and MRI), and a longer training
+budget keeps compounding on GNC\_705 -- the best result of the whole
+progression -- while easing back slightly on the two brain-lesion
+sources from stage 2's peak.
 
-\paragraph{Not yet isolated from the training-mix change.} Two further
-generator changes -- cross-class intensity/variance correlation and
-widened shape diversity -- exist and have been evaluated, but only on
-top of a checkpoint that concurrently switched the training data mix
-from CT-only to CT+MRI. Their standalone effect, isolated from that
-mix change, has not been measured.
-\todo{Rerun the cross-class-correlation and shape-diversity ablations
-on a CT-only baseline (matching this section's texture-noise arms) so
-the synthetic-generator effect can be reported without being
-confounded by the CT+MRI training-mix change reported elsewhere.}
+\paragraph{No in-distribution cost.} The same checkpoints' own periodic
+TotalSegmentator validation shows the OOD gain is additive, not traded
+against in-distribution accuracy:
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{TotalSegmentator validation Dice for the same checkpoints.
+  seen/unseen: macro Dice by trained-class membership. MRI/CT: Dice by
+  target modality.}
+  \label{tab:synth-realhost-indist}
+  \begin{tabular}{lccccc}
+    \toprule
+    Stage & Dice & seen & unseen & MRI & CT \\
+    \midrule
+    Baseline & 0.418 & 0.489 & 0.344 & 0.390 & 0.468 \\
+    1) Synthetic-bank canvas & 0.422 & 0.485 & 0.356 & 0.385 & 0.470 \\
+    2) Real canvas, one family & 0.417 & 0.483 & 0.348 & 0.384 & 0.467 \\
+    3) Real canvas, all families & \textbf{0.490} & \textbf{0.579} & \textbf{0.397} & \textbf{0.474} & \textbf{0.534} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The seen/unseen and MRI/CT gaps hold at roughly the same size at every
+stage; stage 3's longer budget lifts all five numbers together rather
+than trading one for another.
+\todo{Stage 2$\to$3 changes several axes at once (family count, host
+pool, training budget); only stage 1$\to$2 is a controlled ablation.
+N=1 seed throughout.}
