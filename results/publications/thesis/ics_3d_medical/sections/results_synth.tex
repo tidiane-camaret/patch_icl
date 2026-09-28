@@ -69,6 +69,43 @@ against in-distribution accuracy:
 The seen/unseen and MRI/CT gaps hold at roughly the same size at every
 stage; stage 3's longer budget lifts all five numbers together rather
 than trading one for another.
+
+\paragraph{The gain survives cascading.} Resuming the stage-3 checkpoint
+into coarse-to-fine cascade training (\autoref{sec:methodology-cascade})
+and re-evaluating the same nine OOD sources tests whether the real-host
+canvas helps under a different training and inference regime, not only
+the single-level one it was found under.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{OOD Dice under cascade inference. 146: cascade baseline,
+  synthetic-bank canvas. 168: 146 resumed with the real-host canvas
+  (stage 3 above). Medverse: released weights, depth-matched native
+  autoregressive inference (\autoref{sec:results-cascade}); omitted for
+  four sources where both models score too low to be informative.}
+  \label{tab:synth-cascade-realhost}
+  \begin{tabular}{lccc}
+    \toprule
+    Dataset & 146 & 168 (real-host) & Medverse \\
+    \midrule
+    HU\_LWK1 & \textbf{0.152} & 0.124 & 0.020 \\
+    ISLES22 & 0.069 & \textbf{0.070} & -- \\
+    Shifts-MS & \textbf{0.031} & 0.019 & -- \\
+    ATLAS v2.0 & 0.026 & \textbf{0.032} & -- \\
+    MSD Prostate & \textbf{0.375} & 0.372 & 0.357 \\
+    MSD Hippocampus & 0.303 & 0.518 & \textbf{0.686} \\
+    GNC\_705 & 0.024 & \textbf{0.035} & -- \\
+    FLARE22 & \textbf{0.751} & 0.743 & 0.359 \\
+    NasalSeg & 0.547 & 0.644 & \textbf{0.737} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The real-host canvas still wins or ties on five of nine sources under
+cascade inference, including a 0.21 gain on MSD Hippocampus, without
+closing the gap to Medverse on the two sources where Medverse's
+full-FOV pyramid already dominates.
 \todo{Stage 2$\to$3 changes several axes at once (family count, host
 pool, training budget); only stage 1$\to$2 is a controlled ablation.
-N=1 seed throughout.}
+N=1 seed throughout, including the cascade re-run above.}
