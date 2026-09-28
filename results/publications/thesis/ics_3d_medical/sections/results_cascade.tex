@@ -8,9 +8,37 @@ responsible for the in-distribution gain.
 
 \paragraph{Coarse-to-fine cascading improves accuracy in-distribution.}
 A spacing sweep from 4mm to 1.5mm crop resolution (117 classes, 3897
-samples) raises macro Dice from \textbf{0.361 to 0.538} (+0.177).
-\todo{Add cascade vs.\ single-level at matched final spacing: the direct
-test of whether cascading, not just resolution, helps.}
+samples) raises macro Dice from \textbf{0.361 to 0.538} (+0.177). Because
+this sweep ground-truth-centers the crop at every spacing, it does not by
+itself distinguish a genuine cascading benefit from simply evaluating at
+finer resolution. \autoref{tab:cascade-levels} isolates that: for the
+predicted-prior checkpoint, each level's Dice instead uses that level's
+own model-predicted localization, inherited from the previous level, not
+the ground truth. Dice still rises substantially level by level on every
+source, confirming the gain is not solely an oracle-centering artifact.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Per-level macro Dice using each level's own model-predicted
+  localization (not the ground-truth-centered crop of the sweep above),
+  vs.\ the final stitched cascade Dice, for the predicted-prior checkpoint
+  (\autoref{tab:cascade-medverse}'s ``Ours'').}
+  \label{tab:cascade-levels}
+  \begin{tabular}{lccc}
+    \toprule
+    Dataset & Levels (mm) & Per-level Dice & Stitched \\
+    \midrule
+    TotalSeg CT & $[6,3,1.5]$ & $0.394 \to 0.523 \to 0.577$ & \textbf{0.586} \\
+    TotalSeg MRI & $[6,3,1.5]$ & $0.365 \to 0.481 \to 0.497$ & \textbf{0.506} \\
+    HU\_LWK1 & $[6,3,1]$ & $0.065 \to 0.109 \to 0.152$ & \textbf{0.152} \\
+    FLARE22 & $[6,3,2.5]$ & $0.603 \to 0.718 \to 0.751$ & \textbf{0.751} \\
+    MSD Prostate & $[3,1.5,0.75]$ & $0.276 \to 0.361 \to 0.381$ & \textbf{0.375} \\
+    NasalSeg & $[1.5,0.8]$ & $0.484 \to 0.547$ & \textbf{0.547} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 At the coarsest level, the fixed-margin box placed at the coarse
 prediction's centroid contains on average 92.2\% of the target
 structure's voxels (\emph{containment}), compared with 97.0\% for a box
@@ -123,17 +151,13 @@ Feeding the model's own real previous prediction forward beats a
 perturbed ground-truth prior on 99 of 117 classes (median $\Delta+0.043$)
 -- a \emph{prior-source} ablation (real vs.\ noisy synthetic), distinct
 from the Medverse \emph{prior-presence} finding above. A comparison
-against no prior at all is still missing. On the six out-of-distribution
-sources in \autoref{tab:cascade-ablation} (all but TotalSeg CT), the
-predicted prior is better on five, worse only on MSD Hippocampus;
-including three further lesion sources not in the table (Shifts-MS,
-ATLAS v2.0, GNC\_705 -- all scoring below 0.1 for both variants), it is
-better on five of nine -- weaker than the clear in-distribution
-majority.
+against no prior at all is still missing. On the five out-of-distribution
+sources in \autoref{tab:cascade-ablation} (all but TotalSeg CT and
+TotalSeg MRI, both in-distribution for this section), the predicted
+prior is better on four, worse only on MSD Hippocampus; including three
+further lesion sources not in the table (Shifts-MS, ATLAS v2.0,
+GNC\_705 -- all scoring below 0.1 for both variants), it is better on
+four of eight -- weaker than the clear in-distribution majority.
 \todo{Add a no-query-prior control arm to complete the ablation table
 promised in the methodology chapter (full model vs.\ $-$query-prior vs.\
 $-$region-restriction vs.\ $-$register-carry).}
-
-\todo{Add NasalSeg to \autoref{tab:ood-sources} in
-\autoref{sec:results-setup} for consistency -- it is evaluated in this
-chapter but missing from that table.}
