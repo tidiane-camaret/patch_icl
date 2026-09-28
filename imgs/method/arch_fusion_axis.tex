@@ -1,0 +1,298 @@
+\documentclass[tikz,border=4pt,12pt]{standalone}
+\usepackage{ifthen}
+\usetikzlibrary{arrows.meta,calc,positioning}
+\input{arch-macros.tex}
+
+% Define a vibrant, brighter blue for all attention arrows
+\definecolor{archBrightBlue}{HTML}{3B82F6}
+
+% ---------------------------------------------------------------------------
+% Figure B of the former arch_biaxial.tex: the fusion-axis detail within the
+% shared-encoder family arch_fusion_family.tex introduces generically. Two
+% panels, stacked, both members of that same family (only the fusion axis
+% differs between them):
+%
+% Baseline (top): 1x Fuse (image/label tokens merged once per cell by one
+% shared operator -- concat / sum / MLP / pixel-shuffle, drawn as a single
+% oplus) followed by Lx Patch axis -- fusion happens once, patch-axis
+% attention repeats for L layers, so only the Patch-axis box carries the
+% "xL" mark.
+% Ours (bottom): the WHOLE pair (image/label axis -> patch axis) repeats as
+% one layer, Lx -- so both boxes sit inside one outer dashed wrapper that
+% carries the single "xL" mark for the pair.
+%
+% Style follows TabPFN's Fig. 1 (Hollmann et al., Nature 2024): small token
+% grids connected by simple curved double-arrows rather than full
+% cell/token-block renderings. The "special test row" device (edges
+% touching it get a distinct color) maps onto our target row, which really
+% is architecturally special in both methods: it cross-attends/fuses
+% read-only into context, and its label-stream input is a predicted prior
+% rather than real ground truth like context's, which is why target's
+% label tokens are gray rather than a role color throughout.
+% ---------------------------------------------------------------------------
+
+% \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
+\newcommand{\tpsq}[4]{
+  \fill[#3] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+  \draw[#4,line width=1.2pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpcluster{x}{y}{fill}{ring} -- 3 stacked tokens standing in for N.
+\newcommand{\tpcluster}[4]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsq{#1}{#2+\doff}{#3}{#4}
+  }
+}
+% \tpsqsplit{x}{y}{fillImg}{fillLbl}{ring} -- one token, diagonally split
+\newcommand{\tpsqsplit}[5]{
+  \begin{scope}
+    \clip (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+    \fill[#3] (#1-\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2-\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+    \fill[#4] (#1-\tsz/2,#2-\tsz/2) -- (#1-\tsz/2,#2+\tsz/2) -- (#1+\tsz/2,#2+\tsz/2) -- cycle;
+  \end{scope}
+  \draw[#5,line width=1.2pt] (#1-\tsz/2,#2-\tsz/2) rectangle ++(\tsz,\tsz);
+}
+% \tpclustersplit{x}{y}{fillImg}{fillLbl}{ring} -- 3 stacked split tokens.
+\newcommand{\tpclustersplit}[5]{
+  \foreach \doff in {-\toff,0,\toff} {
+    \tpsqsplit{#1}{#2+\doff}{#3}{#4}{#5}
+  }
+}
+% \dblarrow{p1}{p2}{color} -- curved double-headed attention edge.
+\newcommand{\dblarrow}[3]{
+  \draw[{Latex[length=3.0mm,width=2.5mm]}-{Latex[length=3.0mm,width=2.5mm]},
+        line width=1.5pt,#3] #1 to[bend left=12] #2;
+}
+% \fusearrow{p1}{p2}{color} -- straight single-headed merge edge.
+\newcommand{\fusearrow}[3]{
+  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
+}
+
+% \tabpfnattn{x} -- Fully connected, right-side routed attention with cascading transparency
+\newcommand{\tabpfnattn}[1]{
+  \def\attnstyle{[{Latex[length=3.0mm,width=2.5mm]}-{Latex[length=3.0mm,width=2.5mm]}, line width=1.5pt, archBrightBlue]}
+  \def\ax{#1+\tsz/2+0.05}
+
+  \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=30] (\ax, \yTgt);
+  \draw\attnstyle (\ax, \yTgt)       to[bend left=30] (\ax, \yTgt-\toff);
+  \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=30] (\ax, \yCtx+\toff);
+  \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=30] (\ax, \yCtx);
+  \draw\attnstyle (\ax, \yCtx)       to[bend left=30] (\ax, \yCtx-\toff);
+
+  \begin{scope}[opacity=0.6]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=45] (\ax, \yTgt-\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=45] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=45] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=45] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.3]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=60] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=60] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=60] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.15]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=75] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=75] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.08]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=90] (\ax, \yCtx-\toff);
+  \end{scope}
+}
+
+% ---- dimensions, matched to the other arch_* figures ----
+\def\tsz{0.50}
+\def\toff{0.80}
+\def\rowpitch{2.40}
+\def\colpitch{2.4}
+\def\panelgap{2.6}
+\def\clusterhalf{1.10}
+\def\pairpitch{1.1}
+
+\def\xlab{-0.8}
+\def\yTgt{\rowpitch}
+\def\yCtx{0}
+
+\def\boxw{6.0}
+\def\xA{-0.30}
+\def\ximgTop{1.0}
+\def\boxpad{0.60}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+
+  \pgfmathsetmacro{\xB}{\xA+\boxw+\panelgap}
+  \pgfmathsetmacro{\boxAcenter}{\xA+\boxw/2}
+  \pgfmathsetmacro{\boxBcenter}{\xB+\boxw/2}
+
+  \pgfmathsetmacro{\outerLeftBase}{\xB-0.50}
+  \pgfmathsetmacro{\outerRightBase}{\xB+\boxw+0.50}
+
+  % Stacked Layout: Ours shares X-coords with Baseline
+  \pgfmathsetmacro{\xC}{\xA}
+  \pgfmathsetmacro{\xD}{\xB}
+  \pgfmathsetmacro{\boxCcenter}{\xC+\boxw/2}
+  \pgfmathsetmacro{\boxDcenter}{\xD+\boxw/2}
+
+  \pgfmathsetmacro{\outerLeft}{\xC-0.50}
+  \pgfmathsetmacro{\outerRight}{\xD+\boxw+0.50}
+
+  \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
+  \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
+
+  \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
+
+  \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}
+  \pgfmathsetmacro{\xFusedTop}{\xlblTop+2.0}
+
+  \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
+  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.35}
+  \pgfmathsetmacro{\yMid}{\rowpitch/2}
+
+  \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
+  \pgfmathsetmacro{\ximgBot}{\boxCcenter-\colpitch/2}
+  \pgfmathsetmacro{\xlblBot}{\ximgBot+\colpitch}
+  \pgfmathsetmacro{\ximgPatchBot}{\boxDcenter-\pairpitch/2}
+  \pgfmathsetmacro{\xlblPatchBot}{\ximgPatchBot+\pairpitch}
+
+
+  % =========================================================================
+  % Baseline: 1x Fuse, then Lx Patch axis (TOP PANEL)
+  % =========================================================================
+  \begin{scope}[yshift=0cm]
+
+    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+
+    % Group title, spanning both panels
+    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY+0.80})
+      {\archtitle Shared encoder + cross-attn};
+
+    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY}) {\archboxlabel Baseline: early fusion};
+
+    \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
+      ({\outerLeftBase},{\outerBot}) rectangle ({\outerRightBase},{\outerTop});
+
+    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+      (\xA,\yCtx-\clusterhalf-\boxpad) rectangle ({\xA+\boxw},\yTgt+\clusterhalf+\boxpad);
+    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+      ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+\boxpad);
+
+    \node[anchor=south] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
+    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
+
+    \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+
+    \archarrow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{black!30}
+
+    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
+    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.25) {lbl};
+    \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {fused};
+    \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {fused};
+
+    \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
+      \fill[black!15,rounded corners=3pt]
+        ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+        ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+    }
+
+    \foreach \y in {\yTgt,\yCtx} {
+      \foreach \doff in {-\toff,0,\toff} {
+        \fill[black!15,rounded corners=3pt]
+          ({\xFusedPatchTop-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
+          ({\xFusedPatchTop+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
+      }
+    }
+
+    % target's label column is gray, not a role color -- it is never real
+    % ground truth (a zero-mask placeholder here), unlike context's
+    \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/black!8,
+                                       \yCtx/archContextPink/archContextAccent} {
+      \tpcluster{\ximgTop}{\y}{\imgfill}{black!70}
+      \tpcluster{\xlblTop}{\y}{\lblfill}{black!70}
+      \tpclustersplit{\xFusedTop}{\y}{\imgfill}{\lblfill}{black!70}
+      \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
+    }
+
+    \node[font=\huge] at ({\xFuseOp},{\yMid}) {$\oplus$};
+    \fusearrow{({\xFuseArrowStart},{\yMid})}{({\xFusedTop-\tsz/2-0.18},{\yMid})}{black!55}
+
+    \tabpfnattn{\xFusedPatchTop}
+
+  \end{scope}
+
+
+  % =========================================================================
+  % Divider between Baseline and Ours
+  % =========================================================================
+  \pgfmathsetmacro{\divY}{\outerBot - 1.2}
+  \draw[black!20,dashed,line width=1pt] ({\xA-1.0},{\divY}) -- ({\xB+\boxw+1.0},{\divY});
+
+
+  % =========================================================================
+  % Ours: Lx (image/label axis -> patch axis) (BOTTOM PANEL)
+  % =========================================================================
+  \begin{scope}[yshift=-9.5cm]
+
+    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+
+    \node[anchor=south] at ({\xC+(\xD+\boxw-\xC)/2},{\methodTitleY}) {\archboxlabel Ours: dual attn.};
+
+    \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
+      ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
+
+    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+      (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxw},\yTgt+\clusterhalf+\boxpad);
+    \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
+      ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxw},\yTgt+\clusterhalf+\boxpad);
+
+    \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Image/label axis};
+    \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
+
+    \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+
+    \archarrow{({\xC+\boxw+0.50},{\yMid})}{({\xD-0.50},{\yMid})}{black!30}
+
+    \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.25) {img};
+    \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.25) {lbl};
+    \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.25) {img};
+    \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.25) {lbl};
+
+    \fill[black!15,rounded corners=3pt]
+      ({\ximgBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\ximgBot+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+    \fill[black!15,rounded corners=3pt]
+      ({\xlblBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
+      ({\xlblBot+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+
+    \foreach \y in {\yTgt,\yCtx} {
+      \foreach \doff in {-\toff,0,\toff} {
+        \fill[black!15,rounded corners=3pt]
+          ({\ximgPatchBot-\tsz/2-0.18},{\y+\doff-\tsz/2-0.10}) rectangle
+          ({\xlblPatchBot+\tsz/2+0.18},{\y+\doff+\tsz/2+0.10});
+      }
+    }
+
+    % target's label column is gray, not a role color -- see the matching
+    % note in the Baseline panel above
+    \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/black!8,
+                                       \yCtx/archContextPink/archContextAccent} {
+      \tpcluster{\ximgBot}{\y}{\imgfill}{black!70}
+      \tpcluster{\xlblBot}{\y}{\lblfill}{black!70}
+      \tpcluster{\ximgPatchBot}{\y}{\imgfill}{black!70}
+      \tpcluster{\xlblPatchBot}{\y}{\lblfill}{black!70}
+    }
+
+    \foreach \doff in {-\toff,0,\toff} {
+      \dblarrow{({\ximgBot+\tsz/2+0.10},\yCtx+\doff)}{({\xlblBot-\tsz/2-0.10},\yCtx+\doff)}{archBrightBlue}
+      \dblarrow{({\ximgBot+\tsz/2+0.10},\yTgt+\doff)}{({\xlblBot-\tsz/2-0.10},\yTgt+\doff)}{archBrightBlue}
+    }
+
+    \tabpfnattn{\xlblPatchBot}
+
+  \end{scope}
+
+\end{tikzpicture}
+\end{document}
