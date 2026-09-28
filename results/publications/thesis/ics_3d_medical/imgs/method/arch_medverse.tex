@@ -12,13 +12,13 @@
 
   % ---- row 1: target ----
   \node[anchor=east,align=center] at (-0.3,5.25) {target\\image};
-  \archvolcube{0}{4}{1.6}{2.5}{archTargetGreen}{ct}{$I^T$}
+  \archvolcube{0}{4}{1.6}{2.5}{archTargetGreen}{ct}{$I^t$}
   \archarrow{(2.1,5.25)}{(2.9,5.25)}{archArrowPale}
   \archbowtie{3.0}{4}{4}{2.5}{0.9}{archTargetGreen}{dual\\U-Net}
 
   % ---- row 2: context ----
   \node[anchor=east,align=center] at (-0.3,1.25) {context\\image + mask};
-  \archvolcube{0}{0}{1.6}{2.5}{archContextPink}{ctmask}{$I^C,M^C$}
+  \archvolcube{0}{0}{1.6}{2.5}{archContextPink}{ctmask}{$I^c,L^c$}
   \archarrow{(2.1,1.25)}{(2.9,1.25)}{archArrowPale}
   \archbowtie{3.0}{0}{4}{2.5}{0.9}{archContextPink}{dual\\U-Net}
 
@@ -28,7 +28,7 @@
 
   % ---- output ----
   \archarrow{(7.1,5.25)}{(7.9,5.25)}{archArrowPale}
-  \archvolcube{8.0}{4}{1.6}{2.5}{archTargetGreen}{predmask}{$M^T_{\mathrm{pred}}$}
+  \archvolcube{8.0}{4}{1.6}{2.5}{archTargetGreen}{predmask}{$\hat{L}^t$}
   \node[anchor=west,align=center] at (10,5.25) {predicted\\target mask};
 
 \end{tikzpicture}

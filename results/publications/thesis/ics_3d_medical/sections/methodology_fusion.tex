@@ -33,7 +33,7 @@ both our baseline and final design belong to.
   label evidence -- a placeholder prior for target, the real mask for
   context -- re-enters at a Fuse step ($\oplus$) before the encoded
   token attends across cells and contexts for $L$ layers (``Attn.'') and
-  a shared decoder (``Dec'') produces the mask. \autoref{fig:biaxial}
+  a shared decoder (``Dec'') produces the mask. \autoref{fig:fusion-axis}
   details the two ways we combine image and label evidence within this
   shared-encoder family.}
   \label{fig:fusion-family}
@@ -62,7 +62,7 @@ uncompressed token grid:
     since tokens from every volume already share one sequence.
 \end{itemize}
 
-\autoref{fig:biaxial} contrasts this dual attention against a
+\autoref{fig:fusion-axis} contrasts this dual attention against a
 single-fusion-step baseline within the same shared-encoder family.
 
 \begin{figure}[t]
@@ -82,7 +82,7 @@ single-fusion-step baseline within the same shared-encoder family.
   input is the query prior (\autoref{sec:methodology-cascade}) rather
   than ground truth, which is why its label token is gray rather than a
   role color.}
-  \label{fig:biaxial}
+  \label{fig:fusion-axis}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
 

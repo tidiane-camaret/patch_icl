@@ -14,10 +14,10 @@
 %
 % Baseline (top): 1x Fuse (image/label tokens merged once per cell by one
 % shared operator -- concat / sum / MLP / pixel-shuffle, drawn as a single
-% oplus) followed by Lx Patch axis -- fusion happens once, patch-axis
-% attention repeats for L layers, so only the Patch-axis box carries the
+% oplus) followed by Lx Position axis -- fusion happens once, position-axis
+% attention repeats for L layers, so only the Position-axis box carries the
 % "xL" mark.
-% Ours (bottom): the WHOLE pair (image/label axis -> patch axis) repeats as
+% Ours (bottom): the WHOLE pair (modality axis -> position axis) repeats as
 % one layer, Lx -- so both boxes sit inside one outer dashed wrapper that
 % carries the single "xL" mark for the pair.
 %
@@ -158,7 +158,7 @@
 
 
   % =========================================================================
-  % Baseline: 1x Fuse, then Lx Patch axis (TOP PANEL)
+  % Baseline: 1x Fuse, then Lx Position axis (TOP PANEL)
   % =========================================================================
   \begin{scope}[yshift=0cm]
 
@@ -180,7 +180,7 @@
       ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+\boxpad);
 
     \node[anchor=south] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
-    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
+    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Position axis};
 
     \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
@@ -248,8 +248,8 @@
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxw},\yTgt+\clusterhalf+\boxpad);
 
-    \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Image/label axis};
-    \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Patch axis};
+    \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Modality axis};
+    \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Position axis};
 
     \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
