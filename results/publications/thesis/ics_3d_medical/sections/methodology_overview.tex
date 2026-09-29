@@ -1,3 +1,4 @@
+% >>> begin sections/methodology_overview.tex
 \subsection{Problem Setup and Backbone}\label{sec:methodology-overview}
 
 We use the setting of \autoref{sec:fundamentals-icl}: given a target volume
@@ -7,8 +8,18 @@ levels with decreasing voxel spacing $r_1 > r_2 > \dots > r_M$. Each level
 predicts a mask, which is passed to the next level as a prior
 (\autoref{sec:methodology-cascade}). Within a level, the model consists of a
 shared encoder, a stack of dual attention layers, and a decoder
-(\autoref{fig:overview}). Medverse's architecture is shown for comparison in
-\autoref{fig:overview-medverse} in the appendix.
+(\autoref{fig:overview}).
+
+At every level, all volumes are resampled onto the same grid of $128^3$
+voxels, and only the voxel spacing changes between levels. A coarse level
+therefore covers a large field of view at low resolution, and a fine level a
+small field of view at high resolution: at 6\,mm spacing the grid spans
+768\,mm per side, at 1.5\,mm only 192\,mm. During training, the spacing is
+sampled from a range rather than fixed to the levels used at inference
+(\autoref{sec:methodology-cascade}).
+\todo[inline]{Give the training spacing range. Your note says the coarse
+level uses 4\,mm, but \autoref{fig:query-prior} and
+\autoref{tab:cascade-levels} use 6\,mm; which is correct?}
 
 \begin{figure}[t]
   \centering
@@ -21,33 +32,52 @@ shared encoder, a stack of dual attention layers, and a decoder
 \todo{Draft diagram, ported from the conference draft; finalize labels/scale once the architecture is settled.}
 
 \paragraph{Shared encoder.}
-All $K+1$ images of a task pass through the same encoder, which produces a
-feature pyramid for each. The encoder sees only images; masks enter the model
-through the label tokens described below. We read out two disjoint sets of
-encoder stages. The coarse stages are resampled to a common
-$R \times R \times R$ grid, giving $N = R^3$ cells per volume, and form the
-input to the attention layers. The fine stages keep their native resolution and
-serve as skip connections for the decoder (\autoref{sec:methodology-fusion}).
-The attention layers therefore always operate on a small grid of fixed size,
-while the decoder can still produce a full-resolution mask.
-\todo[inline]{Specify: encoder architecture and initialization, which stages
-are coarse and which are fine, $R$, token dimension $D$, and the input crop
-size at each level.}
+All $K+1$ images of a task pass through the same encoder, a plain
+convolutional encoder in the style of nnU-Net~\cite{isensee2021nnu} with four
+stages, trained from scratch with He initialization. The encoder sees only
+images; masks enter the model through the label tokens described below. The
+first two stages (0 and 1) are the fine stages: they keep their own resolution
+and serve as skip connections for the decoder
+(\autoref{sec:methodology-fusion}). The last two stages (2 and 3) are the
+coarse stages. Their features are resampled to a common grid of
+$R \times R \times R$ cells with $R = 16$, giving $N = R^3 = 4096$ cells per
+volume, and concatenated along the channel dimension. Each cell therefore
+covers $p^3 = 8^3$ voxels of the input grid, with $p = 128/R$. The attention
+layers always operate on this fixed grid, while the decoder can still produce
+a mask at the full $128^3$ resolution.
+\todo[inline]{\autoref{sec:results-fusion} says the fusion arms warm-start the
+encoder and decoder from a shared checkpoint. Is that a checkpoint of this
+model, itself trained from scratch? If so, say so there.}
 
 \paragraph{Tokens.}
-Each cell of each volume is represented by two tokens: an image token
-$z^{\text{img}}$, computed from the coarse encoder features at that cell, and a
-label token $z^{\text{lbl}}$, an embedding of the mask at that cell. For a
-context volume, the label token embeds the ground-truth mask $L^c_k$. For the
-target, the mask is unknown: at the first cascade level its label tokens are
-initialized with a placeholder, and at later levels with the previous level's
-prediction (\autoref{sec:methodology-cascade}). Learned embeddings mark each
-token as belonging to the target or to a context volume. A small number of
-learned register tokens, shared across volumes, are appended to the sequence.
-They are not tied to any cell and give the attention layers a fixed amount of
-global memory.
-\todo[inline]{Specify: how $\mathrm{LblEmbed}$ maps the mask to a cell token;
-the level-1 placeholder (\autoref{fig:query-prior} calls it ``support mean'':
-is it the mean of the context label tokens?); the number of register tokens;
-and the pooling token used in the extended configuration of
-\autoref{sec:results-synth}.}
+Each cell $i$ of each volume $v$ is represented by two tokens of dimension
+$D = 768$. The image token is a linear projection of the concatenated coarse
+features at that cell,
+%
+\begin{equation}
+  z^{\text{img}}_{v,i} = W_{\text{img}} \, f_{v,i},
+  \label{eq:img-token}
+\end{equation}
+%
+where $f_{v,i}$ denotes the resampled stage-2 and stage-3 features of cell $i$.
+The label token embeds the part of the mask that falls into the cell. We
+flatten the $p^3 = 512$ mask voxels of cell $i$ into a vector $m_{v,i}$ and
+project it linearly:
+%
+\begin{equation}
+  z^{\text{lbl}}_{v,i} = \mathrm{LblEmbed}(m_{v,i}) = W_{\text{lbl}} \, m_{v,i} + b_{\text{lbl}}.
+  \label{eq:lbl-token}
+\end{equation}
+%
+For a context volume, $m_{v,i}$ is taken from the ground-truth mask $L^c_k$.
+For the target, the mask is unknown. At the first cascade level, every target
+cell receives the same placeholder: the average of $m_{v,i}$ over all cells of
+all context volumes, embedded with $\mathrm{LblEmbed}$. It carries the average
+amount of foreground in the context masks, but no information about where the
+target is. At later levels, the target's label tokens are computed from the
+previous level's prediction instead (\autoref{sec:methodology-cascade}).
+
+Learned embeddings mark each token as belonging to the target or to a context
+volume. Eight learned register tokens, shared across all volumes, are
+prepended to the sequence. They are not tied to any cell and give the
+attention layers a fixed amount of global memory.

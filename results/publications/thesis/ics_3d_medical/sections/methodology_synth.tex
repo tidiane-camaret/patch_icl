@@ -1,39 +1,73 @@
+% >>> begin sections/methodology_synth.tex
 \subsection{Synthetic Task Generation}\label{sec:methodology-synth}
 
 During training, a fraction $p_{\text{synth}}$ of tasks is generated
-synthetically instead of being sampled from the annotated cohort. In a
-synthetic task, each of the $K+1$ volumes consists of an image with a
-procedurally generated shape painted onto it, and the mask of that shape.
+synthetically. For each synthetic task, one shape family and one set of shape
+and appearance parameters are drawn; these play the role of the class. Each of
+the $K+1$ volumes then receives its own instance of the shape, painted onto its
+own image. Shape, size, and position vary between volumes with ratios of 0.3,
+0.3, and 0.5, where 0 reuses the task-level value and 1 draws it
+independently.
 
 \paragraph{Shapes.}
-Masks are sampled from seven procedural shape families: blob, splatter, disk,
-cylinder, vessel, torus, and scatter field. The scatter field places many small
-components across a region. It imitates multi-focal lesions, which few
-structures in the training cohort resemble.
-\todo[inline]{Specify: are the context and target masks of one task drawn from
-the same family with different random parameters? Size ranges of the shapes.}
+Masks come from seven procedural families (\autoref{tab:synth-shapes}). The
+scatter field places many small components across a region to imitate
+multi-focal lesions, which few structures in the training cohort resemble.
+Sizes are defined in millimeters and converted to voxels at each cascade
+level, so a shape is the same physical object at every level.
 
-\paragraph{Appearance.}
-The painted intensity is set relative to the surrounding tissue: it is drawn
-from a range defined by the local mean and standard deviation of the image
-where the shape is placed, not as an absolute value. The paint is textured with
-multi-octave noise, a sum of noise fields at several spatial scales, so that
-it is spatially correlated like real tissue rather than independent from voxel
-to voxel. Optionally, the core and the rim of the shape receive different
-intensities.
-\todo[inline]{Specify the intensity offset distribution, the noise scales and
-amplitudes, and the core/rim blend.}
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Shape families. Target diameters are drawn from 10--50\,mm unless
+  stated otherwise.}
+  \label{tab:synth-shapes}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Family & Family-specific parameters \\
+    \midrule
+    Blob, disk      & -- \\
+    Splatter        & 2--6 components, spread 5--20\,mm \\
+    Scatter field   & 10--120 components, spread 20--140\,mm \\
+    Cylinder        & length 30--100\,mm \\
+    Vessel          & trunk 40--120\,mm, branching depth 2--4 \\
+    Torus           & ratio of major to minor radius 2--5 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \paragraph{Canvas.}
-We compare two sources for the image that shapes are painted onto. The
-\emph{synthetic-bank} canvas takes an image region from a precomputed bank
-built from segmented real scans. The \emph{real-host} canvas uses a real
-TotalSegmentator training case, CT or MRI, directly. With the real-host
-canvas, all $K+1$ volumes of a task share the same subject as their image and
-differ only in the painted shapes.
-\todo[inline]{Clarify what the bank contains and how an entry is selected
-(\autoref{sec:results-synth} notes it was built from CT only). For the
-real-host canvas: are the $K+1$ volumes different crops of the subject, or the
-same crop with different shapes? If the images are identical apart from the
-paint, the target could be solved by comparing it with the context images
-voxel by voxel; state how this is avoided.}
+We compare two sources for the images.
+The \emph{real-host} canvas uses real TotalSegmentator scans. A host structure
+is drawn, and $K+1$ different subjects containing it are sampled; the shape is
+placed within $\pm 30$\,mm per axis of the host structure's centroid. Since the
+volumes of a task are different scans, the target cannot be found by comparing
+it with the context images voxel by voxel.
+The \emph{synthetic-bank} canvas uses a bank of label maps from segmented CT
+scans of about 21 datasets. A class is drawn, and $K+1$ label maps containing
+it are selected, optionally preferring maps of similar geometry. As in
+SynthSeg~\cite{billot2023synthseg}, the image is synthesized from the label
+map with Gaussian-mixture intensities, and the shape is painted into it, with
+an optional blend of core and rim intensity. Only the anatomical layout of this
+canvas is real; its appearance is synthetic.
+
+\paragraph{Appearance on the real-host canvas.}
+The shape is painted relative to the local tissue statistics $\mu$ and
+$\sigma$ of the host image:
+%
+\begin{equation}
+  I(x) = \mu + c\,\sigma + \sigma\, n(x), \qquad c \sim \mathcal{U}(-2.5, 2.5),
+  \label{eq:paint}
+\end{equation}
+%
+with the contrast $c$ drawn once per task. The range covers the
+lesion-to-tissue contrast we measured on seven of the evaluation datasets
+(10th to 90th percentile: $-0.87$ to $2.00$), widened symmetrically because
+the sign of the contrast is not known for an arbitrary host. The texture
+$n(x)$ is fractal value noise with unit variance: four octaves of random grids,
+starting from 15\,mm cells and halving the cell size per octave, weighted by
+$0.5^k$.
+\todo[inline]{Over which region are $\mu$ and $\sigma$ computed (a ring
+around the shape?) Which seven datasets were used for the contrast
+calibration?}
+% <<< end sections/methodology_synth.tex

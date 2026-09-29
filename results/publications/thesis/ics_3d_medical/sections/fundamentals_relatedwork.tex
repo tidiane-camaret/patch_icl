@@ -9,8 +9,19 @@ UniverSeg~\cite{butoiUniverSegUniversalMedical2023} was one of the first
 in-context segmentation models for medical images. It operates on 2D images.
 Its CrossBlock combines target and context features with a CrossConv layer, a
 convolution applied to each concatenated target--context feature pair, at every
-scale of a U-Net-like network. It predicts in a single pass and is trained on
-real data only.
+scale of a U-Net-like network. It incorporates 
+synthetic tasks (procedurally generated geometric shapes) alongside real 
+medical datasets during training to improve zero-shot generalization.
+
+
+
+\paragraph{Medverse.}
+Medverse~\cite{huMedverseUniversalModel2025a} uses two separate 3D U-Nets, one
+for the target and one for the context. The context branch receives image and
+mask concatenated as channels, while the target branch receives only the image.
+The two branches exchange features at several stages: the context queries the
+target in the encoder, and the target queries the context in the decoder.  Following UniverSeg, it also relies on procedural synthetic shapes 
+during training to expand task diversity.
 
 \paragraph{Iris.}
 Iris~\cite{gaoShowSegmentUniversal2025} encodes the context pairs once into a
@@ -19,17 +30,6 @@ encoder. The target interacts with the context only through this embedding, via
 a single bidirectional cross-attention step in the mask decoder, and the
 embedding is reused across queries. Inference is a single pass without
 refinement across scales.
-
-\paragraph{Medverse.}
-Medverse~\cite{huMedverseUniversalModel2025a} uses two separate 3D U-Nets, one
-for the target and one for the context. The context branch receives image and
-mask concatenated as channels, while the target branch receives only the image.
-The two branches exchange features at several stages: the context queries the
-target in the encoder, and the target queries the context in the decoder. This
-exchange uses a Blockwise Cross-Attention Module (BAM), which mean-pools queries
-and keys over a $4^3$ block grid before attending, while values stay at full
-resolution. Pooling reduces the cost of attention at the price of positional
-precision.
 
 \paragraph{Coarse-to-fine approaches.}
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large
@@ -47,19 +47,16 @@ ground-truth mask stands in for this prediction.
 \begin{table}[t]
   \centering
   \small
-  \caption{Design choices of prior in-context segmentation models on the three
+  \caption{Design choices of 3D in-context segmentation models on the three
     questions of \autoref{sec:motivation}.}
   \label{tab:relatedwork}
-  \begin{tabular}{@{}llll@{}}
+  \begin{tabular}{@{} l p{4.5cm} p{4.5cm} p{4cm} @{}}
     \toprule
-    & Image--label fusion & Coarse-to-fine & Synthetic tasks \\
+    & Image--label fusion & Coarse-to-fine prior & Synthetic tasks \\
     \midrule
-    UniverSeg (2D) & CrossConv at every scale & no & no \\
-    Iris & task embedding, computed once & no & no \\
-    Medverse & two U-Nets + blockwise cross-attn. & full volume per step & no \\
-    \textbf{Ours} & dual attention at every layer & region-restricted, predicted prior & shapes painted on real scans \\
+    Iris & Before attention (pixel shuffle) & No & No \\
+    Medverse & Before attention (channel concatenation) & Ground truth mask & Procedural shapes \\
+    \textbf{Ours} & dual attention at every layer & Previous level prediction & Procedural shapes, painted on real scans \\
     \bottomrule
   \end{tabular}
 \end{table}
-
-\todo[inline]{Iris and Medverse actually use synthetic tasks during training. check.}

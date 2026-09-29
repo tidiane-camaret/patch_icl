@@ -1,63 +1,78 @@
+% >>> begin sections/methodology_cascade.tex
 \subsection{Coarse-to-Fine Cascade}\label{sec:methodology-cascade}
 
-The cascade processes the target at $M$ resolution levels. Consecutive levels
-are linked in two ways: the previous level's prediction initializes the
-target's label tokens, and it determines which region the next level
-processes.
+Each of the $M$ levels processes a single $128^3$ crop; levels differ only in
+spacing and hence field of view. The prediction of one level determines where
+the next crop is placed and initializes the target's label tokens.
+
+\paragraph{Crop placement.}
+The first crop is centered at the center of the volume, with a spacing chosen
+per dataset to cover the region where the target can occur. Each later crop
+is centered at the probability-weighted centroid of the previous prediction,
+or at the volume center if that prediction is empty. The finest spacing is
+chosen so that the field of view exceeds the largest expected target
+(\autoref{tab:cascade-levels}). Each level thus costs one forward pass,
+independent of volume and target size. We refer to this as region
+restriction. Its drawbacks are that a target missed at a coarse level cannot
+be recovered, and that a target with several distant components may not fit
+into one fine crop.
+
+\paragraph{Stitching.}
+The coarsest prediction is pasted into the original volume first; each finer
+level then overwrites the region covered by its crop.
 
 \paragraph{Prediction as prior.}
-At level $\ell > 1$, the target's label tokens are initialized from the
-prediction of level $\ell{-}1$:
+At level $\ell > 1$, the target's label tokens are computed from the previous
+prediction, cell by cell as in \autoref{eq:lbl-token}:
 %
 \begin{equation}
   z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1})\big),
   \label{eq:query-prior}
 \end{equation}
 %
-where $\mathrm{Warp}$ resamples the prediction onto the crop grid of level
-$\ell$, accounting for the different center, field of view, and augmentation
-of the two crops. The prior thus enters the same token stream as the context
-masks and is processed by the same dual attention layers, instead of through a
-separate branch as in Medverse (\autoref{sec:fundamentals-relatedwork}). The
-prediction is detached before warping, so no gradients flow from one level
-back into the previous one. \autoref{fig:query-prior} shows the flow across
-two levels.
-\todo[inline]{Specify whether the prior is the probability map or a
-binarized mask.}
-
-During training, the prior at level $\ell$ is either the model's own
-prediction from level $\ell{-}1$ (predicted prior) or a randomly perturbed
-ground-truth mask (perturbed ground-truth prior). \autoref{sec:results-cascade}
-compares the two.
-\todo[inline]{Specify the perturbations applied to the ground-truth prior; how
-levels are sampled during training (all $M$ levels per step, or one at a time);
-how training crops are placed at each level; and the cross-level register
-carry of the extended configuration (are the level-$\ell$ registers
-initialized from the final level-$(\ell{-}1)$ registers?).}
+where $\hat{L}^t_{\ell-1}$ is the sigmoid probability map of level $\ell{-}1$,
+detached from the computation graph, and $\mathrm{Warp}$ resamples it onto the
+crop grid of level $\ell$. The prior thus enters the same stream as the
+context masks, instead of a separate branch as in Medverse
+(\autoref{sec:fundamentals-relatedwork}); see \autoref{fig:query-prior}.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{arch_query_prior.pdf}
-  \caption{Label prior across two cascade levels. At level 1 no prior exists,
-  and the target's label tokens are initialized with a placeholder (dashed).
-  At level 2 they are initialized from a crop of the level-1 prediction
-  $\hat{L}^t_1$, in the same position that the mask occupies for context
-  volumes.}
+  \caption{Label prior across two cascade levels. At level 1, the target's
+  label tokens hold a placeholder (dashed); at level 2, a crop of the level-1
+  prediction $\hat{L}^t_1$.}
   \label{fig:query-prior}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
 
-\paragraph{Region-restricted processing.}
-At each level after the first, we threshold the previous prediction, place a
-box around the predicted foreground, pad it by a fixed margin, and run the
-sliding window only inside this box. The cost of the fine levels then depends
-on the size of the structure rather than the size of the volume. The drawback
-is that fine levels cannot recover structures that the coarse level missed or
-placed far from their true position.
-\todo[inline]{Specify: what level 1 processes (whole volume or a crop);
-threshold and margin; whether the box is the bounding box of the foreground or
-a fixed-size box at its centroid (\autoref{sec:results-cascade} describes a
-fixed-margin box at the centroid); sliding-window size and overlap; behavior
-when the coarse prediction is empty; how level predictions are stitched into
-the final mask (\autoref{tab:cascade-levels} reports a ``stitched'' Dice); and
-how the level spacings are chosen per dataset.}
+\paragraph{Training.}
+All $M$ levels are processed in one forward pass. The first crop is centered
+on the ground truth (at inference: on the volume center), later crops on the
+previous prediction, at its centroid or at a random foreground point. The
+coarsest spacing is drawn per batch, and each finer spacing log-uniformly
+between the previous spacing and a lower bound, with a minimum ratio between
+levels. The prior is either the model's own prediction (predicted prior) or
+the ground truth, dilated or eroded, shifted, and with added Gaussian noise
+(perturbed ground-truth prior); \autoref{sec:results-cascade} compares both.
+\todo[inline]{Values: $M$, spacing range, lower bound, minimum ratio,
+centroid vs.\ random-point probability, foreground threshold, perturbation
+magnitudes. Confirm inference always uses the centroid.}
+
+
+% <<< end sections/methodology_cascade.tex
+
+% >>> begin sections/methodology_objective.tex
+\subsection{Training Objective}\label{sec:methodology-objective}
+
+The same network is applied at every level, and each level is supervised at
+its own resolution:
+%
+\begin{equation}
+  \mathcal{L} = \sum_{\ell=1}^{M} \left( \mathcal{L}_{\text{BCE}}^\ell + \mathcal{L}_{\text{Dice}}^\ell \right).
+  \label{eq:loss}
+\end{equation}
+%
+Gradients cross levels only through the carried registers of the Synth
+configuration. The experiments of \autoref{sec:results-fusion} use $M = 1$.
+% <<< end sections/methodology_objective.tex

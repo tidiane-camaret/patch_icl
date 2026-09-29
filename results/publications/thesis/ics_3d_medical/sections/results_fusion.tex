@@ -120,15 +120,3 @@ similar to early fusion by construction and 65\% higher than Dual U-Net
 Cross-Attn. Latency is nearly identical for all three (72.5 to 73.2\,ms)
 despite these differences in GFLOPs.
 
-\paragraph{Limitations of this comparison.}
-The comparison with Dual U-Net Cross-Attn is not a controlled ablation: it
-differs in initialization and compute, and it was trained to convergence while
-the other two were not, which may favor the shared-encoder variants less than
-their final performance would. All results come from a single seed, and several
-rows rest on few classes (two unseen FLARE22 classes, two classes each for the
-MSD datasets, one for HU\_LWK1).
-\todo[inline]{Dual U-Net Cross-Attn does not receive the query-conditioning
-signal the other two arms receive (dropped due to a training instability under
-compilation). Define this signal here, or fix it and re-run. Re-read once all
-three arms reach their full training budget; add $\geq 2$ seeds before citing
-effect sizes.}
