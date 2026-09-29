@@ -1,125 +1,139 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-The baseline is the same configuration trained with
-$p_\text{synth}{=}0.5$ and the synthetic-bank canvas. On four held-out
-sources with no anatomical overlap with training (ISLES22, Shifts-MS,
-ATLAS v2.0, GNC\_705 -- lesion targets on MRI, one Dixon), the baseline
-checkpoint scores Dice 0.008--0.082. Widening the
-shape generator's family mix or dosage on the synthetic-bank canvas
-(\autoref{sec:methodology-synth}) left every source within noise of
-baseline. The bank turned out to be built entirely from CT scans, while
-every target source here is MRI -- a canvas-modality mismatch, not a
-shape-diversity problem.
+This section evaluates the synthetic task generator on the four lesion
+datasets: ISLES22, Shifts-MS, ATLAS v2.0, and GNC\_705. They are the most
+difficult evaluation datasets, since their targets are lesions on MRI with no
+counterpart among the training classes.
 
-\paragraph{Canvas source.} A matched pair isolates
-the fix: identical checkpoint, shape family (scatter\_field), dose, and
-training budget, only the canvas source changes from the synthetic bank to a real
-MRI training case from TotalSegmentator. Every source improves except ATLAS v2.0, a
-single compact chronic lesion -- the only non-multi-focal target of the
-four, plausibly outside what a multiplicity-targeted family like
-scatter\_field can reach.
+\paragraph{Synthetic-bank canvas.}
+The baseline is the Synth configuration trained with $p_\text{synth} = 0.5$
+and the synthetic-bank canvas. It reaches Dice between 0.008 and 0.082 on the
+four datasets (\autoref{tab:synth-realhost-ood}). Changing the mix of shape
+families or $p_\text{synth}$ with this canvas did not change these results
+beyond run-to-run variation. The bank consists only of CT images, while all
+four target datasets are MRI. This suggested that the modality of the canvas,
+not the variety of shapes, limits transfer.
+\todo[inline]{Show the family-mix and $p_\text{synth}$ runs (appendix table),
+and say what ``run-to-run variation'' means with a single seed.}
+
+\paragraph{Real-host canvas.}
+To test this, we continued training from the baseline checkpoint in two runs
+that differ only in the canvas: the synthetic bank (stage 1) or a real MRI case
+from TotalSegmentator (stage 2). Both use only the scatter-field family, with
+the same $p_\text{synth}$ and training budget. The real canvas improves Dice on
+three of the four datasets: ISLES22 from 0.045 to 0.098, Shifts-MS from 0.011
+to 0.058, and GNC\_705 from 0.070 to 0.105. ATLAS v2.0 is unchanged (0.033
+vs.\ 0.032). ATLAS v2.0 mostly contains single compact lesions, whereas
+scatter-field shapes consist of many small components, which may explain why
+it does not benefit. Absolute Dice remains low on all four datasets.
+\todo[inline]{Confirm that stages 1 and 2 are continued from the baseline
+checkpoint, and what distinguishes stage 1 from the baseline.}
+
+In stage 3, the real-host canvas is extended to all seven shape families and to
+all TotalSegmentator subjects (CT and MRI, all organs), and training runs
+longer. This raises Dice on GNC\_705 to 0.223, while ISLES22 and Shifts-MS drop
+slightly below their stage-2 values. Because stage 3 changes three factors at
+once, the result cannot be attributed to any one of them.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{OOD Dice, real-host canvas progression. Stage 1$\to$2 is a
-  single-variable comparison (canvas only); stage 2$\to$3 additionally
-  extends to all shape families, a wider real-subject pool, and a longer
-  budget.}
+  \caption{Dice on the lesion datasets for successive synthetic-task
+  configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
+  shape families, all TotalSegmentator subjects as canvas, and a longer
+  training budget.}
   \label{tab:synth-realhost-ood}
-  \begin{tabular}{lcccc}
+  \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Stage & ISLES22 & Shifts-MS & ATLAS v2.0 & GNC\_705 \\
+    Configuration & ISLES22 & Shifts-MS & ATLAS v2.0 & GNC\_705 \\
     \midrule
-    Baseline & 0.050 & 0.008 & 0.028 & 0.082 \\
-    1) Synthetic-bank canvas & 0.045 & 0.011 & 0.033 & 0.070 \\
-    2) Real canvas, one family & \textbf{0.098} & \textbf{0.058} & 0.032 & 0.105 \\
-    3) Real canvas, all families & 0.087 & 0.051 & 0.027 & \textbf{0.223} \\
+    Baseline                          & 0.050 & 0.008 & 0.028 & 0.082 \\
+    1) Synthetic bank, scatter field  & 0.045 & 0.011 & \textbf{0.033} & 0.070 \\
+    2) Real host, scatter field       & \textbf{0.098} & \textbf{0.058} & 0.032 & 0.105 \\
+    3) Real host, all families        & 0.087 & 0.051 & 0.027 & \textbf{0.223} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Extending the real-host canvas from one shape family to all seven, a
-wider real-subject pool (every organ, CT and MRI), and a longer training
-budget keeps compounding on GNC\_705 -- the best result of the whole
-progression -- while easing back slightly on the two brain-lesion
-sources from stage 2's peak.
-
-\paragraph{In-distribution accuracy.} The same checkpoints' own periodic
-TotalSegmentator validation shows the OOD gain is additive, not traded
-against in-distribution accuracy:
+\paragraph{Effect on TotalSegmentator.}
+\autoref{tab:synth-realhost-indist} reports TotalSegmentator validation Dice
+for the same checkpoints. Stages 1 and 2 change it by at most 0.012 in any
+column, so the gains of stage 2 on the lesion datasets do not reduce accuracy
+on the training distribution. Stage 3 improves all five values, from 0.418 to
+0.490 overall. Given its longer training budget, this gain likely reflects the
+additional training rather than the synthetic tasks themselves.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{TotalSegmentator validation Dice for the same checkpoints.
-  seen/unseen: macro Dice by trained-class membership. MRI/CT: Dice by
-  target modality.}
+  \caption{TotalSegmentator validation Dice for the checkpoints of
+  \autoref{tab:synth-realhost-ood}, overall, by class membership (seen,
+  unseen), and by modality (MRI, CT).}
   \label{tab:synth-realhost-indist}
-  \begin{tabular}{lccccc}
+  \begin{tabular}{@{}lccccc@{}}
     \toprule
-    Stage & Dice & seen & unseen & MRI & CT \\
+    Configuration & All & Seen & Unseen & MRI & CT \\
     \midrule
-    Baseline & 0.418 & 0.489 & 0.344 & 0.390 & 0.468 \\
-    1) Synthetic-bank canvas & 0.422 & 0.485 & 0.356 & 0.385 & 0.470 \\
-    2) Real canvas, one family & 0.417 & 0.483 & 0.348 & 0.384 & 0.467 \\
-    3) Real canvas, all families & \textbf{0.490} & \textbf{0.579} & \textbf{0.397} & \textbf{0.474} & \textbf{0.534} \\
+    Baseline                          & 0.418 & 0.489 & 0.344 & 0.390 & 0.468 \\
+    1) Synthetic bank, scatter field  & 0.422 & 0.485 & 0.356 & 0.385 & 0.470 \\
+    2) Real host, scatter field       & 0.417 & 0.483 & 0.348 & 0.384 & 0.467 \\
+    3) Real host, all families        & \textbf{0.490} & \textbf{0.579} & \textbf{0.397} & \textbf{0.474} & \textbf{0.534} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-The seen/unseen and MRI/CT gaps hold at roughly the same size at every
-stage; stage 3's longer budget lifts all five numbers together rather
-than trading one for another.
-
-\paragraph{Cascade inference.} Resuming the stage-3 checkpoint
-into coarse-to-fine cascade training (\autoref{sec:methodology-cascade})
-and re-evaluating the same nine OOD sources tests whether the real-host
-canvas helps under a different training and inference regime, not only
-the single-level one it was found under.
+\paragraph{Cascade inference.}
+Synth + Cascade continues the stage-3 checkpoint with 20 epochs of cascade
+training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
+uses no synthetic tasks, and with step-matched Medverse on the nine held-out
+datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
+NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
+($-0.012$), and differs by about 0.01 or less on the other datasets. It remains
+below Medverse on MSD Hippocampus and NasalSeg. The two models differ in more
+than the synthetic tasks: Synth + Cascade also uses register carry and a
+pooling token, and has a different training history. The differences can
+therefore not be attributed to the synthetic tasks alone.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{OOD Dice under cascade inference. No synth (146): the
-  reference cascade model of \autoref{sec:results-cascade}, trained with
-  no synthetic tasks at all. Real-host canvas (168): the stage-3 model
-  above resumed into cascade training for 20 epochs. Medverse: released
-  weights, depth-matched native autoregressive inference
-  (\autoref{sec:results-cascade}); omitted for four sources where both
-  models score too low to be informative.}
+  \caption{Dice on the held-out datasets under cascade inference. Medverse:
+  released weights, step-matched autoregressive inference
+  (\autoref{sec:results-cascade}); omitted where both models score too low to
+  be informative.}
   \label{tab:synth-cascade-realhost}
-  \begin{tabular}{lccc}
+  \begin{tabular}{@{}lccc@{}}
     \toprule
-    Dataset & No synth (146) & Real-host canvas (168) & Medverse \\
+    Dataset & Cascade & Synth + Cascade & Medverse \\
     \midrule
-    HU\_LWK1 & \textbf{0.152} & 0.124 & 0.020 \\
-    ISLES22 & 0.069 & \textbf{0.070} & -- \\
-    Shifts-MS & \textbf{0.031} & 0.019 & -- \\
-    ATLAS v2.0 & 0.026 & \textbf{0.032} & -- \\
-    MSD Prostate & \textbf{0.375} & 0.372 & 0.357 \\
+    HU\_LWK1        & \textbf{0.152} & 0.124 & 0.020 \\
+    ISLES22         & 0.069 & \textbf{0.070} & -- \\
+    Shifts-MS       & \textbf{0.031} & 0.019 & -- \\
+    ATLAS v2.0      & 0.026 & \textbf{0.032} & -- \\
+    MSD Prostate    & \textbf{0.375} & 0.372 & 0.357 \\
     MSD Hippocampus & 0.303 & 0.518 & \textbf{0.686} \\
-    GNC\_705 & 0.024 & \textbf{0.035} & -- \\
-    FLARE22 & \textbf{0.751} & 0.743 & 0.359 \\
-    NasalSeg & 0.547 & 0.644 & \textbf{0.737} \\
+    GNC\_705        & 0.024 & \textbf{0.035} & -- \\
+    FLARE22         & \textbf{0.751} & 0.743 & 0.359 \\
+    NasalSeg        & 0.547 & 0.644 & \textbf{0.737} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Under cascade inference, the real-host canvas gains substantially on
-MSD Hippocampus ($+0.215$) and NasalSeg ($+0.097$), loses on HU\_LWK1
-($-0.028$) and Shifts-MS ($-0.012$), and changes Dice by about 0.01 or
-less elsewhere. It does not close the gap to Medverse on either source
-where Medverse leads. The largest single-level gain, on GNC\_705
-(0.223, \autoref{tab:synth-realhost-ood}), does not carry over: under
-cascade inference both models score below 0.04 there. A likely cause:
-the coarse level's prediction on this source is dominated by an
-intensity-brightness confound rather than real segmentation (its
-qualitative failure mode is documented in
-\texttt{docs/datasets/gnc\_kidney\_lesions.md}), so the imprecise coarse
-centroid misdirects the fine level's region-restricted re-crop away from
-the lesion entirely -- a real limitation of region restriction on small,
-easily-mislocalized targets, not just a canvas-source effect.
-\todo{Stage 2$\to$3 changes several axes at once (family count, host
-pool, training budget); only stage 1$\to$2 is a controlled ablation.
-N=1 seed throughout, including the cascade re-run above.}
+The gain on GNC\_705 at a single level (0.223,
+\autoref{tab:synth-realhost-ood}) does not carry over to cascade inference,
+where both models score below 0.04. A likely cause is localization: on this
+dataset, the coarse predictions follow bright regions rather than the lesions,
+so the region-restricted fine levels process crops that miss the lesion. This
+illustrates the limitation of region restriction noted in
+\autoref{sec:methodology-cascade}: small targets that the coarse level
+mislocalizes cannot be recovered.
+\todo[inline]{Support this with the containment of the coarse box on GNC\_705
+and a qualitative figure (appendix), instead of the reference to
+\texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
+uses ground-truth-centered crops, the drop may mainly reflect the loss of
+ground-truth localization; state which is the case.}
+
+\paragraph{Limitations.}
+All results in this section come from a single seed. Only the step from stage
+1 to stage 2 is a controlled comparison. Dice on the lesion datasets remains
+low in absolute terms for all configurations.

@@ -1,51 +1,44 @@
 \subsection{Image--Label Fusion}\label{sec:results-fusion}
 
-Two comparisons follow, each isolating one design choice. The first asks
-whether moving from Medverse's dual U-Net and cross-attention to a shared
-encoder with attention already helps, before anything else about this
-thesis's architecture is considered; the second asks whether keeping image
-and label evidence as separate streams -- dual attention -- helps further,
-within that same encoder-and-attention family.
+This section compares three architectures. The comparison between Dual U-Net
+Cross-Attn and early fusion tests the change from two U-Nets coupled by
+cross-attention to a shared encoder with attention layers. The comparison
+between early fusion and dual attention tests whether, within the
+shared-encoder design, keeping image and label tokens separate improves over
+merging them once.
 
-\paragraph{Setup.} \autoref{tab:relatedwork} classifies Medverse's fusion strategy as dual
-U-Net cross-attention: target and context are encoded by two separate U-Nets and fused via
-cross-attention between the two streams at every stage, rather than through a single shared
-encoder. This arm is labeled \textbf{Dual U-Net Cross-Attn} throughout, not Medverse: it
-starts from Medverse's released weights
-(the best available starting point for this architecture) but is then trained under the
-identical recipe as the other two arms for the same $\sim$250 epochs -- a different thing
-from the released, unmodified baseline evaluated elsewhere in this thesis
-(\autoref{sec:results-cascade}). The single-axis
-control isolates the architectural family this comparison targets: it keeps the shared
-encoder and attention stack common to every architecture in this thesis, but collapses
-image and label evidence into one token per cell via a pixel shuffle--unshuffle operation
-\emph{before} the transformer, similar to the pixel shuffle Iris uses when encoding its context, and withholding dual attention until the next step of the staircase.
+\paragraph{Architectures.}
+\emph{Dual U-Net Cross-Attn} is Medverse's architecture
+(\autoref{sec:fundamentals-relatedwork}), initialized from the released weights
+and then trained with our recipe. It is therefore a different model from the
+released Medverse baseline used in \autoref{sec:results-cascade}.
+\emph{Early fusion} and \emph{dual attention} are the two variants shown in
+\autoref{fig:fusion-axis}. Removing the modality axis also removes a large part
+of the compute, so early fusion uses $L{=}9$ attention layers instead of 4.
+This gives both variants similar compute (3973 vs.\ 3892 GFLOPs). Parameter
+count could not be matched at the same time, and early fusion has 52\% more
+parameters. Dual U-Net Cross-Attn is not compute-matched to either variant.
 
-Its transformer depth is raised from $l{=}4$ to $l{=}9$ specifically to compute-match the
-dual-attention arm (removing the modality axis also removes a large share of the model's
-compute; parameter count and compute could not be matched simultaneously, leaving
-parameters 52\% higher for the single-axis control). This adjustment is made relative to
-dual attention only, not to Dual U-Net Cross-Attn, so the Dual U-Net Cross-Attn comparison alone is not
-compute-matched.
-
-All three arms train under an identical recipe (\autoref{tab:fusion-trainsettings}), an
-identical data pipeline, and an identical augmentation recipe, but not an identical
-starting point: Dual U-Net Cross-Attn keeps its released initialization, while the single-axis and
-dual-attention arms warm-start only the encoder and decoder from a shared checkpoint, with
-the entire in-context reasoning core (transformer, image/label embeddings, context/query
-id, register tokens, cascade projection, pool projection) randomly initialized for both --
-so neither patchset arm starts from an already-trained transformer. Training uses real anatomy only ($p_\text{synth}{=}0$), on
-TotalSegmentator CT training cases and classes only. The three arms also did not train to a
-matched stopping point: Dual U-Net Cross-Attn trained to full convergence, the patchset arms did not.
+\paragraph{Training.}
+All three architectures use the same training recipe
+(\autoref{tab:fusion-trainsettings}), data pipeline, and augmentations. They
+are trained on the CT cases and training classes of TotalSegmentator, without
+synthetic tasks, at a single level. Their initialization differs. Dual U-Net
+Cross-Attn starts from Medverse's weights. Early fusion and dual attention
+initialize the encoder and decoder from a shared checkpoint, and all other
+components (attention layers, token embeddings, register tokens) randomly.
+Dual U-Net Cross-Attn was trained to convergence, while early fusion and dual
+attention had not yet completed their training budget when evaluated.
+\todo[inline]{Specify which checkpoint the shared encoder and decoder come
+from.}
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Training settings shared by Dual U-Net Cross-Attn, the single-axis control, and dual
-  attention (ours). Epoch count is a placeholder pending confirmation of the exact
-  per-arm value.}
+  \caption{Training settings shared by the three architectures of
+  \autoref{sec:results-fusion}.}
   \label{tab:fusion-trainsettings}
-  \begin{tabular}{ll}
+  \begin{tabular}{@{}ll@{}}
     \toprule
     Optimizer & AdamW \\
     Learning rate & $10^{-4}$ \\
@@ -58,82 +51,84 @@ matched stopping point: Dual U-Net Cross-Attn trained to full convergence, the p
     \bottomrule
   \end{tabular}
 \end{table}
+\todo[inline]{Confirm the epoch count per architecture.}
 
-All three arms are then evaluated with an identical protocol -- fixed 3\,mm single-level
-crops, fp32, each model's own best checkpoint -- across every dataset this thesis
-evaluates (\autoref{sec:results-setup}), not TotalSegmentator alone.
-
-Rows below are grouped by each dataset's relationship to the training vocabulary, not by
-how different the source otherwise looks: TotalSegmentator itself (61 seen / 56 unseen
-classes) and FLARE22 (11 seen / 2 unseen, out of 13 total, \autoref{sec:results-setup}) both
-reuse the training vocabulary and so split into a genuine seen/unseen pair; MSD Prostate and
-MSD Hippocampus introduce organs with no vocabulary overlap at all, so every class in that
-pair is unseen by construction, not by a train/val split; HU\_LWK1's target is a
-HU-measurement region, not a segmentable anatomical object, a categorically different kind
-of ``unseen'' from a novel organ; TotalSegmentator's own MRI acquisition isolates a held-out
-\emph{modality}, since these models see no MRI during training, over
-classes the vocabulary already contains.
+\paragraph{Evaluation.}
+All three architectures are evaluated at a single level with 3\,mm spacing, in
+fp32, using the best checkpoint of each.
+\autoref{tab:fusion-staircase} reports the results, grouped as in
+\autoref{tab:ood-sources}.
+\todo[inline]{Specify where the 3\,mm crops are placed (centered on the ground
+truth?). The table omits ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, and
+NasalSeg: state why, or add them. Define ``mean of 5 held-out sources'': which
+five? The values cannot be reproduced from the rows shown.}
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Dual U-Net Cross-Attn, the single-axis control, and dual attention (ours), across all
-  evaluation datasets (\autoref{sec:results-setup}). Grouped by vocabulary relationship:
-  in-vocabulary seen/unseen, novel-vocabulary (unseen by construction), non-object,
-  held-out modality.}
+  \caption{Dice of the three architectures at a single level (3\,mm), with
+  parameter count, compute, and latency.}
   \label{tab:fusion-staircase}
-  \begin{tabular}{lccc}
+  \begin{tabular}{@{}lccc@{}}
     \toprule
-     & Dual U-Net Cross-Attn & \multicolumn{2}{c}{Encoder + Attention} \\
-    \cmidrule(lr){3-4}
-     & & Single-axis & Dual attention (ours) \\
+    & Dual U-Net Cross-Attn & Early fusion & Dual attention \\
     \midrule
-    TotalSeg CT -- seen      & 0.348 & 0.574 & \textbf{0.582} \\
-    TotalSeg CT -- unseen    & 0.221 & 0.408 & \textbf{0.426} \\
-    FLARE22 -- seen          & 0.532 & 0.693 & \textbf{0.709} \\
-    FLARE22 -- unseen        & 0.443 & \textbf{0.632} & 0.604 \\
+    TotalSeg CT, seen      & 0.348 & 0.574 & \textbf{0.582} \\
+    TotalSeg CT, unseen    & 0.221 & 0.408 & \textbf{0.426} \\
+    FLARE22, seen          & 0.532 & 0.693 & \textbf{0.709} \\
+    FLARE22, unseen        & 0.443 & \textbf{0.632} & 0.604 \\
     \midrule
-    MSD Prostate (unseen)    & \textbf{0.377} & 0.205 & 0.247 \\
-    MSD Hippocampus (unseen) & 0.172 & 0.122 & \textbf{0.184} \\
+    MSD Prostate           & \textbf{0.377} & 0.205 & 0.247 \\
+    MSD Hippocampus        & 0.172 & 0.122 & \textbf{0.184} \\
     \midrule
-    HU\_LWK1 (non-object)    & \textbf{0.146} & 0.079 & 0.102 \\
+    HU\_LWK1               & \textbf{0.146} & 0.079 & 0.102 \\
     \midrule
-    TotalSeg MRI (modality)  & 0.178 & 0.232 & \textbf{0.259} \\
+    TotalSeg MRI           & 0.178 & 0.232 & \textbf{0.259} \\
     \midrule
-    mean of 5 held-out sources & 0.278 & 0.264 & \textbf{0.297} \\
+    Mean of 5 held-out sources & 0.278 & 0.264 & \textbf{0.297} \\
     \midrule
-    $l$       & --     & 9      & 4       \\
-    params    & 71.1M  & 74.1M  & \textbf{48.7M}  \\
-    GFLOPs    & \textbf{2362.6} & 3973.1 & 3892.5 \\
-    latency (fp32, per sample) & 73.2\,ms & 73.0\,ms & \textbf{72.5\,ms} \\
+    Parameters             & 71.1M  & 74.1M  & 48.7M  \\
+    GFLOPs                 & 2362.6 & 3973.1 & 3892.5 \\
+    Latency per sample     & 73.2\,ms & 73.0\,ms & 72.5\,ms \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Results.} Single-axis alone already beats Dual U-Net Cross-Attn on five of the eight rows --
-both TotalSegmentator splits, both FLARE22 splits, and TotalSeg MRI -- while Dual U-Net Cross-Attn wins
-the three remaining rows: MSD Prostate, MSD Hippocampus, and HU\_LWK1. Restoring dual
-attention flips one of those three (MSD Hippocampus, 0.184 vs.\ 0.172) without touching the
-other two, bringing the full architecture to six wins out of eight against Dual U-Net Cross-Attn. The
-one aggregate number in the table -- mean of the five held-out sources -- shows why that
-flip matters: single-axis alone is a net regression against Dual U-Net Cross-Attn there (0.264 vs.\
-0.278), and only once dual attention restores the modality axis does the full architecture
-overtake Dual U-Net Cross-Attn (0.297). The architectural family change alone, in other words, is not
-what carries this result; dual attention is. The compute picture is mixed rather than
-uniformly favorable: dual attention has the fewest parameters and the lowest latency of the
-three, but not the fewest GFLOPs -- Dual U-Net Cross-Attn remains cheapest by that measure despite its
-lower accuracy, so no arm here is a strict win on both accuracy and compute at once. Two
-caveats keep this from a single-variable ablation: Dual U-Net Cross-Attn starts from a pretrained
-initialization rather than the randomly-initialized reasoning core the patchset arms share,
-and does not receive the same query-conditioning signal during training -- so this is best
-read as a comparison against Dual U-Net Cross-Attn's strongest available starting point, not a fully
-symmetric ablation. \todo{Re-read once Dual U-Net Cross-Attn receives the same query-conditioning
-signal -- currently dropped due to a training instability under compilation.}
+\paragraph{Results.}
+Early fusion outperforms Dual U-Net Cross-Attn on the classes from the
+training vocabulary, by 0.16 to 0.23 Dice on TotalSegmentator and FLARE22, and
+on TotalSeg MRI (0.232 vs.\ 0.178). It is worse on the three sources with new
+or non-anatomical targets: MSD Prostate, MSD Hippocampus, and HU\_LWK1.
 
-\paragraph{Status.} Neither patchset arm had reached its full training budget at the point
-these numbers were read, while Dual U-Net Cross-Attn had already converged -- so
-\autoref{tab:fusion-staircase} may understate Dual U-Net Cross-Attn's eventual ceiling more than either
-patchset arm's. All three arms are N=1 seed, and several rows rest on very few classes
-(FLARE22's unseen split, both MSD sources, HU\_LWK1) -- directional evidence, not settled
-effect sizes. \todo{Re-read once all three arms reach their full training budget; add
-$\geq 2$ seeds before citing any effect size as settled.}
+Dual attention improves over early fusion on seven of the eight rows. The
+gains are small on the in-vocabulary CT rows (0.008 to 0.018) and larger on
+the new targets and the unseen modality: MSD Hippocampus ($+0.062$), MSD
+Prostate ($+0.042$), TotalSeg MRI ($+0.027$), and HU\_LWK1 ($+0.023$). The
+exception is the unseen FLARE22 classes, where dual attention scores 0.028
+lower.
+
+Compared with Dual U-Net Cross-Attn, dual attention is better on six of the
+eight rows, including MSD Hippocampus (0.184 vs.\ 0.172), but remains worse on
+MSD Prostate (0.247 vs.\ 0.377) and HU\_LWK1 (0.102 vs.\ 0.146). On the mean
+over held-out sources, early fusion is below Dual U-Net Cross-Attn (0.264 vs.\
+0.278), while dual attention is above it (0.297). The shared-encoder design
+alone thus improves accuracy on known classes, and dual attention is needed to
+also improve on held-out sources.
+
+Dual attention has the fewest parameters of the three (48.7M). Its compute is
+similar to early fusion by construction and 65\% higher than Dual U-Net
+Cross-Attn. Latency is nearly identical for all three (72.5 to 73.2\,ms)
+despite these differences in GFLOPs.
+
+\paragraph{Limitations of this comparison.}
+The comparison with Dual U-Net Cross-Attn is not a controlled ablation: it
+differs in initialization and compute, and it was trained to convergence while
+the other two were not, which may favor the shared-encoder variants less than
+their final performance would. All results come from a single seed, and several
+rows rest on few classes (two unseen FLARE22 classes, two classes each for the
+MSD datasets, one for HU\_LWK1).
+\todo[inline]{Dual U-Net Cross-Attn does not receive the query-conditioning
+signal the other two arms receive (dropped due to a training instability under
+compilation). Define this signal here, or fix it and re-run. Re-read once all
+three arms reach their full training budget; add $\geq 2$ seeds before citing
+effect sizes.}

@@ -1,39 +1,42 @@
 \subsection{Volumetric Encoders and Attention}\label{sec:fundamentals-backbone}
 
-\paragraph{Convolutional volumetric backbones.} 3D
-U-Net~\cite{cciccek20163d} and its self-configuring descendant
-nnU-Net~\cite{isensee2021nnu} encode a volume through a downsampling
-encoder into a feature pyramid, then decode back to full resolution via a
-mirrored upsampling path with skip connections carrying fine detail past
-the bottleneck. Deeper encoder stages have coarser spatial extent and more
-channels; shallower stages retain spatial detail at low channel count.
-This split -- a coarse, semantically rich bottleneck feeding a
-computationally light attention stack, and fine, spatially precise early
-stages reserved for the decoder -- is exactly what the coarse/fine tap
-split in \autoref{sec:methodology-overview} reuses. UNETR~\cite{hatamizadeh2022unetr}
-is a prior example of combining a convolutional decoder with transformer
-attention for 3D segmentation.
+\paragraph{Convolutional volumetric backbones.}
+The 3D U-Net~\cite{cciccek20163d} and its self-configuring successor
+nnU-Net~\cite{isensee2021nnu} encode a volume into a feature pyramid with a
+downsampling encoder and decode it back to full resolution with a mirrored
+upsampling path. Skip connections pass fine spatial detail from the encoder to
+the decoder around the bottleneck. Deeper stages have lower spatial resolution
+and more channels, while shallow stages keep spatial detail at a low channel
+count. Our model uses this split directly: the coarse, high-channel stages feed
+the attention layers, and the fine stages are passed to the decoder as skip
+connections (\autoref{sec:methodology-overview}).
+UNETR~\cite{hatamizadeh2022unetr} is an earlier example of combining
+transformer attention with a convolutional decoder for 3D segmentation.
 
-\paragraph{Attention.} Scaled dot-product attention~\cite{vaswani2017attention}
-computes, for each query token, a weighted average of value vectors, with
-weights given by the similarity between the query and each key:
+\paragraph{Attention.}
+Scaled dot-product attention~\cite{vaswani2017attention} computes, for each
+query, a weighted average of value vectors. The weights are given by the
+similarity between the query and each key:
 %
 \begin{equation}
-  \mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V.
+  \mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V,
+  \label{eq:attention}
 \end{equation}
 %
-Multi-head attention runs several such operations in parallel subspaces
-and concatenates the results, letting different heads attend to different
-relationships in the same input.
+where $d$ is the key dimension. Multi-head attention runs several attention
+operations in parallel on lower-dimensional projections and concatenates their
+outputs, so that different heads can capture different relations within the
+same input.
 
-\paragraph{Position encoding.} Attention itself is permutation-invariant,
-so position must be injected separately. Rotary position embedding
-(RoPE)~\cite{su2021roformer} does this by rotating each query/key vector
-by an angle proportional to its position before the dot product, so the
-result depends only on the \emph{relative} position between the two
-tokens rather than their absolute indices. In 3D, this is applied
-axially: the head dimension is split into three chunks, one per spatial
-axis, each rotated by an angle proportional to that axis's physical
-coordinate (scaled by voxel spacing) -- letting attention between two
-cells at different cascade resolutions still reflect their true physical
-distance, not just their grid index.
+\paragraph{Position encoding.}
+Attention is permutation-invariant, so positional information has to be added
+explicitly. Rotary position embedding (RoPE)~\cite{su2021roformer} rotates each
+query and key vector by an angle proportional to its position before the dot
+product. The resulting attention score depends only on the relative position
+of the two tokens. In 3D, RoPE can be applied per axis: the head dimension is
+split into three parts, and each part is rotated according to the token's
+coordinate along one spatial axis. If these coordinates are given in physical
+units, i.e.\ scaled by the voxel spacing, attention between tokens from volumes
+of different resolution reflects their physical distance rather than their grid
+indices. Our cascade relies on this property, since its levels operate at
+different spacings (\autoref{sec:methodology-cascade}).

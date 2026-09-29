@@ -1,52 +1,65 @@
 \subsection{Related Work}\label{sec:fundamentals-relatedwork}
 
-Three prior systems attempt in-context medical image segmentation, each
-making a different choice on the three axes this thesis organizes around.
+Prior in-context segmentation models make different choices on the three
+questions raised in \autoref{sec:motivation}. \autoref{tab:relatedwork}
+summarizes them.
 
-\paragraph{UniverSeg~\cite{butoiUniverSegUniversalMedical2023}} popularized
-the approach with a CrossBlock architecture that densely cross-attends
-target and context features at full resolution -- no coarse-to-fine
-structure, and no synthetic-task training.
+\paragraph{UniverSeg.}
+UniverSeg~\cite{butoiUniverSegUniversalMedical2023} was one of the first
+in-context segmentation models for medical images. It operates on 2D images.
+Its CrossBlock combines target and context features with a CrossConv layer, a
+convolution applied to each concatenated target--context feature pair, at every
+scale of a U-Net-like network. It predicts in a single pass and is trained on
+real data only.
 
-\paragraph{Iris~\cite{gaoShowSegmentUniversal2025}} encodes each context
-pair once into a compact task embedding, using pixel shuffle operations
-in its context encoder. The target interacts with the context only
-through this embedding, in the mask decoder, and inference is a single
-pass with no refinement across scales.
+\paragraph{Iris.}
+Iris~\cite{gaoShowSegmentUniversal2025} encodes the context pairs once into a
+compact task embedding per class, using pixel shuffle operations in its context
+encoder. The target interacts with the context only through this embedding, via
+a single bidirectional cross-attention step in the mask decoder, and the
+embedding is reused across queries. Inference is a single pass without
+refinement across scales.
 
-\paragraph{Medverse~\cite{huMedverseUniversalModel2025a}} uses separate
-3D U-Nets for the target and the context and exchanges features between
-them at every stage: target-to-context in the encoder, context-to-target
-in the decoder. The exchange uses a Blockwise Cross-Attention Module
-(BAM), which mean-pools queries and keys over a $4^3$ block grid before
-attending, while values stay at full resolution.
+\paragraph{Medverse.}
+Medverse~\cite{huMedverseUniversalModel2025a} uses two separate 3D U-Nets, one
+for the target and one for the context. The context branch receives image and
+mask concatenated as channels, while the target branch receives only the image.
+The two branches exchange features at several stages: the context queries the
+target in the encoder, and the target queries the context in the decoder. This
+exchange uses a Blockwise Cross-Attention Module (BAM), which mean-pools queries
+and keys over a $4^3$ block grid before attending, while values stay at full
+resolution. Pooling reduces the cost of attention at the price of positional
+precision.
 
-\paragraph{Hierarchical, coarse-to-fine approaches.} Deep Neural
-Patchworks~\cite{reisertDeepNeuralPatchworks2022a} stacks levels of
-increasing resolution for large-volume segmentation, but targets
-single-model supervised segmentation rather than in-context, few-shot
-prediction -- an architectural precedent for coarse-to-fine cascades
-outside the ICL setting. Medverse applies a similar idea within the ICL setting through
-next-scale autoregressive segmentation, inspired by next-scale image
-generation~\cite{tian2024visual}. The first step predicts the whole
-volume at low resolution. Each later step doubles the resolution and
-processes the entire volume with a sliding window, feeding the previous
-step's prediction into a third U-Net branch that shares weights with the
-context branch. 
+\paragraph{Coarse-to-fine approaches.}
+Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large
+volumes by stacking levels of increasing resolution. It is a supervised,
+closed-set method rather than an in-context one, but it is an early example of
+a coarse-to-fine cascade for 3D segmentation. Medverse brings a similar idea to
+in-context segmentation with next-scale autoregressive prediction, following
+next-scale image generation~\cite{tian2024visual}. The first step predicts the
+whole volume at low resolution. Each later step doubles the resolution and
+processes the entire volume with a sliding window. The previous prediction is
+passed, together with the target image, through a third U-Net branch that
+shares weights with the context branch. During training, a downsampled
+ground-truth mask stands in for this prediction.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Positioning against prior in-context segmentation models on
-  the three axes this thesis organizes around.}\label{tab:relatedwork}
-  \begin{tabular}{lccc}
+  \caption{Design choices of prior in-context segmentation models on the three
+    questions of \autoref{sec:motivation}.}
+  \label{tab:relatedwork}
+  \begin{tabular}{@{}llll@{}}
     \toprule
-     & Fusion & Coarse-to-fine & Synthetic tasks \\
+    & Image--label fusion & Coarse-to-fine & Synthetic tasks \\
     \midrule
-    UniverSeg & dense cross-attn. & no & no \\
-    Iris & one-shot pixel shuffle & no & no \\
-    Medverse & dual U-Net cross-attn. & full-volume re-scan & no \\
-    \textbf{Ours} & dual attention (repeated) & region-restricted, prediction-seeded & GMM repaint + texture \\
+    UniverSeg (2D) & CrossConv at every scale & no & no \\
+    Iris & task embedding, computed once & no & no \\
+    Medverse & two U-Nets + blockwise cross-attn. & full volume per step & no \\
+    \textbf{Ours} & dual attention at every layer & region-restricted, predicted prior & shapes painted on real scans \\
     \bottomrule
   \end{tabular}
 \end{table}
+
+\todo[inline]{Iris and Medverse actually use synthetic tasks during training. check.}

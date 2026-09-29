@@ -1,26 +1,39 @@
 \subsection{Synthetic Task Generation}\label{sec:methodology-synth}
 
-A fraction $p_{\text{synth}}$ of training tasks are drawn from a synthetic
-generator instead of real context/target subjects, broadening training
-beyond the anatomical classes and appearance distribution the real
-cohort covers.
+During training, a fraction $p_{\text{synth}}$ of tasks is generated
+synthetically instead of being sampled from the annotated cohort. In a
+synthetic task, each of the $K+1$ volumes consists of an image with a
+procedurally generated shape painted onto it, and the mask of that shape.
 
-\paragraph{Procedural shape generator.} Each synthetic task samples a
-binary target mask from one of seven procedural shape families (blob,
-splatter, disk, cylinder, scatter\_field, vessel, torus) and paints it
-onto a canvas image. Paint intensity is host-anchored -- drawn relative
-to the canvas region's own local mean/std rather than an absolute value
--- and textured with multi-octave, spatially correlated noise (matching
-real tissue's autocorrelation, unlike flat i.i.d.\ paint), with an
-optional core/rim intensity blend for added heterogeneity.
-\emph{scatter\_field} specifically targets lesion \emph{multiplicity}
-(many small, spatially scattered components), a pattern most
-anatomical structures in the real training cohort do not exhibit.
+\paragraph{Shapes.}
+Masks are sampled from seven procedural shape families: blob, splatter, disk,
+cylinder, vessel, torus, and scatter field. The scatter field places many small
+components across a region. It imitates multi-focal lesions, which few
+structures in the training cohort resemble.
+\todo[inline]{Specify: are the context and target masks of one task drawn from
+the same family with different random parameters? Size ranges of the shapes.}
 
-\paragraph{Canvas: synthetic bank vs.\ real subject.} Two canvas sources
-are available. The \emph{synthetic-bank} canvas draws a candidate
-mask/image region from a precomputed bank of segmented real scans and
-paints the shape into it. The \emph{real-host} canvas instead paints the same procedural shape directly onto a real
-TotalSegmentator training case (CT or MRI, any organ) , bypassing the bank entirely: every volume
-in a task shares one real subject as its base image, differing only in
-the painted region.
+\paragraph{Appearance.}
+The painted intensity is set relative to the surrounding tissue: it is drawn
+from a range defined by the local mean and standard deviation of the image
+where the shape is placed, not as an absolute value. The paint is textured with
+multi-octave noise, a sum of noise fields at several spatial scales, so that
+it is spatially correlated like real tissue rather than independent from voxel
+to voxel. Optionally, the core and the rim of the shape receive different
+intensities.
+\todo[inline]{Specify the intensity offset distribution, the noise scales and
+amplitudes, and the core/rim blend.}
+
+\paragraph{Canvas.}
+We compare two sources for the image that shapes are painted onto. The
+\emph{synthetic-bank} canvas takes an image region from a precomputed bank
+built from segmented real scans. The \emph{real-host} canvas uses a real
+TotalSegmentator training case, CT or MRI, directly. With the real-host
+canvas, all $K+1$ volumes of a task share the same subject as their image and
+differ only in the painted shapes.
+\todo[inline]{Clarify what the bank contains and how an entry is selected
+(\autoref{sec:results-synth} notes it was built from CT only). For the
+real-host canvas: are the $K+1$ volumes different crops of the subject, or the
+same crop with different shapes? If the images are identical apart from the
+paint, the target could be solved by comparing it with the context images
+voxel by voxel; state how this is avoided.}

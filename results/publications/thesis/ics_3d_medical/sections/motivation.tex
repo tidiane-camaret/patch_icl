@@ -1,69 +1,70 @@
 \section{Motivation}\label{sec:motivation}
 
-In-context learning (ICL) recasts segmentation as few-shot matching:
-given a target scan and a small set of (image, mask) context pairs
-illustrating the structure of interest, a model predicts a mask for the
-target with no task-specific fine-tuning. This removes the need to
-retrain for every new anatomical class -- valuable for structures that
-are rare, newly defined, or annotated at only a handful of sites.
+In-context learning (ICL) treats segmentation as a few-shot matching problem.
+The model receives a target scan and a small set of context pairs, each an
+image with a mask of the structure of interest, and predicts the corresponding
+mask for the target without task-specific fine-tuning. A single trained model
+can therefore segment new anatomical classes without retraining. This is useful
+for structures that are rare, newly defined, or annotated at only a few sites.
 
-Most ICL segmentation models were designed and validated in 2D. Moving to
-native 3D volumes is attractive -- CT/MRI are inherently volumetric, and
-slice-wise processing discards through-plane context needed to resolve
-thin or elongated structures -- but it sharpens an already difficult
-resolution/compute trade-off: dense cross-attention between a target
-volume and its context volumes scales with the cube of side length, so a
-design affordable at $64^3$ becomes impractical at $256^3$.
+Most ICL segmentation models were developed and evaluated on 2D images. CT and
+MRI are volumetric, however, and processing them slice by slice discards
+through-plane context that helps to resolve thin or elongated structures.
+Working directly on 3D volumes avoids this, but makes compute a central
+constraint. The number of tokens grows with the cube of the volume's side
+length, and the cost of dense attention between target and context grows with
+the square of the number of tokens. Going from a $64^3$ to a $256^3$ volume
+multiplies the number of voxels by 64 and the cost of dense attention by
+roughly 4000.
 
-This trade-off is not one problem but three, and this thesis addresses
-each with its own mechanism:
+This thesis addresses three questions that arise when building an efficient
+3D ICL segmentation model.
 
 \begin{enumerate}[leftmargin=1.6em,itemsep=0.2em]
-  \item \textbf{How should image and label evidence be combined?}
-    Concatenating image and mask channels before a shared encoder, or
-    fusing them once through a single operation, commits to one fusion
-    point before most of the network's capacity is applied.
-    \autoref{sec:methodology} proposes \emph{dual attention}, keeping the
-    two streams separate and letting them exchange information
-    repeatedly over a modality axis and a position axis.
-  \item \textbf{Where should compute be spent?} Re-scanning an entire
-    volume with a sliding window at every processing step wastes compute
-    on regions already known not to contain the structure of interest.
-    \autoref{sec:methodology} proposes a \emph{coarse-to-fine cascade}
-    that restricts fine processing to the region a coarse pass has
-    already localized, and passes each level's prediction to the next
-    level as a query prior.
-  \item \textbf{Where does training signal come from beyond limited
-    annotation?} Real (image, mask) pairs are limited to the classes and
-    appearance distribution covered by the training cohort.
-    \autoref{sec:methodology} proposes a \emph{synthetic task generator}
-    that repaints real anatomical geometry with novel, controllable
-    appearance, producing label-perfect training tasks beyond the
-    annotated cohort.
+  \item \textbf{How should image and label information be combined?}
+    In existing models, image and mask information is merged once, early in
+    the network, either by concatenating channels before the encoder or through
+    a single fusion operation. We instead keep image and label tokens as
+    separate streams and let them exchange information at every layer through
+    \emph{dual attention} (\autoref{sec:methodology-fusion}).
+  \item \textbf{Where should compute be spent?}
+    Medverse~\cite{huMedverseUniversalModel2025a} refines its prediction by
+    processing the entire volume with a sliding window at every resolution
+    step, including regions that the previous step has already ruled out. We
+    use a \emph{coarse-to-fine cascade} in which each level processes only the
+    region localized by the previous level and receives that level's
+    prediction as a prior (\autoref{sec:methodology-cascade}).
+  \item \textbf{Where can training data come from beyond the annotated classes?}
+    Real image--mask pairs cover only the classes and appearance range of the
+    training cohort. We generate additional training tasks with a
+    \emph{synthetic task generator} that paints procedurally generated shapes
+    with spatially correlated texture onto real scans, which gives exact labels
+    for structures outside the annotated classes
+    (\autoref{sec:methodology-synth}).
 \end{enumerate}
 
 \paragraph{Contributions.}
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
-  \item A dual attention mechanism that keeps image and label tokens
-    separate, compared against a single-token control of matched compute
-    and a dual U-Net cross-attention model initialized from Medverse.
-  \item A coarse-to-fine cascade that seeds each level with the previous
-    level's prediction and restricts fine processing to the region it
-    localizes. We compare predicted and perturbed ground-truth priors, and
-    compare accuracy and latency against Medverse's native autoregressive
-    inference.
-  \item A GMM-based synthetic task generator with a texture-noise variant
-    that better matches real tissue's spatial autocorrelation, evaluated
-    against real-only and i.i.d.-noise training.
-  \item Evaluation on TotalSegmentator CT and a range of
-    out-of-distribution cohorts and modalities, reporting where each
-    mechanism helps and where it does not.
+  \item A dual attention mechanism that keeps image and label tokens separate.
+    We compare it with a compute-matched variant that merges both into a single
+    token per cell, and with a dual U-Net cross-attention model initialized
+    from Medverse.
+  \item A coarse-to-fine cascade that passes each level's prediction to the
+    next level as a prior and restricts fine-level processing to the localized
+    region. We compare predicted priors with perturbed ground-truth priors, and
+    compare accuracy and latency with Medverse's autoregressive inference.
+  \item A synthetic task generator that paints procedural shapes onto real CT
+    and MRI scans. We evaluate it against training on real data only and study
+    the effect of the canvas the shapes are painted on.
+  \item An evaluation on nine datasets covering
+    unseen classes, lesions, a non-anatomical target region, and MRI as a
+    held-out modality.
 \end{itemize}
 
-\paragraph{Outline.} \autoref{sec:fundamentals} introduces in-context
-segmentation, the volumetric encoder and attention machinery the method
-builds on, and synthetic-data background, then positions UniverSeg, Iris,
-and Medverse against the three axes above. \autoref{sec:methodology}
-details the model. \autoref{sec:results} evaluates each axis in turn.
-\autoref{sec:discussion} synthesizes what the evidence supports and what
-remains open, and \autoref{sec:conclusion} summarizes.
+\paragraph{Outline.}
+\autoref{sec:fundamentals} introduces in-context segmentation, the volumetric
+encoders and attention mechanisms the model builds on, and positions related methods with respect to the three
+questions above. \autoref{sec:methodology} describes the model.
+\autoref{sec:results} evaluates each component in turn.
+\autoref{sec:discussion} discusses the findings and their limitations, and
+\autoref{sec:conclusion} concludes.

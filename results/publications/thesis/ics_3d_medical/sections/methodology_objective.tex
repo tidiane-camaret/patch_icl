@@ -1,14 +1,14 @@
 \subsection{Training Objective}\label{sec:methodology-objective}
 
-Each cascade level is supervised independently at its own resolution with
-a combined binary cross-entropy and soft Dice loss, summed over the $M$
-levels:
+Each cascade level is supervised at its own resolution with the sum of a
+binary cross-entropy and a soft Dice loss:
 %
 \begin{equation}
-  \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell \left( \mathcal{L}_{\text{BCE}}^\ell + \mathcal{L}_{\text{Dice}}^\ell \right).
+  \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell \left( \mathcal{L}_{\text{BCE}}^\ell + \mathcal{L}_{\text{Dice}}^\ell \right),
+  \label{eq:loss}
 \end{equation}
 %
-Level weights $\lambda_\ell$ are uniform ($\lambda_\ell{=}1$). Because
-the query prior is detached (\autoref{sec:methodology-cascade}), each
-level's loss does not back-propagate through the coarser level's
-prediction.
+with uniform weights $\lambda_\ell = 1$. Because the prior is detached
+(\autoref{sec:methodology-cascade}), the loss at level $\ell$ does not
+propagate into level $\ell{-}1$. The single-level experiments of
+\autoref{sec:results-fusion} use $M = 1$.

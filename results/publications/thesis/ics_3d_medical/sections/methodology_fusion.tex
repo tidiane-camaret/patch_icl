@@ -1,95 +1,81 @@
-\subsection{Dual Attention: Modality and Position Axes}\label{sec:methodology-fusion}
+\subsection{Dual Attention}\label{sec:methodology-fusion}
 
-How a model combines image and label evidence, and how context and target
-interact, are two related design choices this section addresses together.
-Medverse~\cite{huMedverseUniversalModel2025a} concatenates image and label
-channels before a shared U-Net; context and target then interact through a
-Blockwise Cross-Attention Module (BAM) placed at two points in that network
-(once encoder-side, once decoder-side), which pools its queries and keys to
-block resolution before attending -- trading positional precision for a
-cheaper attention cost -- while its values stay at full resolution.
-Iris~\cite{gaoShowSegmentUniversal2025} fuses image and label features
-once, through a pixel shuffle--unshuffle operation, then lets context
-inform the target through a single bidirectional cross-attention step
-against a compressed, per-class task embedding computed once and reused
-across every query. Both commit every design choice -- fusion point and
-context--target interaction alike -- to a single, early step, computed
-once. \autoref{fig:fusion-family} contrasts Medverse's dual,
-separately-weighted per-row encoders against the shared-encoder family
-both our baseline and final design belong to.
+The attention layers have two jobs: combining image and label information, and
+matching the target against the context. In Medverse and Iris, these happen at
+fixed points in the network (\autoref{sec:fundamentals-relatedwork}).
+\autoref{fig:fusion-family} contrasts Medverse's design with the
+shared-encoder design used in this thesis.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{arch_fusion_family.pdf}
-  \caption{Two families of context/target coupling, shown for a single
-  context volume ($K{=}1$) and 3 of its $N$ tokens per stream. Top:
-  Medverse channel-concatenates image and mask into one volume (context
-  only -- target gets no mask channel at all) and feeds each row through
-  its own, separately-weighted U-Net, coupled by cross-attention at
-  several stages: context queries target's encoder while narrowing,
-  target queries context's decoder while widening (blue arrows). Bottom:
-  the family both our baseline and final design belong to instead
-  passes only the image through one shared encoder (``Enc''), run once;
-  label evidence -- a placeholder prior for target, the real mask for
-  context -- re-enters at a Fuse step ($\oplus$) before the encoded
-  token attends across cells and contexts for $L$ layers (``Attn.'') and
-  a shared decoder (``Dec'') produces the mask. \autoref{fig:fusion-axis}
-  details the two ways we combine image and label evidence within this
-  shared-encoder family.}
+  \caption{Two ways of coupling target and context, shown for one context
+  volume ($K{=}1$) and three of its $N$ tokens. Top: Medverse feeds the target
+  image, and the context image and mask concatenated as channels, into two
+  separate U-Nets that exchange features through cross-attention at several
+  stages (blue arrows). Bottom: the shared-encoder design used in this thesis.
+  Only images pass through the encoder. Label information is added to the
+  encoded tokens afterwards, the tokens attend across cells and volumes for
+  $L$ layers, and a shared decoder produces the mask. \autoref{fig:fusion-axis}
+  shows the two ways of adding label information that we compare.}
   \label{fig:fusion-family}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
 
-We instead keep image tokens $z^{\text{img}}$ and label tokens
-$z^{\text{lbl}}$ (\autoref{sec:methodology-overview}) as separate streams
-throughout the network and let them exchange information repeatedly,
-through \emph{dual attention} -- following the general pattern of
-Fu et al.~\cite{fuDualAttentionNetwork2019}, who fuse a position-wise and a
-channel-wise attention branch at every layer of a scene-segmentation
-network -- with two attention axes applied at every layer, on the full,
-uncompressed token grid:
+We keep image and label tokens as separate streams throughout the attention
+layers and let them interact through two attention operations. This follows
+the dual attention network of Fu et al.~\cite{fuDualAttentionNetwork2019},
+which combines position-wise and channel-wise attention for scene
+segmentation. Each of the $L$ layers applies:
 
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
-  \item \textbf{Modality axis}: at each cell, the image and label token
-    attend to each other, letting label evidence sharpen the image
-    representation and vice versa, independently per cell.
-  \item \textbf{Position axis}: every cell of every volume -- context,
-    target, and the register tokens -- attends over the entire token
-    sequence at once, using 3D axial rotary position embeddings so
-    attention is a function of physical distance between cells rather
-    than raw grid index. This single joint attention performs
-    within-volume self-attention and cross-context matching together,
-    since tokens from every volume already share one sequence.
+  \item \textbf{Modality axis.} Within each cell, the image token and the
+    label token attend to each other. This is attention over a sequence of
+    length two, computed independently for every cell, so its cost grows
+    linearly with the number of cells.
+  \item \textbf{Position axis.} The tokens of all volumes and the register
+    tokens attend to each other in one sequence. This single operation covers
+    both attention within a volume and matching between target and context.
+    Queries and keys use 3D axial RoPE with physical coordinates
+    (\autoref{sec:fundamentals-backbone}), so attention depends on the
+    physical distance between cells.
 \end{itemize}
 
-\autoref{fig:fusion-axis} contrasts this dual attention against a
-single-fusion-step baseline within the same shared-encoder family.
+\todo[inline]{Specify: (1) whether the position axis attends over image and
+label tokens jointly ($2N$ tokens per volume) or over each stream separately;
+(2) the attention mask: the old text said every token attends to every other
+token, but the old \autoref{fig:fusion-axis} caption said the target attends
+``read-only'' into the context, which would mean context tokens do not attend
+to the target; (3) the order of the two axes, normalization and MLP blocks,
+number of heads, and $L$.}
+
+\paragraph{Early-fusion baseline.}
+As a baseline, the early-fusion variant (\autoref{fig:fusion-axis}, top)
+merges the image and label token of each cell into a single token before the
+attention layers, using a pixel shuffle--unshuffle operation similar to the one
+Iris uses in its context encoder. It then applies only the position axis. The
+image and label information of a cell is thus combined once, before any
+attention, rather than in every layer.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{arch_fusion_axis.pdf}
-  \caption{Two variants within the shared-encoder family
-  (\autoref{fig:fusion-family}), shown for a single context volume
-  ($K{=}1$ for clarity) and 3 of its $N$ spatial tokens per stream. Top:
-  early fusion (our baseline) -- image and label tokens are merged once
-  ($\oplus$), then the fused token grid attends across cells and
-  contexts for $L$ layers (the position axis). Bottom: dual attention
-  (ours) -- image and label tokens instead attend to each other directly
-  at every layer (the modality axis, blue double arrows), alongside the
-  same cross-cell/cross-context attention (the position axis), repeated
-  together for $L$ layers. In both, the target row (green image tokens)
-  cross-attends read-only into context (pink tokens); its label-stream
-  input is the query prior (\autoref{sec:methodology-cascade}) rather
-  than ground truth, which is why its label token is gray rather than a
-  role color.}
+  \caption{The two variants of the shared-encoder design compared in
+  \autoref{sec:results-fusion}, shown for one context volume and three of its
+  $N$ cells. Top: early fusion (baseline). Image and label tokens are merged
+  once ($\oplus$), and the fused tokens attend across cells and volumes for
+  $L$ layers. Bottom: dual attention. Image and label tokens stay separate; in
+  each of the $L$ layers they attend to each other within each cell (modality
+  axis) and across cells and volumes (position axis). The target's label token
+  (gray) holds the prior of \autoref{sec:methodology-cascade}, not ground
+  truth.}
   \label{fig:fusion-axis}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
 
-Only the target's post-attention \emph{image} token is read out for
-decoding; the label token is discarded after the last layer, since it
-started from a placeholder rather than real image evidence for the target
-row. The decoded image tokens are projected back to the coarse token grid
-and progressively fused with the encoder's fine-resolution skip features
-(\autoref{sec:methodology-overview}) via upsampling and convolution, one step
-per fine stage, into the final full-resolution mask logits.
+\paragraph{Decoder.}
+After the last layer, only the target's image tokens are passed to the
+decoder; the label tokens are not used further. The decoder reshapes the image
+tokens to the $R^3$ grid and upsamples them in steps. At each step it fuses the
+result with the corresponding fine encoder stage through convolution, until it
+reaches the input resolution and outputs the mask logits.

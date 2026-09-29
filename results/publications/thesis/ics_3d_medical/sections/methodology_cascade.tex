@@ -1,47 +1,63 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:methodology-cascade}
 
-The cascade connects consecutive resolution levels through two
-mechanisms: a query prior and region-restricted fine processing.
+The cascade processes the target at $M$ resolution levels. Consecutive levels
+are linked in two ways: the previous level's prediction initializes the
+target's label tokens, and it determines which region the next level
+processes.
 
-\paragraph{Query prior.} Medverse passes the previous step's prediction, together with the target
-image, through a third U-Net branch that shares weights with its context
-branch; during training, this input is a downsampled ground-truth mask
-standing in for a coarse prediction. Iris has no multi-step inference
-and uses no prior. At level $\ell > 1$, we instead initialize the target's
-label token directly from level $\ell{-}1$'s own prediction:
+\paragraph{Prediction as prior.}
+At level $\ell > 1$, the target's label tokens are initialized from the
+prediction of level $\ell{-}1$:
 %
 \begin{equation}
   z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1})\big),
+  \label{eq:query-prior}
 \end{equation}
 %
-where $\mathrm{Warp}$ resamples level $\ell{-}1$'s prediction onto level
-$\ell$'s crop grid, correcting for the two levels' different centers,
-field of view, and any augmentation applied independently to each. This
-makes the previous level's belief part of the same token stream processed
-by dual attention alongside the image (\autoref{sec:methodology-fusion}),
-rather than a separate side channel. The previous level's prediction is detached before warping, so no
-gradient flows between levels through the prior. \autoref{fig:query-prior} shows this
-flow across two levels.
+where $\mathrm{Warp}$ resamples the prediction onto the crop grid of level
+$\ell$, accounting for the different center, field of view, and augmentation
+of the two crops. The prior thus enters the same token stream as the context
+masks and is processed by the same dual attention layers, instead of through a
+separate branch as in Medverse (\autoref{sec:fundamentals-relatedwork}). The
+prediction is detached before warping, so no gradients flow from one level
+back into the previous one. \autoref{fig:query-prior} shows the flow across
+two levels.
+\todo[inline]{Specify whether the prior is the probability map or a
+binarized mask.}
+
+During training, the prior at level $\ell$ is either the model's own
+prediction from level $\ell{-}1$ (predicted prior) or a randomly perturbed
+ground-truth mask (perturbed ground-truth prior). \autoref{sec:results-cascade}
+compares the two.
+\todo[inline]{Specify the perturbations applied to the ground-truth prior; how
+levels are sampled during training (all $M$ levels per step, or one at a time);
+how training crops are placed at each level; and the cross-level register
+carry of the extended configuration (are the level-$\ell$ registers
+initialized from the final level-$(\ell{-}1)$ registers?).}
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{arch_query_prior.pdf}
-  \caption{Query image prior across two cascade levels, with the full
-  model input/output flow. At level 1 the target has no real prior yet
-  (dashed support-mean placeholder); at level 2 the target's second lane
-  is a real crop of level 1's own prediction $\hat{L}^t_1$ -- the same
-  lane the context mask always occupies.}
+  \caption{Label prior across two cascade levels. At level 1 no prior exists,
+  and the target's label tokens are initialized with a placeholder (dashed).
+  At level 2 they are initialized from a crop of the level-1 prediction
+  $\hat{L}^t_1$, in the same position that the mask occupies for context
+  volumes.}
   \label{fig:query-prior}
 \end{figure}
 \todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
 
-\paragraph{Region-restricted fine processing.} Medverse processes the entire volume with a sliding window at every
-step after the first. Once a coarse level
-has localized the structure of interest, we instead restrict the sliding
-window at the next, finer level to the coarse prediction's foreground
-region, thresholded and padded by a fixed margin. Fine-level compute then
-depends on the size of the structure rather than the size of the input
-volume. The cost is that fine levels depend on the coarse level
-localizing the structure approximately correctly.
-
-
+\paragraph{Region-restricted processing.}
+At each level after the first, we threshold the previous prediction, place a
+box around the predicted foreground, pad it by a fixed margin, and run the
+sliding window only inside this box. The cost of the fine levels then depends
+on the size of the structure rather than the size of the volume. The drawback
+is that fine levels cannot recover structures that the coarse level missed or
+placed far from their true position.
+\todo[inline]{Specify: what level 1 processes (whole volume or a crop);
+threshold and margin; whether the box is the bounding box of the foreground or
+a fixed-size box at its centroid (\autoref{sec:results-cascade} describes a
+fixed-margin box at the centroid); sliding-window size and overlap; behavior
+when the coarse prediction is empty; how level predictions are stitched into
+the final mask (\autoref{tab:cascade-levels} reports a ``stitched'' Dice); and
+how the level spacings are chosen per dataset.}
