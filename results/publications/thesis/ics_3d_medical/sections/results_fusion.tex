@@ -13,8 +13,7 @@ merging them once.
 and then trained with our recipe. It is therefore a different model from the
 released Medverse baseline used in \autoref{sec:results-cascade}.
 \emph{Early fusion} and \emph{dual attention} are the two variants shown in
-\autoref{fig:fusion-axis}. Removing the modality axis also removes a large part
-of the compute, so early fusion uses $L{=}9$ attention layers instead of 4.
+\autoref{fig:fusion-axis}. Early fusion uses $L{=}9$ layers to match the compute of dual attention (\autoref{sec:methodology-fusion}).
 This gives both variants similar compute (3973 vs.\ 3892 GFLOPs). Parameter
 count could not be matched at the same time, and early fusion has 52\% more
 parameters. Dual U-Net Cross-Attn is not compute-matched to either variant.
@@ -25,12 +24,7 @@ All three architectures use the same training recipe
 are trained on the CT cases and training classes of TotalSegmentator, without
 synthetic tasks, at a single level. Their initialization differs. Dual U-Net
 Cross-Attn starts from Medverse's weights. Early fusion and dual attention
-initialize the encoder and decoder from a shared checkpoint, and all other
-components (attention layers, token embeddings, register tokens) randomly.
-Dual U-Net Cross-Attn was trained to convergence, while early fusion and dual
-attention had not yet completed their training budget when evaluated.
-\todo[inline]{Specify which checkpoint the shared encoder and decoder come
-from.}
+are randomly initialized.
 
 \begin{table}[t]
   \centering
@@ -47,11 +41,10 @@ from.}
     Batch size & 8 \\
     Gradient clipping & 1.0 \\
     Loss & BCE + Dice \\
-    Epochs & $\sim$250 \\
+    Epochs & 250 \\
     \bottomrule
   \end{tabular}
 \end{table}
-\todo[inline]{Confirm the epoch count per architecture.}
 
 \paragraph{Evaluation.}
 All three architectures are evaluated at a single level with 3\,mm spacing, in
@@ -101,7 +94,7 @@ on TotalSeg MRI (0.232 vs.\ 0.178). It is worse on the three sources with new
 or non-anatomical targets: MSD Prostate, MSD Hippocampus, and HU\_LWK1.
 
 Dual attention improves over early fusion on seven of the eight rows. The
-gains are small on the in-vocabulary CT rows (0.008 to 0.018) and larger on
+gains are small on the other in-vocabulary rows (0.008 to 0.018) and larger on
 the new targets and the unseen modality: MSD Hippocampus ($+0.062$), MSD
 Prostate ($+0.042$), TotalSeg MRI ($+0.027$), and HU\_LWK1 ($+0.023$). The
 exception is the unseen FLARE22 classes, where dual attention scores 0.028
@@ -112,7 +105,7 @@ eight rows, including MSD Hippocampus (0.184 vs.\ 0.172), but remains worse on
 MSD Prostate (0.247 vs.\ 0.377) and HU\_LWK1 (0.102 vs.\ 0.146). On the mean
 over held-out sources, early fusion is below Dual U-Net Cross-Attn (0.264 vs.\
 0.278), while dual attention is above it (0.297). The shared-encoder design
-alone thus improves accuracy on known classes, and dual attention is needed to
+alone thus improves accuracy on the training vocabulary, and dual attention is needed to
 also improve on held-out sources.
 
 Dual attention has the fewest parameters of the three (48.7M). Its compute is

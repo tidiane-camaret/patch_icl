@@ -7,3 +7,65 @@
   \caption{Medverse's architecture: dual U-Net cross-attention, shown for comparison against our architecture (\autoref{fig:overview}).}
   \label{fig:overview-medverse}
 \end{figure}
+
+\begin{table}[p]
+  \centering
+  \small
+  \caption{TotalSegmentator classes used for training (seen) and held out
+  (unseen), with the number of classes per category in parentheses.
+  $^\dagger$: also available on TotalSegmentator MRI. On MRI, 50 classes are
+  available, 31 of them seen.}
+  \label{tab:totalseg-classes}
+  \begin{tabularx}{\linewidth}{@{}p{3.2cm}XX@{}}
+    \toprule
+    Category & Seen & Unseen \\
+    \midrule
+    Organs, abdomen and pelvis (12\,/\,5)
+      & adrenal gland L$^\dagger$, colon$^\dagger$, duodenum$^\dagger$,
+        esophagus$^\dagger$, gallbladder$^\dagger$, kidney L$^\dagger$,
+        liver$^\dagger$, pancreas$^\dagger$, small bowel$^\dagger$,
+        spleen$^\dagger$, stomach$^\dagger$, urinary bladder$^\dagger$
+      & adrenal gland R$^\dagger$, kidney R$^\dagger$, prostate$^\dagger$,
+        kidney cyst L, kidney cyst R \\
+    \addlinespace
+    Organs, thorax, head, and spine (8\,/\,3)
+      & brain$^\dagger$, heart$^\dagger$, spinal cord$^\dagger$, thyroid
+        gland, trachea, lung lower lobe L, lung middle lobe R, lung upper
+        lobe R
+      & lung lower lobe R, lung upper lobe L, left atrial appendage \\
+    \addlinespace
+    Muscles (5\,/\,5)
+      & autochthon L$^\dagger$, gluteus maximus L$^\dagger$, gluteus medius
+        R$^\dagger$, gluteus minimus L$^\dagger$, iliopsoas R$^\dagger$
+      & autochthon R$^\dagger$, gluteus maximus R$^\dagger$, gluteus medius
+        L$^\dagger$, gluteus minimus R$^\dagger$, iliopsoas L$^\dagger$ \\
+    \addlinespace
+    Bones, limbs, shoulder, and pelvis (6\,/\,5)
+      & clavicle R$^\dagger$, femur L$^\dagger$, hip R$^\dagger$, humerus
+        L$^\dagger$, scapula L$^\dagger$, skull
+      & clavicle L$^\dagger$, femur R$^\dagger$, hip L$^\dagger$, humerus
+        R$^\dagger$, scapula R$^\dagger$ \\
+    \addlinespace
+    Bones, spine (11\,/\,15)
+      & sacrum$^\dagger$; vertebrae C3, C7, T3, T6, T9, T12, L1, L3, L5, S1
+      & vertebrae C1, C2, C4--C6, T1, T2, T4, T5, T7, T8, T10, T11, L2, L4 \\
+    \addlinespace
+    Bones, ribs and sternum (9\,/\,17)
+      & sternum, costal cartilages; ribs L2, L3, L9, L12, R2, R6, R11
+      & ribs L1, L4--L8, L10, L11, R1, R3--R5, R7--R10, R12 \\
+    \addlinespace
+    Vessels (10\,/\,6)
+      & aorta$^\dagger$, inferior vena cava$^\dagger$, portal and splenic
+        vein$^\dagger$, iliac artery L$^\dagger$, iliac vein L$^\dagger$,
+        superior vena cava, pulmonary vein, brachiocephalic trunk, common
+        carotid artery L, subclavian artery L
+      & iliac artery R$^\dagger$, iliac vein R$^\dagger$, common carotid
+        artery R, subclavian artery R, brachiocephalic vein L,
+        brachiocephalic vein R \\
+    \midrule
+    MRI only (0\,/\,4)
+      & --
+      & lung L, lung R, vertebrae (all levels merged), intervertebral discs \\
+    \bottomrule
+  \end{tabularx}
+\end{table}

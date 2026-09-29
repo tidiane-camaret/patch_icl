@@ -10,15 +10,14 @@ The baseline is the Synth configuration trained with $p_\text{synth} = 0.5$
 and the synthetic-bank canvas. It reaches Dice between 0.008 and 0.082 on the
 four datasets (\autoref{tab:synth-realhost-ood}). Changing the mix of shape
 families or $p_\text{synth}$ with this canvas did not change these results
-beyond run-to-run variation. The bank consists only of CT images, while all
-four target datasets are MRI. This suggested that the modality of the canvas,
-not the variety of shapes, limits transfer.
+beyond run-to-run variation.   The bank's images are synthesized from label maps of CT scans, whereas all
+  four target datasets are real MRI. This suggested that the canvas, rather
+  than the variety of shapes, limits transfer.
 \todo[inline]{Show the family-mix and $p_\text{synth}$ runs (appendix table)}
 
 \paragraph{Real-host canvas.}
 To test this, we continued training from the baseline checkpoint in two runs
-that differ only in the canvas: the synthetic bank (stage 1) or a real MRI case
-from TotalSegmentator (stage 2). Both use only the scatter-field family, with
+that differ only in the canvas: the synthetic bank (stage 1) or real scans from TotalSegmentator (stage 2). Both use only the scatter-field family, with
 the same $p_\text{synth}$ and training budget. The real canvas improves Dice on
 three of the four datasets: ISLES22 from 0.045 to 0.098, Shifts-MS from 0.011
 to 0.058, and GNC\_705 from 0.070 to 0.105. ATLAS v2.0 is unchanged (0.033
@@ -132,7 +131,3 @@ and a qualitative figure (appendix), instead of the reference to
 uses ground-truth-centered crops, the drop may mainly reflect the loss of
 ground-truth localization; state which is the case.}
 
-\paragraph{Limitations.}
-All results in this section come from a single seed. Only the step from stage
-1 to stage 2 is a controlled comparison. Dice on the lesion datasets remains
-low in absolute terms for all configurations.

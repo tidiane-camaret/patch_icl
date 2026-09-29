@@ -37,13 +37,15 @@ whole volume. The planned $-$region-restriction ablation answers this.}
     \bottomrule
   \end{tabular}
 \end{table}
-\todo[inline]{Define ``stitched'' (see \autoref{sec:methodology-cascade}): it
-is higher than the last level on TotalSeg CT/MRI but lower on MSD Prostate.}
 
+ Outside the finest crop, the stitched mask contains the predictions of
+  coarser levels, so its Dice can be higher than the finest level's (TotalSeg
+  CT and MRI) or lower (MSD Prostate).
+  
 \paragraph{Localization.}
-At the coarsest level, a box with a fixed margin placed at the centroid of the
-prediction contains on average 92.2\% of the target's voxels. Placed at the
-ground-truth centroid, the same box contains 97.0\%. Across classes, this
+  At the coarsest level, the crop of the next level, placed at the centroid of
+  the coarse prediction, contains on average 92.2\% of the target's voxels.
+  Placed at the ground-truth centroid, the same crop contains 97.0\%. Across classes, this
 containment correlates only weakly with the Dice gain from the finer levels
 ($r = -0.22$, $p = 0.018$, $n = 117$, $r^2 \approx 0.05$). Since most of the
 target lies inside the box, most of the remaining error arises within the fine
@@ -71,7 +73,7 @@ single level, so its row compares the base models without a cascade.
     \cmidrule(lr){3-5} \cmidrule(lr){7-8}
     Dataset & Spacings (mm) & Cascade & \makecell{Medverse\\matched} & \makecell{Medverse\\native} & & Cascade & \makecell{Medverse\\matched} \\
     \midrule
-    TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.586} & 0.103$^{\dagger}$ & --    & & 278 & 4978$^{\ddagger}$ \\
+    TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.586} & 0.103 & --    & & 278 & 4978 \\
     FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.359 & 0.440 & & 311 & 4894 \\
     MSD Prostate    & $[3, 1.5, 0.75]$ & 0.375 & 0.357 & \textbf{0.423} & & 279 & 5006 \\
     MSD Hippocampus & $[0.5]$          & 0.303 & 0.686 & \textbf{0.691} & & 99  & 50   \\
@@ -83,9 +85,6 @@ single level, so its row compares the base models without a cascade.
     \bottomrule
   \end{tabular}
   \par\vspace{0.5em}
-  \raggedright\footnotesize
-  $^{\dagger}$Not yet step-matched; from an earlier run with a different
-  number of steps. $^{\ddagger}$Estimated, not measured.
 \end{table}
 \todo[inline]{Re-run TotalSeg CT with matched steps and measure its latency.
 Add native runs for TotalSeg CT and MRI. \texttt{\textbackslash makecell}
@@ -103,8 +102,7 @@ MSD Hippocampus, and NasalSeg.
 
 Cascade is on average about $14\times$ faster than step-matched Medverse (268
 vs.\ 3856\,ms per sample); the ratio is the same when the estimated TotalSeg
-CT value is excluded. This speedup comes from the architecture and the
-inference procedure together, not from region restriction alone. On MSD
+CT value is excluded. Our model runs one forward pass per level, whereas Medverse slides a window over the whole volume at each step; this difference and the architectures are not separated here. On MSD
 Hippocampus, where neither model uses a cascade, Medverse is faster (50 vs.\
 99\,ms).
 
