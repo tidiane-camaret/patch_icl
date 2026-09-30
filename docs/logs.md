@@ -10734,3 +10734,59 @@ first fix above). Verified directly: `assemble_task` now returns `tgt_modality="
 crashing on the real one. 64/64 tests still pass. Two real bugs in one previously-untested
 code path (cascade x real-host) is a reminder this combination needs its own dedicated test,
 not just a manual smoke check each time -- not yet added (gap).
+
+## 2026-09-29 — Fusion checkpoints (150/151/152) evaluated on the 5 OOD sources they'd never seen
+
+Closed the Fusion gap in `results/publications/thesis/TODO.md` (found earlier the same day
+auditing Results): none of ISLES22, Shifts-MS, ATLAS v2.0, GNC_705, NasalSeg had ever been run
+against `1a_feature_fusion`'s three checkpoints (150 bi-axial, 151 single-axis fusion l=9, 152
+medverse baseline). 5 datasets x 3 checkpoints = 15 `experiments/3d/eval.py` runs on nora-odin
+(RTX PRO 6000 Blackwell, `.venv_blackwell`, free GPU).
+
+Resolved checkpoint paths by querying the wandb API for each run's config (`paths.results`
+NFS path was live in the run config, but nothing had synced to
+`results/patch_icl/checkpoints/` -- the actual write target for these `experiments/3d/train.py`
+runs is `paths.results/3d_train/<date>_<wandb_name>/best.pt`, not `paths.checkpoints`, which is
+only `scripts/train.py`'s legacy save location): `2026-09-24_150_cascade_coldtransformer_dualaxis`,
+`2026-09-25_151_cascade_coldtransformer_singleaxis_l9` (a `2026-09-24` dir for 151 exists but is
+empty -- an aborted first start), `2026-09-25_152_cascade_medverse_baseline`.
+
+Matched `1b_fusion_ood`'s protocol exactly by pulling that experiment's own `wandb-metadata.json`
+`args` (not re-deriving from the TODO's prose, which turned out to list some train-time-only
+knobs): `dataset=<name> eval.model=<patchset3d|medverse> eval.checkpoint=<best.pt>
+data.crop_spacing_mm=3 eval.split=test eval.n_subjects=null wandb.name=<label>_<dataset>_3mm`.
+No `eval.autocast`/`medverse_bounded_head`/`medverse.compile`/`eval_autocast` overrides needed --
+1b's own 152 runs pass none of these either; `medverse_bounded_head` is inherited from the
+checkpoint's stored training flag (`eval.yaml`'s `medverse_bounded_head: null` default), and
+`medverse.compile`/`train.eval_autocast` are `train.py`-only keys already baked into 152's weights.
+A smoke test (`eval.n_subjects=3` on shifts_ms) confirmed the pipeline before committing to the
+full batch; note `eval.n_subjects` doesn't cap native-grid providers like shifts_ms (ran all 46
+regardless), harmless here since the final protocol wants `n_subjects=null` anyway.
+
+All 15 runs finished, exit 0 (~34 min wall time total). Mean Dice (Dual attention=150,
+Early fusion=151, Dual U-Net Cross-Attn=152):
+
+| Source | 150 (dual attn) | 151 (early fusion) | 152 (medverse) |
+|---|---|---|---|
+| ISLES22 (MRI DWI, stroke lesion) | 0.043 | 0.037 | 0.045 |
+| Shifts-MS (MRI FLAIR, MS lesion) | 0.109 | 0.038 | 0.087 |
+| ATLAS v2.0 (MRI T1, chronic stroke lesion) | 0.022 | 0.014 | 0.031 |
+| GNC_705 (Dixon MRI, 13 kidney-lesion classes, macro) | 0.025 | 0.014 | 0.044 |
+| NasalSeg (CT, 5 air-cavity classes, macro) | 0.358 | 0.272 | 0.434 |
+
+All three checkpoints are near-collapse on the four lesion/stroke sources (0.01-0.11 Dice,
+consistent with `2c_cascade_medverse`'s and exp92's earlier single-level readings on the same
+sources — unseen lesion classes + non-CT modality stack badly). NasalSeg is the one source
+where all three do reasonably, and the ranking there (152 > 150 > 151) does NOT match
+`tab:fusion-staircase`'s existing pattern of 150 (dual attention) beating 152 on most held-out
+rows — the first case among all fusion-checkpoint OOD sources where the medverse-initialized
+baseline wins outright.
+
+Saved to `results/publications/thesis/experiments/1c_fusion_ood_5sources/` (`runs.json` +
+`samples.csv`, generated with `extract_run_results.py` from the local `wandb/run-*-<id>` dirs
+this session produced). **Not yet merged** into `results_fusion.tex`'s `tab:fusion-staircase` or
+its seen/unseen prose — these 5 sources are single/few-class with near-zero TotalSegmentator
+class overlap, so unlike TotalSeg CT/FLARE22 there's no seen/unseen split to report, and folding
+them into the existing "mean of 5 held-out sources" row is a content decision (mean of 10? a
+second footnoted mean? drop the lesion-collapsed rows from the headline mean?), not just a data
+copy -- left as a TODO follow-up rather than decided unilaterally here.

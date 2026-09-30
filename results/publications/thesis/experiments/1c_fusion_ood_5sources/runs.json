@@ -1,0 +1,83 @@
+{
+  "experiment": "1c_fusion_ood_5sources",
+  "description": "Extends 1b_fusion_ood to the 5 OOD sources it never covered (ISLES22, Shifts-MS, ATLAS v2.0, GNC_705, NasalSeg -- flagged as a gap in results/publications/thesis/TODO.md, found 2026-09-29 auditing Results). Same three cold-transformer-chain checkpoints as 1a/1b (150=bi-axial dual_axis, 151=single-axis fusion l=9, 152=medverse baseline) and the exact same protocol as 1b_fusion_ood: single-level (no cascade), data.crop_spacing_mm=3 (overriding each source's own tuned default, deliberately uniform across sources per 1b's rationale), eval.split=test, eval.n_subjects=null (full coverage), eval.autocast=false (fp32, the harness default -- not overridden since it already matches), eval.model=patchset3d for 150/151 and eval.model=medverse for 152 (medverse_bounded_head/medverse.compile/eval_autocast are train-time recipe knobs baked into 152's checkpoint itself, not eval.py flags -- confirmed by inspecting 1b_fusion_ood's own wandb-metadata.json args, which pass no such flags for 152's eval runs either). Checkpoints: 150=3d_train/2026-09-24_150_cascade_coldtransformer_dualaxis/best.pt, 151=3d_train/2026-09-25_151_cascade_coldtransformer_singleaxis_l9/best.pt, 152=3d_train/2026-09-25_152_cascade_medverse_baseline/best.pt. No query_prior injection for any model (single-level eval never touches it), so no recipe asymmetry between the three arms, same as 1b. Run 2026-09-29 on nora-odin (RTX PRO 6000 Blackwell, .venv_blackwell), all 15 runs exit 0. Numbers not yet merged into ics_3d_medical/sections/results_fusion.tex's tab:fusion-staircase or its seen/unseen prose -- these 5 sources have no in-vocabulary/novel-class split the way TotalSeg/FLARE22 do (single lesion/cavity classes, mostly zero-overlap with TotalSegmentator's 117 classes), so merging needs a decision on how to group them alongside the existing 'mean of 5 held-out sources' row, not just a data copy.",
+  "wandb_entity": "tidiane-camaret-ndir-universit-tsklinikum-freiburg",
+  "wandb_project": "patchset_eval",
+  "runs": [
+    {
+      "id": "hzyx6va3",
+      "name": "150_dualaxis_isles22_3mm",
+      "description": "150 (bi-axial) on isles22 (MRI DWI, stroke lesion), single-level 3mm"
+    },
+    {
+      "id": "z35wy143",
+      "name": "150_dualaxis_shifts_ms_3mm",
+      "description": "150 (bi-axial) on shifts_ms (MRI FLAIR, MS lesion), single-level 3mm"
+    },
+    {
+      "id": "3cltru9n",
+      "name": "150_dualaxis_atlas_v2_3mm",
+      "description": "150 (bi-axial) on atlas_v2 (MRI T1, chronic stroke lesion), single-level 3mm"
+    },
+    {
+      "id": "gnixfwxs",
+      "name": "150_dualaxis_gnc_kidney_3mm",
+      "description": "150 (bi-axial) on gnc_kidney (Dixon MRI, 13 kidney-lesion classes), single-level 3mm"
+    },
+    {
+      "id": "42twujpi",
+      "name": "150_dualaxis_nasalseg_3mm",
+      "description": "150 (bi-axial) on nasalseg (CT, 5 air-cavity classes), single-level 3mm"
+    },
+    {
+      "id": "jqwr0ms7",
+      "name": "151_singleaxis_isles22_3mm",
+      "description": "151 (single-axis fusion, l=9) on isles22, single-level 3mm"
+    },
+    {
+      "id": "eip0mi9k",
+      "name": "151_singleaxis_shifts_ms_3mm",
+      "description": "151 (single-axis fusion, l=9) on shifts_ms, single-level 3mm"
+    },
+    {
+      "id": "lyx7i5iz",
+      "name": "151_singleaxis_atlas_v2_3mm",
+      "description": "151 (single-axis fusion, l=9) on atlas_v2, single-level 3mm"
+    },
+    {
+      "id": "y6mohg6s",
+      "name": "151_singleaxis_gnc_kidney_3mm",
+      "description": "151 (single-axis fusion, l=9) on gnc_kidney, single-level 3mm"
+    },
+    {
+      "id": "d6xm517v",
+      "name": "151_singleaxis_nasalseg_3mm",
+      "description": "151 (single-axis fusion, l=9) on nasalseg, single-level 3mm"
+    },
+    {
+      "id": "sbmn3284",
+      "name": "152_medverse_isles22_3mm",
+      "description": "152 (medverse baseline) on isles22, single-level 3mm"
+    },
+    {
+      "id": "kgnj2x2h",
+      "name": "152_medverse_shifts_ms_3mm",
+      "description": "152 (medverse baseline) on shifts_ms, single-level 3mm"
+    },
+    {
+      "id": "8o19pwyx",
+      "name": "152_medverse_atlas_v2_3mm",
+      "description": "152 (medverse baseline) on atlas_v2, single-level 3mm"
+    },
+    {
+      "id": "serucakm",
+      "name": "152_medverse_gnc_kidney_3mm",
+      "description": "152 (medverse baseline) on gnc_kidney, single-level 3mm"
+    },
+    {
+      "id": "gj3jm0yr",
+      "name": "152_medverse_nasalseg_3mm",
+      "description": "152 (medverse baseline) on nasalseg, single-level 3mm"
+    }
+  ]
+}
