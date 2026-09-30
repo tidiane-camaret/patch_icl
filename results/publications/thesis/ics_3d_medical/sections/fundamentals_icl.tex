@@ -3,18 +3,7 @@
 Given a target image $I^t$ and a context set
 $\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image--mask pairs showing the same class,
 in-context segmentation predicts a target mask $\hat{L}^t$ in a single forward
-pass, without gradient updates or class-specific parameters.
-
-This setting differs from two more common ones. Closed-set supervised
-segmentation fixes the label set at training time, so adding a class requires
-retraining or fine-tuning. Interactive segmentation asks a user to provide
-clicks or boxes on each target image at inference time. In-context segmentation
-instead specifies the task through a few labeled examples from other subjects,
-similar to showing a radiologist a few example cases of a finding before asking
-them to find it in a new scan.
-
-The setting is particularly well-suited to medical imaging for three main reasons. 
-First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
+pass, without gradient updates or class-specific parameters. The setting is well-suited to medical imaging :  First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
 Second, new anatomical structures and pathologies are defined much faster than 
 large-scale supervised datasets can be curated for them. 
 Finally, significant differences in acquisition protocols often limit how well a 

@@ -28,7 +28,11 @@
 % whichever token grid it is anchored to.
 \newcommand{\tabpfnattn}[1]{
   \def\attnstyle{[{Latex[length=1.8mm,width=1.5mm]}-{Latex[length=1.8mm,width=1.5mm]}, line width=1.5pt, archBrightBlue]}
-  \def\ax{#1+\tsz/2+0.05}
+  % #1 is the lbl column's \archtokengrid x -- its LEFT edge, not a center
+  % (unlike arch_fusion_axis.tex's tpsq/tpcluster, which are center-
+  % anchored) -- so the fan must start past x + the drawn square's own
+  % width (0.82*\tsz), not past x + half of it.
+  \def\ax{#1+0.82*\tsz+0.05}
 
   \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=30] (\ax, \yTgt);
   \draw\attnstyle (\ax, \yTgt)       to[bend left=30] (\ax, \yTgt-\toff);
@@ -94,8 +98,10 @@
   \archtokengrid{7.925}{1.3125}{3}{1}{0.875}{archContextAccent}
 
   % ---- dual attention block ----
-  % Centered arrow entering the block
-  \archarrow{(8.80,3.9375)}{(9.00,3.9375)}{archArrowPale}
+  % Centered arrow entering the block -- standard-length shaft (0.56),
+  % gapped 0.10 off the Tgt/Ctx Lbl grid's right edge (8.6425) and the
+  % wrapper's left edge (9.40, pushed out 0.40 below to make room)
+  \archarrow{(8.74,3.9375)}{(9.30,3.9375)}{archArrowPale}
 
   % Outer Attention wrapper -- same green dashed/filled box as
   % arch_fusion_axis.tex's "Dual attention" panel wrapper (grown 0.3 on
@@ -103,9 +109,11 @@
   % Vertically centered on 3.9375 -- the seam where the pre-attention Ctx
   % and Tgt token stacks meet outside the block, and where the entry/exit
   % connector arrows above/below already sit -- not an arbitrary center.
+  % Whole block pushed +0.40 right of its original 9.00 left edge, to open
+  % up the entry-arrow gap above without shrinking anything inside it.
   \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
-    (9.00, 1.5375) rectangle (15.10, 6.3375);
-  \node[align=center] at (12.05,6.6375) {\archboxlabel dual\\attention};
+    (9.40, 1.5375) rectangle (15.50, 6.3375);
+  \node[align=center] at (12.45,6.6375) {\archboxlabel dual\\attention};
 
   % Row geometry shared by both sub-blocks below -- cell/gap grown from
   % 0.5 to 0.65 (1.3x) so the token stacks scale up along with the boxes
@@ -120,56 +128,71 @@
   % Grown to a 0.20 margin from the green box on every outer-facing side
   % (left/top/bottom) -- the boundary with Position axis stays put, so the
   % two boxes nearly fill the wrapper without changing their shared gap.
-  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.20, 1.7375) rectangle (11.95, 6.1375);
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.60, 1.7375) rectangle (12.35, 6.1375);
 
-  % img/lbl columns widened and recentered in the bigger box (0.325
-  % padding to each side edge, matching the new cell half-width)
-  \archtokengrid{9.85}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
-  \archtokengrid{11.30}{3.9375}{3}{1}{0.65}{black!15}
-  \archtokengrid{9.85}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
-  \archtokengrid{11.30}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
+  % \archtokengrid's x is the column's LEFT edge (the drawn square spans
+  % [x, x+0.82*\tsz]), not a center -- img/lbl placed so the pair sits
+  % symmetric in the box (0.45 margin both sides) with the dblarrow
+  % centered in the gap between them, instead of hugging the right edge.
+  \archtokengrid{10.05}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
+  \archtokengrid{11.37}{3.9375}{3}{1}{0.65}{black!15}
+  \archtokengrid{10.05}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
+  \archtokengrid{11.37}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
 
-  % Modality-axis edges: same \dblarrow as arch_fusion_axis.tex
+  % Modality-axis edges: same \dblarrow as arch_fusion_axis.tex. Anchored
+  % off the drawn square edges -- x+0.82*\tsz for the left column's right
+  % edge, x for the right column's left edge -- not their centers.
   \foreach \doff in {-\toff,0,\toff} {
-    \dblarrow{({9.85+\tsz/2+0.13},{\yCtx+\doff})}{({11.30-\tsz/2-0.13},{\yCtx+\doff})}{archBrightBlue}
-    \dblarrow{({9.85+\tsz/2+0.13},{\yTgt+\doff})}{({11.30-\tsz/2-0.13},{\yTgt+\doff})}{archBrightBlue}
+    \dblarrow{({10.05+0.82*\tsz+0.13},{\yCtx+\doff})}{({11.37-0.13},{\yCtx+\doff})}{archBrightBlue}
+    \dblarrow{({10.05+0.82*\tsz+0.13},{\yTgt+\doff})}{({11.37-0.13},{\yTgt+\doff})}{archBrightBlue}
   }
 
   % --- Sub-block 2: Position axis ---
   % Same 0.20 margin, grown outward (right/top/bottom) to match
-  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (12.15, 1.7375) rectangle (14.90, 6.1375);
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (12.55, 1.7375) rectangle (15.30, 6.1375);
 
-  % Columns still grouped tighter (0.80 apart, vs. Modality's 1.45) to
-  % leave the \tabpfnattn fan room to bulge into on the right
-  \archtokengrid{12.50}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
-  \archtokengrid{13.30}{3.9375}{3}{1}{0.65}{black!15}
-  \archtokengrid{12.50}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
-  \archtokengrid{13.30}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
-  
+  % Columns grouped tight (0.30 gap) and left-aligned to the same 0.45
+  % margin Modality uses, so the leftover width -- not a centered pair --
+  % sits on the right for the \tabpfnattn fan to bulge into, matching
+  % arch_fusion_axis.tex's Position axis.
+  \archtokengrid{13.00}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
+  \archtokengrid{13.83}{3.9375}{3}{1}{0.65}{black!15}
+  \archtokengrid{13.00}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
+  \archtokengrid{13.83}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
+
   % Position-axis fan: same \tabpfnattn as arch_fusion_axis.tex, anchored
-  % directly off the (now wider) lbl column -- leaves ~1.2 units of
+  % off the lbl column's drawn right edge -- leaves ~0.9 units of
   % clearance to the box's right edge for the fan to bulge into.
-  \tabpfnattn{13.30}
+  \tabpfnattn{13.83}
 
   % ---- post-attention output grids ----
-  % Centered arrow exiting the block
-  \archarrow{(15.20,3.9375)}{(15.40,3.9375)}{archArrowPale}
-  
-  % Output token grids maintaining the lighter tone from inside attention
-  \archtokengrid{15.50}{3.9375}{3}{1}{0.875}{archTargetGreen!40!white}
-  \archtokengrid{16.375}{3.9375}{3}{1}{0.875}{black!15}
-  \archtokengrid{15.50}{1.3125}{3}{1}{0.875}{archContextPink!40!white}
-  \archtokengrid{16.375}{1.3125}{3}{1}{0.875}{archContextAccent!40!white}
-  
+  % Centered arrow exiting the block -- standard-length shaft (0.55),
+  % gapped 0.10 off the wrapper's right edge and the output grid's left
+  % edge (both pushed out an extra 0.35 below to make room)
+  \archarrow{(15.60,3.9375)}{(16.15,3.9375)}{archArrowPale}
+
+  % Output token grids maintaining the lighter tone from inside attention.
+  % This whole block (grids, grey box, decoder, its in/out arrows) is
+  % pushed +0.75 right of its original 15.50 left edge: +0.40 to follow
+  % the dual-attention block above, +0.35 more to open up the exit-arrow
+  % gap just drawn.
+  \archtokengrid{16.25}{3.9375}{3}{1}{0.875}{archTargetGreen!40!white}
+  \archtokengrid{17.125}{3.9375}{3}{1}{0.875}{black!15}
+  \archtokengrid{16.25}{1.3125}{3}{1}{0.875}{archContextPink!40!white}
+  \archtokengrid{17.125}{1.3125}{3}{1}{0.875}{archContextAccent!40!white}
+
   % Grey box highlighting the Target Label tokens
-  \draw[black!40, line width=1.5pt, rounded corners=2pt] (16.27, 3.84) rectangle (17.19, 6.46);
-  
+  \draw[black!40, line width=1.5pt, rounded corners=2pt] (17.02, 3.84) rectangle (17.94, 6.46);
+
   % ---- output decoder (fed from Target Label only) ----
-  \archarrow{(17.30,5.25)}{(17.80,5.25)}{archArrowPale}
-  \archfunnel{17.90}{4.45}{1.6}{1.9}{1.0}{-1}{archEncGray}{Dec}
-  
-  \archarrow{(19.60,5.25)}{(20.10,5.25)}{archArrowPale}
-  \archvolcube{20.20}{4.45}{1.6}{1.6}{archTargetGreen}{predmask}{$\hat{L}^t$}
+  \archarrow{(18.05,5.25)}{(18.55,5.25)}{archArrowPale}
+  \archfunnel{18.65}{4.45}{1.6}{1.9}{1.0}{-1}{archEncGray}{Dec}
+
+  % Standard-length shaft (0.55), gapped 0.10 off the decoder funnel's true
+  % right edge (18.65+1.9=20.55) and the output cube (pushed out an extra
+  % 0.35 below so the gap has room for a full-size arrow, not just the tip)
+  \archarrow{(20.65,5.25)}{(21.20,5.25)}{archArrowPale}
+  \archvolcube{21.30}{4.45}{1.6}{1.6}{archTargetGreen}{predmask}{$\hat{L}^t$}
 
 \end{tikzpicture}
 \end{document}

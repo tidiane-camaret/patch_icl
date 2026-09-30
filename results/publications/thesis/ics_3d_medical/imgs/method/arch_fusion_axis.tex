@@ -2,6 +2,7 @@
 \usepackage{ifthen}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
+\archarrowset{compact}
 
 % Define a vibrant, brighter blue for all attention arrows
 \definecolor{archBrightBlue}{HTML}{3B82F6}
@@ -64,8 +65,10 @@
         line width=1.5pt,#3] #1 to[bend left=12] #2;
 }
 % \fusearrow{p1}{p2}{color} -- straight single-headed merge edge.
+% Line width matches \archflow's compact bucket (2.2pt) -- only the head
+% shape (3.0mm/2.5mm) stays distinct, to read as "merge" not "flow".
 \newcommand{\fusearrow}[3]{
-  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
+  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=2.2pt,#3] #1 -- #2;
 }
 
 % \tabpfnattn{x} -- Fully connected, right-side routed attention with cascading transparency
@@ -122,6 +125,13 @@
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
+% Whole picture scaled down 25% -- shrinks the native canvas (this figure
+% was needlessly tall/square vs. its arch_* siblings) and, since TikZ node
+% text is NOT rescaled by a canvas transform while everything else (boxes,
+% lines, gaps) is, it also makes text ~33% bigger relative to the geometry
+% once re-inflated to \linewidth on the page. Tune this one number if the
+% balance needs adjusting after a compile.
+\begin{scope}[scale=0.75]
 
   \pgfmathsetmacro{\xB}{\xA+\boxw+\panelgap}
   \pgfmathsetmacro{\boxAcenter}{\xA+\boxw/2}
@@ -178,7 +188,7 @@
 
     \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
-    \archarrow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{black!30}
+    \archflow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{neutral}
 
     \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
     \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
@@ -310,6 +320,8 @@
     \tabpfnattn{\xlblPatchBot}
 
   \end{scope}
+
+\end{scope}
 
 \end{tikzpicture}
 \end{document}

@@ -28,8 +28,10 @@ Iris~\cite{gaoShowSegmentUniversal2025} encodes the context pairs once into a
 compact task embedding per class, using pixel shuffle operations in its context
 encoder. The target interacts with the context only through this embedding, via
 a single bidirectional cross-attention step in the mask decoder, and the
-embedding is reused across queries. Inference is a single pass without
+embedding is reused across queries. Large volumes are processed via a sliding window approach, without
 refinement across scales.
+
+\todo{focus more on the single img-lbl fusion point}
 
 \paragraph{Coarse-to-fine approaches.}
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large

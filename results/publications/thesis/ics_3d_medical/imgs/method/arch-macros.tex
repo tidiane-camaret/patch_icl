@@ -168,3 +168,42 @@
 \newcommand{\archarrow}[3]{%
   \draw[-{Latex[length=2.4mm,width=2mm]},line width=2.2pt,#3] #1 -- #2;
 }
+
+% ---------------------------------------------------------------
+% Dataflow-arrow vocabulary -- opt-in via \archarrowset{compact|detailed},
+% called once near the top of a figure (after \input{arch-macros.tex}).
+% \archarrow keeps its classic small size by default for any arch_*.tex
+% figure that never calls \archarrowset -- this block is purely additive.
+%   \archflowstyle              -- current draw options (head + line
+%                                  width), for a hand-rolled elbow \draw
+%                                  that \archarrow's straight "--" can't
+%                                  express (e.g. "-|" routing)
+%   \archflowNeutral/Target/Context -- the only 3 colors a plain dataflow
+%                                  arrow should use: generic same-role
+%                                  passthrough; target's own real output
+%                                  leaving the decoder; a real label/mask
+%                                  tensor entering fusion or attention
+%                                  (context's ground truth, or target's
+%                                  own real prior fed back from a
+%                                  previous cascade level -- same role
+%                                  either way: real mask data, not a
+%                                  feature)
+%   \archflow{p1}{p2}{role}     -- \archarrow wrapper keyed by role name
+%                                  (role in {neutral, target, context})
+% ---------------------------------------------------------------
+\newcommand{\archarrowset}[1]{%
+  \ifthenelse{\equal{#1}{detailed}}{%
+    \def\archflowstyle{-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt}%
+  }{%
+    \def\archflowstyle{-{Latex[length=2.4mm,width=2mm]},line width=2.2pt}%
+  }%
+  \renewcommand{\archarrow}[3]{\draw[\archflowstyle,##3] ##1 -- ##2;}%
+}
+\newcommand{\archflowNeutral}{black!30}
+\newcommand{\archflowTarget}{archTargetAccent}
+\newcommand{\archflowContext}{archContextAccent}
+\newcommand{\archflow}[3]{%
+  \ifthenelse{\equal{#3}{target}}{\archarrow{#1}{#2}{\archflowTarget}}{%
+  \ifthenelse{\equal{#3}{context}}{\archarrow{#1}{#2}{\archflowContext}}{%
+  \archarrow{#1}{#2}{\archflowNeutral}}}%
+}

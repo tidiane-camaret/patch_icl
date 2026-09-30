@@ -34,6 +34,7 @@ This thesis addresses three questions that arise when building an efficient
     use a \emph{coarse-to-fine cascade} in which each level processes only the
     region localized by the previous level and receives that level's
     prediction as a prior (\autoref{sec:methodology-cascade}).
+  \todo{talk about query prior injection instead of localized processing}
   \item \textbf{Where can training data come from beyond the annotated classes?}
     Real image--mask pairs cover only the classes and appearance range of the
     training cohort. We generate additional training tasks with a
@@ -49,13 +50,13 @@ This thesis addresses three questions that arise when building an efficient
     We compare it with a compute-matched variant that merges both into a single
     token per cell, and with a dual U-Net cross-attention model initialized
     from Medverse.
-  \item A coarse-to-fine cascade that passes each level's prediction to the
+  \item A coarse-to-fine approach that passes each level's prediction to the
     next level as a prior and restricts fine-level processing to the localized
     region. We compare predicted priors with perturbed ground-truth priors, and
-    compare accuracy and latency with Medverse's autoregressive inference.
+    compare accuracy and latency with Medverse's coarse-to-fine approach.
   \item A synthetic task generator that paints procedural shapes onto real CT
     and MRI scans. We evaluate it against training on real data only and study
-    the effect of the canvas the shapes are painted on.
+    its effect on real tasks.
   \item An evaluation on nine datasets covering
     unseen tasks such as lesions, a non-anatomical target region, and MRI as a
     held-out modality.
@@ -66,5 +67,4 @@ This thesis addresses three questions that arise when building an efficient
 encoders and attention mechanisms the model builds on, and positions related methods with respect to the three
 questions above. \autoref{sec:methodology} describes the model.
 \autoref{sec:results} evaluates each component in turn.
-\autoref{sec:discussion} discusses the findings and their limitations, and
-\autoref{sec:conclusion} concludes.
+\autoref{sec:discussion} discusses the findings and their limitations.

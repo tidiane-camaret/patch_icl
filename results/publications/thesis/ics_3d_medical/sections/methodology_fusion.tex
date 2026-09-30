@@ -1,7 +1,7 @@
 % >>> begin sections/methodology_fusion.tex
 \subsection{Dual Attention}\label{sec:methodology-fusion}
 
-The attention layers have two jobs: combining image and label information, and
+The attention layers have two roles : combining image and label information, and
 matching the target against the context. In Medverse and Iris, these happen at
 fixed points in the network (\autoref{sec:fundamentals-relatedwork}).
 \autoref{fig:fusion-family} contrasts Medverse's design with the
@@ -9,7 +9,7 @@ shared-encoder design used in this thesis.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{arch_fusion_family.pdf}
+  \includegraphics[width=0.85\linewidth]{arch_fusion_family.pdf}
   \caption{Two ways of coupling target and context, shown for one context
   volume ($K{=}1$) and three of its $N$ tokens. Top: Medverse feeds the target
   image, and the context image and mask concatenated as channels, into two
@@ -26,9 +26,9 @@ shared-encoder design used in this thesis.
 \paragraph{Token array.}
 We arrange all tokens of a task in an array
 $Z \in \mathbb{R}^{S \times 2 \times D}$. Each of its $S$ rows corresponds to
-one cell of one volume or to one register token, and its two columns hold the
+one cell of one volume, and its two columns hold the
 image stream and the label stream (\autoref{sec:methodology-overview}). With
-$K+1$ volumes of $N$ cells and eight registers, $S = (K+1)N + 8$. Dual attention attends along
+$K+1$ volumes of $N$ cells, $S = (K+1)N$. Dual attention attends along
 each of the two axes of this array in turn, following the general pattern of
 the dual attention network of Fu et al.~\cite{fuDualAttentionNetwork2019},
 which combines position-wise and channel-wise attention for scene
@@ -82,8 +82,8 @@ Since attention is unmasked, the context tokens also depend on the target:
 the context is encoded anew for each target, rather than once per task as in
 Iris.
 
-\paragraph{Early-fusion baseline.}
-As a baseline, the early-fusion variant (\autoref{fig:fusion-axis}, top)
+\paragraph{Single-axis attention baseline.}
+As a baseline, the single-axis attention variant (\autoref{fig:fusion-axis}, top)
 merges the image and label token of each cell into a single token before the
 attention layers, using a pixel shuffle--unshuffle operation similar to the one
 Iris uses in its context encoder. The array then has a single column, and each
@@ -98,7 +98,7 @@ $W_{\text{img}}$? Otherwise the same block structure (RMSNorm, MLP, 12 heads)?}
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{arch_fusion_axis.pdf}
+  \includegraphics[width=0.85\linewidth]{arch_fusion_axis.pdf}
   \caption{The two variants of the shared-encoder design compared in
   \autoref{sec:results-fusion}, shown for one context volume and three of its
   $N$ cells. Top: early fusion (baseline). Image and label tokens are merged

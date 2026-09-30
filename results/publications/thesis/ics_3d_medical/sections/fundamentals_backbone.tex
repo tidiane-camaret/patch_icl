@@ -1,16 +1,8 @@
 \subsection{Volumetric Encoders and Attention}\label{sec:fundamentals-backbone}
 
 \paragraph{Convolutional volumetric backbones.}
-The 3D U-Net~\cite{cciccek20163d} and its self-configuring successor
-nnU-Net~\cite{isensee2021nnu} encode a volume into a feature pyramid with a
-downsampling encoder and decode it back to full resolution with a mirrored
-upsampling path. Skip connections pass fine spatial detail from the encoder to
-the decoder around the bottleneck. Deeper stages have lower spatial resolution
-and more channels, while shallow stages keep spatial detail at a low channel
-count. Our model uses this split directly: the coarse, high-channel stages feed
-the attention layers, and the fine stages are passed to the decoder as skip
-connections (\autoref{sec:methodology-overview}).
-UNETR~\cite{hatamizadeh2022unetr} is an earlier example of combining
+The 3D U-Net~\cite{cciccek20163d} architecture encodes a volume into a feature pyramid with a
+downsampling encoder and decodes it back to full resolution. Deeper stages have lower spatial resolution and more channels, while shallow stages keep spatial detail at a low channel count. Our model uses this split directly: the coarse, high-channel stages feed the attention layers, and the fine stages are passed to the decoder as skip connections (\autoref{sec:methodology-overview}). UNETR~\cite{hatamizadeh2022unetr} is an earlier example of combining
 transformer attention with a convolutional decoder for 3D segmentation.
 
 \paragraph{Attention.}
@@ -38,5 +30,4 @@ split into three parts, and each part is rotated according to the token's
 coordinate along one spatial axis. If these coordinates are given in physical
 units, i.e.\ scaled by the voxel spacing, attention between tokens from volumes
 of different resolution reflects their physical distance rather than their grid
-indices. Our cascade relies on this property, since its levels operate at
-different spacings (\autoref{sec:methodology-cascade}).
+indices. Our coarse-to-fine approach relies on this property, since its levels operate at different spacings (\autoref{sec:methodology-cascade}).

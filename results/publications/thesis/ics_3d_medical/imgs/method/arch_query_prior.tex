@@ -16,10 +16,9 @@
 % second (mask-like) lane, exactly like context always had.
 % ---------------------------------------------------------------------------
 
-% Bigger arrows than the shared default
-\renewcommand{\archarrow}[3]{%
-  \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,#3] #1 -- #2;
-}
+% Bigger arrows than the shared default -- shared \archflow vocabulary
+% (see arch-macros.tex), same "detailed" bucket as arch_patchset.tex
+\archarrowset{detailed}
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
@@ -36,10 +35,10 @@
       % ---- lane 0: target image (always real) ----
       \node[anchor=east,font=\normalsize] at (-0.2,6.15) {$I^t$};
       \archvolcube{0}{5.5}{1.15}{1.3}{archTargetGreen}{ct}{}
-      \archarrow{(1.25,6.15)}{(1.6,6.15)}{archArrowPale}
+      \archflow{(1.25,6.15)}{(1.6,6.15)}{neutral}
       \archfunnel{1.7}{5.5}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
       % Direct compact route to Attention
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (2.45,6.15) -| (3.1,5.0) -- (3.5,5.0);
+      \draw[\archflowstyle,\archflowNeutral] (2.45,6.15) -| (3.1,5.0) -- (3.5,5.0);
 
       % ---- lane 1: target PRIOR ----
       \ifthenelse{\equal{\L}{1}}{
@@ -47,27 +46,29 @@
         \fill[black!3] (0,3.8) rectangle (1.15, 5.1);
         \draw[black!25, dashed, line width=1.2pt] (0,3.8) rectangle (1.15, 5.1);
         \node[align=center, black!40] at (0.575, 4.45) {\archnote support\\mean};
-        % Ghosted routing arrow directly into Attention
-        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,black!20] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
+        % Ghosted routing arrow directly into Attention -- intentionally
+        % NOT \archflowContext: there is no real prior yet at L1
+        \draw[\archflowstyle,black!20] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
       }{
-        % Level 2: REAL prior cube (receives crop from Level 1)
+        % Level 2: REAL prior cube (receives crop from Level 1) -- a real
+        % mask-like tensor entering fusion, same role as context's mask
         \node[anchor=east,font=\normalsize] at (-0.2,4.45) {$\hat L^t_1$};
         \archvolcube{0}{3.8}{1.15}{1.3}{archTargetAccent}{predmask}{}
-        \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
+        \draw[\archflowstyle,\archflowContext] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
       }
 
       % ---- lane 2: context image (always real) ----
       \node[anchor=east,font=\normalsize] at (-0.2,2.75) {$I^c$};
       \archvolcube{0}{2.1}{1.15}{1.3}{archContextPink}{ct}{}
-      \archarrow{(1.25,2.75)}{(1.6,2.75)}{archArrowPale}
+      \archflow{(1.25,2.75)}{(1.6,2.75)}{neutral}
       \archfunnel{1.7}{2.1}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
       % Direct route to Attention
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (2.45,2.75) -- (3.5,2.75);
+      \draw[\archflowstyle,\archflowNeutral] (2.45,2.75) -- (3.5,2.75);
 
       % ---- lane 3: context mask (always real) ----
       \node[anchor=east,font=\normalsize] at (-0.2,0.9) {$L^c$};
       \archvolcube{0}{0.4}{1.15}{1.0}{archContextAccent}{predmask}{}
-      \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
+      \draw[\archflowstyle,\archflowContext] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
 
 
       % -------------------------------------------------------------------------
@@ -94,10 +95,10 @@
       % -------------------------------------------------------------------------
       % Output & Decoder Routing
       % -------------------------------------------------------------------------
-      \archarrow{(5.7, 4.55)}{(6.6, 4.55)}{archArrowPale}
-      
+      \archflow{(5.7, 4.55)}{(6.6, 4.55)}{target}
+
       \archfunnel{6.7}{3.9}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
-      \archarrow{(7.45, 4.55)}{(7.95, 4.55)}{archArrowPale}
+      \archflow{(7.45, 4.55)}{(7.95, 4.55)}{target}
       \archvolcube{8.05}{3.9}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
 
       % Level 1 specific Crop Bounding Box

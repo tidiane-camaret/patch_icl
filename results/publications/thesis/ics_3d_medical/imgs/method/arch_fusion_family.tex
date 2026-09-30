@@ -2,6 +2,7 @@
 \usepackage{ifthen}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
+\archarrowset{compact}
 
 % Define a vibrant, brighter blue for all attention arrows
 \definecolor{archBrightBlue}{HTML}{3B82F6}
@@ -104,8 +105,10 @@
   }
 }
 % \fusearrow{p1}{p2}{color} -- straight single-headed merge/passthrough edge.
+% Line width matches \archflow's compact bucket (2.2pt) -- only the head
+% shape (3.0mm/2.5mm) stays distinct, to read as "merge" not "flow".
 \newcommand{\fusearrow}[3]{
-  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=1.5pt,#3] #1 -- #2;
+  \draw[-{Latex[length=3.0mm,width=2.5mm]},line width=2.2pt,#3] #1 -- #2;
 }
 % \tabpfnattn{x} -- Fully connected, right-side routed attention with cascading transparency
 \newcommand{\tabpfnattn}[1]{
@@ -156,6 +159,13 @@
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
+% Whole picture scaled down 25% -- shrinks the native canvas (this figure
+% was needlessly tall/square vs. its arch_* siblings) and, since TikZ node
+% text is NOT rescaled by a canvas transform while everything else (boxes,
+% lines, gaps) is, it also makes text ~33% bigger relative to the geometry
+% once re-inflated to \linewidth on the page. Tune this one number if the
+% balance needs adjusting after a compile.
+\begin{scope}[scale=0.75]
 
   % ---- input-volume geometry, shared by BOTH panels for visual parity:
   % the same cube size, and the same left-edge x (\xIn), so Medverse's
@@ -248,8 +258,8 @@
     \archvolcube{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image (1ch)}
     \archvolcube{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ctmask}{image$\,\oplus\,$mask (2ch)}
 
-    \archarrow{({\xIn+\cubew+0.15},{\yTgt})}{({\bcx-0.55},{\yTgt})}{black!30}
-    \archarrow{({\xIn+\cubew+0.15},{\yCtx})}{({\bcx-0.55},{\yCtx})}{black!30}
+    \archflow{({\xIn+\cubew+0.15},{\yTgt})}{({\bcx-0.55},{\yTgt})}{neutral}
+    \archflow{({\xIn+\cubew+0.15},{\yCtx})}{({\bcx-0.55},{\yCtx})}{neutral}
 
     \archbowtie{\bcx}{\bcyTgt}{\bw}{\bh}{\bpinch}{archTargetGreen}{target U-Net}
     \archbowtie{\bcx}{\bcyCtx}{\bw}{\bh}{\bpinch}{archContextPink}{context U-Net}
@@ -271,7 +281,7 @@
 
     % predicted mask (target row only -- context's own decoder output is
     % internal, never exposed)
-    \archarrow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{archTargetAccent}
+    \archflow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{target}
     \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
@@ -339,8 +349,8 @@
     % ---- shared encoder: one funnel per row, same weights both rows --
     % image only, matching arch_query_prior.tex's cube->funnel->attention
     % routing
-    \archarrow{({\xCubeImg+\cubew+0.15},{\yTgt})}{({\xEnc-0.05},{\yTgt})}{black!30}
-    \archarrow{({\xCubeImg+\cubew+0.15},{\yCtx})}{({\xEnc-0.05},{\yCtx})}{black!30}
+    \archflow{({\xCubeImg+\cubew+0.15},{\yTgt})}{({\xEnc-0.05},{\yTgt})}{neutral}
+    \archflow{({\xCubeImg+\cubew+0.15},{\yCtx})}{({\xEnc-0.05},{\yCtx})}{neutral}
     \archfunnel{\xEnc}{{\yTgt-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
     \archfunnel{\xEnc}{{\yCtx-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
 
@@ -350,8 +360,8 @@
     % output arrow becomes an "img" token cluster once inside the box;
     % the "lbl" cluster beside it is gray/content-free for target's
     % placeholder prior, solid archContextAccent for context's real mask.
-    \archarrow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft-0.50},{\yTgt})}{black!30}
-    \archarrow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft-0.50},{\yCtx})}{black!30}
+    \archflow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft-0.50},{\yTgt})}{neutral}
+    \archflow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft-0.50},{\yCtx})}{neutral}
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},\yTgt+\clusterhalf+\boxpad);
@@ -363,7 +373,7 @@
     % context mask -> context "lbl" cluster, routed under the Fuse box
     % and up into the column from below (drawn now, before the column
     % background/tokens below, so those layer on top of its approach)
-    \draw[-{Latex[length=2.4mm,width=2mm]},line width=2.2pt,archContextAccent]
+    \draw[\archflowstyle,\archflowContext]
       ({\xCubeImg+\cubew+0.15},{\yMask}) -| ({\xlblTok},{\yCtx-\toff-\tsz/2-0.10});
 
     \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
@@ -385,8 +395,8 @@
     \fusearrow{({\xFuseOp+0.35},{\yTgt})}{({\xfusedTok-\tsz/2-0.18},{\yTgt})}{black!55}
     \fusearrow{({\xFuseOp+0.35},{\yCtx})}{({\xfusedTok-\tsz/2-0.18},{\yCtx})}{black!55}
 
-    \archarrow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yTgt})}{({\xB-0.20},{\yTgt})}{black!55}
-    \archarrow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yCtx})}{({\xB-0.20},{\yCtx})}{black!55}
+    \archflow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yTgt})}{({\xB-0.20},{\yTgt})}{neutral}
+    \archflow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yCtx})}{({\xB-0.20},{\yCtx})}{neutral}
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxwXattn},\yTgt+\clusterhalf+\boxpad);
@@ -410,12 +420,14 @@
     % only and never decoded, exactly like Medverse's context decoder
     % output above) -- OUTSIDE the xL wrapper, since decoding runs once,
     % after L layers of cross-attention, not once per layer
-    \archarrow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{archTargetAccent}
+    \archflow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{target}
     \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
-    \archarrow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{archTargetAccent}
+    \archflow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{target}
     \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
+
+\end{scope}
 
 \end{tikzpicture}
 \end{document}

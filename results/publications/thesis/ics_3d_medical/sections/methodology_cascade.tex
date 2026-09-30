@@ -52,8 +52,7 @@ previous prediction, at its centroid or at a random foreground point. The
 coarsest spacing is drawn per batch, and each finer spacing log-uniformly
 between the previous spacing and a lower bound, with a minimum ratio between
 levels. The prior is either the model's own prediction (predicted prior) or
-the ground truth, dilated or eroded, shifted, and with added Gaussian noise
-(perturbed ground-truth prior); \autoref{sec:results-cascade} compares both.
+the downsampled ground-truth mask; \autoref{sec:results-cascade} compares both.
 \todo[inline]{Values: $M$, spacing range, lower bound, minimum ratio,
 centroid vs.\ random-point probability, foreground threshold, perturbation
 magnitudes. Confirm inference always uses the centroid.}

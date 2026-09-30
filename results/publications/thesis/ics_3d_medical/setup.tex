@@ -25,6 +25,7 @@
 \sloppy
 
 % UTILITIES
+\usepackage{comment}
 \usepackage{tabularx}
 \usepackage{makecell}
 \usepackage{amsmath, amsthm, amsfonts, mathtools}
@@ -42,12 +43,14 @@
 \usepackage[labelfont=bf, labelsep=colon, format=hang]{caption} % Make image captions nicer
 \usepackage{subcaption} % side-by-side sub-figures (architecture comparisons)
 \usepackage{booktabs} % nicer tables
+\usepackage{longtable} % multi-page appendix tables
+\usepackage{multirow} % dataset-name column spanning its classes' rows
 \usepackage{listings} % to include code
 \renewcommand{\lstlistingname}{Algorithm}
 \lstset{keywordstyle=\bfseries}
 \lstset{commentstyle=\color{cd_blue}\bfseries}
 \usepackage[section]{placeins}  % To keep all figures inside there section
-\usepackage[stylemods=longextra, symbols, automake]{glossaries-extra}
+\usepackage[nomain]{glossaries-extra}
 \usepackage{pdfpages} % to include PDFs
 \usepackage[nottoc]{tocbibind}  % Add References and others to the table of contents
 \usepackage{orcidlink}  % ORCID is an unique identifier for scientists
