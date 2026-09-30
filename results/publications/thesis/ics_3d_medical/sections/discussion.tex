@@ -46,15 +46,16 @@ with 97\% for a box at the ground-truth centroid, and most of the remaining
 error at this step arises within the fine crops rather than from
 localization; the middle-to-finest step is not measured this way.
 
-The clearest advantage over Medverse is speed. Cascade is about 14 times faster
-than Medverse with the same number of refinement steps. The accuracy comparison
-depends on how Medverse is run. With matched steps, Cascade is more accurate on
-five of seven datasets; against Medverse at its native number of steps, it is
-more accurate on five of the nine datasets where a native run exists (FLARE22,
-HU\_LWK1, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
-better supported than the accuracy result, and the accuracy comparison on
-TotalSegmentator additionally depends on verifying Medverse's low scores
-there.
+The clearest advantage over Medverse is speed. Cascade is about 17 times faster
+than Medverse with the same number of refinement steps, sample-weighted over
+the six datasets where both latencies are measured. The accuracy comparison
+depends on how Medverse is run. With matched
+steps, Cascade is more accurate on seven of the ten datasets with a matched
+value; against Medverse at its native number
+of steps, it is more accurate on six of the same ten (FLARE22, HU\_LWK1,
+TotalSeg MRI, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
+better supported than the accuracy result. TotalSeg CT is not part of this
+comparison (\autoref{sec:results-cascade}).
 
 Training with the model's own predictions as prior worked better than training
 with perturbed ground-truth masks on the training distribution (99 of 117

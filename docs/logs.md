@@ -10790,3 +10790,71 @@ class overlap, so unlike TotalSeg CT/FLARE22 there's no seen/unseen split to rep
 them into the existing "mean of 5 held-out sources" row is a content decision (mean of 10? a
 second footnoted mean? drop the lesion-collapsed rows from the headline mean?), not just a data
 copy -- left as a TODO follow-up rather than decided unilaterally here.
+
+## 2026-09-30 — Cascade section (tab:cascade-medverse) gap-fill: 8 of 10 runs done, 2 incomplete
+
+Closed most of the second Cascade gap in `TODO.md` ((a) Medverse "matched" column missing for
+4 lesion datasets, (b) TotalSeg CT/MRI numbers in `tab:cascade-levels`/`tab:cascade-medverse`/
+`tab:cascade-ablation` untraceable to any archived run). Caught and fixed two real errors in the
+TODO's own proposed commands before running anything (both independently re-derived from wandb
+ground truth, then cross-checked against a live correction from the user):
+
+- **Ladders for shifts_ms/atlas_v2 were wrong in the TODO.** `2b_cascade_val`'s own run
+  descriptions show the published `tab:cascade-medverse` "Cascade" column actually used 2-level
+  ladders for isles22/shifts_ms/atlas_v2 (`[3,1.5]`, `[3,1.5]`, `[3.8,1.9]`), not the 3-level
+  `[6,3,1.5]`/`[6,3,1.9]` the TODO stated. Depth-matching Medverse to the wrong M would have
+  produced a comparison that LOOKS matched but isn't. Used M=2 -> image_size=256 for those three,
+  M=3 -> image_size=384 for gnc_kidney (genuinely 3-level, `[6,3,1.2]`, unchanged).
+- **`cascade.py` is a library module, not a script**; every archived cascade eval actually runs
+  through `experiments/3d/eval.py experiment=<config> ...`. Also `data.source=totalseg_mri` (with
+  underscore) is not a valid `data.source` value -- `common.py`'s `_source_root` only recognizes
+  `totalsegmri` (no underscore); `totalseg_mri` is only the Hydra *dataset-group* filename, valid
+  as `dataset=totalseg_mri` (composes a config that sets `data.source: totalsegmri` internally)
+  but not as a raw `data.source=` override layered on `experiment=146_...`.
+
+Also added, not in the TODO: `data.val_classes=all` forced explicitly on all 3 TotalSeg CT/MRI
+variants (our model already had it; `dataset=totalseg`'s own default is `val_classes: benchmark`
+and `dataset=totalseg_mri`'s is `val_classes: val` -- both subsets, which would have silently
+scored Medverse on a different class set than our model) and `train.cascade_loss_weights=[1,1,1]`
+on the two our-model runs (every archived 3-level cascade eval sizes this to match
+`len(cascade_spacings)`; the `146_...` experiment's own default is `[1,1]` from its 2-level
+training ladder).
+
+Checkpoint 146 resolved: wandb `wrwzs5fs` ->
+`3d_train/2026-09-24_146_cascade_randomfg_predprior_regoff/best.pt` (confirmed on disk, 445 MB).
+A smoke test of the riskiest novel combo (146 + `data.source=totalseg` override + the 3-level
+`cascade_loss_weights`) ran clean before committing to the full batch: cascade stitching behaved
+exactly as expected (6mm 0.394 -> 3mm 0.521 -> 1.5mm 0.576 mean Dice, monotonic improvement).
+
+**Results (8 of 10, finished):**
+
+| Run | Mean Dice | Mean NSD |
+|---|---|---|
+| Medverse matched, isles22 (M=2, img=256) | 0.059 | 0.070 |
+| Medverse matched, shifts_ms (M=2, img=256) | 0.098 | 0.136 |
+| Medverse matched, atlas_v2 (M=2, img=256) | 0.024 | 0.012 |
+| Medverse matched, gnc_kidney (M=3, img=384) | 0.007 | 0.005 |
+| Our model (146), TotalSeg CT, cascade [6,3,1.5] | 0.585 | 0.630 |
+| Our model (146), TotalSeg MRI, cascade [6,3,1.5] | 0.503 | 0.496 |
+| Medverse matched, TotalSeg MRI (img=384) | 0.055 | 0.043 |
+| Medverse native, TotalSeg MRI (img=256) | 0.072 | 0.059 |
+
+TotalSeg CT cascade levels (146): 6mm=0.394, 3mm=0.522, 1.5mm=0.576 (117 classes). TotalSeg MRI:
+6mm=0.365, 3mm=0.479, 1.5mm=0.495 (50 classes). Both monotonically improve coarse->fine as
+expected.
+
+**2 of 10 did not complete** (both `dataset=totalseg` + `eval.model=medverse`, i.e. the OLD v1
+`TotalSegInContextDataset` loader — matched/native at image_size 384/256): first attempt hit a
+real bug, `eval.workers=8` -> `TypeError: cannot pickle 'module' object` under the v1 loader's
+forkserver multiprocessing start (same class of issue as the known eval-CUDA-fork-crash gotcha;
+`eval.workers=0` is the workaround). The `eval.workers=0` retry was then killed mid-run by an
+unrelated session/environment teardown (hostname changed nora-odin -> nero mid-task, `/tmp`
+scratchpad wiped, GPU driver unreachable from the new session) before it could finish -- 3 total
+wandb attempts (`he9sznty` failed, `2b2lce79`/`pyubou99` crashed), none produced a Mean Dice.
+User said stop rather than re-retry a third time this session. **Not re-attempted** — TotalSeg CT
+Medverse matched/native cells remain open, see `TODO.md`.
+
+Saved to `results/publications/thesis/experiments/2d_cascade_medverse_gaps/` (`runs.json` incl.
+an `incomplete_runs` block recording the 3 failed wandb attempts, + `samples.csv` for the 8
+finished runs via `extract_run_results.py`). Not yet merged into `results_cascade.tex`'s
+`tab:cascade-levels`/`tab:cascade-medverse`/`tab:cascade-ablation` or their prose.

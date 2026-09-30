@@ -41,48 +41,75 @@ three factors at once, the result cannot be attributed to any one of them.
   \caption{Dice on the lesion datasets for successive synthetic-task
   configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
   shape families, all TotalSegmentator subjects as canvas, and a longer
-  training budget. Bold marks each dataset's best value across the four
-  configurations, not the winner of any single stage-to-stage comparison
-  (contrast \autoref{tab:synth-cascade-realhost}, where bold marks the best
-  model per row).}
+  training budget. Bold marks the best configuration per dataset, as in
+  \autoref{tab:synth-cascade-realhost}.}
   \label{tab:synth-realhost-ood}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Configuration & ISLES22 & Shifts-MS & ATLAS v2.0 & GNC\_705 \\
+    Dataset & Baseline & \makecell{1) Synthetic\\bank} & \makecell{2) Real host,\\scatter} & \makecell{3) Real host,\\all families} \\
     \midrule
-    Baseline                          & 0.050 & 0.008 & 0.028 & 0.082 \\
-    1) Synthetic bank, scatter field  & 0.045 & 0.011 & \textbf{0.033} & 0.070 \\
-    2) Real host, scatter field       & \textbf{0.098} & \textbf{0.058} & 0.032 & 0.105 \\
-    3) Real host, all families        & 0.087 & 0.051 & 0.027 & \textbf{0.223} \\
+    ISLES22    & 0.050 & 0.045 & \textbf{0.098} & 0.087 \\
+    Shifts-MS  & 0.008 & 0.011 & \textbf{0.058} & 0.051 \\
+    ATLAS v2.0 & 0.028 & \textbf{0.033} & 0.032 & 0.027 \\
+    GNC\_705   & 0.082 & 0.070 & 0.105 & \textbf{0.223} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & 0.063 & 0.057 & 0.084 & \textbf{0.153} \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the four datasets, weighted by each one's
+  own number of evaluated tasks (46 for Shifts-MS to 1490 for GNC\_705,
+  identical across all four configurations). GNC\_705 alone is 61\% of the
+  total weight, so this mean tracks GNC\_705 closely; the unweighted mean
+  (Baseline 0.042, stage 1 0.040, stage 2 0.073, stage 3 0.097) ranks the four
+  configurations the same way, but with a much smaller stage-3 lead.
 \end{table}
 
 \paragraph{Effect on TotalSegmentator.}
 \autoref{tab:synth-realhost-indist} reports TotalSegmentator validation Dice
-for the same checkpoints. Stages 1 and 2 change it by at most 0.012 in any
-column, so the gains of stage 2 on the lesion datasets do not reduce accuracy
-on the training distribution. Stage 3 improves all five values, from 0.418 to
-0.490 overall. Given its longer training budget, this gain likely reflects the
-additional training rather than the synthetic tasks themselves.
+for the same checkpoints, split by modality and class membership. Stages 1
+and 2 change it by at most 0.023 in any row (TotalSeg CT, unseen) relative to
+the baseline, so the gains of stage 2 on the lesion datasets do not reduce
+accuracy on the training distribution. Stage 3 improves all four values, and
+the sample-weighted mean rises from 0.434 to 0.505. Given its longer training
+budget, this gain likely reflects the additional training rather than the
+synthetic tasks themselves.
 
 \begin{table}[t]
   \centering
   \small
   \caption{TotalSegmentator validation Dice for the checkpoints of
-  \autoref{tab:synth-realhost-ood}, overall, by class membership (seen,
-  unseen), and by modality (MRI, CT).}
+  \autoref{tab:synth-realhost-ood}, by modality and class membership,
+  computed the same way as every other results table (macro: per-class mean,
+  then averaged over classes). This differs from an earlier version of this
+  table, whose MRI/CT rows were computed as a flat per-sample mean instead
+  (matching \texttt{train.py}'s own internal logging); under that
+  convention TotalSeg MRI scored below TotalSeg CT overall, but splitting
+  seen from unseen first, as here, reverses that (MRI-seen scores above
+  CT-seen at every stage) --- a composition effect, not a correction of an
+  error.}
   \label{tab:synth-realhost-indist}
-  \begin{tabular}{@{}lccccc@{}}
+  \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Configuration & All & Seen & Unseen & MRI & CT \\
+     & Baseline & \makecell{1) Synthetic\\bank} & \makecell{2) Real host,\\scatter} & \makecell{3) Real host,\\all families} \\
     \midrule
-    Baseline                          & 0.418 & 0.489 & 0.344 & 0.390 & 0.468 \\
-    1) Synthetic bank, scatter field  & 0.422 & 0.485 & 0.356 & 0.385 & 0.470 \\
-    2) Real host, scatter field       & 0.417 & 0.483 & 0.348 & 0.384 & 0.467 \\
-    3) Real host, all families        & \textbf{0.490} & \textbf{0.579} & \textbf{0.397} & \textbf{0.474} & \textbf{0.534} \\
+    TotalSeg CT, seen      & 0.479 & 0.476 & 0.474 & \textbf{0.572} \\
+    TotalSeg CT, unseen    & 0.326 & 0.348 & 0.337 & \textbf{0.385} \\
+    TotalSeg MRI, seen     & 0.505 & 0.500 & 0.498 & \textbf{0.590} \\
+    TotalSeg MRI, unseen   & 0.395 & 0.379 & 0.379 & \textbf{0.430} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & 0.434 & 0.435 & 0.430 & \textbf{0.505} \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the four rows, weighted by each one's own
+  number of evaluated tasks (155 for TotalSeg MRI, unseen to 273 for TotalSeg
+  MRI, seen, identical across all four configurations); the unweighted mean
+  (Baseline 0.426, stage 1 0.426, stage 2 0.422, stage 3 0.494) ranks the
+  configurations the same way, though Baseline and stage 1 are within 0.0002
+  of each other under either weighting and should be read as tied.
 \end{table}
 
 \paragraph{Cascade inference.}
@@ -91,8 +118,15 @@ training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
 uses no synthetic tasks, and with step-matched Medverse on the nine held-out
 datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
 NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
-($-0.012$), and differs by at most 0.011 on the other datasets. It remains
-below Medverse on MSD Hippocampus and NasalSeg. The two models differ in more
+($-0.012$), and differs by at most 0.011 on the other datasets. On the
+sample-weighted mean of the five non-lesion datasets, Synth + Cascade is
+highest (0.615), ahead of Medverse (0.552) and Cascade (0.531); this ordering
+is driven by MSD Hippocampus and NasalSeg, the two datasets where Cascade
+trails both other models by the largest margins. It remains
+below Medverse on MSD Hippocampus, NasalSeg, and Shifts-MS, where Medverse's
+step-matched result (0.098) is the best of the three despite this being one
+of the four lesion datasets that motivated the synthetic-task generator. The
+two models differ in more
 than the synthetic tasks: Synth + Cascade also uses register carry and a
 pooling token, and has a different training history. The differences can
 therefore not be attributed to the synthetic tasks alone.
@@ -102,27 +136,38 @@ therefore not be attributed to the synthetic tasks alone.
   \small
   \caption{Dice on the held-out datasets under cascade inference. Medverse:
   released weights, step-matched autoregressive inference
-  (\autoref{sec:results-cascade}); omitted where both models score too low to
-  be informative. Cascade and Synth + Cascade use the same per-dataset ladder
-  (identical sample counts confirmed for every dataset), so differences are
-  not a ladder confound; Medverse uses its own depth-matched ladder from
-  \autoref{tab:cascade-medverse}.}
+  (\autoref{sec:results-cascade}). Cascade and Synth + Cascade use the same
+  per-dataset ladder (identical sample counts confirmed for every dataset), so
+  differences are not a ladder confound; Medverse uses its own depth-matched
+  ladder from \autoref{tab:cascade-medverse}.}
   \label{tab:synth-cascade-realhost}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
     Dataset & Spacings (mm) & Cascade & Synth + Cascade & Medverse \\
     \midrule
-    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.124 & 0.020 \\
-    ISLES22         & $[3, 1.5]$       & 0.069 & \textbf{0.070} & -- \\
-    Shifts-MS       & $[3, 1.5]$       & \textbf{0.031} & 0.019 & -- \\
-    ATLAS v2.0      & $[3.8, 1.9]$     & 0.026 & \textbf{0.032} & -- \\
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.743 & 0.359 \\
     MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.375} & 0.372 & 0.357 \\
     MSD Hippocampus & $[0.5]$          & 0.303 & 0.518 & \textbf{0.686} \\
-    GNC\_705        & $[6, 3, 1.2]$    & 0.024 & \textbf{0.035} & -- \\
-    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.743 & 0.359 \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.124 & 0.020 \\
     NasalSeg        & $[1.5, 0.8]$     & 0.547 & 0.644 & \textbf{0.737} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & & 0.531 & \textbf{0.615} & 0.552 \\
+    \midrule
+    ISLES22         & $[3, 1.5]$       & 0.069 & \textbf{0.070} & 0.059 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.031 & 0.019 & \textbf{0.098} \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & 0.026 & \textbf{0.032} & 0.024 \\
+    GNC\_705        & $[6, 3, 1.2]$    & 0.024 & \textbf{0.035} & 0.007 \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the five datasets above the second
+  midrule, each weighted by its own number of evaluated tasks (36 for
+  HU\_LWK1 to 650 for FLARE22, identical across all three models here); the
+  unweighted mean-of-datasets ranks the three models the same way (Cascade
+  0.426, Synth + Cascade 0.480, Medverse 0.432). The four lesion datasets
+  below the second midrule are excluded (all three models score below 0.1 on
+  every one of them).
 \end{table}
 
 The gain on GNC\_705 at a single level (0.223,
@@ -156,4 +201,66 @@ search), instead of the reference to
 \texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
 uses ground-truth-centered crops, the drop may mainly reflect the loss of
 ground-truth localization; state which is the case.}
+
+\paragraph{Final comparison: Synth + Cascade vs.\ Medverse.}
+\autoref{tab:synth-cascade-medverse-final} adds NSD and latency to the Dice
+comparison above, restricted to our best cascade configuration, Synth +
+Cascade, against step-matched Medverse. On the sample-weighted mean of the
+five non-lesion datasets, Synth + Cascade leads on both Dice (0.615 vs.\
+0.552) and NSD (0.729 vs.\ 0.631) while being $15\times$ faster (179 vs.\
+2697\,ms per sample), consistent with the $15$--$17\times$ latency gap already
+reported for Cascade in \autoref{sec:results-cascade}. NSD moves in the same
+direction as Dice on seven of the nine datasets; the exceptions are
+Shifts-MS, where Medverse's Dice lead (0.098 vs.\ 0.019) is even larger on NSD
+(0.136 vs.\ 0.123), and ATLAS v2.0, where Synth + Cascade's Dice lead (0.032
+vs.\ 0.024) is much larger still on NSD (0.044 vs.\ 0.012). On the four lesion
+datasets, absolute scores stay below 0.1 Dice for both models on every one of
+them, and Medverse is faster only on MSD Hippocampus, the one dataset run at a
+single level rather than a cascade.
+\autoref{tab:synth-cascade-medverse-perclass} in the appendix breaks this
+comparison down to every individual class on all nine datasets.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Final comparison, Synth + Cascade (ours) vs.\ Medverse: Dice, NSD,
+  and mean latency per sample on all nine held-out datasets. Medverse:
+  released weights, autoregressive inference with its number of steps matched
+  to our number of levels per dataset (\autoref{sec:results-cascade}). Bold
+  marks the best value per row for Dice and NSD; latency is bolded only in
+  the sample-weighted mean row. MV: Medverse.}
+  \label{tab:synth-cascade-medverse-final}
+  \begin{tabular}{@{}lccc c cc c cc@{}}
+    \toprule
+    & & \multicolumn{2}{c}{Dice} & & \multicolumn{2}{c}{NSD} & & \multicolumn{2}{c}{Latency (ms)} \\
+    \cmidrule(lr){3-4} \cmidrule(lr){6-7} \cmidrule(lr){9-10}
+    Dataset & Spacings (mm) & Ours & MV & & Ours & MV & & Ours & MV \\
+    \midrule
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.743} & 0.359 & & \textbf{0.775} & 0.333 & & 274 & 4894 \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.372} & 0.357 & & \textbf{0.314} & 0.300 & & 278 & 5013 \\
+    MSD Hippocampus & $[0.5]$          & 0.518 & \textbf{0.686} & & 0.753 & \textbf{0.905} & & 97  & 50   \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.124} & 0.020 & & \textbf{0.049} & 0.029 & & 407 & 5336 \\
+    NasalSeg        & $[1.5, 0.8]$     & 0.644 & \textbf{0.737} & & 0.791 & \textbf{0.844} & & 106 & 1886 \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & & \textbf{0.615} & 0.552 & & \textbf{0.729} & 0.631 & & \textbf{179} & 2697 \\
+    \midrule
+    ISLES22         & $[3, 1.5]$       & \textbf{0.070} & 0.059 & & \textbf{0.086} & 0.070 & & 145 & 1894 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.019 & \textbf{0.098} & & 0.123 & \textbf{0.136} & & 272 & 1911 \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & \textbf{0.032} & 0.024 & & \textbf{0.044} & 0.012 & & 151 & 1862 \\
+    GNC\_705        & $[6, 3, 1.2]$    & \textbf{0.035} & 0.007 & & \textbf{0.044} & 0.005 & & 225 & 4874 \\
+    \bottomrule
+  \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the five datasets above the second
+  midrule, each weighted by its own number of evaluated tasks (36 for
+  HU\_LWK1 to 650 for FLARE22, identical across both models here); the
+  unweighted mean-of-datasets ranks the two models the same way on every
+  metric (Dice: Synth + Cascade 0.480, Medverse 0.432. NSD: 0.536, 0.482.
+  Latency: 232, 3436\,ms). The four lesion datasets below the second midrule
+  are excluded from the means (both models score below 0.1 Dice on every one
+  of them). Dice and NSD are macro (per-class mean, then averaged over
+  classes, as in \autoref{sec:results-setup}); latency is a flat mean over
+  samples.
+\end{table}
 

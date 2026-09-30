@@ -83,7 +83,70 @@ Dataset config names (`configs/experiment/3d/dataset/*.yaml`): `atlas_v2`,
   near-collapse (Dice 0.01–0.11) unlike NasalSeg's 0.27–0.43. Needs an
   authorial decision, not just pasting numbers in.
 
-### Cascade (results_cascade.tex, tab:cascade-medverse) — 10 runs
+### Cascade (results_cascade.tex, tab:cascade-medverse) — 8 of 10 runs done
+
+- [x] Run 2026-09-29/30 — 8 of 10 finished cleanly. Numbers + per-case CSV in
+  `experiments/2d_cascade_medverse_gaps/` (`runs.json` + `samples.csv`); full
+  writeup incl. the two ladder/command corrections caught before launching
+  (shifts_ms/atlas_v2 are actually 2-level not 3-level; `cascade.py` isn't a
+  standalone script; `data.source=totalsegmri` not `totalseg_mri`) in
+  `docs/logs.md` 2026-09-30 ("Cascade section (tab:cascade-medverse) gap-fill").
+- [x] **2026-10-01: TotalSeg CT decided out of scope for the final paper.**
+  Commented out (not deleted) the TotalSeg CT row in `tab:cascade-levels`,
+  `tab:cascade-medverse`, and `tab:medverse-matched-native`, and recomputed
+  the sample-weighted means that changed: `tab:cascade-medverse`'s Mean row
+  is now Ours 0.526 (was 0.545 with CT)/Medverse 0.393 unchanged (Medverse
+  never had a CT value to begin with, so its mean's scope didn't move), both
+  over the same 6 datasets; the 17x latency ratio was already scoped to
+  those same 6 so it didn't change. All affected prose updated (win-counts,
+  the training-data caveat, the qualitative-figures intro, the example in
+  "Accuracy across levels"). This makes item below **moot for
+  `tab:cascade-medverse`** — no need to re-attempt those 2 runs for this
+  table. (The raw data, if ever wanted again: our own model's TotalSeg CT
+  cascade run is done — see `experiments/2d_cascade_medverse_gaps/`; Medverse's
+  matched/native cells there never completed, see the old retry command
+  below, kept for reference only.)
+- [x] Merged 2026-09-30 into `tab:cascade-levels`/`tab:cascade-medverse`/
+  `tab:cascade-ablation` + all affected prose (win-counts, the 14x→17x speed
+  ratio, the stale "0.103/0.038" Medverse-Dice todo, `discussion.tex`,
+  `conclusion.tex`). Also filled the Medverse column in
+  `results_synth.tex`'s `tab:synth-cascade-realhost` for the 4 lesion datasets
+  (was `--`) — worth noting: Medverse actually **beats both our models** on
+  Shifts-MS there (0.098 vs.\ 0.031/0.019), now reflected in that section's
+  prose too.
+- [ ] **Still open — checkpoint 145 / `tab:cascade-ablation`, not affected
+  by the scoping decision above**: `tab:cascade-ablation` still shows a
+  TotalSeg CT row (0.543/0.585) and was *not* asked to drop it, so checkpoint
+  145's TotalSeg CT/MRI numbers are still exactly as untraceable as 146's
+  were before 2026-09-30 — same missing-archived-run problem, just on the
+  other checkpoint, and still worth fixing (or also commenting out, if that
+  table gets the same treatment later). Needs the same treatment:
+  `experiments/3d/eval.py experiment=145_cascade_randomfg_gtprior_regoff
+  ...` with the corrected `data.source=totalseg`/`totalsegmri`,
+  `data.cascade_spacings=[6,3,1.5]`, `data.val_classes=all`,
+  `train.cascade_loss_weights=[1,1,1]` recipe already worked out for 146.
+
+<details>
+<summary>Superseded retry command for TotalSeg CT's Medverse cells (kept for reference only — moot per the scoping decision above, unless TotalSeg CT is ever reinstated)</summary>
+
+`medverse_depthmatched_totalseg` and `medverse_native_totalseg` (TotalSeg CT,
+`dataset=totalseg` + Medverse — the old v1 loader) never completed. First hit
+a real bug (`eval.workers=8` → `TypeError: cannot pickle 'module' object`
+under v1's forkserver start; `eval.workers=0` is the fix). The `workers=0`
+retry was then killed mid-run by an unrelated session/environment teardown
+(3 wandb attempts total, none produced a Dice).
+```
+experiments/3d/eval.py dataset=totalseg eval.model=medverse data.p_synth=0 \
+  data.image_size=[384,384,384] data.val_classes=all eval.autocast=true \
+  eval.batch_size=2 eval.workers=0 eval.split=test eval.n_subjects=null
+experiments/3d/eval.py dataset=totalseg eval.model=medverse data.p_synth=0 \
+  data.image_size=[256,256,256] data.val_classes=all eval.autocast=true \
+  eval.batch_size=2 eval.workers=0 eval.split=test eval.n_subjects=null
+```
+</details>
+
+<details>
+<summary>Original task note (kept for the resolved command corrections)</summary>
 
 **(a) 4 runs — Medverse "matched" column for the 4 added lesion datasets.**
 ISLES22/Shifts-MS/ATLAS v2.0/GNC\_705 now appear in `tab:cascade-medverse`
@@ -172,6 +235,8 @@ sample-weighted 209.2\,ms (MSD Hippocampus and NasalSeg have large sample
 counts and low latency, pulling the weighted mean down substantially). Same
 reweighting already applied to Fusion's `tab:fusion-staircase` "Mean of 10
 held-out sources" row — see that table's footnote for the method.
+
+</details>
 
 ### Synth (results_synth.tex, tab:synth-cascade-realhost) — 2 runs
 
