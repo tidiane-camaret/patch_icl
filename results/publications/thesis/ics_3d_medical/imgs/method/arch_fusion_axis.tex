@@ -12,14 +12,15 @@
 % panels, stacked, both members of that same family (only the fusion axis
 % differs between them):
 %
-% Baseline (top): 1x Fuse (image/label tokens merged once per cell by one
-% shared operator -- concat / sum / MLP / pixel-shuffle, drawn as a single
-% oplus) followed by Lx Position axis -- fusion happens once, position-axis
-% attention repeats for L layers, so only the Position-axis box carries the
-% "xL" mark.
-% Ours (bottom): the WHOLE pair (modality axis -> position axis) repeats as
-% one layer, Lx -- so both boxes sit inside one outer dashed wrapper that
-% carries the single "xL" mark for the pair.
+% Single axis attention (top): 1x Fuse (image/label tokens merged once per
+% cell by one shared operator -- concat / sum / MLP / pixel-shuffle, drawn
+% as a single oplus) followed by Lx Position axis -- fusion happens once,
+% position-axis attention repeats for L layers, so only the Position-axis
+% box carries the "xL" mark. Only one axis (position) is ever attention.
+% Dual attention (bottom): the WHOLE pair (modality axis -> position axis)
+% repeats as one layer, Lx -- so both boxes sit inside one outer dashed
+% wrapper that carries the single "xL" mark for the pair. Both axes
+% (modality and position) are attention.
 %
 % Style follows TabPFN's Fig. 1 (Hollmann et al., Nature 2024): small token
 % grids connected by simple curved double-arrows rather than full
@@ -162,14 +163,7 @@
   % =========================================================================
   \begin{scope}[yshift=0cm]
 
-    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
-    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
-
-    % Group title, spanning both panels
-    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY+0.80})
-      {\archtitle Shared encoder + cross-attn};
-
-    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY}) {\archboxlabel Baseline: early fusion};
+    \node[anchor=south] at ({\xA+(\xB+\boxw-\xA)/2},{\methodTitleY}) {\archboxlabel Single axis attention};
 
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeftBase},{\outerBot}) rectangle ({\outerRightBase},{\outerTop});
@@ -186,15 +180,15 @@
 
     \archarrow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{black!30}
 
-    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.25) {lbl};
-    \node[anchor=south,font=\normalsize] at (\xFusedTop,\yTgt+\clusterhalf+0.25) {fused};
-    \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {fused};
+    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
 
     \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
-      \fill[black!15,rounded corners=3pt]
-        ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
-        ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+      \foreach \y in {\yTgt, \yCtx} {
+        \fill[black!15,rounded corners=3pt]
+          ({\x-\tsz/2-0.18},{\y-\toff-\tsz/2-0.10}) rectangle
+          ({\x+\tsz/2+0.18},{\y+\toff+\tsz/2+0.10});
+      }
     }
 
     \foreach \y in {\yTgt,\yCtx} {
@@ -215,8 +209,10 @@
       \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
     }
 
-    \node[font=\huge] at ({\xFuseOp},{\yMid}) {$\oplus$};
-    \fusearrow{({\xFuseArrowStart},{\yMid})}{({\xFusedTop-\tsz/2-0.18},{\yMid})}{black!55}
+    \node[font=\huge] at ({\xFuseOp},{\yTgt}) {$\oplus$};
+    \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
+    \fusearrow{({\xFuseArrowStart},{\yTgt})}{({\xFusedTop-\tsz/2-0.18},{\yTgt})}{black!55}
+    \fusearrow{({\xFuseArrowStart},{\yCtx})}{({\xFusedTop-\tsz/2-0.18},{\yCtx})}{black!55}
 
     \tabpfnattn{\xFusedPatchTop}
 
@@ -235,30 +231,51 @@
   % =========================================================================
   \begin{scope}[yshift=-9.5cm]
 
-    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
-    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+    % Compact, panel-local geometry: unlike the Baseline panel above, the
+    % two axes here are one paired operation per layer, not two sequential
+    % stages -- so there is no connecting arrow between them, and both
+    % boxes (and the outer wrapper) are narrowed to just what their own
+    % content needs, rather than sharing \boxw/\panelgap with Baseline.
+    % Position axis matches Modality axis's width, with its pair of
+    % columns (and the \tabpfnattn fan hanging off \xlblPatchBot) centered
+    % the same way Modality axis's own img/lbl pair is.
+    \pgfmathsetmacro{\boxwMod}{3.8}
+    \pgfmathsetmacro{\boxwPos}{\boxwMod}
+    \pgfmathsetmacro{\gapOurs}{0.8}
+    % Now that this panel is narrower than Baseline's, re-center it (as a
+    % whole) under Baseline's overall span instead of sharing Baseline's
+    % left edge \xA -- otherwise it reads as left-hung, not a sibling panel.
+    \pgfmathsetmacro{\topCenter}{(\xA+\outerRightBase)/2}
+    \pgfmathsetmacro{\xC}{\topCenter-(\boxwMod+\gapOurs+\boxwPos)/2}
+    \pgfmathsetmacro{\outerLeft}{\xC-0.50}
+    \pgfmathsetmacro{\xD}{\xC+\boxwMod+\gapOurs}
+    \pgfmathsetmacro{\boxCcenter}{\xC+\boxwMod/2}
+    \pgfmathsetmacro{\boxDcenter}{\xD+\boxwPos/2}
+    \pgfmathsetmacro{\outerRight}{\xD+\boxwPos+0.50}
+    \pgfmathsetmacro{\ximgBot}{\boxCcenter-\colpitch/2}
+    \pgfmathsetmacro{\xlblBot}{\ximgBot+\colpitch}
+    \pgfmathsetmacro{\ximgPatchBot}{\boxDcenter-\pairpitch/2}
+    \pgfmathsetmacro{\xlblPatchBot}{\ximgPatchBot+\pairpitch}
 
-    \node[anchor=south] at ({\xC+(\xD+\boxw-\xC)/2},{\methodTitleY}) {\archboxlabel Ours: dual attn.};
+    \node[anchor=south] at ({(\outerLeft+\outerRight)/2},{\methodTitleY}) {\archboxlabel Dual attention};
 
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxw},\yTgt+\clusterhalf+\boxpad);
+      (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxwMod},\yTgt+\clusterhalf+\boxpad);
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxw},\yTgt+\clusterhalf+\boxpad);
+      ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxwPos},\yTgt+\clusterhalf+\boxpad);
 
     \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Modality axis};
     \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Position axis};
 
     \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
-    \archarrow{({\xC+\boxw+0.50},{\yMid})}{({\xD-0.50},{\yMid})}{black!30}
-
-    \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.25) {lbl};
-    \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.25) {lbl};
+    \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
 
     \fill[black!15,rounded corners=3pt]
       ({\ximgBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle

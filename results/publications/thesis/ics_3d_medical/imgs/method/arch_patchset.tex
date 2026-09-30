@@ -9,6 +9,56 @@
   \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,#3] #1 -- #2;
 }
 
+% Same dual-attention arrow vocabulary as arch_fusion_axis.tex's "Dual
+% attention" panel: \dblarrow for the Modality-axis pairwise edges,
+% \tabpfnattn for the Position-axis fully-connected fan.
+\definecolor{archBrightBlue}{HTML}{3B82F6}
+
+% \dblarrow{p1}{p2}{color} -- curved double-headed attention edge.
+% Thinner arrowheads than arch_fusion_axis.tex's original -- Position
+% axis's fan (below) packs many overlapping arrows into a tight space,
+% and the bigger heads made individual edges impossible to tell apart.
+\newcommand{\dblarrow}[3]{
+  \draw[{Latex[length=1.8mm,width=1.5mm]}-{Latex[length=1.8mm,width=1.5mm]},
+        line width=1.5pt,#3] #1 to[bend left=12] #2;
+}
+
+% \tabpfnattn{x} -- fully connected, right-side routed attention with
+% cascading transparency. Expects \tsz/\toff/\yTgt/\yCtx defined to match
+% whichever token grid it is anchored to.
+\newcommand{\tabpfnattn}[1]{
+  \def\attnstyle{[{Latex[length=1.8mm,width=1.5mm]}-{Latex[length=1.8mm,width=1.5mm]}, line width=1.5pt, archBrightBlue]}
+  \def\ax{#1+\tsz/2+0.05}
+
+  \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=30] (\ax, \yTgt);
+  \draw\attnstyle (\ax, \yTgt)       to[bend left=30] (\ax, \yTgt-\toff);
+  \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=30] (\ax, \yCtx+\toff);
+  \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=30] (\ax, \yCtx);
+  \draw\attnstyle (\ax, \yCtx)       to[bend left=30] (\ax, \yCtx-\toff);
+
+  \begin{scope}[opacity=0.6]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=45] (\ax, \yTgt-\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=45] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=45] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yCtx+\toff) to[bend left=45] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.3]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=60] (\ax, \yCtx+\toff);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=60] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt-\toff) to[bend left=60] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.15]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=75] (\ax, \yCtx);
+    \draw\attnstyle (\ax, \yTgt)       to[bend left=75] (\ax, \yCtx-\toff);
+  \end{scope}
+
+  \begin{scope}[opacity=0.08]
+    \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=90] (\ax, \yCtx-\toff);
+  \end{scope}
+}
+
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
 
@@ -45,50 +95,65 @@
 
   % ---- dual attention block ----
   % Centered arrow entering the block
-  \archarrow{(8.80,3.9375)}{(9.30,3.9375)}{archArrowPale}
-  
-  % Outer Attention wrapper
-  \draw[archAttnBlue!70!black,thin,dashed] (9.30, 2.10) rectangle (14.80, 6.30);
-  \node[align=center] at (12.05,6.60) {\archboxlabel dual\\attention};
+  \archarrow{(8.80,3.9375)}{(9.00,3.9375)}{archArrowPale}
+
+  % Outer Attention wrapper -- same green dashed/filled box as
+  % arch_fusion_axis.tex's "Dual attention" panel wrapper (grown 0.3 on
+  % every side beyond the two inner boxes for more breathing room).
+  % Vertically centered on 3.9375 -- the seam where the pre-attention Ctx
+  % and Tgt token stacks meet outside the block, and where the entry/exit
+  % connector arrows above/below already sit -- not an arbitrary center.
+  \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
+    (9.00, 1.5375) rectangle (15.10, 6.3375);
+  \node[align=center] at (12.05,6.6375) {\archboxlabel dual\\attention};
+
+  % Row geometry shared by both sub-blocks below -- cell/gap grown from
+  % 0.5 to 0.65 (1.3x) so the token stacks scale up along with the boxes
+  % instead of floating small inside them. Centered on 3.9375 (see note
+  % on the outer wrapper above), not the green box's own midpoint.
+  \def\tsz{0.65}
+  \def\toff{0.65}
+  \def\yTgt{4.9125}
+  \def\yCtx{2.9625}
 
   % --- Sub-block 1: Modality axis ---
-  % Box width is 2.5
-  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.45, 2.25) rectangle (11.95, 5.60);
-  
-  % Smaller inner tokens spread out to allow roomy arrows
-  \archtokengrid{9.65}{3.9375}{3}{1}{0.5}{archTargetGreen!40!white}
-  \archtokengrid{11.25}{3.9375}{3}{1}{0.5}{black!15}
-  \archtokengrid{9.65}{2.4375}{3}{1}{0.5}{archContextPink!40!white}
-  \archtokengrid{11.25}{2.4375}{3}{1}{0.5}{archContextAccent!40!white}
-  
-  % Horizontal bidirectional arrows merging image and label axes
-  \foreach \y in {2.6875, 3.1875, 3.6875, 4.1875, 4.6875, 5.1875} {
-    \draw[{Latex[length=1.5mm,width=1.5mm]}-{Latex[length=1.5mm,width=1.5mm]}, line width=1pt, black!50] (10.25, \y) -- (11.15, \y);
+  % Grown to a 0.20 margin from the green box on every outer-facing side
+  % (left/top/bottom) -- the boundary with Position axis stays put, so the
+  % two boxes nearly fill the wrapper without changing their shared gap.
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (9.20, 1.7375) rectangle (11.95, 6.1375);
+
+  % img/lbl columns widened and recentered in the bigger box (0.325
+  % padding to each side edge, matching the new cell half-width)
+  \archtokengrid{9.85}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
+  \archtokengrid{11.30}{3.9375}{3}{1}{0.65}{black!15}
+  \archtokengrid{9.85}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
+  \archtokengrid{11.30}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
+
+  % Modality-axis edges: same \dblarrow as arch_fusion_axis.tex
+  \foreach \doff in {-\toff,0,\toff} {
+    \dblarrow{({9.85+\tsz/2+0.13},{\yCtx+\doff})}{({11.30-\tsz/2-0.13},{\yCtx+\doff})}{archBrightBlue}
+    \dblarrow{({9.85+\tsz/2+0.13},{\yTgt+\doff})}{({11.30-\tsz/2-0.13},{\yTgt+\doff})}{archBrightBlue}
   }
 
   % --- Sub-block 2: Position axis ---
-  % Box width is 2.5 (identical to sub-block 1)
-  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (12.15, 2.25) rectangle (14.65, 5.60);
+  % Same 0.20 margin, grown outward (right/top/bottom) to match
+  \draw[black!20, fill=white, rounded corners=4pt, line width=0.8pt] (12.15, 1.7375) rectangle (14.90, 6.1375);
+
+  % Columns still grouped tighter (0.80 apart, vs. Modality's 1.45) to
+  % leave the \tabpfnattn fan room to bulge into on the right
+  \archtokengrid{12.50}{3.9375}{3}{1}{0.65}{archTargetGreen!40!white}
+  \archtokengrid{13.30}{3.9375}{3}{1}{0.65}{black!15}
+  \archtokengrid{12.50}{1.9875}{3}{1}{0.65}{archContextPink!40!white}
+  \archtokengrid{13.30}{1.9875}{3}{1}{0.65}{archContextAccent!40!white}
   
-  % Smaller inner tokens grouped tighter to make room for fan arrows
-  \archtokengrid{12.35}{3.9375}{3}{1}{0.5}{archTargetGreen!40!white}
-  \archtokengrid{13.05}{3.9375}{3}{1}{0.5}{black!15}
-  \archtokengrid{12.35}{2.4375}{3}{1}{0.5}{archContextPink!40!white}
-  \archtokengrid{13.05}{2.4375}{3}{1}{0.5}{archContextAccent!40!white}
-  
-  % Vertical bezier fan arrows connecting Target rows to Context rows
-  \foreach \yt/\yc/\bulge in {
-    4.1875/3.6875/0.25, 4.1875/3.1875/0.40, 4.1875/2.6875/0.55,
-    4.6875/3.6875/0.40, 4.6875/3.1875/0.55, 4.6875/2.6875/0.70,
-    5.1875/3.6875/0.55, 5.1875/3.1875/0.70, 5.1875/2.6875/0.85
-  } {
-    \draw[{Latex[length=1.5mm,width=1.2mm]}-{Latex[length=1.5mm,width=1.2mm]}, line width=0.8pt, archTargetAccent!70!white]
-      (13.65,\yc) .. controls +(\bulge,0.1) and +(\bulge,-0.1) .. (13.65,\yt);
-  }
+  % Position-axis fan: same \tabpfnattn as arch_fusion_axis.tex, anchored
+  % directly off the (now wider) lbl column -- leaves ~1.2 units of
+  % clearance to the box's right edge for the fan to bulge into.
+  \tabpfnattn{13.30}
 
   % ---- post-attention output grids ----
   % Centered arrow exiting the block
-  \archarrow{(14.90,3.9375)}{(15.40,3.9375)}{archArrowPale}
+  \archarrow{(15.20,3.9375)}{(15.40,3.9375)}{archArrowPale}
   
   % Output token grids maintaining the lighter tone from inside attention
   \archtokengrid{15.50}{3.9375}{3}{1}{0.875}{archTargetGreen!40!white}

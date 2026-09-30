@@ -37,24 +37,33 @@
 %
 % The generic panel below starts from the SAME kind of input cube as
 % Medverse above (parity), at the same x so the two line up across the
-% divider -- but only ONE cube, the image, since only the image goes
-% through the (shared, real, multi-stage) encoder; the label/prior/mask
-% never does -- it is a much simpler per-cell embedding, not something
-% worth drawing its own cube+encoder pipeline for. The encoder is a
-% funnel (\archfunnel), same visual language as arch_query_prior.tex's
-% Enc/Dec icons. Label evidence re-enters at a Fuse box right after the
-% encoder -- the SAME token-cluster + oplus element the original
-% arch_biaxial.tex Baseline panel used (img tokens, lbl tokens, oplus,
-% fused tokens), not a bespoke drawing: the encoder's single output
-% arrow becomes an "img" token cluster (\tpcluster) once inside the box,
-% a separate "lbl" cluster sits beside it (gray/content-free for
-% target's placeholder prior, solid archContextAccent for context's real
-% mask), and oplus feeds a split "fused" cluster (\tpclustersplit) --
-% the SAME cluster then reappears inside the "Attn." (cross-attention)
-% box, carried over by one more arrow, exactly like the old Fuse->Patch-
-% axis pair did. HOW exactly the combination happens (concat / sum / MLP
-% / attention) is deliberately left generic here -- that is exactly what
+% divider -- but only ONE cube per row goes through the encoder, the
+% image, since only the image goes through the (shared, real,
+% multi-stage) encoder; the label/prior/mask never does -- it is a much
+% simpler per-cell embedding, not something worth drawing its own
+% cube+encoder pipeline for. The encoder is a funnel (\archfunnel), same
+% visual language as arch_query_prior.tex's Enc/Dec icons. Label
+% evidence re-enters at a Fuse box right after the encoder -- the SAME
+% token-cluster + oplus element the original arch_biaxial.tex Baseline
+% panel used (img tokens, lbl tokens, oplus, fused tokens), not a
+% bespoke drawing: the encoder's single output arrow becomes an "img"
+% token cluster (\tpcluster) once inside the box, a separate "lbl"
+% cluster sits beside it (gray/content-free for target's placeholder
+% prior, solid archContextAccent for context's real mask), and oplus
+% feeds a split "fused" cluster (\tpclustersplit) -- the SAME cluster
+% then reappears inside the "Attn." (cross-attention) box, carried over
+% by one more arrow, exactly like the old Fuse->Patch-axis pair did. HOW
+% exactly the combination happens (concat / sum / MLP / attention) is
+% deliberately left generic here -- that is exactly what
 % arch_fusion_axis.tex reveals next.
+%
+% Context DOES get a real mask cube, though, drawn below its image
+% (parity with arch_patchset.tex's own $L^c$ lane) and routed with a
+% long elbow arrow straight into the bottom of its "lbl" token cluster
+% inside the Fuse box -- bypassing the shared image encoder entirely,
+% same as arch_patchset.tex's mask lane skips straight to its token
+% grid rather than through Enc. Target gets no such cube: its "lbl"
+% slot is a placeholder prior, not a real input.
 %
 % Panels are stacked top (Medverse) over bottom (generic), with their
 % image-input cubes column-aligned (both at \xIn/\xCubeImg). Their
@@ -174,8 +183,8 @@
   % with Medverse's own \xOut ----
   \pgfmathsetmacro{\xFuseBoxLeft}{\xEnc+\encw+0.8}
   \pgfmathsetmacro{\ximgTok}{\xFuseBoxLeft+0.8}
-  \pgfmathsetmacro{\xlblTok}{\ximgTok+1.1}
-  \pgfmathsetmacro{\xfusedTok}{\xlblTok+1.4}
+  \pgfmathsetmacro{\xlblTok}{\ximgTok+1.5}
+  \pgfmathsetmacro{\xfusedTok}{\xlblTok+1.0}
   \pgfmathsetmacro{\boxwFuse}{\xfusedTok+0.6-\xFuseBoxLeft}
   \pgfmathsetmacro{\xFuseOp}{(\ximgTok+\xlblTok)/2}
 
@@ -219,20 +228,18 @@
     \pgfmathsetmacro{\boxRight}{\bcx+\bw+0.5}
     \pgfmathsetmacro{\outerTop}{\yTgt+\cubeh/2+0.85}
     \pgfmathsetmacro{\outerBot}{\yCtx-\cubeh/2-0.40}
-    \pgfmathsetmacro{\methodTitleY}{\outerTop+0.85}
+    \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
 
     \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target};
     \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context};
 
     \node[anchor=south] at ({(\xIn+\xOut)/2},{\methodTitleY})
-      {\archtitle Dual ConvNet \normalsize\normalfont(Medverse)};
+      {\archtitle Dual U-Net};
 
     % plain box, no xL marker: U-Net stages change resolution and are NOT
     % the same layer applied L times, unlike the generic panel below
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\boxLeft},{\outerBot}) rectangle ({\boxRight},{\outerTop});
-    \node[anchor=south,align=center] at ({(\boxLeft+\boxRight)/2},{\outerTop+0.20})
-      {\archboxlabel Dual U-Net (own weights per row)};
 
     % input VOLUMES, channel-concatenated before any conv -- not tokens.
     % Context: image+mask, 2 input channels. Target: image alone --
@@ -319,6 +326,16 @@
     \archvolcube{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image}
     \archvolcube{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ct}{image}
 
+    % ---- context's real mask, its own cube in its own lane below the
+    % image row (like arch_patchset.tex's $L^c$) -- no target counterpart,
+    % since target's "lbl" is only a placeholder prior. Routed straight
+    % into the Fuse box's context "lbl" cluster below; the arrow is drawn
+    % later (just before that cluster) so it disappears under the column
+    % background and the bottom token, exactly like arch_patchset.tex's
+    % routed arrow vanishes under its Ctx Lbl token grid.
+    \pgfmathsetmacro{\yMask}{\yCtx-\rowpitch}
+    \archvolcube{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{predmask}{mask}
+
     % ---- shared encoder: one funnel per row, same weights both rows --
     % image only, matching arch_query_prior.tex's cube->funnel->attention
     % routing
@@ -340,14 +357,21 @@
       ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},\yTgt+\clusterhalf+\boxpad);
     \node[anchor=south] at ({\xFuseBoxLeft+\boxwFuse/2},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
 
-    \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.25) {img};
-    \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.25) {lbl};
-    \node[anchor=south,font=\normalsize] at (\xfusedTok,\yTgt+\clusterhalf+0.25) {fused};
+    \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
+
+    % context mask -> context "lbl" cluster, routed under the Fuse box
+    % and up into the column from below (drawn now, before the column
+    % background/tokens below, so those layer on top of its approach)
+    \draw[-{Latex[length=2.4mm,width=2mm]},line width=2.2pt,archContextAccent]
+      ({\xCubeImg+\cubew+0.15},{\yMask}) -| ({\xlblTok},{\yCtx-\toff-\tsz/2-0.10});
 
     \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
-      \fill[black!15,rounded corners=3pt]
-        ({\x-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle
-        ({\x+\tsz/2+0.18},{\yTgt+\toff+\tsz/2+0.10});
+      \foreach \y in {\yTgt, \yCtx} {
+        \fill[black!15,rounded corners=3pt]
+          ({\x-\tsz/2-0.18},{\y-\toff-\tsz/2-0.10}) rectangle
+          ({\x+\tsz/2+0.18},{\y+\toff+\tsz/2+0.10});
+      }
     }
 
     \foreach \y/\imgfill/\lblfill in {\yTgt/archTargetGreen/black!8,
@@ -369,7 +393,6 @@
     \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Attn.};
     \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
-    \node[anchor=south,font=\normalsize] at ({\xFusedPatchTop},\yTgt+\clusterhalf+0.25) {encoded};
     \foreach \y in {\yTgt,\yCtx} {
       \foreach \doff in {-\toff,0,\toff} {
         \fill[black!15,rounded corners=3pt]

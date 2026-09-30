@@ -24,7 +24,10 @@ All three architectures use the same training recipe
 are trained on the CT cases and training classes of TotalSegmentator, without
 synthetic tasks, at a single level. Their initialization differs. Dual U-Net
 Cross-Attn starts from Medverse's weights. Early fusion and dual attention
-are randomly initialized.
+are randomly initialized. Dual U-Net Cross-Attn completed its training
+budget; early fusion and dual attention were stopped before completing
+theirs, so the comparison also reflects this difference in training progress,
+not only initialization.
 
 \begin{table}[t]
   \centering
@@ -52,9 +55,7 @@ fp32, using the best checkpoint of each.
 \autoref{tab:fusion-staircase} reports the results, grouped as in
 \autoref{tab:ood-sources}.
 \todo[inline]{Specify where the 3\,mm crops are placed (centered on the ground
-truth?). The table omits ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, and
-NasalSeg: state why, or add them. Define ``mean of 5 held-out sources'': which
-five? The values cannot be reproduced from the rows shown.}
+truth?).}
 
 \begin{table}[t]
   \centering
@@ -78,20 +79,38 @@ five? The values cannot be reproduced from the rows shown.}
     \midrule
     TotalSeg MRI           & 0.178 & 0.232 & \textbf{0.259} \\
     \midrule
-    Mean of 5 held-out sources & 0.278 & 0.264 & \textbf{0.297} \\
+    ISLES22                & \textbf{0.046} & 0.037 & 0.043 \\
+    Shifts-MS               & 0.087 & 0.038 & \textbf{0.109} \\
+    ATLAS v2.0              & \textbf{0.031} & 0.014 & 0.022 \\
+    GNC\_705                & \textbf{0.044} & 0.014 & 0.025 \\
+    NasalSeg                & \textbf{0.434} & 0.272 & 0.358 \\
+    \midrule
+    Mean of 10 held-out sources$^{\dagger}$ & 0.187 & 0.174 & \textbf{0.201} \\
     \midrule
     Parameters             & 71.1M  & 74.1M  & 48.7M  \\
     GFLOPs                 & 2362.6 & 3973.1 & 3892.5 \\
     Latency per sample     & 73.2\,ms & 73.0\,ms & 72.5\,ms \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$MSD Prostate, MSD Hippocampus, HU\_LWK1, TotalSeg MRI, FLARE22
+  (all 13 classes, not split by seen/unseen as above), ISLES22, Shifts-MS,
+  ATLAS v2.0, GNC\_705, and NasalSeg — held-out at the dataset level
+  (\autoref{sec:results-setup}). Sample-weighted: each dataset's macro Dice is
+  weighted by its number of evaluated tasks (36 for HU\_LWK1 to 1490 for
+  GNC\_705) rather than counted once per dataset, since task counts differ by
+  up to $40\times$. The unweighted mean-of-datasets (0.203/0.170/0.204) and
+  the fully pooled per-task mean (0.186/0.172/0.200) rank the three
+  architectures identically.
 \end{table}
 
 \paragraph{Results.}
 Early fusion outperforms Dual U-Net Cross-Attn on the classes from the
 training vocabulary, by 0.16 to 0.23 Dice on TotalSegmentator and FLARE22, and
-on TotalSeg MRI (0.232 vs.\ 0.178). It is worse on the three sources with new
-or non-anatomical targets: MSD Prostate, MSD Hippocampus, and HU\_LWK1.
+by a smaller margin on the unseen-modality TotalSeg MRI (0.232 vs.\ 0.178). It
+is worse on the three sources with new or non-anatomical targets: MSD
+Prostate, MSD Hippocampus, and HU\_LWK1.
 
 Dual attention improves over early fusion on seven of the eight rows. The
 gains are small on the other in-vocabulary rows (0.008 to 0.018) and larger on
@@ -102,11 +121,23 @@ lower.
 
 Compared with Dual U-Net Cross-Attn, dual attention is better on six of the
 eight rows, including MSD Hippocampus (0.184 vs.\ 0.172), but remains worse on
-MSD Prostate (0.247 vs.\ 0.377) and HU\_LWK1 (0.102 vs.\ 0.146). On the mean
-over held-out sources, early fusion is below Dual U-Net Cross-Attn (0.264 vs.\
-0.278), while dual attention is above it (0.297). The shared-encoder design
-alone thus improves accuracy on the training vocabulary, and dual attention is needed to
-also improve on held-out sources.
+MSD Prostate (0.247 vs.\ 0.377) and HU\_LWK1 (0.102 vs.\ 0.146).
+
+On the five lesion and cavity datasets in \autoref{tab:fusion-staircase}
+(ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, NasalSeg), the pattern reverses:
+Dual U-Net Cross-Attn is best of the three on four of five, losing only on
+Shifts-MS, where dual attention is best (0.109 vs.\ 0.087). Dual attention's
+margin behind Dual U-Net Cross-Attn on the other four is at most 0.076
+(NasalSeg).
+
+On the sample-weighted mean over all ten held-out sources, early fusion is
+below Dual U-Net Cross-Attn (0.174 vs.\ 0.187), while dual attention is above
+it (0.201); the unweighted mean-of-datasets and the fully pooled per-task mean
+rank the three architectures the same way. This aggregate advantage for dual
+attention comes from the first five sources, not the lesion and cavity ones,
+where Dual U-Net Cross-Attn wins more often. The shared-encoder design alone
+thus improves accuracy on the training vocabulary, and dual attention improves
+on held-out sources in aggregate, though not on every individual source.
 
 Dual attention has the fewest parameters of the three (48.7M). Its compute is
 similar to early fusion by construction and 65\% higher than Dual U-Net

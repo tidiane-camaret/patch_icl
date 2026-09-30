@@ -69,3 +69,25 @@
     \bottomrule
   \end{tabularx}
 \end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Medverse's released weights run inside our cascade inference
+  (\autoref{sec:results-cascade}, ``Medverse with our cascade''), with and
+  without its own coarse prediction passed forward as a prior. Macro Dice.}
+  \label{tab:medverse-prior-appendix}
+  \begin{tabular}{@{}lcc@{}}
+    \toprule
+    Dataset & No prior & Prior \\
+    \midrule
+    HU\_LWK1        & 0.000 & 0.000 \\
+    ISLES22         & 0.049 & 0.035 \\
+    Shifts-MS       & 0.036 & 0.028 \\
+    MSD Hippocampus & 0.691 & 0.050 \\
+    MSD Prostate    & 0.327 & 0.251 \\
+    ATLAS v2.0      & 0.126 & 0.020 \\
+    GNC\_705        & 0.008 & 0.001 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

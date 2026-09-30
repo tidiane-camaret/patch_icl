@@ -40,11 +40,7 @@ training data in the other two sections.
   \end{tabular}
 \end{table}
 \todo[inline]{Resolve before submission: report a single final configuration,
-or keep this split? Check the table entries, especially the number of levels of
-Synth (cross-level register carry implies $>1$ level, but the Synth results are
-described as single-level). The old text said the cascade comparison at the
-end of \autoref{sec:results-synth} starts from the Cascade model only, but
-\autoref{tab:synth-cascade-realhost} compares Cascade and Synth + Cascade.}
+or keep this split?}
 
 \paragraph{Baselines.}
 The external baseline is Medverse~\cite{huMedverseUniversalModel2025a} with
@@ -82,6 +78,11 @@ from the TotalSegmentator vocabulary, so their classes split into seen and
 unseen ones. The other datasets contain targets that do not occur in training:
 new anatomical structures, lesions, a measurement region that is not an
 anatomical object, and, for the fusion experiments, an unseen modality.
+Because of this split, "held-out" is used at two levels below: at the
+dataset level (a dataset whose images were never trained on, e.g.\ FLARE22,
+whose classes are nonetheless mostly in-vocabulary) and, where stated
+explicitly as such, at the class level (excluding classes that are in the
+training vocabulary, even if their dataset is held out).
 
 \begin{table}[t]
   \centering

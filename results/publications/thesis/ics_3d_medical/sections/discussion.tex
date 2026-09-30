@@ -14,7 +14,10 @@ help: early fusion was below Dual U-Net Cross-Attn on MSD Prostate, MSD
 Hippocampus, and HU\_LWK1. Dual attention changed this pattern only partly.
 Its gains over early fusion were small on in-vocabulary classes and larger on
 new targets and on the unseen modality, and it was the only variant above Dual
-U-Net Cross-Attn on the mean over held-out sources.
+U-Net Cross-Attn on the sample-weighted mean over held-out sources. This
+aggregate advantage does not hold source-by-source: on the five lesion and
+cavity datasets, Dual U-Net Cross-Attn wins more often (four of five), so the
+mean is driven by the first five, more anatomical, held-out sources.
 
 One interpretation is that repeated interaction between image and label tokens
 matters most when the model cannot rely on having seen the class during
@@ -36,23 +39,27 @@ drawing conclusions about compute.}
 
 When each level's crop is placed from the previous level's prediction, Dice
 still increases from level to level on every dataset
-(\autoref{tab:cascade-levels}). The coarse level localizes the target well
-enough for this: a box at its predicted centroid contains 92\% of the target's
-voxels on average, compared with 97\% for a box at the ground-truth centroid.
-Most of the remaining error therefore arises within the fine crops.
+(\autoref{tab:cascade-levels}). On TotalSeg CT, the coarse level localizes the
+target well enough for the first, coarsest-to-middle step: a box at its
+predicted centroid contains 92\% of the target's voxels on average, compared
+with 97\% for a box at the ground-truth centroid, and most of the remaining
+error at this step arises within the fine crops rather than from
+localization; the middle-to-finest step is not measured this way.
 
 The clearest advantage over Medverse is speed. Cascade is about 14 times faster
 than Medverse with the same number of refinement steps. The accuracy comparison
 depends on how Medverse is run. With matched steps, Cascade is more accurate on
 five of seven datasets; against Medverse at its native number of steps, it is
-more accurate on two of the five datasets where a native run exists (FLARE22
-and HU\_LWK1). The efficiency result is thus better supported than the
-accuracy result, and the accuracy comparison on TotalSegmentator additionally
-depends on verifying Medverse's low scores there.
+more accurate on five of the nine datasets where a native run exists (FLARE22,
+HU\_LWK1, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
+better supported than the accuracy result, and the accuracy comparison on
+TotalSegmentator additionally depends on verifying Medverse's low scores
+there.
 
 Training with the model's own predictions as prior worked better than training
 with perturbed ground-truth masks on the training distribution (99 of 117
-classes) and was mixed on held-out datasets (four of eight). A plausible
+classes) and was mixed on datasets outside the training vocabulary (five of
+eight). A plausible
 explanation is that a model trained on its own predictions sees, during
 training, the kind of errors it will encounter at inference, which a
 hand-designed perturbation of the ground truth only approximates. Whether the
