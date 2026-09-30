@@ -1,9 +1,11 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-This section evaluates the synthetic task generator on the four lesion
-datasets: ISLES22, Shifts-MS, ATLAS v2.0, and GNC\_705. They are the most
-difficult evaluation datasets, since their targets are lesions on MRI with no
-counterpart among the training classes.
+This section evaluates the synthetic task generator, mainly on the four
+lesion datasets it targets: ISLES22, Shifts-MS, ATLAS v2.0, and GNC\_705. They
+are the most difficult evaluation datasets, since their targets are lesions on
+MRI with no counterpart among the training classes. Under cascade inference,
+the comparison widens to all nine held-out datasets used in
+\autoref{sec:results-cascade}.
 
 \paragraph{Synthetic-bank canvas.}
 The baseline is the Synth configuration trained with $p_\text{synth} = 0.5$
@@ -29,9 +31,9 @@ checkpoint, and what distinguishes stage 1 from the baseline.}
 
 In stage 3, the real-host canvas is extended to all seven shape families and to
 all TotalSegmentator subjects (CT and MRI, all organs), and training runs
-longer. This raises Dice on GNC\_705 to 0.223, while ISLES22 and Shifts-MS drop
-slightly below their stage-2 values. Because stage 3 changes three factors at
-once, the result cannot be attributed to any one of them.
+longer. This raises Dice on GNC\_705 to 0.223, while ISLES22, Shifts-MS, and ATLAS
+v2.0 all drop slightly below their stage-2 values. Because stage 3 changes
+three factors at once, the result cannot be attributed to any one of them.
 
 \begin{table}[t]
   \centering
@@ -39,7 +41,10 @@ once, the result cannot be attributed to any one of them.
   \caption{Dice on the lesion datasets for successive synthetic-task
   configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
   shape families, all TotalSegmentator subjects as canvas, and a longer
-  training budget.}
+  training budget. Bold marks each dataset's best value across the four
+  configurations, not the winner of any single stage-to-stage comparison
+  (contrast \autoref{tab:synth-cascade-realhost}, where bold marks the best
+  model per row).}
   \label{tab:synth-realhost-ood}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -86,7 +91,7 @@ training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
 uses no synthetic tasks, and with step-matched Medverse on the nine held-out
 datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
 NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
-($-0.012$), and differs by about 0.01 or less on the other datasets. It remains
+($-0.012$), and differs by at most 0.011 on the other datasets. It remains
 below Medverse on MSD Hippocampus and NasalSeg. The two models differ in more
 than the synthetic tasks: Synth + Cascade also uses register carry and a
 pooling token, and has a different training history. The differences can
@@ -98,21 +103,24 @@ therefore not be attributed to the synthetic tasks alone.
   \caption{Dice on the held-out datasets under cascade inference. Medverse:
   released weights, step-matched autoregressive inference
   (\autoref{sec:results-cascade}); omitted where both models score too low to
-  be informative.}
+  be informative. Cascade and Synth + Cascade use the same per-dataset ladder
+  (identical sample counts confirmed for every dataset), so differences are
+  not a ladder confound; Medverse uses its own depth-matched ladder from
+  \autoref{tab:cascade-medverse}.}
   \label{tab:synth-cascade-realhost}
-  \begin{tabular}{@{}lccc@{}}
+  \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Dataset & Cascade & Synth + Cascade & Medverse \\
+    Dataset & Spacings (mm) & Cascade & Synth + Cascade & Medverse \\
     \midrule
-    HU\_LWK1        & \textbf{0.152} & 0.124 & 0.020 \\
-    ISLES22         & 0.069 & \textbf{0.070} & -- \\
-    Shifts-MS       & \textbf{0.031} & 0.019 & -- \\
-    ATLAS v2.0      & 0.026 & \textbf{0.032} & -- \\
-    MSD Prostate    & \textbf{0.375} & 0.372 & 0.357 \\
-    MSD Hippocampus & 0.303 & 0.518 & \textbf{0.686} \\
-    GNC\_705        & 0.024 & \textbf{0.035} & -- \\
-    FLARE22         & \textbf{0.751} & 0.743 & 0.359 \\
-    NasalSeg        & 0.547 & 0.644 & \textbf{0.737} \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.124 & 0.020 \\
+    ISLES22         & $[3, 1.5]$       & 0.069 & \textbf{0.070} & -- \\
+    Shifts-MS       & $[3, 1.5]$       & \textbf{0.031} & 0.019 & -- \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & 0.026 & \textbf{0.032} & -- \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.375} & 0.372 & 0.357 \\
+    MSD Hippocampus & $[0.5]$          & 0.303 & 0.518 & \textbf{0.686} \\
+    GNC\_705        & $[6, 3, 1.2]$    & 0.024 & \textbf{0.035} & -- \\
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.743 & 0.359 \\
+    NasalSeg        & $[1.5, 0.8]$     & 0.547 & 0.644 & \textbf{0.737} \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -124,9 +132,27 @@ dataset, the coarse predictions follow bright regions rather than the lesions,
 so the region-restricted fine levels process crops that miss the lesion. This
 illustrates the limitation of region restriction noted in
 \autoref{sec:methodology-cascade}: small targets that the coarse level
-mislocalizes cannot be recovered.
-\todo[inline]{Support this with the containment of the coarse box on GNC\_705
-and a qualitative figure (appendix), instead of the reference to
+mislocalizes cannot be recovered. \autoref{fig:gnc-localization-fail} shows one
+such case: the lesion is a handful of voxels at the edge of the kidney
+(yellow circle, added for visibility, on the ground-truth panel), and the
+region-restricted finest level predicts nothing in that same location
+(Dice 0.00).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{gnc_localization_fail.png}
+  \caption{GNC\_705, class hypo\_mask\_r, subject 100014\_v30 (Cascade
+  checkpoint), coarse (6\,mm) and mid (3\,mm) level images shown for context:
+  the lesion (yellow circle) is a handful of voxels at the edge of the
+  kidney; the finest (1.2\,mm) level, restricted to its own region, predicts
+  nothing there (Dice 0.00).}
+  \label{fig:gnc-localization-fail}
+\end{figure}
+\todo[inline]{Support this further with the containment of the coarse box on
+GNC\_705 across all samples, not just this one case (currently a single
+qualitative example, re-rendered directly from \texttt{cascade.run\_cascade}
+on this one (subject, context, class) triple, not a systematic worst-case
+search), instead of the reference to
 \texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
 uses ground-truth-centered crops, the drop may mainly reflect the loss of
 ground-truth localization; state which is the case.}
