@@ -31,6 +31,7 @@
 \sloppy
 
 % UTILITIES
+\usepackage{comment}
 \usepackage{tabularx}
 \usepackage{makecell}
 \usepackage{amsmath, amsthm, amsfonts, mathtools}
@@ -48,12 +49,14 @@
 \usepackage[labelfont=bf, labelsep=colon, format=hang]{caption} % Make image captions nicer
 \usepackage{subcaption} % side-by-side sub-figures (architecture comparisons)
 \usepackage{booktabs} % nicer tables
+\usepackage{longtable} % multi-page appendix tables
+\usepackage{multirow} % dataset-name column spanning its classes' rows
 \usepackage{listings} % to include code
 \renewcommand{\lstlistingname}{Algorithm}
 \lstset{keywordstyle=\bfseries}
 \lstset{commentstyle=\color{cd_blue}\bfseries}
 \usepackage[section]{placeins}  % To keep all figures inside there section
-\usepackage[stylemods=longextra, symbols, automake]{glossaries-extra}
+\usepackage[nomain]{glossaries-extra}
 \usepackage{pdfpages} % to include PDFs
 \usepackage[nottoc]{tocbibind}  % Add References and others to the table of contents
 \usepackage{orcidlink}  % ORCID is an unique identifier for scientists
@@ -99,18 +102,7 @@
 % <<< end setup.tex
 % >>> begin references/glossary.tex
 \makeglossaries
-\newglossaryentry{label-one}{name={name one},
-    description={description one},
-    plural={plural of name one}
-}
-\newabbreviation[
-    description={description two},
-    plural={plural of long form of name two}
-]{label-two}{short2}{long form of name two}
 
-\glsxtrnewsymbol[
-    description={description symbol}
-]{label-three}{\ensuremath{a\ symbol}}
 % <<< end references/glossary.tex
 
 \begin{document}
@@ -278,6 +270,7 @@ This thesis addresses three questions that arise when building an efficient
     use a \emph{coarse-to-fine cascade} in which each level processes only the
     region localized by the previous level and receives that level's
     prediction as a prior (\autoref{sec:methodology-cascade}).
+  \todo{talk about query prior injection instead of localized processing}
   \item \textbf{Where can training data come from beyond the annotated classes?}
     Real image--mask pairs cover only the classes and appearance range of the
     training cohort. We generate additional training tasks with a
@@ -293,13 +286,13 @@ This thesis addresses three questions that arise when building an efficient
     We compare it with a compute-matched variant that merges both into a single
     token per cell, and with a dual U-Net cross-attention model initialized
     from Medverse.
-  \item A coarse-to-fine cascade that passes each level's prediction to the
+  \item A coarse-to-fine approach that passes each level's prediction to the
     next level as a prior and restricts fine-level processing to the localized
     region. We compare predicted priors with perturbed ground-truth priors, and
-    compare accuracy and latency with Medverse's autoregressive inference.
+    compare accuracy and latency with Medverse's coarse-to-fine approach.
   \item A synthetic task generator that paints procedural shapes onto real CT
     and MRI scans. We evaluate it against training on real data only and study
-    the effect of the canvas the shapes are painted on.
+    its effect on real tasks.
   \item An evaluation on nine datasets covering
     unseen tasks such as lesions, a non-anatomical target region, and MRI as a
     held-out modality.
@@ -310,8 +303,7 @@ This thesis addresses three questions that arise when building an efficient
 encoders and attention mechanisms the model builds on, and positions related methods with respect to the three
 questions above. \autoref{sec:methodology} describes the model.
 \autoref{sec:results} evaluates each component in turn.
-\autoref{sec:discussion} discusses the findings and their limitations, and
-\autoref{sec:conclusion} concludes.% <<< end sections/motivation.tex
+\autoref{sec:discussion} discusses the findings and their limitations.% <<< end sections/motivation.tex
 % >>> begin sections/fundamentals.tex
 \section{\iflanguage{english}{Fundamentals}{Grundlagen}}\label{sec:fundamentals}
 
@@ -321,18 +313,7 @@ questions above. \autoref{sec:methodology} describes the model.
 Given a target image $I^t$ and a context set
 $\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image--mask pairs showing the same class,
 in-context segmentation predicts a target mask $\hat{L}^t$ in a single forward
-pass, without gradient updates or class-specific parameters.
-
-This setting differs from two more common ones. Closed-set supervised
-segmentation fixes the label set at training time, so adding a class requires
-retraining or fine-tuning. Interactive segmentation asks a user to provide
-clicks or boxes on each target image at inference time. In-context segmentation
-instead specifies the task through a few labeled examples from other subjects,
-similar to showing a radiologist a few example cases of a finding before asking
-them to find it in a new scan.
-
-The setting is particularly well-suited to medical imaging for three main reasons. 
-First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
+pass, without gradient updates or class-specific parameters. The setting is well-suited to medical imaging :  First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
 Second, new anatomical structures and pathologies are defined much faster than 
 large-scale supervised datasets can be curated for them. 
 Finally, significant differences in acquisition protocols often limit how well a 
@@ -341,16 +322,8 @@ closed-set model trained at one site transfers to another.% <<< end sections/fun
 \subsection{Volumetric Encoders and Attention}\label{sec:fundamentals-backbone}
 
 \paragraph{Convolutional volumetric backbones.}
-The 3D U-Net~\cite{cciccek20163d} and its self-configuring successor
-nnU-Net~\cite{isensee2021nnu} encode a volume into a feature pyramid with a
-downsampling encoder and decode it back to full resolution with a mirrored
-upsampling path. Skip connections pass fine spatial detail from the encoder to
-the decoder around the bottleneck. Deeper stages have lower spatial resolution
-and more channels, while shallow stages keep spatial detail at a low channel
-count. Our model uses this split directly: the coarse, high-channel stages feed
-the attention layers, and the fine stages are passed to the decoder as skip
-connections (\autoref{sec:methodology-overview}).
-UNETR~\cite{hatamizadeh2022unetr} is an earlier example of combining
+The 3D U-Net~\cite{cciccek20163d} architecture encodes a volume into a feature pyramid with a
+downsampling encoder and decodes it back to full resolution. Deeper stages have lower spatial resolution and more channels, while shallow stages keep spatial detail at a low channel count. Our model uses this split directly: the coarse, high-channel stages feed the attention layers, and the fine stages are passed to the decoder as skip connections (\autoref{sec:methodology-overview}). UNETR~\cite{hatamizadeh2022unetr} is an earlier example of combining
 transformer attention with a convolutional decoder for 3D segmentation.
 
 \paragraph{Attention.}
@@ -378,8 +351,7 @@ split into three parts, and each part is rotated according to the token's
 coordinate along one spatial axis. If these coordinates are given in physical
 units, i.e.\ scaled by the voxel spacing, attention between tokens from volumes
 of different resolution reflects their physical distance rather than their grid
-indices. Our cascade relies on this property, since its levels operate at
-different spacings (\autoref{sec:methodology-cascade}).% <<< end sections/fundamentals_backbone.tex
+indices. Our coarse-to-fine approach relies on this property, since its levels operate at different spacings (\autoref{sec:methodology-cascade}).% <<< end sections/fundamentals_backbone.tex
 % >>> begin sections/fundamentals_synthdata.tex
 \subsection{Synthetic Training Data}\label{sec:fundamentals-synthdata}
 
@@ -390,18 +362,7 @@ demonstrated this at scale for medical segmentation: training pairs are
 generated by sampling a random Gaussian-mixture appearance conditioned
 only on a label map, so the resulting segmentation network never sees a
 real image of any specific contrast during training yet generalizes
-across MRI contrasts and resolutions. GIN/IPA~\cite{ouyang2022causality}
-takes a complementary, appearance-only approach to single-source domain
-generalization: a random nonlinear intensity warp (GIN), optionally
-blended across spatially distinct regions of the same volume (IPA) to
-break spurious global appearance correlations, achieving strong
-generalization from randomizing appearance alone, without touching shape
-or geometry. Both results motivate treating appearance randomization as a
-distinct lever from geometric augmentation -- a question the synthetic
-task generator (\autoref{sec:methodology-synth}) revisits directly by
-ablating \emph{how} painted appearance is randomized (i.i.d.\ vs.\
-spatially correlated texture noise) while holding geometry fixed.
-% <<< end sections/fundamentals_synthdata.tex
+across MRI contrasts and resolutions. \todo{say what it motivates us to generate tasks on real scans}% <<< end sections/fundamentals_synthdata.tex
 % >>> begin sections/fundamentals_relatedwork.tex
 \subsection{Related Work}\label{sec:fundamentals-relatedwork}
 
@@ -433,8 +394,10 @@ Iris~\cite{gaoShowSegmentUniversal2025} encodes the context pairs once into a
 compact task embedding per class, using pixel shuffle operations in its context
 encoder. The target interacts with the context only through this embedding, via
 a single bidirectional cross-attention step in the mask decoder, and the
-embedding is reused across queries. Inference is a single pass without
+embedding is reused across queries. Large volumes are processed via a sliding window approach, without
 refinement across scales.
+
+\todo{focus more on the single img-lbl fusion point}
 
 \paragraph{Coarse-to-fine approaches.}
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large
@@ -491,9 +454,7 @@ small field of view at high resolution: at 6\,mm spacing the grid spans
 768\,mm per side, at 1.5\,mm only 192\,mm. During training, the spacing is
 sampled from a range rather than fixed to the levels used at inference
 (\autoref{sec:methodology-cascade}).
-\todo[inline]{Give the training spacing range. Your note says the coarse
-level uses 4\,mm, but \autoref{fig:query-prior} and
-\autoref{tab:cascade-levels} use 6\,mm; which is correct?}
+\todo[inline]{Give the training spacing range in the results settings}
 
 \begin{figure}[t]
   \centering
@@ -560,7 +521,7 @@ attention layers a fixed amount of global memory.
 % >>> begin sections/methodology_fusion.tex
 \subsection{Dual Attention}\label{sec:methodology-fusion}
 
-The attention layers have two jobs: combining image and label information, and
+The attention layers have two roles : combining image and label information, and
 matching the target against the context. In Medverse and Iris, these happen at
 fixed points in the network (\autoref{sec:fundamentals-relatedwork}).
 \autoref{fig:fusion-family} contrasts Medverse's design with the
@@ -568,7 +529,7 @@ shared-encoder design used in this thesis.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{arch_fusion_family.pdf}
+  \includegraphics[width=0.85\linewidth]{arch_fusion_family.pdf}
   \caption{Two ways of coupling target and context, shown for one context
   volume ($K{=}1$) and three of its $N$ tokens. Top: Medverse feeds the target
   image, and the context image and mask concatenated as channels, into two
@@ -585,9 +546,9 @@ shared-encoder design used in this thesis.
 \paragraph{Token array.}
 We arrange all tokens of a task in an array
 $Z \in \mathbb{R}^{S \times 2 \times D}$. Each of its $S$ rows corresponds to
-one cell of one volume or to one register token, and its two columns hold the
+one cell of one volume, and its two columns hold the
 image stream and the label stream (\autoref{sec:methodology-overview}). With
-$K+1$ volumes of $N$ cells and eight registers, $S = (K+1)N + 8$. Dual attention attends along
+$K+1$ volumes of $N$ cells, $S = (K+1)N$. Dual attention attends along
 each of the two axes of this array in turn, following the general pattern of
 the dual attention network of Fu et al.~\cite{fuDualAttentionNetwork2019},
 which combines position-wise and channel-wise attention for scene
@@ -641,8 +602,8 @@ Since attention is unmasked, the context tokens also depend on the target:
 the context is encoded anew for each target, rather than once per task as in
 Iris.
 
-\paragraph{Early-fusion baseline.}
-As a baseline, the early-fusion variant (\autoref{fig:fusion-axis}, top)
+\paragraph{Single-axis attention baseline.}
+As a baseline, the single-axis attention variant (\autoref{fig:fusion-axis}, top)
 merges the image and label token of each cell into a single token before the
 attention layers, using a pixel shuffle--unshuffle operation similar to the one
 Iris uses in its context encoder. The array then has a single column, and each
@@ -657,7 +618,7 @@ $W_{\text{img}}$? Otherwise the same block structure (RMSNorm, MLP, 12 heads)?}
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{arch_fusion_axis.pdf}
+  \includegraphics[width=0.85\linewidth]{arch_fusion_axis.pdf}
   \caption{The two variants of the shared-encoder design compared in
   \autoref{sec:results-fusion}, shown for one context volume and three of its
   $N$ cells. Top: early fusion (baseline). Image and label tokens are merged
@@ -727,8 +688,7 @@ previous prediction, at its centroid or at a random foreground point. The
 coarsest spacing is drawn per batch, and each finer spacing log-uniformly
 between the previous spacing and a lower bound, with a minimum ratio between
 levels. The prior is either the model's own prediction (predicted prior) or
-the ground truth, dilated or eroded, shifted, and with added Gaussian noise
-(perturbed ground-truth prior); \autoref{sec:results-cascade} compares both.
+the downsampled ground-truth mask; \autoref{sec:results-cascade} compares both.
 \todo[inline]{Values: $M$, spacing range, lower bound, minimum ratio,
 centroid vs.\ random-point probability, foreground threshold, perturbation
 magnitudes. Confirm inference always uses the centroid.}% <<< end sections/methodology_cascade.tex
@@ -858,9 +818,9 @@ training data in the other two sections.
   \label{tab:configs}
   \begin{tabular}{@{}lllll@{}}
     \toprule
-    Name & Section & Training data & Levels & $p_\text{synth}$  \\
+    Experiment & Section & Training data & Levels & $p_\text{synth}$  \\
     \midrule
-    Fusion arms & \ref{sec:results-fusion} & TotalSeg CT & 1 & 0  \\
+    Image--Label Fusion & \ref{sec:results-fusion} & TotalSeg CT & 1 & 0  \\
     Cascade & \ref{sec:results-cascade}, \ref{sec:results-synth} & TotalSeg CT + MRI & 2--3 & 0 \\
     Synth & \ref{sec:results-synth} & TotalSeg CT + MRI & 1 & 0.5 \\
     Synth + Cascade & \ref{sec:results-synth} & TotalSeg CT + MRI & 2--3 & 0.5 \\
@@ -1103,7 +1063,8 @@ despite these differences in GFLOPs.
 This section evaluates the Cascade configuration (\autoref{tab:configs}). We
 first examine how accuracy develops across levels and how well the coarse level
 localizes the target. We then compare with Medverse in accuracy and latency,
-and finally compare the two sources of the label prior.
+compare the two sources of the label prior, and finally test a register-carry
+variant.
 
 \paragraph{Accuracy across levels.}
 When the crop is centered on the ground truth, reducing the spacing from 4\,mm
@@ -1112,8 +1073,8 @@ classes, 3897 samples). Because these crops use the ground-truth position, this
 shows the benefit of finer resolution, not of the cascade.
 \autoref{tab:cascade-levels} therefore reports the Dice of each level when its
 crop is placed using the previous level's prediction. Dice still increases from
-level to level on every dataset, for example from 0.394 to 0.523 to 0.577 on
-TotalSeg CT.
+level to level on every dataset, for example from 0.603 to 0.718 to 0.751 on
+FLARE22.
 \todo[inline]{This shows that the cascade works without ground-truth
 localization, but not that it beats a single fine-resolution pass over the
 whole volume. The planned $-$region-restriction ablation answers this.}
@@ -1128,11 +1089,11 @@ whole volume. The planned $-$region-restriction ablation answers this.}
     \toprule
     Dataset & Spacings (mm) & Dice per level & Stitched \\
     \midrule
-    TotalSeg CT  & $[6, 3, 1.5]$    & $0.394 \to 0.523 \to 0.577$ & 0.586 \\
-    TotalSeg MRI & $[6, 3, 1.5]$    & $0.365 \to 0.481 \to 0.497$ & 0.506 \\
-    HU\_LWK1     & $[6, 3, 1]$      & $0.065 \to 0.109 \to 0.152$ & 0.152 \\
+    % TotalSeg CT  & $[6, 3, 1.5]$    & $0.394 \to 0.522 \to 0.576$ & 0.585 \\ % removed for final paper (see TODO.md)
     FLARE22      & $[6, 3, 2.5]$    & $0.603 \to 0.718 \to 0.751$ & 0.751 \\
     MSD Prostate & $[3, 1.5, 0.75]$ & $0.276 \to 0.361 \to 0.381$ & 0.375 \\
+    HU\_LWK1     & $[6, 3, 1]$      & $0.065 \to 0.109 \to 0.152$ & 0.152 \\
+    TotalSeg MRI & $[6, 3, 1.5]$    & $0.365 \to 0.479 \to 0.495$ & 0.503 \\
     NasalSeg     & $[1.5, 0.8]$     & $0.484 \to 0.547$           & 0.547 \\
     \bottomrule
   \end{tabular}
@@ -1140,7 +1101,7 @@ whole volume. The planned $-$region-restriction ablation answers this.}
 
  Outside the finest crop, the stitched mask contains the predictions of
   coarser levels, so its Dice can be higher than the finest level's (TotalSeg
-  CT and MRI), lower (MSD Prostate), or unchanged (HU\_LWK1, FLARE22,
+  MRI), lower (MSD Prostate), or unchanged (HU\_LWK1, FLARE22,
   NasalSeg) when the target lies entirely inside the finest crop and there is
   nothing outside it for a coarser prediction to add.
   
@@ -1158,82 +1119,86 @@ localization; whether the same holds for the middle-to-finest transition is
 not tested here.
 
 \paragraph{Comparison with Medverse.}
-\autoref{tab:cascade-medverse} compares Cascade with Medverse's released
-weights, using its own autoregressive coarse-to-fine inference. We report
-Medverse both at its native number of refinement steps and with the number of
-steps matched to our number of levels per dataset. Four lesion datasets
-(ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705), where both models score below 0.1,
-appear at the bottom of the table with Cascade and Medverse's native depth
-only: no step-matched Medverse run exists for them yet. MSD Hippocampus is
-processed at a single level, so its row compares the base models without a
-cascade.
+\autoref{tab:cascade-medverse} compares Ours with Medverse's released
+weights, using its own autoregressive coarse-to-fine inference with the
+number of steps matched to our number of levels per dataset (Medverse's
+native, unmatched depth is compared separately in
+\autoref{sec:results-cascade-medverse-depth}). Four lesion datasets (ISLES22,
+Shifts-MS, ATLAS v2.0, GNC\_705), where both numbers are below 0.1, appear at
+the bottom of the table. TotalSeg CT is not included in this comparison (see
+the table's \texttt{\textbackslash todo}). MSD Hippocampus is processed at a
+single level, so its row compares the base models without a cascade.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Cascade vs.\ Medverse: macro Dice and mean latency per sample.
+  \caption{Ours vs.\ Medverse: macro Dice and mean latency per sample.
   Medverse is evaluated with its number of autoregressive steps matched to our
-  number of levels (matched) and at its native number of steps (native).}
+  number of levels per dataset.}
   \label{tab:cascade-medverse}
-  \begin{tabular}{@{}lccccccc@{}}
+  \begin{tabular}{@{}lcccccc@{}}
     \toprule
-    & & \multicolumn{3}{c}{Dice} & & \multicolumn{2}{c}{Latency (ms)} \\
-    \cmidrule(lr){3-5} \cmidrule(lr){7-8}
-    Dataset & Spacings (mm) & Cascade & \makecell{Medverse\\matched} & \makecell{Medverse\\native} & & Cascade & \makecell{Medverse\\matched} \\
+    & & \multicolumn{2}{c}{Dice} & & \multicolumn{2}{c}{Latency (ms)} \\
+    \cmidrule(lr){3-4} \cmidrule(lr){6-7}
+    Dataset & Spacings (mm) & Ours & Medverse & & Ours & Medverse \\
     \midrule
-    TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.586} & 0.103 & --    & & 278 & 4978 \\
-    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.359 & 0.440 & & 311 & 4894 \\
-    MSD Prostate    & $[3, 1.5, 0.75]$ & 0.375 & 0.357 & \textbf{0.423} & & 279 & 5006 \\
-    MSD Hippocampus & $[0.5]$          & 0.303 & 0.686 & \textbf{0.691} & & 99  & 50   \\
-    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.020 & 0.071 & & 439 & 5336 \\
-    TotalSeg MRI    & $[6, 3, 1.5]$    & \textbf{0.506} & 0.038 & --    & & 306 & 4842 \\
-    NasalSeg        & $[1.5, 0.8]$     & 0.547 & \textbf{0.737} & 0.735 & & 161 & 1886 \\
+    % TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.585} & --    & & 206 & --   \\ % removed for final paper (see TODO.md)
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.359 & & 311 & 4894 \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & 0.375 & 0.357 & & 279 & 5006 \\
+    MSD Hippocampus & $[0.5]$          & 0.303 & \textbf{0.686} & & 99  & 50   \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.020 & & 439 & 5336 \\
+    TotalSeg MRI    & $[6, 3, 1.5]$    & \textbf{0.503} & 0.055 & & 194 & 5188 \\
+    NasalSeg        & $[1.5, 0.8]$     & 0.547 & \textbf{0.737} & & 161 & 1886 \\
     \midrule
-    Mean            &                  &       &       &       & & 268 & 3856 \\
+    Mean (sample-weighted)$^{\dagger}$ & & \textbf{0.526} & 0.393 & & \textbf{206} & 3491 \\
     \midrule
-    ISLES22         & $[3, 1.5]$       & \textbf{0.069} & -- & 0.053 & & 155 & -- \\
-    Shifts-MS       & $[3, 1.5]$       & 0.031 & -- & \textbf{0.152} & & 289 & -- \\
-    ATLAS v2.0      & $[3.8, 1.9]$     & \textbf{0.026} & -- & 0.023 & & 149 & -- \\
-    GNC\_705        & $[6, 3, 1.2]$    & \textbf{0.024} & -- & 0.011 & & 288 & -- \\
+    ISLES22         & $[3, 1.5]$       & \textbf{0.069} & 0.059 & & 155 & 1894 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.031 & \textbf{0.098} & & 289 & 1911 \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & \textbf{0.026} & 0.024 & & 149 & 1862 \\
+    GNC\_705        & $[6, 3, 1.2]$    & \textbf{0.024} & 0.007 & & 288 & 4874 \\
     \bottomrule
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  Mean is computed over the seven datasets above the second midrule, which
-  have a step-matched Medverse run; the four lesion datasets below lack one.
+  $^{\dagger}$Dice and latency are both sample-weighted, each dataset weighted
+  by its own number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22).
+  Ours and Medverse are both averaged over the same six datasets above the
+  second midrule (Ours: Dice 0.526, unweighted 0.439; latency 206\,ms,
+  unweighted 247\,ms. Medverse: Dice 0.393, unweighted 0.369; latency
+  3491\,ms, unweighted 3727\,ms). The four lesion datasets below the second
+  midrule are excluded from both means (both models score below 0.1 on every
+  one of them).
 \end{table}
-\todo[inline]{Re-run TotalSeg CT with matched steps and measure its latency.
-Add native runs for TotalSeg CT and MRI. Run a step-matched Medverse pass for
-ISLES22/Shifts-MS/ATLAS v2.0/GNC\_705 to fill their ``--'' cells.
-\texttt{\textbackslash makecell} needs the \texttt{makecell} package.}
+\todo[inline]{TotalSeg CT is commented out of this table (and of
+\autoref{tab:cascade-levels} and \autoref{tab:medverse-matched-native}) ---
+decided out of scope for the final paper. Its numbers, where they exist, are
+still available if this changes: see \texttt{TODO.md} for what is and isn't
+archived (our own model's TotalSeg CT cascade run is done; Medverse's matched
+and native cells there never completed).}
 
-Against Medverse with matched steps, Cascade is more accurate on five of the
-seven datasets: TotalSeg CT, FLARE22, MSD Prostate, HU\_LWK1, and TotalSeg MRI.
+Against Medverse with matched steps, Ours is more accurate on seven of the
+ten datasets: FLARE22, MSD Prostate, HU\_LWK1, TotalSeg
+MRI, ISLES22, ATLAS v2.0, and GNC\_705.
 Medverse is more accurate on MSD Hippocampus, reportedly part of its training
-classes but not of ours, and on NasalSeg, which neither model saw during
-training. Matching the number of steps lowers Medverse's accuracy on four of
-the five datasets with a native run, most clearly on FLARE22 (0.440 to 0.359)
-and HU\_LWK1 (0.071 to 0.020). Against Medverse at its native depth, Cascade
-is more accurate on FLARE22 and HU\_LWK1 and less accurate on MSD Prostate,
-MSD Hippocampus, and NasalSeg. On the four lesion datasets, which only have a
-native comparison, Cascade is more accurate on three (ISLES22, ATLAS v2.0,
-GNC\_705) and Medverse on one (Shifts-MS); all Dice values there are below
-0.1 except Medverse's native Shifts-MS result (0.152).
+classes but not of ours, on NasalSeg, which neither model saw during
+training, and on Shifts-MS.
 
 \autoref{fig:cascade-medverse-qual} shows one case from each side of this
 comparison, using the context, ground truth, and prediction of both models on
-the same target subject (Medverse run in its native-autoregressive mode).
-Ground truth is shown in green, Cascade's prediction in blue, Medverse's in
-orange throughout this section. On FLARE22 gallbladder, Cascade recovers the
-organ's shape (Dice 0.79) while Medverse predicts a small mislocated fragment
-(Dice 0.00). On MSD Hippocampus, the pattern reverses: Cascade's prediction is
-fragmented into disconnected blobs (Dice 0.34), while Medverse produces a
-single contiguous region closer to the ground-truth shape (Dice 0.59).
+the same target subject (Medverse run in its native-autoregressive mode, not
+the step-matched mode of \autoref{tab:cascade-medverse}; see
+\autoref{sec:results-cascade-medverse-depth}). Ground truth is shown in
+green, Ours in blue, Medverse's in orange throughout this section. On FLARE22
+gallbladder, Ours recovers the organ's shape (Dice 0.79) while Medverse
+predicts a small mislocated fragment (Dice 0.00). On MSD Hippocampus, the
+pattern reverses: Ours is fragmented into disconnected blobs (Dice 0.34),
+while Medverse produces a single contiguous region closer to the
+ground-truth shape (Dice 0.70).
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{flare22_gallbladder_win.png}
-  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Cascade recovers
+  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Ours recovers
   the organ shape where Medverse's native-autoregressive prediction misses
   almost entirely.}
   \label{fig:cascade-medverse-qual}
@@ -1243,7 +1208,7 @@ single contiguous region closer to the ground-truth shape (Dice 0.59).
   \centering
   \includegraphics[width=0.85\linewidth]{msd_hippocampus_fail.png}
   \caption{MSD Hippocampus, posterior class, subject hippocampus\_001:
-  Cascade's prediction fragments into disconnected blobs, while Medverse's
+  Ours fragments into disconnected blobs, while Medverse's
   native-autoregressive prediction stays a single contiguous region.}
   \label{fig:cascade-medverse-qual-fail}
 \end{figure}
@@ -1256,33 +1221,79 @@ and settings matching
 / \texttt{2026-09-14\_medverse\_ar\_msd\_hippocampus} -- rather than the
 harness's own saved diagnostic panels, so the color scheme could be made
 consistent across models (green/blue/orange). Each sample is the first the
-eval loader hit for its class, not a systematic best/worst search; Medverse's
-native-AR dice on this MSD Hippocampus sample varies by a few hundredths
-between runs (bf16-autocast nondeterminism), so treat 0.59 as approximate.}
+eval loader hit for its class, not a systematic best/worst search.}
 
-Cascade is on average about $14\times$ faster than step-matched Medverse (268
-vs.\ 3856\,ms per sample); excluding the estimated TotalSeg CT value gives a
-similar ratio ($13.8\times$ vs.\ $14.4\times$ with it). Our model runs one forward pass per level, whereas Medverse slides a window over the whole volume at each step; this difference and the architectures are not separated here. On MSD
-Hippocampus, where neither model uses a cascade, Medverse is faster (50 vs.\
-99\,ms).
+Ours is about $17\times$ faster than step-matched Medverse, sample-weighted
+over the six datasets in \autoref{tab:cascade-medverse} (206 vs.\ 3491\,ms per
+sample; unweighted, $15\times$: 247 vs.\ 3727\,ms). Our model
+runs one forward pass per level, whereas Medverse slides a window over the
+whole volume at each step; this difference and the architectures are not
+separated here. On MSD Hippocampus, where neither model uses a cascade,
+Medverse is faster (50 vs.\ 99\,ms).
 
-TotalSeg CT and MRI are part of our training data. The large differences on
-these two rows therefore partly reflect training data, not only architecture.
+TotalSeg MRI is part of our training data. The large difference there
+therefore partly reflects training data, not only architecture.
 \todo[inline]{State what Medverse was trained on, including whether MSD
 Hippocampus is actually among its training classes (currently asserted above
 without a citation) and whether its training data includes TotalSegmentator.
-Its Dice of 0.103 on TotalSeg CT and 0.038 on TotalSeg MRI is very low; if
-Medverse's training data includes TotalSegmentator, check preprocessing
-(orientation, intensity normalization, spacing) before reporting these
-numbers.}
+Its matched Dice of 0.055 on TotalSeg MRI is very low; if Medverse's training
+data includes TotalSegmentator, check preprocessing (orientation, intensity
+normalization, spacing) before reporting these numbers.}
+
+\begin{comment}
+
+\paragraph{Medverse: matched vs.\ native depth.}\label{sec:results-cascade-medverse-depth}
+Medverse's own released weights default to more autoregressive refinement
+steps than our number of cascade levels per dataset; \autoref{tab:medverse-matched-native}
+compares its accuracy at both depths, holding the model fixed and varying
+only how many steps it is given.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Medverse's own macro Dice at its number of autoregressive steps
+  matched to our number of levels per dataset (matched, repeated from
+  \autoref{tab:cascade-medverse}) vs.\ its native, unmatched number of steps
+  (native).}
+  \label{tab:medverse-matched-native}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Dataset & Spacings (mm) & Matched & Native \\
+    \midrule
+    % TotalSeg CT     & $[6, 3, 1.5]$    & -- & -- \\ % removed for final paper (see TODO.md)
+    FLARE22         & $[6, 3, 2.5]$    & 0.359 & \textbf{0.440} \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & 0.357 & \textbf{0.423} \\
+    MSD Hippocampus & $[0.5]$          & 0.686 & \textbf{0.691} \\
+    HU\_LWK1        & $[6, 3, 1]$      & 0.020 & \textbf{0.071} \\
+    TotalSeg MRI    & $[6, 3, 1.5]$    & 0.055 & \textbf{0.072} \\
+    NasalSeg        & $[1.5, 0.8]$     & \textbf{0.737} & 0.735 \\
+    \midrule
+    ISLES22         & $[3, 1.5]$       & \textbf{0.059} & 0.053 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.098 & \textbf{0.152} \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & \textbf{0.024} & 0.023 \\
+    GNC\_705        & $[6, 3, 1.2]$    & 0.007 & \textbf{0.011} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Matching the number of steps to ours lowers Medverse's accuracy on seven of
+the ten datasets with both values, most clearly on FLARE22 (0.440 to 0.359)
+and MSD Prostate (0.423 to 0.357); it raises accuracy on NasalSeg, ISLES22,
+and ATLAS v2.0, each by 0.006 or less. Against Medverse at its native depth,
+Ours (\autoref{tab:cascade-medverse}) is still more accurate on six (FLARE22,
+HU\_LWK1, TotalSeg MRI, ISLES22, ATLAS v2.0, GNC\_705) and less accurate on
+four (MSD Prostate, MSD Hippocampus, NasalSeg, Shifts-MS) --- a similar
+picture to the matched comparison, just with Medverse given more steps. Of
+the eight matched/native values across the four lesion datasets, only one
+exceeds 0.1: Medverse's native Shifts-MS result (0.152).
 
 \paragraph{Medverse with our cascade.}
 We also ran Medverse's weights inside our cascade inference
 (\autoref{sec:methodology-cascade}), with and without its coarse prediction
 passed on as a prior, on these seven eval-expansion sources: HU\_LWK1,
 ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0, and GNC\_705
-(distinct from \autoref{tab:cascade-medverse}'s seven datasets, which instead
-include TotalSeg CT, FLARE22, TotalSeg MRI, and NasalSeg). Each source uses
+(distinct from \autoref{tab:cascade-medverse}'s six datasets, which instead
+include FLARE22, TotalSeg MRI, and NasalSeg). Each source uses
 its own multi-level ladder, e.g.\ $[6,3,0.5]$\,mm for MSD Hippocampus; unlike
 our own model, which runs MSD Hippocampus single-level in
 \autoref{tab:cascade-medverse}, Medverse is given an actual cascade here on
@@ -1316,6 +1327,8 @@ Medverse's prior-conditioned prediction grows to cover much of the lesion
 \autoref{tab:medverse-prior-appendix}, so this single sample should not be
 read as typical of that row.
 
+\end{comment}
+
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{msd_prostate_cascade_win.png}
@@ -1347,7 +1360,10 @@ read as typical of that row.
   prediction grows to cover much of the lesion. This sample scores far above
   ATLAS v2.0's aggregate Prior Dice (0.42 vs.\ 0.020) and was chosen
   specifically to show that the prior does not hurt Medverse uniformly, not
-  as a representative case.}
+  as a representative case. This particular Dice value is also unstable
+  across reruns of Medverse's cascade-mode prediction on this exact sample
+  (0.42--0.88 observed, see the todo below) --- read it as illustrating the
+  direction of the effect, not as a precise number.}
   \label{fig:cascade-vs-medverse-cascade-atlas}
 \end{figure}
 \todo[inline]{Single-sample illustrations, not aggregate-representative cases
@@ -1381,11 +1397,13 @@ prior used during training: the model's own prediction from the previous
 level, or a perturbed ground-truth mask. At inference, both use their own
 predicted prior, since no ground truth is available then. On TotalSeg CT, the predicted prior is better on
 99 of 117 classes (median difference $+0.043$ Dice) and also improves NSD
-(0.631 vs.\ 0.576). MSD Hippocampus runs a single level, so no prior is
-passed; its row reflects the two checkpoints, not the prior, and is excluded
-from the counts below. On the remaining eight datasets outside the training
-vocabulary (class-level held-out, \autoref{sec:results-setup}; this excludes
-FLARE22 as well as TotalSeg CT), the predicted prior is better on five and
+(0.631 vs.\ 0.576). FLARE22, also part of the training vocabulary, shows the
+same direction (0.731 to 0.751). MSD Hippocampus runs a single level, so no
+prior is passed; its row reflects the two checkpoints, not the prior, and is
+excluded from the counts below. On the remaining eight datasets outside the
+training vocabulary (class-level held-out, \autoref{sec:results-setup}; this
+excludes FLARE22 as well as TotalSeg CT, both already covered above), the
+predicted prior is better on five and
 worse on three: Shifts-MS, ATLAS v2.0, and GNC\_705. These three, together with ISLES22, are lesion datasets
 on which both priors score below 0.1; among these four, only ISLES22 favors
 the predicted prior.
@@ -1393,21 +1411,20 @@ the predicted prior.
 \begin{table}[t]
   \centering
   \small
-  \caption{Macro Dice of models trained with a perturbed ground-truth prior or
+  \caption{Macro Dice of models trained with a ground-truth target mask prior or
   with their own predicted prior.}
   \label{tab:cascade-ablation}
   \begin{tabular}{@{}lcc@{}}
     \toprule
-    Dataset & Perturbed ground truth & Predicted \\
+    Dataset & Ground-truth prior & Predicted prior \\
     \midrule
-    TotalSeg CT     & 0.543 & \textbf{0.586} \\
-    TotalSeg MRI    & 0.449 & \textbf{0.506} \\
+    TotalSeg CT     & 0.543 & \textbf{0.585} \\
+    TotalSeg MRI    & 0.449 & \textbf{0.503} \\
     FLARE22         & 0.731 & \textbf{0.751} \\
     MSD Prostate    & 0.310 & \textbf{0.375} \\
-    MSD Hippocampus$^{*}$ & 0.319 & 0.303 \\
+    % MSD Hippocampus$^{*}$ & 0.319 & 0.303 \\
     HU\_LWK1        & 0.099 & \textbf{0.152} \\
     NasalSeg        & 0.399 & \textbf{0.547} \\
-    \midrule
     ISLES22         & 0.067 & \textbf{0.069} \\
     Shifts-MS       & \textbf{0.035} & 0.031 \\
     ATLAS v2.0      & \textbf{0.029} & 0.026 \\
@@ -1416,19 +1433,27 @@ the predicted prior.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{*}$MSD Hippocampus runs a single level, so no prior is passed; this row
-  reflects the two checkpoints, not the prior, and is excluded from the
-  counts in the text.
+  % $^{*}$MSD Hippocampus runs a single level, so no prior is passed; this row   reflects the two checkpoints, not the prior, and is excluded from the counts in the text.
 \end{table}
 \todo[inline]{Planned ablations: no prior at all, and no region restriction
-(full-volume sliding window at fine levels, same checkpoint).}
+(full-volume sliding window at fine levels, same checkpoint). Checkpoint 145's
+TotalSeg CT/MRI numbers (0.543/0.449 above) are untraceable to any archived
+run, same gap as checkpoint 146 had before the 2026-09-30 gap-fill (see
+\autoref{tab:cascade-medverse}'s todo) --- 145 was not part of that batch and
+still needs the equivalent re-run.}
 
+\begin{comment}
 \paragraph{Register carry.}
 A variant that additionally carries the register tokens across levels was
 tested against the same predicted-prior checkpoint, with a mixed effect on
-the same nine datasets: it lowers Dice on six (most on MSD Prostate,
-$-0.016$) and raises it on three (most on NasalSeg, $+0.061$, and MSD
-Hippocampus, $+0.097$).% <<< end sections/results_cascade.tex
+nine datasets (HU\_LWK1, ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, MSD
+Prostate, MSD Hippocampus, FLARE22, and NasalSeg --- a different nine from
+the ``eight'' just above: this set includes FLARE22 and MSD Hippocampus but,
+like every comparison in this paragraph, excludes TotalSeg CT/MRI, which
+were not part of this ablation's OOD sweep): it lowers Dice on six (most on
+MSD Prostate, $-0.016$) and raises it on three (most on NasalSeg, $+0.061$,
+and MSD Hippocampus, $+0.097$).
+\end{comment}% <<< end sections/results_cascade.tex
 % >>> begin sections/results_synth.tex
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
@@ -1473,48 +1498,75 @@ three factors at once, the result cannot be attributed to any one of them.
   \caption{Dice on the lesion datasets for successive synthetic-task
   configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
   shape families, all TotalSegmentator subjects as canvas, and a longer
-  training budget. Bold marks each dataset's best value across the four
-  configurations, not the winner of any single stage-to-stage comparison
-  (contrast \autoref{tab:synth-cascade-realhost}, where bold marks the best
-  model per row).}
+  training budget. Bold marks the best configuration per dataset, as in
+  \autoref{tab:synth-cascade-realhost}.}
   \label{tab:synth-realhost-ood}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Configuration & ISLES22 & Shifts-MS & ATLAS v2.0 & GNC\_705 \\
+    Dataset & Baseline & \makecell{1) Synthetic\\bank} & \makecell{2) Real host,\\scatter} & \makecell{3) Real host,\\all families} \\
     \midrule
-    Baseline                          & 0.050 & 0.008 & 0.028 & 0.082 \\
-    1) Synthetic bank, scatter field  & 0.045 & 0.011 & \textbf{0.033} & 0.070 \\
-    2) Real host, scatter field       & \textbf{0.098} & \textbf{0.058} & 0.032 & 0.105 \\
-    3) Real host, all families        & 0.087 & 0.051 & 0.027 & \textbf{0.223} \\
+    ISLES22    & 0.050 & 0.045 & \textbf{0.098} & 0.087 \\
+    Shifts-MS  & 0.008 & 0.011 & \textbf{0.058} & 0.051 \\
+    ATLAS v2.0 & 0.028 & \textbf{0.033} & 0.032 & 0.027 \\
+    GNC\_705   & 0.082 & 0.070 & 0.105 & \textbf{0.223} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & 0.063 & 0.057 & 0.084 & \textbf{0.153} \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the four datasets, weighted by each one's
+  own number of evaluated tasks (46 for Shifts-MS to 1490 for GNC\_705,
+  identical across all four configurations). GNC\_705 alone is 61\% of the
+  total weight, so this mean tracks GNC\_705 closely; the unweighted mean
+  (Baseline 0.042, stage 1 0.040, stage 2 0.073, stage 3 0.097) ranks the four
+  configurations the same way, but with a much smaller stage-3 lead.
 \end{table}
 
 \paragraph{Effect on TotalSegmentator.}
 \autoref{tab:synth-realhost-indist} reports TotalSegmentator validation Dice
-for the same checkpoints. Stages 1 and 2 change it by at most 0.012 in any
-column, so the gains of stage 2 on the lesion datasets do not reduce accuracy
-on the training distribution. Stage 3 improves all five values, from 0.418 to
-0.490 overall. Given its longer training budget, this gain likely reflects the
-additional training rather than the synthetic tasks themselves.
+for the same checkpoints, split by modality and class membership. Stages 1
+and 2 change it by at most 0.023 in any row (TotalSeg CT, unseen) relative to
+the baseline, so the gains of stage 2 on the lesion datasets do not reduce
+accuracy on the training distribution. Stage 3 improves all four values, and
+the sample-weighted mean rises from 0.434 to 0.505. Given its longer training
+budget, this gain likely reflects the additional training rather than the
+synthetic tasks themselves.
 
 \begin{table}[t]
   \centering
   \small
   \caption{TotalSegmentator validation Dice for the checkpoints of
-  \autoref{tab:synth-realhost-ood}, overall, by class membership (seen,
-  unseen), and by modality (MRI, CT).}
+  \autoref{tab:synth-realhost-ood}, by modality and class membership,
+  computed the same way as every other results table (macro: per-class mean,
+  then averaged over classes). This differs from an earlier version of this
+  table, whose MRI/CT rows were computed as a flat per-sample mean instead
+  (matching \texttt{train.py}'s own internal logging); under that
+  convention TotalSeg MRI scored below TotalSeg CT overall, but splitting
+  seen from unseen first, as here, reverses that (MRI-seen scores above
+  CT-seen at every stage) --- a composition effect, not a correction of an
+  error.}
   \label{tab:synth-realhost-indist}
-  \begin{tabular}{@{}lccccc@{}}
+  \begin{tabular}{@{}lcccc@{}}
     \toprule
-    Configuration & All & Seen & Unseen & MRI & CT \\
+     & Baseline & \makecell{1) Synthetic\\bank} & \makecell{2) Real host,\\scatter} & \makecell{3) Real host,\\all families} \\
     \midrule
-    Baseline                          & 0.418 & 0.489 & 0.344 & 0.390 & 0.468 \\
-    1) Synthetic bank, scatter field  & 0.422 & 0.485 & 0.356 & 0.385 & 0.470 \\
-    2) Real host, scatter field       & 0.417 & 0.483 & 0.348 & 0.384 & 0.467 \\
-    3) Real host, all families        & \textbf{0.490} & \textbf{0.579} & \textbf{0.397} & \textbf{0.474} & \textbf{0.534} \\
+    TotalSeg CT, seen      & 0.479 & 0.476 & 0.474 & \textbf{0.572} \\
+    TotalSeg CT, unseen    & 0.326 & 0.348 & 0.337 & \textbf{0.385} \\
+    TotalSeg MRI, seen     & 0.505 & 0.500 & 0.498 & \textbf{0.590} \\
+    TotalSeg MRI, unseen   & 0.395 & 0.379 & 0.379 & \textbf{0.430} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & 0.434 & 0.435 & 0.430 & \textbf{0.505} \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the four rows, weighted by each one's own
+  number of evaluated tasks (155 for TotalSeg MRI, unseen to 273 for TotalSeg
+  MRI, seen, identical across all four configurations); the unweighted mean
+  (Baseline 0.426, stage 1 0.426, stage 2 0.422, stage 3 0.494) ranks the
+  configurations the same way, though Baseline and stage 1 are within 0.0002
+  of each other under either weighting and should be read as tied.
 \end{table}
 
 \paragraph{Cascade inference.}
@@ -1523,8 +1575,15 @@ training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
 uses no synthetic tasks, and with step-matched Medverse on the nine held-out
 datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
 NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
-($-0.012$), and differs by at most 0.011 on the other datasets. It remains
-below Medverse on MSD Hippocampus and NasalSeg. The two models differ in more
+($-0.012$), and differs by at most 0.011 on the other datasets. On the
+sample-weighted mean of the five non-lesion datasets, Synth + Cascade is
+highest (0.615), ahead of Medverse (0.552) and Cascade (0.531); this ordering
+is driven by MSD Hippocampus and NasalSeg, the two datasets where Cascade
+trails both other models by the largest margins. It remains
+below Medverse on MSD Hippocampus, NasalSeg, and Shifts-MS, where Medverse's
+step-matched result (0.098) is the best of the three despite this being one
+of the four lesion datasets that motivated the synthetic-task generator. The
+two models differ in more
 than the synthetic tasks: Synth + Cascade also uses register carry and a
 pooling token, and has a different training history. The differences can
 therefore not be attributed to the synthetic tasks alone.
@@ -1534,27 +1593,38 @@ therefore not be attributed to the synthetic tasks alone.
   \small
   \caption{Dice on the held-out datasets under cascade inference. Medverse:
   released weights, step-matched autoregressive inference
-  (\autoref{sec:results-cascade}); omitted where both models score too low to
-  be informative. Cascade and Synth + Cascade use the same per-dataset ladder
-  (identical sample counts confirmed for every dataset), so differences are
-  not a ladder confound; Medverse uses its own depth-matched ladder from
-  \autoref{tab:cascade-medverse}.}
+  (\autoref{sec:results-cascade}). Cascade and Synth + Cascade use the same
+  per-dataset ladder (identical sample counts confirmed for every dataset), so
+  differences are not a ladder confound; Medverse uses its own depth-matched
+  ladder from \autoref{tab:cascade-medverse}.}
   \label{tab:synth-cascade-realhost}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
     Dataset & Spacings (mm) & Cascade & Synth + Cascade & Medverse \\
     \midrule
-    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.124 & 0.020 \\
-    ISLES22         & $[3, 1.5]$       & 0.069 & \textbf{0.070} & -- \\
-    Shifts-MS       & $[3, 1.5]$       & \textbf{0.031} & 0.019 & -- \\
-    ATLAS v2.0      & $[3.8, 1.9]$     & 0.026 & \textbf{0.032} & -- \\
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.743 & 0.359 \\
     MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.375} & 0.372 & 0.357 \\
     MSD Hippocampus & $[0.5]$          & 0.303 & 0.518 & \textbf{0.686} \\
-    GNC\_705        & $[6, 3, 1.2]$    & 0.024 & \textbf{0.035} & -- \\
-    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.743 & 0.359 \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.124 & 0.020 \\
     NasalSeg        & $[1.5, 0.8]$     & 0.547 & 0.644 & \textbf{0.737} \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & & 0.531 & \textbf{0.615} & 0.552 \\
+    \midrule
+    ISLES22         & $[3, 1.5]$       & 0.069 & \textbf{0.070} & 0.059 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.031 & 0.019 & \textbf{0.098} \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & 0.026 & \textbf{0.032} & 0.024 \\
+    GNC\_705        & $[6, 3, 1.2]$    & 0.024 & \textbf{0.035} & 0.007 \\
     \bottomrule
   \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the five datasets above the second
+  midrule, each weighted by its own number of evaluated tasks (36 for
+  HU\_LWK1 to 650 for FLARE22, identical across all three models here); the
+  unweighted mean-of-datasets ranks the three models the same way (Cascade
+  0.426, Synth + Cascade 0.480, Medverse 0.432). The four lesion datasets
+  below the second midrule are excluded (all three models score below 0.1 on
+  every one of them).
 \end{table}
 
 The gain on GNC\_705 at a single level (0.223,
@@ -1588,6 +1658,68 @@ search), instead of the reference to
 \texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
 uses ground-truth-centered crops, the drop may mainly reflect the loss of
 ground-truth localization; state which is the case.}
+
+\paragraph{Final comparison: Synth + Cascade vs.\ Medverse.}
+\autoref{tab:synth-cascade-medverse-final} adds NSD and latency to the Dice
+comparison above, restricted to our best cascade configuration, Synth +
+Cascade, against step-matched Medverse. On the sample-weighted mean of the
+five non-lesion datasets, Synth + Cascade leads on both Dice (0.615 vs.\
+0.552) and NSD (0.729 vs.\ 0.631) while being $15\times$ faster (179 vs.\
+2697\,ms per sample), consistent with the $15$--$17\times$ latency gap already
+reported for Cascade in \autoref{sec:results-cascade}. NSD moves in the same
+direction as Dice on seven of the nine datasets; the exceptions are
+Shifts-MS, where Medverse's Dice lead (0.098 vs.\ 0.019) is even larger on NSD
+(0.136 vs.\ 0.123), and ATLAS v2.0, where Synth + Cascade's Dice lead (0.032
+vs.\ 0.024) is much larger still on NSD (0.044 vs.\ 0.012). On the four lesion
+datasets, absolute scores stay below 0.1 Dice for both models on every one of
+them, and Medverse is faster only on MSD Hippocampus, the one dataset run at a
+single level rather than a cascade.
+\autoref{tab:synth-cascade-medverse-perclass} in the appendix breaks this
+comparison down to every individual class on all nine datasets.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Final comparison, Synth + Cascade (ours) vs.\ Medverse: Dice, NSD,
+  and mean latency per sample on all nine held-out datasets. Medverse:
+  released weights, autoregressive inference with its number of steps matched
+  to our number of levels per dataset (\autoref{sec:results-cascade}). Bold
+  marks the best value per row for Dice and NSD; latency is bolded only in
+  the sample-weighted mean row. MV: Medverse.}
+  \label{tab:synth-cascade-medverse-final}
+  \begin{tabular}{@{}lccc c cc c cc@{}}
+    \toprule
+    & & \multicolumn{2}{c}{Dice} & & \multicolumn{2}{c}{NSD} & & \multicolumn{2}{c}{Latency (ms)} \\
+    \cmidrule(lr){3-4} \cmidrule(lr){6-7} \cmidrule(lr){9-10}
+    Dataset & Spacings (mm) & Ours & MV & & Ours & MV & & Ours & MV \\
+    \midrule
+    FLARE22         & $[6, 3, 2.5]$    & \textbf{0.743} & 0.359 & & \textbf{0.775} & 0.333 & & 274 & 4894 \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.372} & 0.357 & & \textbf{0.314} & 0.300 & & 278 & 5013 \\
+    MSD Hippocampus & $[0.5]$          & 0.518 & \textbf{0.686} & & 0.753 & \textbf{0.905} & & 97  & 50   \\
+    HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.124} & 0.020 & & \textbf{0.049} & 0.029 & & 407 & 5336 \\
+    NasalSeg        & $[1.5, 0.8]$     & 0.644 & \textbf{0.737} & & 0.791 & \textbf{0.844} & & 106 & 1886 \\
+    \midrule
+    Mean (sample-weighted)$^{\dagger}$ & & \textbf{0.615} & 0.552 & & \textbf{0.729} & 0.631 & & \textbf{179} & 2697 \\
+    \midrule
+    ISLES22         & $[3, 1.5]$       & \textbf{0.070} & 0.059 & & \textbf{0.086} & 0.070 & & 145 & 1894 \\
+    Shifts-MS       & $[3, 1.5]$       & 0.019 & \textbf{0.098} & & 0.123 & \textbf{0.136} & & 272 & 1911 \\
+    ATLAS v2.0      & $[3.8, 1.9]$     & \textbf{0.032} & 0.024 & & \textbf{0.044} & 0.012 & & 151 & 1862 \\
+    GNC\_705        & $[6, 3, 1.2]$    & \textbf{0.035} & 0.007 & & \textbf{0.044} & 0.005 & & 225 & 4874 \\
+    \bottomrule
+  \end{tabular}
+  \par\vspace{0.5em}
+  \raggedright\footnotesize
+  $^{\dagger}$Sample-weighted over the five datasets above the second
+  midrule, each weighted by its own number of evaluated tasks (36 for
+  HU\_LWK1 to 650 for FLARE22, identical across both models here); the
+  unweighted mean-of-datasets ranks the two models the same way on every
+  metric (Dice: Synth + Cascade 0.480, Medverse 0.432. NSD: 0.536, 0.482.
+  Latency: 232, 3436\,ms). The four lesion datasets below the second midrule
+  are excluded from the means (both models score below 0.1 Dice on every one
+  of them). Dice and NSD are macro (per-class mean, then averaged over
+  classes, as in \autoref{sec:results-setup}); latency is a flat mean over
+  samples.
+\end{table}
 
 % <<< end sections/results_synth.tex
 % <<< end sections/results.tex
@@ -1640,15 +1772,16 @@ with 97\% for a box at the ground-truth centroid, and most of the remaining
 error at this step arises within the fine crops rather than from
 localization; the middle-to-finest step is not measured this way.
 
-The clearest advantage over Medverse is speed. Cascade is about 14 times faster
-than Medverse with the same number of refinement steps. The accuracy comparison
-depends on how Medverse is run. With matched steps, Cascade is more accurate on
-five of seven datasets; against Medverse at its native number of steps, it is
-more accurate on five of the nine datasets where a native run exists (FLARE22,
-HU\_LWK1, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
-better supported than the accuracy result, and the accuracy comparison on
-TotalSegmentator additionally depends on verifying Medverse's low scores
-there.
+The clearest advantage over Medverse is speed. Cascade is about 17 times faster
+than Medverse with the same number of refinement steps, sample-weighted over
+the six datasets where both latencies are measured. The accuracy comparison
+depends on how Medverse is run. With matched
+steps, Cascade is more accurate on seven of the ten datasets with a matched
+value; against Medverse at its native number
+of steps, it is more accurate on six of the same ten (FLARE22, HU\_LWK1,
+TotalSeg MRI, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
+better supported than the accuracy result. TotalSeg CT is not part of this
+comparison (\autoref{sec:results-cascade}).
 
 Training with the model's own predictions as prior worked better than training
 with perturbed ground-truth masks on the training distribution (99 of 117
@@ -1761,9 +1894,9 @@ datasets, although not on every dataset.
 
 For the second question, we proposed a coarse-to-fine cascade in which each
 level receives the previous level's prediction as a prior and processes only
-the region that prediction localizes. The cascade was about 14 times faster
+the region that prediction localizes. The cascade was about 17 times faster
 than Medverse with the same number of refinement steps. It was more accurate
-than step-matched Medverse on five of seven datasets, but the comparison with
+than step-matched Medverse on seven of ten datasets, but the comparison with
 Medverse at its native depth was mixed. Training with the model's own
 predictions as prior worked better than training with perturbed ground-truth
 masks on the training distribution.
@@ -1813,12 +1946,6 @@ ablations are complete.}% <<< end sections/conclusion.tex
 \addcontentsline{toc}{section}{\iflanguage{english}{Appendix}{Anhang}}
 \section*{\iflanguage{english}{Appendix}{Anhang}}\label{sec:appendix}
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.6\linewidth]{arch_medverse.pdf}
-  \caption{Medverse's architecture: dual U-Net cross-attention, shown for comparison against our architecture (\autoref{fig:overview}).}
-  \label{fig:overview-medverse}
-\end{figure}
 
 \begin{table}[p]
   \centering
@@ -1882,6 +2009,8 @@ ablations are complete.}% <<< end sections/conclusion.tex
   \end{tabularx}
 \end{table}
 
+
+\begin{comment}
 \begin{table}[t]
   \centering
   \small
@@ -1902,6 +2031,94 @@ ablations are complete.}% <<< end sections/conclusion.tex
     GNC\_705        & 0.008 & 0.001 \\
     \bottomrule
   \end{tabular}
-\end{table}% <<< end sections/appendix.tex
+\end{table}
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.6\linewidth]{arch_medverse.pdf}
+  \caption{Medverse's architecture: dual U-Net cross-attention, shown for comparison against our architecture (\autoref{fig:overview}).}
+  \label{fig:overview-medverse}
+\end{figure}
+
+\end{comment}
+
+\begin{longtable}{@{}llcccc@{}}
+  \caption{Per-class Dice and NSD, Synth + Cascade (ours) vs.\ Medverse,
+  extending the dataset-level results of
+  \autoref{tab:synth-cascade-medverse-final} to every class on all nine
+  held-out datasets. Same protocol: Medverse's number of autoregressive steps
+  matched to our number of levels per dataset
+  (\autoref{sec:results-cascade}). Bold marks the better value per row; exact
+  ties are left unbolded (GNC\_705, Hyper mask L, NSD: both 0.000). MV:
+  Medverse.}
+  \label{tab:synth-cascade-medverse-perclass} \\
+  \toprule
+  & & \multicolumn{2}{c}{Dice} & \multicolumn{2}{c}{NSD} \\
+  \cmidrule(lr){3-4} \cmidrule(lr){5-6}
+  Dataset & Class & Ours & MV & Ours & MV \\
+  \midrule
+  \endfirsthead
+  \multicolumn{6}{l}{\textit{\tablename\ \thetable{} -- continued from previous page}} \\
+  \toprule
+  & & \multicolumn{2}{c}{Dice} & \multicolumn{2}{c}{NSD} \\
+  \cmidrule(lr){3-4} \cmidrule(lr){5-6}
+  Dataset & Class & Ours & MV & Ours & MV \\
+  \midrule
+  \endhead
+  \midrule
+  \multicolumn{6}{r}{\textit{continued on next page}} \\
+  \endfoot
+  \bottomrule
+  \endlastfoot
+  \multirow{13}{*}{FLARE22} & Adrenal gland L & \textbf{0.623} & 0.001 & \textbf{0.806} & 0.000 \\
+   & Adrenal gland R & \textbf{0.260} & 0.001 & \textbf{0.415} & 0.000 \\
+   & Aorta & \textbf{0.878} & 0.454 & \textbf{0.929} & 0.461 \\
+   & Duodenum & \textbf{0.500} & 0.020 & \textbf{0.502} & 0.029 \\
+   & Esophagus & \textbf{0.678} & 0.004 & \textbf{0.747} & 0.005 \\
+   & Gallbladder & \textbf{0.757} & 0.019 & \textbf{0.797} & 0.017 \\
+   & Inferior vena cava & \textbf{0.808} & 0.119 & \textbf{0.813} & 0.112 \\
+   & Kidney L & \textbf{0.910} & 0.903 & \textbf{0.919} & 0.875 \\
+   & Kidney R & 0.908 & \textbf{0.915} & \textbf{0.910} & 0.902 \\
+   & Liver & \textbf{0.950} & 0.945 & \textbf{0.893} & 0.851 \\
+   & Pancreas & \textbf{0.616} & 0.077 & \textbf{0.624} & 0.063 \\
+   & Spleen & \textbf{0.934} & 0.755 & \textbf{0.960} & 0.720 \\
+   & Stomach & \textbf{0.832} & 0.448 & \textbf{0.757} & 0.294 \\
+  \midrule
+  \multirow{2}{*}{MSD Prostate} & Prostate PZ & \textbf{0.188} & 0.075 & \textbf{0.245} & 0.121 \\
+   & Prostate TZ & 0.557 & \textbf{0.640} & 0.382 & \textbf{0.480} \\
+  \midrule
+  \multirow{2}{*}{MSD Hippocampus} & Hippocampus anterior & 0.562 & \textbf{0.704} & 0.767 & \textbf{0.902} \\
+   & Hippocampus posterior & 0.473 & \textbf{0.668} & 0.739 & \textbf{0.907} \\
+  \midrule
+  HU\_LWK1 & L1 center & \textbf{0.124} & 0.020 & \textbf{0.049} & 0.029 \\
+  \midrule
+  \multirow{5}{*}{NasalSeg} & Maxillary sinus L & 0.763 & \textbf{0.861} & 0.826 & \textbf{0.912} \\
+   & Maxillary sinus R & 0.799 & \textbf{0.822} & 0.864 & \textbf{0.890} \\
+   & Nasal cavity L & 0.419 & \textbf{0.633} & 0.685 & \textbf{0.805} \\
+   & Nasal cavity R & 0.443 & \textbf{0.556} & 0.737 & \textbf{0.740} \\
+   & Nasopharynx & 0.795 & \textbf{0.812} & 0.843 & \textbf{0.874} \\
+  \midrule
+  ISLES22 & Stroke lesion & \textbf{0.070} & 0.059 & \textbf{0.086} & 0.070 \\
+  \midrule
+  Shifts-MS & MS lesion & 0.019 & \textbf{0.098} & 0.123 & \textbf{0.136} \\
+  \midrule
+  ATLAS v2.0 & Stroke lesion & \textbf{0.032} & 0.024 & \textbf{0.044} & 0.012 \\
+  \midrule
+  \multirow{13}{*}{GNC\_705} & Complex L & \textbf{0.092} & 0.026 & \textbf{0.106} & 0.027 \\
+   & Complex R & \textbf{0.032} & 0.010 & \textbf{0.034} & 0.009 \\
+   & Complex cyst L & \textbf{0.038} & 0.004 & \textbf{0.050} & 0.003 \\
+   & Complex cyst R & \textbf{0.019} & 0.002 & \textbf{0.032} & 0.001 \\
+   & Hyper L & \textbf{0.053} & 0.003 & \textbf{0.075} & 0.001 \\
+   & Hyper R & \textbf{0.021} & 0.003 & \textbf{0.029} & 0.000 \\
+   & Hyper cyst L & \textbf{0.079} & 0.006 & \textbf{0.102} & 0.001 \\
+   & Hyper cyst R & \textbf{0.008} & 0.005 & \textbf{0.015} & 0.000 \\
+   & Hyper mask L & 0.000 & \textbf{0.004} & 0.000 & 0.000 \\
+   & Hypo L & \textbf{0.035} & 0.005 & \textbf{0.035} & 0.003 \\
+   & Hypo R & \textbf{0.016} & 0.009 & \textbf{0.018} & 0.005 \\
+   & Hypo mask L & \textbf{0.033} & 0.008 & \textbf{0.038} & 0.004 \\
+   & Hypo mask R & \textbf{0.033} & 0.010 & \textbf{0.036} & 0.008 \\
+\end{longtable}
+% <<< end sections/appendix.tex
 
 \end{document}
