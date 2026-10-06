@@ -31,7 +31,13 @@ a single bidirectional cross-attention step in the mask decoder, and the
 embedding is reused across queries. Large volumes are processed via a sliding window approach, without
 refinement across scales.
 
-\todo{focus more on the single img-lbl fusion point}
+\paragraph{Image--label fusion.}
+All three models fuse image and label information once, before target and
+context interact: UniverSeg and Medverse concatenate each context image with
+its mask as input channels, and Iris merges them in its context encoder. From
+then on, label information is carried only in fused features. Dual attention
+instead keeps a separate label stream throughout
+(\autoref{sec:methodology-fusion}).
 
 \paragraph{Coarse-to-fine approaches.}
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large
@@ -52,13 +58,13 @@ ground-truth mask stands in for this prediction.
   \caption{Design choices of 3D in-context segmentation models on the three
     questions of \autoref{sec:motivation}.}
   \label{tab:relatedwork}
-  \begin{tabular}{@{} l p{4.5cm} p{4.5cm} p{4cm} @{}}
+  \begin{tabular}{@{} l p{4.2cm} p{4.4cm} p{3.4cm} @{}}
     \toprule
     & Image--label fusion & Coarse-to-fine prior & Synthetic tasks \\
     \midrule
-    Iris & Before attention (pixel shuffle) & No & No \\
-    Medverse & Before attention (channel concatenation) & Ground truth mask & Procedural shapes \\
-    \textbf{Ours} & dual attention at every layer & Previous level prediction & Procedural shapes, painted on real scans \\
+    Iris & Once, in the context encoder (pixel shuffle) & None (sliding window) & No \\
+    Medverse & Once, at the input (channel concatenation) & Previous prediction in a separate branch; ground truth in training & Procedural shapes \\
+    \textbf{Ours} & In every layer (dual attention) & Previous prediction in the label tokens; own prediction in training & Procedural shapes on real scans \\
     \bottomrule
   \end{tabular}
 \end{table}

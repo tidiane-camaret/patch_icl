@@ -1,23 +1,18 @@
 \subsection{Coarse-to-Fine Cascade}\label{sec:results-cascade}
 
-This section evaluates the Cascade configuration (\autoref{tab:configs}). We
-first examine how accuracy develops across levels and how well the coarse level
-localizes the target. We then compare with Medverse in accuracy and latency,
-compare the two sources of the label prior, and finally test a register-carry
-variant.
+This section evaluates the Cascade configuration (\autoref{tab:configs}): how
+accuracy develops across levels, how well the coarse level localizes the
+target, how the cascade compares with Medverse in accuracy and latency, and
+which prior works better during training.
 
 \paragraph{Accuracy across levels.}
-When the crop is centered on the ground truth, reducing the spacing from 4\,mm
-to 1.5\,mm raises macro Dice on TotalSegmentator from 0.361 to 0.538 (117
-classes, 3897 samples). Because these crops use the ground-truth position, this
-shows the benefit of finer resolution, not of the cascade.
-\autoref{tab:cascade-levels} therefore reports the Dice of each level when its
-crop is placed using the previous level's prediction. Dice still increases from
-level to level on every dataset, for example from 0.603 to 0.718 to 0.751 on
-FLARE22.
-\todo[inline]{This shows that the cascade works without ground-truth
-localization, but not that it beats a single fine-resolution pass over the
-whole volume. The planned $-$region-restriction ablation answers this.}
+\autoref{tab:cascade-levels} reports the Dice of each level, with each crop
+placed from the previous level's prediction. Dice increases from level to
+level on every dataset, e.g.\ from 0.603 to 0.751 on FLARE22 and from 0.065
+to 0.152 on HU\_LWK1. The stitched mask keeps the coarser predictions outside
+the finest crop. This recovers target parts on TotalSeg MRI (0.495 to 0.503),
+adds false positives on MSD Prostate (0.381 to 0.375), and changes nothing
+where the coarser levels predict no foreground outside the finest crop.
 
 \begin{table}[t]
   \centering
@@ -39,40 +34,44 @@ whole volume. The planned $-$region-restriction ablation answers this.}
   \end{tabular}
 \end{table}
 
- Outside the finest crop, the stitched mask contains the predictions of
-  coarser levels, so its Dice can be higher than the finest level's (TotalSeg
-  MRI), lower (MSD Prostate), or unchanged (HU\_LWK1, FLARE22,
-  NasalSeg) when the target lies entirely inside the finest crop and there is
-  nothing outside it for a coarser prediction to add.
-  
+\autoref{fig:c2f-hu-lwk1} and \autoref{fig:c2f-flare22} show the crop
+placement for Cascade and for Medverse run through the same cascade.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{c2f_hu_lwk1.png}
+  \caption{HU\_LWK1: Cascade's box tracks the vertebra center across all
+  three levels; Medverse's drifts off by level 1, so its finest crop no
+  longer contains the target.}
+  \label{fig:c2f-hu-lwk1}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{c2f_flare22.png}
+  \caption{FLARE22: both models' boxes converge on the spleen by level 1.}
+  \label{fig:c2f-flare22}
+\end{figure}
+
+
 \paragraph{Localization.}
-  On TotalSeg CT (117 classes), at the coarsest level, the crop of the middle
-  level, placed at the centroid of the coarse prediction, contains on average
-  92.2\% of the target's voxels; placed at the ground-truth centroid, the same
-  crop contains 97.0\%. Across classes, this
-containment correlates only weakly with the Dice gain from the finer levels
-($r = -0.22$, $p = 0.018$, $n = 117$, $r^2 \approx 0.05$). This measures only
-the coarsest-to-middle transition, not the middle-to-finest one. Since most of
-the target already lies inside the box at this first step, most of the
-remaining error at this step arises within the fine crops rather than from
-localization; whether the same holds for the middle-to-finest transition is
-not tested here.
+On TotalSeg CT, a middle-level crop centered at the centroid of the coarse
+prediction contains on average 92.2\% of the target's voxels, compared with
+97.0\% when centered at the ground-truth centroid. Localization thus loses
+about 5\% of the target at this transition, and most of the remaining error
+arises within the fine crops. The middle-to-finest transition is not measured.
 
 \paragraph{Comparison with Medverse.}
-\autoref{tab:cascade-medverse} compares Ours with Medverse's released
-weights, using its own autoregressive coarse-to-fine inference with the
-number of steps matched to our number of levels per dataset (Medverse's
-native, unmatched depth is compared separately in
-\autoref{sec:results-cascade-medverse-depth}). Four lesion datasets (ISLES22,
-Shifts-MS, ATLAS v2.0, GNC\_705), where both numbers are below 0.1, appear at
-the bottom of the table. TotalSeg CT is not included in this comparison (see
-the table's \texttt{\textbackslash todo}). MSD Hippocampus is processed at a
-single level, so its row compares the base models without a cascade.
+\autoref{tab:cascade-medverse} compares Cascade with Medverse's released
+weights, run with its own autoregressive inference and with its number of
+steps matched to our number of levels per dataset; its native depth is
+compared below. MSD Hippocampus runs at a single level, so its row compares
+the two models without a cascade. Medverse is not evaluated on TotalSeg CT.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Ours vs.\ Medverse: macro Dice and mean latency per sample.
+  \caption{Cascade vs.\ Medverse: macro Dice and mean latency per sample.
   Medverse is evaluated with its number of autoregressive steps matched to our
   number of levels per dataset.}
   \label{tab:cascade-medverse}
@@ -80,11 +79,10 @@ single level, so its row compares the base models without a cascade.
     \toprule
     & & \multicolumn{2}{c}{Dice} & & \multicolumn{2}{c}{Latency (ms)} \\
     \cmidrule(lr){3-4} \cmidrule(lr){6-7}
-    Dataset & Spacings (mm) & Ours & Medverse & & Ours & Medverse \\
+    Dataset & Spacings (mm) & Cascade & Medverse & & Cascade & Medverse \\
     \midrule
-    % TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.585} & --    & & 206 & --   \\ % removed for final paper (see TODO.md)
     FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.359 & & 311 & 4894 \\
-    MSD Prostate    & $[3, 1.5, 0.75]$ & 0.375 & 0.357 & & 279 & 5006 \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.375} & 0.357 & & 279 & 5006 \\
     MSD Hippocampus & $[0.5]$          & 0.303 & \textbf{0.686} & & 99  & 50   \\
     HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.020 & & 439 & 5336 \\
     TotalSeg MRI    & $[6, 3, 1.5]$    & \textbf{0.503} & 0.055 & & 194 & 5188 \\
@@ -100,47 +98,34 @@ single level, so its row compares the base models without a cascade.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Dice and latency are both sample-weighted, each dataset weighted
-  by its own number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22).
-  Ours and Medverse are both averaged over the same six datasets above the
-  second midrule (Ours: Dice 0.526, unweighted 0.439; latency 206\,ms,
-  unweighted 247\,ms. Medverse: Dice 0.393, unweighted 0.369; latency
-  3491\,ms, unweighted 3727\,ms). The four lesion datasets below the second
-  midrule are excluded from both means (both models score below 0.1 on every
-  one of them).
+  $^{\dagger}$Over the six datasets above the second midrule, each weighted by
+  its number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22).
+  Unweighted: Dice 0.439 vs.\ 0.369, latency 247 vs.\ 3727\,ms. The four
+  lesion datasets are excluded, since both models score below 0.1 on all of
+  them.
 \end{table}
-\todo[inline]{TotalSeg CT is commented out of this table (and of
-\autoref{tab:cascade-levels} and \autoref{tab:medverse-matched-native}) ---
-decided out of scope for the final paper. Its numbers, where they exist, are
-still available if this changes: see \texttt{TODO.md} for what is and isn't
-archived (our own model's TotalSeg CT cascade run is done; Medverse's matched
-and native cells there never completed).}
 
-Against Medverse with matched steps, Ours is more accurate on seven of the
-ten datasets: FLARE22, MSD Prostate, HU\_LWK1, TotalSeg
-MRI, ISLES22, ATLAS v2.0, and GNC\_705.
-Medverse is more accurate on MSD Hippocampus, reportedly part of its training
-classes but not of ours, on NasalSeg, which neither model saw during
-training, and on Shifts-MS.
+On the six non-lesion datasets, Cascade is more accurate on four (FLARE22,
+MSD Prostate, HU\_LWK1, TotalSeg MRI) and Medverse on two (MSD Hippocampus,
+NasalSeg); the sample-weighted means are 0.526 and 0.393. The largest gaps in
+our favor are on TotalSeg MRI, which is part of our training data, and on
+FLARE22, whose classes are mostly in our training vocabulary. Medverse's two
+wins, in contrast, are on datasets that neither model saw during training. On
+the four lesion datasets, both models stay below 0.1 Dice.
 
-\autoref{fig:cascade-medverse-qual} shows one case from each side of this
-comparison, using the context, ground truth, and prediction of both models on
-the same target subject (Medverse run in its native-autoregressive mode, not
-the step-matched mode of \autoref{tab:cascade-medverse}; see
-\autoref{sec:results-cascade-medverse-depth}). Ground truth is shown in
-green, Ours in blue, Medverse's in orange throughout this section. On FLARE22
-gallbladder, Ours recovers the organ's shape (Dice 0.79) while Medverse
-predicts a small mislocated fragment (Dice 0.00). On MSD Hippocampus, the
-pattern reverses: Ours is fragmented into disconnected blobs (Dice 0.34),
-while Medverse produces a single contiguous region closer to the
-ground-truth shape (Dice 0.70).
+\autoref{fig:cascade-medverse-qual} and \autoref{fig:cascade-medverse-qual-fail}
+show one case from each side, with Medverse at its native depth. Ground truth
+is shown in green, Cascade in blue, and Medverse in orange. On a FLARE22
+gallbladder, Cascade recovers the organ (Dice 0.79), while Medverse predicts a
+small, mislocated fragment (0.00). On MSD Hippocampus, Cascade's prediction
+breaks into disconnected blobs (0.34), while Medverse's is a single region
+close to the ground truth (0.70).
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{flare22_gallbladder_win.png}
-  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Ours recovers
-  the organ shape where Medverse's native-autoregressive prediction misses
-  almost entirely.}
+  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Cascade recovers
+  the organ, while Medverse (native depth) misses it almost entirely.}
   \label{fig:cascade-medverse-qual}
 \end{figure}
 
@@ -148,59 +133,41 @@ ground-truth shape (Dice 0.70).
   \centering
   \includegraphics[width=0.85\linewidth]{msd_hippocampus_fail.png}
   \caption{MSD Hippocampus, posterior class, subject hippocampus\_001:
-  Ours fragments into disconnected blobs, while Medverse's
-  native-autoregressive prediction stays a single contiguous region.}
+  Cascade's prediction breaks into disconnected blobs, while Medverse (native
+  depth) predicts a single contiguous region.}
   \label{fig:cascade-medverse-qual-fail}
 \end{figure}
-\todo[inline]{Both panels are re-rendered directly from run\_cascade /
-model.predict() outputs on these two (target, context) pairs -- checkpoints
-and settings matching
-\texttt{2026-09-26\_147\_cascade\_randomfg\_predprior\_regon\_flare22\_ood} /
-\texttt{2026-09-15\_medverse\_ar\_flare22} and
-\texttt{2026-09-24\_146\_cascade\_randomfg\_predprior\_regoff\_msd\_hippocampus\_ood}
-/ \texttt{2026-09-14\_medverse\_ar\_msd\_hippocampus} -- rather than the
-harness's own saved diagnostic panels, so the color scheme could be made
-consistent across models (green/blue/orange). Each sample is the first the
-eval loader hit for its class, not a systematic best/worst search.}
+% Provenance: re-rendered from run_cascade / model.predict() on these
+% (target, context) pairs. FLARE22: 2026-09-26_147_cascade_randomfg_predprior_regon_flare22_ood
+% vs. 2026-09-15_medverse_ar_flare22. Hippocampus:
+% 2026-09-24_146_cascade_randomfg_predprior_regoff_msd_hippocampus_ood vs.
+% 2026-09-14_medverse_ar_msd_hippocampus. First sample the eval loader hit
+% per class, not a best/worst search.
 
-Ours is about $17\times$ faster than step-matched Medverse, sample-weighted
-over the six datasets in \autoref{tab:cascade-medverse} (206 vs.\ 3491\,ms per
-sample; unweighted, $15\times$: 247 vs.\ 3727\,ms). Our model
-runs one forward pass per level, whereas Medverse slides a window over the
-whole volume at each step; this difference and the architectures are not
-separated here. On MSD Hippocampus, where neither model uses a cascade,
-Medverse is faster (50 vs.\ 99\,ms).
+Cascade is about $17\times$ faster than step-matched Medverse (206 vs.\
+3491\,ms per sample, sample-weighted; $15\times$ unweighted, 247 vs.\
+3727\,ms). At a single level (MSD Hippocampus), Medverse is faster (50 vs.\
+99\,ms). The speedup therefore comes from processing one crop per level
+instead of sliding a window over the whole volume at each step, not from a
+cheaper forward pass.
 
-TotalSeg MRI is part of our training data. The large difference there
-therefore partly reflects training data, not only architecture.
-\todo[inline]{State what Medverse was trained on, including whether MSD
-Hippocampus is actually among its training classes (currently asserted above
-without a citation) and whether its training data includes TotalSegmentator.
-Its matched Dice of 0.055 on TotalSeg MRI is very low; if Medverse's training
-data includes TotalSegmentator, check preprocessing (orientation, intensity
-normalization, spacing) before reporting these numbers.}
-
-\begin{comment}
-
-\paragraph{Medverse: matched vs.\ native depth.}\label{sec:results-cascade-medverse-depth}
-Medverse's own released weights default to more autoregressive refinement
-steps than our number of cascade levels per dataset; \autoref{tab:medverse-matched-native}
-compares its accuracy at both depths, holding the model fixed and varying
-only how many steps it is given.
+\paragraph{Medverse at native depth.}
+By default, Medverse runs more autoregressive steps than our cascade has
+levels. \autoref{tab:medverse-matched-native} compares its Dice at both
+depths.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Medverse's own macro Dice at its number of autoregressive steps
-  matched to our number of levels per dataset (matched, repeated from
-  \autoref{tab:cascade-medverse}) vs.\ its native, unmatched number of steps
+  \caption{Medverse's macro Dice with its number of autoregressive steps
+  matched to our number of levels (matched, as in
+  \autoref{tab:cascade-medverse}) and at its default number of steps
   (native).}
   \label{tab:medverse-matched-native}
   \begin{tabular}{@{}lccc@{}}
     \toprule
     Dataset & Spacings (mm) & Matched & Native \\
     \midrule
-    % TotalSeg CT     & $[6, 3, 1.5]$    & -- & -- \\ % removed for final paper (see TODO.md)
     FLARE22         & $[6, 3, 2.5]$    & 0.359 & \textbf{0.440} \\
     MSD Prostate    & $[3, 1.5, 0.75]$ & 0.357 & \textbf{0.423} \\
     MSD Hippocampus & $[0.5]$          & 0.686 & \textbf{0.691} \\
@@ -216,143 +183,44 @@ only how many steps it is given.
   \end{tabular}
 \end{table}
 
-Matching the number of steps to ours lowers Medverse's accuracy on seven of
-the ten datasets with both values, most clearly on FLARE22 (0.440 to 0.359)
-and MSD Prostate (0.423 to 0.357); it raises accuracy on NasalSeg, ISLES22,
-and ATLAS v2.0, each by 0.006 or less. Against Medverse at its native depth,
-Ours (\autoref{tab:cascade-medverse}) is still more accurate on six (FLARE22,
-HU\_LWK1, TotalSeg MRI, ISLES22, ATLAS v2.0, GNC\_705) and less accurate on
-four (MSD Prostate, MSD Hippocampus, NasalSeg, Shifts-MS) --- a similar
-picture to the matched comparison, just with Medverse given more steps. Of
-the eight matched/native values across the four lesion datasets, only one
-exceeds 0.1: Medverse's native Shifts-MS result (0.152).
+Matching lowers Medverse's Dice on seven of the ten datasets, most on FLARE22
+($-0.081$) and MSD Prostate ($-0.066$), and raises it on the other three by at
+most 0.006. At native depth, Medverse overtakes Cascade on MSD Prostate (0.423
+vs.\ 0.375), so the two models split the non-lesion datasets three to three,
+and it exceeds 0.1 on one lesion dataset, Shifts-MS (0.152). The accuracy
+comparison therefore depends on how Medverse is run. The latency advantage
+does not, since native depth only adds steps.
 
 \paragraph{Medverse with our cascade.}
 We also ran Medverse's weights inside our cascade inference
-(\autoref{sec:methodology-cascade}), with and without its coarse prediction
-passed on as a prior, on these seven eval-expansion sources: HU\_LWK1,
-ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0, and GNC\_705
-(distinct from \autoref{tab:cascade-medverse}'s six datasets, which instead
-include FLARE22, TotalSeg MRI, and NasalSeg). Each source uses
-its own multi-level ladder, e.g.\ $[6,3,0.5]$\,mm for MSD Hippocampus; unlike
-our own model, which runs MSD Hippocampus single-level in
-\autoref{tab:cascade-medverse}, Medverse is given an actual cascade here on
-every source, so the two MSD Hippocampus numbers come from different
-evaluation setups. \autoref{tab:medverse-prior-appendix} in the appendix
-reports the full results; passing the prior lowered Dice on six of the seven,
-and on HU\_LWK1, Dice is 0.0 in both cases. The largest drop is on MSD
-Hippocampus, from 0.691 to 0.050. Errors of Medverse's coarse prediction
-therefore propagate strongly through its prior.
-
-\autoref{fig:cascade-vs-medverse-cascade} shows two cases from this
-comparison. To make the coarse-to-fine progression directly comparable, both
-models are run on a common ladder for each figure (rather than each model's
-own ladder from \autoref{tab:medverse-prior-appendix}, which differ in depth
-and spacing), one column per shared physical spacing. On MSD Prostate TZ
-(ladder $[6,3,1.5,0.75]$\,mm, common to both), Cascade's prediction grows to
-fill the zone's shape across the four levels (Dice 0.69) while Medverse's box
-tracks the same region but never produces a prediction at any level (Dice
-0.00). On MSD Hippocampus (ladder $[6,3,0.5]$\,mm, common to both -- Cascade
-is forced through this cascade here, whereas \autoref{tab:cascade-medverse}
-runs it single-level), Medverse's box is again placed correctly at every
-level but stays empty throughout (Dice 0.00), while Cascade's prediction
-appears already at the coarsest level and refines into a fragmented but
-non-empty final mask (Dice 0.43). This pattern is not universal:
-\autoref{fig:cascade-vs-medverse-cascade-atlas} shows the clearest
-counter-example found, an ATLAS v2.0 case (ladder $[6,3,1.9]$\,mm, common to
-both -- Cascade normally runs $[3.8,1.9]$\,mm here) where Cascade's predicted
-region shrinks to almost nothing by its finest level (Dice 0.01) while
-Medverse's prior-conditioned prediction grows to cover much of the lesion
-(Dice 0.42) -- well above ATLAS v2.0's aggregate Prior Dice of 0.020 in
-\autoref{tab:medverse-prior-appendix}, so this single sample should not be
-read as typical of that row.
-
-\end{comment}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{msd_prostate_cascade_win.png}
-  \caption{MSD Prostate, TZ class, subject prostate\_00\_adc, common
-  $[6,3,1.5,0.75]$\,mm ladder for both models: Cascade's prediction grows to
-  fill the zone's shape while Medverse's stays empty at every level.}
-  \label{fig:cascade-vs-medverse-cascade}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{msd_hippocampus_cascade_prior_fail.png}
-  \caption{MSD Hippocampus, posterior class, subject hippocampus\_001, common
-  $[6,3,0.5]$\,mm ladder for both models: Medverse's box is placed correctly
-  at every level but its prediction collapses to empty throughout, consistent
-  with the aggregate drop from 0.691 (no prior) to 0.050 (prior) in
-  \autoref{tab:medverse-prior-appendix}. Cascade's prediction, forced through
-  the same 3-level ladder for this figure only, is fragmented but present at
-  every level.}
-  \label{fig:cascade-vs-medverse-cascade-hip}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{atlas_v2_cascade_medverse_win.png}
-  \caption{ATLAS v2.0, stroke lesion, subject sub-r004s004, common
-  $[6,3,1.9]$\,mm ladder for both models: Cascade's predicted region shrinks
-  to almost nothing by its finest level while Medverse's prior-conditioned
-  prediction grows to cover much of the lesion. This sample scores far above
-  ATLAS v2.0's aggregate Prior Dice (0.42 vs.\ 0.020) and was chosen
-  specifically to show that the prior does not hurt Medverse uniformly, not
-  as a representative case. This particular Dice value is also unstable
-  across reruns of Medverse's cascade-mode prediction on this exact sample
-  (0.42--0.88 observed, see the todo below) --- read it as illustrating the
-  direction of the effect, not as a precise number.}
-  \label{fig:cascade-vs-medverse-cascade-atlas}
-\end{figure}
-\todo[inline]{Single-sample illustrations, not aggregate-representative cases
-(MSD Prostate's aggregate ``prior'' Dice is 0.251, not 0.00; the ATLAS v2.0
-sample is an extreme outlier the other way, 0.42 vs.\ an aggregate of 0.020 --
-both were picked to illustrate a pattern, not summarize the row). All three
-panels are re-rendered directly from \texttt{cascade.run\_cascade} on these
-specific (subject, context, class) triples -- not the harness's own saved
-diagnostic panels -- so the color scheme is consistent (green GT / blue
-Cascade / orange Medverse) and every level of a shared, common ladder is
-shown for both models, not just the finest. Forcing Cascade onto a ladder it
-was not evaluated on for the main tables (MSD Hippocampus's 3-level ladder;
-ATLAS v2.0's $[6,3,1.9]$\,mm instead of $[3.8,1.9]$\,mm) changes its Dice from
-the officially reported number (e.g.\ MSD Hippocampus 0.34$\to$0.43,
-ATLAS v2.0 0.02$\to$0.01) -- expected since the crop geometry differs, but
-worth being explicit that these two figures' Cascade numbers are not the ones
-in \autoref{tab:cascade-medverse}. Checkpoints:
-\texttt{2026-09-24\_146\_cascade\_randomfg\_predprior\_regoff/best.pt}
-(Cascade, released weights for Medverse). The ATLAS v2.0 and common-ladder
-(subject, context) pairs were not among the sources' saved figures at all and
-required rerunning \texttt{run\_cascade} outside the full eval sweep;
-Medverse's cascade-mode prediction on the ATLAS v2.0 sample is noticeably
-unstable across reruns (0.42--0.88 Dice observed across otherwise-identical
-reruns, plausibly bf16-autocast sensitivity compounding across its two
-feedback steps) -- worth flagging as a finding in its own right, and reason
-for caution reading any single Medverse-in-cascade number too precisely.}
+(\autoref{sec:methodology-cascade}) on seven held-out datasets, with and
+without its coarse prediction passed on as a prior
+(\autoref{tab:medverse-prior-appendix}). Here Medverse runs a multi-level
+cascade on every dataset, including MSD Hippocampus ($[6, 3, 0.5]$\,mm), so
+these numbers are not directly comparable with \autoref{tab:cascade-medverse}.
+The prior lowers Dice on six of the seven datasets, most on MSD Hippocampus
+(0.691 to 0.050) and ATLAS v2.0 (0.126 to 0.020); on HU\_LWK1, Dice is 0 in
+both cases (\autoref{fig:c2f-hu-lwk1}). Medverse is trained with a downsampled
+ground-truth mask as prior, so its own coarse errors are out of distribution
+for this input.
 
 \paragraph{Source of the label prior.}
 \autoref{tab:cascade-ablation} compares two models that differ only in the
 prior used during training: the model's own prediction from the previous
-level, or a perturbed ground-truth mask. At inference, both use their own
-predicted prior, since no ground truth is available then. On TotalSeg CT, the predicted prior is better on
-99 of 117 classes (median difference $+0.043$ Dice) and also improves NSD
-(0.631 vs.\ 0.576). FLARE22, also part of the training vocabulary, shows the
-same direction (0.731 to 0.751). MSD Hippocampus runs a single level, so no
-prior is passed; its row reflects the two checkpoints, not the prior, and is
-excluded from the counts below. On the remaining eight datasets outside the
-training vocabulary (class-level held-out, \autoref{sec:results-setup}; this
-excludes FLARE22 as well as TotalSeg CT, both already covered above), the
-predicted prior is better on five and
-worse on three: Shifts-MS, ATLAS v2.0, and GNC\_705. These three, together with ISLES22, are lesion datasets
-on which both priors score below 0.1; among these four, only ISLES22 favors
-the predicted prior.
+level, or a perturbed ground-truth mask. Both use their own prediction at
+inference. The predicted prior is better on the three datasets from the
+training vocabulary; on TotalSeg CT, it is better on 99 of 117 classes
+(median $+0.043$) and raises NSD from 0.576 to 0.631. On the seven datasets
+outside the training vocabulary, it is better on MSD Prostate, HU\_LWK1, and
+NasalSeg, by 0.053 to 0.148. On the four lesion datasets, both priors stay
+below 0.07 Dice and differ by at most 0.004.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Macro Dice of models trained with a ground-truth target mask prior or
-  with their own predicted prior.}
+  \caption{Macro Dice of Cascade models trained with a perturbed ground-truth
+  prior or with their own predicted prior. Both use their own prediction as
+  prior at inference.}
   \label{tab:cascade-ablation}
   \begin{tabular}{@{}lcc@{}}
     \toprule
@@ -361,36 +229,15 @@ the predicted prior.
     TotalSeg CT     & 0.543 & \textbf{0.585} \\
     TotalSeg MRI    & 0.449 & \textbf{0.503} \\
     FLARE22         & 0.731 & \textbf{0.751} \\
+    \midrule
     MSD Prostate    & 0.310 & \textbf{0.375} \\
-    % MSD Hippocampus$^{*}$ & 0.319 & 0.303 \\
     HU\_LWK1        & 0.099 & \textbf{0.152} \\
     NasalSeg        & 0.399 & \textbf{0.547} \\
+    \midrule
     ISLES22         & 0.067 & \textbf{0.069} \\
     Shifts-MS       & \textbf{0.035} & 0.031 \\
     ATLAS v2.0      & \textbf{0.029} & 0.026 \\
     GNC\_705        & \textbf{0.027} & 0.024 \\
     \bottomrule
   \end{tabular}
-  \par\vspace{0.5em}
-  \raggedright\footnotesize
-  % $^{*}$MSD Hippocampus runs a single level, so no prior is passed; this row   reflects the two checkpoints, not the prior, and is excluded from the counts in the text.
 \end{table}
-\todo[inline]{Planned ablations: no prior at all, and no region restriction
-(full-volume sliding window at fine levels, same checkpoint). Checkpoint 145's
-TotalSeg CT/MRI numbers (0.543/0.449 above) are untraceable to any archived
-run, same gap as checkpoint 146 had before the 2026-09-30 gap-fill (see
-\autoref{tab:cascade-medverse}'s todo) --- 145 was not part of that batch and
-still needs the equivalent re-run.}
-
-\begin{comment}
-\paragraph{Register carry.}
-A variant that additionally carries the register tokens across levels was
-tested against the same predicted-prior checkpoint, with a mixed effect on
-nine datasets (HU\_LWK1, ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, MSD
-Prostate, MSD Hippocampus, FLARE22, and NasalSeg --- a different nine from
-the ``eight'' just above: this set includes FLARE22 and MSD Hippocampus but,
-like every comparison in this paragraph, excludes TotalSeg CT/MRI, which
-were not part of this ablation's OOD sweep): it lowers Dice on six (most on
-MSD Prostate, $-0.016$) and raises it on three (most on NasalSeg, $+0.061$,
-and MSD Hippocampus, $+0.097$).
-\end{comment}

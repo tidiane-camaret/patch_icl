@@ -22,16 +22,17 @@ level then overwrites the region covered by its crop.
 
 \paragraph{Prediction as prior.}
 At level $\ell > 1$, the target's label tokens are computed from the previous
-prediction, cell by cell as in \autoref{eq:lbl-token}:
+prediction instead of the placeholder:
 %
 \begin{equation}
-  z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1})\big),
+  z^{\text{lbl}}_{t,i} = \mathrm{LblEmbed}\big(m_i(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1}))\big),
   \label{eq:query-prior}
 \end{equation}
 %
-where $\hat{L}^t_{\ell-1}$ is the sigmoid probability map of level $\ell{-}1$,
-detached from the computation graph, and $\mathrm{Warp}$ resamples it onto the
-crop grid of level $\ell$. The prior thus enters the same stream as the
+where $t$ indexes the target volume, $m_i(\cdot)$ extracts the $p^3$ voxels of
+cell $i$ as in \autoref{eq:lbl-token}, $\hat{L}^t_{\ell-1}$ is the sigmoid
+probability map of level $\ell{-}1$, detached from the computation graph, and
+$\mathrm{Warp}$ resamples it onto the crop grid of level $\ell$. The prior thus enters the same stream as the
 context masks, instead of a separate branch as in Medverse
 (\autoref{sec:fundamentals-relatedwork}); see \autoref{fig:query-prior}.
 
@@ -43,7 +44,7 @@ context masks, instead of a separate branch as in Medverse
   prediction $\hat{L}^t_1$.}
   \label{fig:query-prior}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
+
 
 \paragraph{Training.}
 All $M$ levels are processed in one forward pass. The first crop is centered
@@ -51,8 +52,5 @@ on the ground truth (at inference: on the volume center), later crops on the
 previous prediction, at its centroid or at a random foreground point. The
 coarsest spacing is drawn per batch, and each finer spacing log-uniformly
 between the previous spacing and a lower bound, with a minimum ratio between
-levels. The prior is either the model's own prediction (predicted prior) or
-the downsampled ground-truth mask; \autoref{sec:results-cascade} compares both.
-\todo[inline]{Values: $M$, spacing range, lower bound, minimum ratio,
-centroid vs.\ random-point probability, foreground threshold, perturbation
-magnitudes. Confirm inference always uses the centroid.}
+levels. The prior is either the model's own prediction (predicted prior) or a
+perturbed ground-truth mask (ground-truth prior); \autoref{sec:results-cascade} compares both.

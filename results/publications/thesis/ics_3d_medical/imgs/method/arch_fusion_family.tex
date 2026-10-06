@@ -322,8 +322,8 @@
     \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
     \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
 
-    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target ($N$)};
-    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context ($N$)};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target};
+    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context};
 
     \node[anchor=south] at ({(\xCubeImg+\xPredCube+\cubew/2)/2},{\methodTitleY})
       {\archtitle Shared encoder + cross-attn};
@@ -367,8 +367,8 @@
       ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},\yTgt+\clusterhalf+\boxpad);
     \node[anchor=south] at ({\xFuseBoxLeft+\boxwFuse/2},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
 
-    \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
-    \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
+    \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
 
     % context mask -> context "lbl" cluster, routed under the Fuse box
     % and up into the column from below (drawn now, before the column

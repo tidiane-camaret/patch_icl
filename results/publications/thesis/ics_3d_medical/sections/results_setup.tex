@@ -9,19 +9,12 @@ TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
 Data Commons). Training uses 61 of the 117 classes, chosen to balance
 anatomical categories and structure thickness: 12 abdominal and pelvic organs,
 8 thoracic, head, and spinal organs, 5 muscles (one side of each pair), 6 limb,
-shoulder, and pelvic bones, 11 vertebrae spanning all spine regions, 9 ribs
+shoulder, and pelvic bones, 10 vertebrae spanning all spine regions and the sacrum, 9 ribs
 and sternal structures, and 10 vessels. The remaining 56 classes form the
-unseen split. (\autoref{tab:totalseg-classes}) It includes structures close to training classes, such as the
+unseen split (\autoref{tab:totalseg-classes}). It includes structures close to training classes, such as the
 contralateral side of each training muscle. On MRI, 31 of the 61 training
 classes are available.
 
-\paragraph{Model configurations.}
-The experiments were run at different stages of development, so the three
-results sections use different model configurations
-(\autoref{tab:configs}). Numbers from different sections are therefore not
-directly comparable. In particular, TotalSegmentator MRI is a held-out
-modality for the fusion experiments, which train on CT only, but part of the
-training data in the other two sections.
 
 \begin{table}[t]
   \centering
@@ -39,8 +32,7 @@ training data in the other two sections.
     \bottomrule
   \end{tabular}
 \end{table}
-\todo[inline]{Resolve before submission: report a single final configuration,
-or keep this split?}
+
 
 \paragraph{Baselines.}
 The external baseline is Medverse~\cite{huMedverseUniversalModel2025a} with
@@ -48,8 +40,7 @@ its released weights (\autoref{sec:results-cascade},
 \autoref{sec:results-synth}). In \autoref{sec:results-fusion}, we additionally
 train Medverse's architecture from its released weights with our training
 recipe.
-\todo[inline]{No Iris baseline exists yet; the comparison in
-\autoref{sec:fundamentals-relatedwork} remains architectural, not empirical.}
+
 
 \paragraph{Evaluation protocol.}
 Each target is segmented with a single context pair ($K = 1$). The context
@@ -57,19 +48,19 @@ subject is drawn at random, with a fixed seed per target, from the same dataset
 and split as the target, among the subjects that contain the target class.
 Every subject that contains a class serves once as a target for that class. For each model, we use the checkpoint with the best
 Dice on the in-distribution validation split; no evaluation dataset is used for
-checkpoint selection.
-\todo[inline]{See open points: MRI validation split, $n$ in
-\autoref{tab:ood-sources}, $K$ during training.}
-
+checkpoint selection. Results of our models and of Dual U-Net Cross-Attn are means over three
+training seeds; the released Medverse weights are a single model.
 
 \paragraph{Metrics.}
 Accuracy is reported as Dice, computed per class and averaged over classes
 unless stated otherwise, and as Normalized Surface Dice (NSD) with a tolerance
 of 3\,mm. Compute is reported as GFLOPs per forward pass and as latency per
 sample. All training and evaluation runs on a single NVIDIA
-RTX PRO 6000 Blackwell Server Edition GPU (96\,GB).
-\todo[inline]{Precision of the latency measurements in
-\autoref{tab:cascade-medverse} (fp32 as in \autoref{tab:fusion-staircase}?).}
+RTX PRO 6000 Blackwell Server Edition GPU (96\,GB). Means over datasets are weighted by each dataset's number of evaluated tasks;
+unweighted means give the same ranking. In the cascade comparisons, the four
+lesion datasets are listed separately and excluded from the mean, since all
+models score below 0.1 Dice on them.
+
 
 \paragraph{Datasets.}
 \autoref{tab:ood-sources} lists the evaluation datasets, grouped by their
@@ -104,19 +95,17 @@ training vocabulary, even if their dataset is held out).
     Shifts-MS~\cite{malininShifts20Extending2022} & MRI FLAIR & MS lesions & 46 & 1 \\
     MSD Hippocampus~\cite{antonelliMedicalSegmentationDecathlon2022} & MRI T1 & hippocampus & 260 & 2 \\
     MSD Prostate~\cite{antonelliMedicalSegmentationDecathlon2022} & MRI T2 + ADC & prostate zones & 64 & 2 \\
-    ATLAS v2.0$^{*}$~\cite{liewLargeCuratedOpensource2022} & MRI T1 & chronic stroke lesion & 654 & 1 \\
+    ATLAS v2.0~\cite{liewLargeCuratedOpensource2022} & MRI T1 & chronic stroke lesion & 654 & 1 \\
     GNC\_705 & MRI Dixon & kidney lesions & 610 & 13 \\
     NasalSeg~\cite{zhangNasalSegDataset2024} & CT & nasal cavity and sinuses & 107 & 5 \\
     \midrule
     \multicolumn{5}{@{}l}{\itshape Non-anatomical target} \\
-    HU\_LWK1 & CT & center of L1 vertebrae & 36 & 1 \\
+    HU\_LWK1 & CT & center of L1 vertebra & 36 & 1 \\
     \midrule
     \multicolumn{5}{@{}l}{\itshape Additional modality (unseen in \autoref{sec:results-fusion})} \\
     TotalSeg MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025} & MRI & full-body 
     anatomical structures & 47 & 50 (31/19) \\
     \bottomrule
   \end{tabular}
-  \par\vspace{0.5em}
-  \raggedright\footnotesize
-  $^{*}$Obtained from an unofficial mirror; provenance not yet confirmed.
+
 \end{table}

@@ -43,8 +43,7 @@ is drawn, and $K+1$ different subjects containing it are sampled; the shape is
 placed within $\pm 30$\,mm per axis of the host structure's centroid. Since the
 volumes of a task are different scans, the target cannot be found by comparing
 it with the context images voxel by voxel.
-The \emph{synthetic-bank} canvas uses a bank of label maps from segmented CT
-scans of about 21 datasets. A class is drawn, and $K+1$ label maps containing
+The \emph{synthetic-bank} canvas uses TotalSegmentator training masks. A class is drawn, and $K+1$ label maps containing
 it are selected, optionally preferring maps of similar geometry. As in
 SynthSeg~\cite{billot2023synthseg}, the image is synthesized from the label
 map with Gaussian-mixture intensities, and the shape is painted into it, with
@@ -60,14 +59,7 @@ $\sigma$ of the host image:
   \label{eq:paint}
 \end{equation}
 %
-with the contrast $c$ drawn once per task. The range covers the
-lesion-to-tissue contrast we measured on seven of the evaluation datasets
-(10th to 90th percentile: $-0.87$ to $2.00$), widened symmetrically because
-the sign of the contrast is not known for an arbitrary host. The texture
+with the contrast $c$ drawn once per task. The texture
 $n(x)$ is fractal value noise with unit variance: four octaves of random grids,
-starting from 15\,mm cells and halving the cell size per octave, weighted by
-$0.5^k$.
-\todo[inline]{Over which region are $\mu$ and $\sigma$ computed (a ring
-around the shape?) Which seven datasets were used for the contrast
-calibration?}
+starting from 15\,mm cells and halving the cell size per octave.
 % <<< end sections/methodology_synth.tex

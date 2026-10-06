@@ -190,8 +190,8 @@
 
     \archflow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{neutral}
 
-    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
-    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
+    \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
 
     \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
       \foreach \y in {\yTgt, \yCtx} {
@@ -267,7 +267,7 @@
     \pgfmathsetmacro{\ximgPatchBot}{\boxDcenter-\pairpitch/2}
     \pgfmathsetmacro{\xlblPatchBot}{\ximgPatchBot+\pairpitch}
 
-    \node[anchor=south] at ({(\outerLeft+\outerRight)/2},{\methodTitleY}) {\archboxlabel Dual attention};
+    \node[anchor=south] at ({(\outerLeft+\outerRight)/2},{\methodTitleY}) {\archboxlabel Dual axis attention};
 
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
@@ -282,10 +282,10 @@
 
     \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
-    \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
-    \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
-    \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.05) {$z^{\text{img}}_{v,i}$};
-    \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.05) {$z^{\text{lbl}}_{v,i}$};
+    \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
+    \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
+    \node[anchor=south,font=\normalsize] at ({\ximgPatchBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
+    \node[anchor=south,font=\normalsize] at ({\xlblPatchBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
 
     \fill[black!15,rounded corners=3pt]
       ({\ximgBot-\tsz/2-0.18},{\yCtx-\toff-\tsz/2-0.10}) rectangle

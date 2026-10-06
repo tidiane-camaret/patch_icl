@@ -1,1 +1,27 @@
 \section*{Abstract}
+
+In-context segmentation predicts the mask of a target structure from a few
+annotated examples, so a single model can segment new classes without
+retraining. For 3D medical images, compute becomes a central constraint,
+since the cost of dense attention between target and context grows
+quadratically with the number of voxels. This thesis develops an efficient 3D
+in-context segmentation model around three questions: how to combine image
+and label information, where to spend compute, and how to obtain training
+tasks beyond the annotated classes.
+
+First, we propose dual attention, which keeps image and label tokens in
+separate streams that interact in every layer. At matched compute and with
+fewer parameters, it outperforms merging the two once on 12 of 13 evaluation
+splits, with the largest gains on new targets. Second, we propose a
+coarse-to-fine cascade in which each level processes a single crop placed by
+the previous level's prediction, which also enters the target's label tokens
+as a prior. Training with the model's own predictions as prior outperforms
+training with perturbed ground-truth masks. Third, we propose a synthetic
+task generator that paints procedural shapes onto real scans; compared with a
+fully synthetic canvas, it improves three of four lesion datasets.
+
+We evaluate the model on held-out datasets and
+compare it with Medverse. With matched refinement steps, our final model is
+15 times faster and more accurate on average over the non-lesion datasets
+(Dice 0.615 vs.\ 0.552), while Medverse remains more accurate on two of them.
+Lesions remain difficult for both models and are the main open problem.

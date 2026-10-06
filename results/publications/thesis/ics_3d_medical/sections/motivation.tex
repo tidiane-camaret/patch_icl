@@ -27,14 +27,15 @@ This thesis addresses three questions that arise when building an efficient
     a single fusion operation. We instead keep image and label tokens as
     separate streams and let them exchange information at every layer through
     \emph{dual attention} (\autoref{sec:methodology-fusion}).
-  \item \textbf{Where should compute be spent?}
+   \item \textbf{Where should compute be spent?}
     Medverse~\cite{huMedverseUniversalModel2025a} refines its prediction by
     processing the entire volume with a sliding window at every resolution
-    step, including regions that the previous step has already ruled out. We
-    use a \emph{coarse-to-fine cascade} in which each level processes only the
-    region localized by the previous level and receives that level's
-    prediction as a prior (\autoref{sec:methodology-cascade}).
-  \todo{talk about query prior injection instead of localized processing}
+    step, including regions that the previous step has already ruled out, and
+    passes the previous prediction through a separate network branch. We use a
+    \emph{coarse-to-fine cascade} in which each level processes only the region
+    localized by the previous level, and the previous prediction enters the
+    target's label tokens directly as a prior
+    (\autoref{sec:methodology-cascade}).
   \item \textbf{Where can training data come from beyond the annotated classes?}
     Real image--mask pairs cover only the classes and appearance range of the
     training cohort. We generate additional training tasks with a
@@ -54,17 +55,17 @@ This thesis addresses three questions that arise when building an efficient
     next level as a prior and restricts fine-level processing to the localized
     region. We compare predicted priors with perturbed ground-truth priors, and
     compare accuracy and latency with Medverse's coarse-to-fine approach.
-  \item A synthetic task generator that paints procedural shapes onto real CT
-    and MRI scans. We evaluate it against training on real data only and study
-    its effect on real tasks.
-  \item An evaluation on nine datasets covering
-    unseen tasks such as lesions, a non-anatomical target region, and MRI as a
-    held-out modality.
+  \item A synthetic task generator that paints procedural shapes onto real
+    scans. We compare it with a SynthSeg-style synthetic canvas and evaluate
+    its effect on lesion datasets and on TotalSegmentator.
+  \item An evaluation on TotalSegmentator and nine held-out datasets, covering
+    lesions, new anatomical structures, a non-anatomical target region, and,
+    for the fusion comparison, MRI as an unseen modality.
 \end{itemize}
 
 \paragraph{Outline.}
 \autoref{sec:fundamentals} introduces in-context segmentation, the volumetric
-encoders and attention mechanisms the model builds on, and positions related methods with respect to the three
-questions above. \autoref{sec:methodology} describes the model.
-\autoref{sec:results} evaluates each component in turn.
-\autoref{sec:discussion} discusses the findings and their limitations.
+encoders and attention mechanisms the model builds on, and related methods.
+\autoref{sec:methodology} describes the model, \autoref{sec:results} evaluates
+each component, \autoref{sec:discussion} discusses the findings and their
+limitations, and \autoref{sec:conclusion} concludes.

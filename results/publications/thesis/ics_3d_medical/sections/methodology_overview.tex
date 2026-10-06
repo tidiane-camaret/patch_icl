@@ -17,7 +17,7 @@ small field of view at high resolution: at 6\,mm spacing the grid spans
 768\,mm per side, at 1.5\,mm only 192\,mm. During training, the spacing is
 sampled from a range rather than fixed to the levels used at inference
 (\autoref{sec:methodology-cascade}).
-\todo[inline]{Give the training spacing range in the results settings}
+
 
 \begin{figure}[t]
   \centering
@@ -27,7 +27,7 @@ sampled from a range rather than fixed to the levels used at inference
   by dual attention; a decoder produces the target mask.}
   \label{fig:overview}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize labels/scale once the architecture is settled.}
+
 
 \paragraph{Shared encoder.}
 All $K+1$ images of a task pass through the same encoder, a plain
@@ -43,9 +43,7 @@ volume, and concatenated along the channel dimension. Each cell therefore
 covers $p^3 = 8^3$ voxels of the input grid, with $p = 128/R$. The attention
 layers always operate on this fixed grid, while the decoder can still produce
 a mask at the full $128^3$ resolution.
-\todo[inline]{\autoref{sec:results-fusion} says the fusion arms warm-start the
-encoder and decoder from a shared checkpoint. Is that a checkpoint of this
-model, itself trained from scratch? If so, say so there.}
+
 
 \paragraph{Tokens.}
 Each cell $i$ of each volume $v$ is represented by two tokens of dimension

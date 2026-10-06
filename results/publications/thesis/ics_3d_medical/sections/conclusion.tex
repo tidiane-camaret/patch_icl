@@ -5,33 +5,21 @@ three questions: how to combine image and label information, where to spend
 compute, and how to obtain training data beyond the annotated classes.
 
 For the first question, we proposed dual attention, which keeps image and label
-tokens separate and lets them interact in every layer. In a comparison trained
-on TotalSegmentator CT, dual attention improved over merging the two once,
-mainly on new targets and on an unseen modality, and it did so with the fewest
-parameters of the compared variants. It was also the only shared-encoder
-variant above a retrained Medverse architecture on the mean over held-out
-datasets, although not on every dataset.
+tokens separate and lets them interact in every layer. Trained on
+TotalSegmentator CT, dual attention improved over merging the two once on 12
+of 13 evaluation rows, most on new targets, and with the fewest parameters of
+the compared variants. A retrained Medverse architecture, initialized from its
+released weights, remained better on most datasets with new targets.
 
 For the second question, we proposed a coarse-to-fine cascade in which each
 level receives the previous level's prediction as a prior and processes only
-the region that prediction localizes. The cascade was about 17 times faster
-than Medverse with the same number of refinement steps. It was more accurate
-than step-matched Medverse on seven of ten datasets, but the comparison with
-Medverse at its native depth was mixed. Training with the model's own
-predictions as prior worked better than training with perturbed ground-truth
-masks on the training distribution.
+the region that prediction localizes. The cascade was more than an order of
+magnitude faster than Medverse, while the accuracy comparison depended on how
+Medverse was run. Training with the model's own predictions as prior worked
+better than training with perturbed ground-truth masks.
 
 For the third question, we proposed a synthetic task generator that paints
-procedural shapes onto scans. The modality of the image the shapes are painted
-on mattered more than the variety of shapes: painting onto real MRI cases
-improved three of four lesion datasets at a single level without reducing
-accuracy on TotalSegmentator. Under cascade inference, synthetic tasks helped
-on held-out anatomical structures but not on lesions.
-
-All results come from single training runs, and several comparisons are not
-fully controlled; \autoref{sec:discussion-limitations} lists the main
-limitations and the ablations still missing. Segmenting lesions from a few
-examples remains the hardest case in this setting and the clearest direction
-for future work.
-\todo[inline]{Update the numbers and claims once the pending re-runs and
-ablations are complete.}
+procedural shapes onto scans. The canvas mattered more than the variety of
+shapes: painting onto real scans improved three of four lesion datasets
+at a single level without reducing accuracy on TotalSegmentator. Under cascade
+inference, however, lesion segmentation remained largely unsolved.

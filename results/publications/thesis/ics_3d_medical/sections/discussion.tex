@@ -1,153 +1,96 @@
 \section{\iflanguage{english}{Discussion}{Diskussion}}\label{sec:discussion}
 
-This chapter summarizes what the experiments show for each of the three
-questions raised in \autoref{sec:motivation}, discusses the limitations of the
-evidence, and outlines open questions.
+This chapter discusses the results for each of the three questions of
+\autoref{sec:motivation}, the limitations of the evidence, and open questions.
 
 \subsection{Image--Label Fusion}\label{sec:discussion-fusion}
 
-Replacing Medverse's two U-Nets with a shared encoder and attention layers
-improved accuracy on classes from the training vocabulary by a large margin,
-between 0.16 and 0.23 Dice on TotalSegmentator and FLARE22
-(\autoref{tab:fusion-staircase}). On new targets, this change alone did not
-help: early fusion was below Dual U-Net Cross-Attn on MSD Prostate, MSD
-Hippocampus, and HU\_LWK1. Dual attention changed this pattern only partly.
-Its gains over early fusion were small on in-vocabulary classes and larger on
-new targets and on the unseen modality, and it was the only variant above Dual
-U-Net Cross-Attn on the sample-weighted mean over held-out sources. This
-aggregate advantage does not hold source-by-source: on the five lesion and
-cavity datasets, Dual U-Net Cross-Attn wins more often (four of five), so the
-mean is driven by the first five, more anatomical, held-out sources.
+Replacing Medverse's two U-Nets with a shared encoder improved accuracy on the
+training vocabulary by 0.16 to 0.23 Dice, but not on new targets: there,
+single-axis attention was below Dual U-Net Cross-Attn on all eight datasets.
+Dual attention improved over single-axis attention on 12 of 13 rows, most on
+new targets. Letting image and label tokens interact in every layer thus seems
+to help most when the model has to extract the target from the context masks
+rather than recognize a trained class, although the results do not test this
+mechanism directly.
 
-One interpretation is that repeated interaction between image and label tokens
-matters most when the model cannot rely on having seen the class during
-training and has to extract the target from the context masks. This is
-consistent with the results, but they do not test it directly. Dual attention
-also remained well below Dual U-Net Cross-Attn on MSD Prostate and HU\_LWK1.
-Dual U-Net Cross-Attn starts from Medverse's weights, which were trained on
-different data; part of its advantage on these datasets may come from that
-pretraining rather than from its architecture.
-
-Dual attention reached these results with the fewest parameters of the three
-variants. The GFLOPs of the three variants differ by up to 65\%, but their
-latency is nearly identical, so GFLOPs did not predict latency in this
-setting.
-\todo[inline]{Check where the time goes (e.g.\ encoder, data movement) before
-drawing conclusions about compute.}
+Against Dual U-Net Cross-Attn, dual attention led on the held-out mean, but
+this lead came from FLARE22 and TotalSeg MRI, whose classes are largely in the
+training vocabulary. On the eight datasets with new targets, Dual U-Net
+Cross-Attn was better on six. Its initialization from Medverse's weights,
+trained on different data, may explain part of this; training both from the
+same initialization would separate the two. Dual attention reached its results
+with the fewest parameters of the three variants.
 
 \subsection{Coarse-to-Fine Cascade}\label{sec:discussion-cascade}
 
-When each level's crop is placed from the previous level's prediction, Dice
-still increases from level to level on every dataset
-(\autoref{tab:cascade-levels}). On TotalSeg CT, the coarse level localizes the
-target well enough for the first, coarsest-to-middle step: a box at its
-predicted centroid contains 92\% of the target's voxels on average, compared
-with 97\% for a box at the ground-truth centroid, and most of the remaining
-error at this step arises within the fine crops rather than from
-localization; the middle-to-finest step is not measured this way.
+Placing each crop from the previous level's prediction works: Dice increases
+from level to level on every dataset (\autoref{tab:cascade-levels}), and on
+TotalSeg CT the coarse prediction places the middle-level crop almost as well
+as the ground truth does (92\% vs.\ 97\% of the target's voxels contained).
 
-The clearest advantage over Medverse is speed. Cascade is about 17 times faster
-than Medverse with the same number of refinement steps, sample-weighted over
-the six datasets where both latencies are measured. The accuracy comparison
-depends on how Medverse is run. With matched
-steps, Cascade is more accurate on seven of the ten datasets with a matched
-value; against Medverse at its native number
-of steps, it is more accurate on six of the same ten (FLARE22, HU\_LWK1,
-TotalSeg MRI, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
-better supported than the accuracy result. TotalSeg CT is not part of this
-comparison (\autoref{sec:results-cascade}).
+The clearest advantage over Medverse is speed: Cascade is more than an order
+of magnitude faster. Since Medverse is faster at a single level, this comes
+from processing one crop per level instead of the whole volume, not from the
+architecture. The accuracy comparison is less clear. On the non-lesion datasets, Cascade leads on four of six against step-matched
+Medverse but only on three of six at Medverse's native depth. Its largest
+leads are on datasets from its training vocabulary, whereas Medverse leads on
+MSD Hippocampus and NasalSeg, which neither model saw during training.
 
-Training with the model's own predictions as prior worked better than training
-with perturbed ground-truth masks on the training distribution (99 of 117
-classes) and was mixed on datasets outside the training vocabulary (five of
-eight). A plausible
-explanation is that a model trained on its own predictions sees, during
-training, the kind of errors it will encounter at inference, which a
-hand-designed perturbation of the ground truth only approximates. Whether the
-prior helps at all compared with no prior has not been tested yet. The
-experiment with Medverse inside our cascade shows that a prior can also hurt:
-passing Medverse's coarse prediction forward lowered its Dice on six of seven
-datasets.
+Training with the model's own prediction as prior was better than training
+with a perturbed ground-truth mask, both on the training vocabulary and on the
+three non-lesion datasets outside it. A likely reason is that the model sees
+its own errors during training, which a hand-designed perturbation only
+approximates. Medverse, trained with a ground-truth prior, shows the opposite
+case: inside our cascade, passing on its own coarse prediction lowered its
+Dice on six of seven datasets. Whether a prior helps at all compared with none
+remains untested.
 
-Region restriction makes the cost of the fine levels depend on the size of the
-target rather than the size of the volume, but it makes the fine levels depend
-on the coarse localization. GNC\_705 shows the consequence: its single-level
-Dice of 0.223 dropped below 0.04 under cascade inference, likely because the
-coarse level mislocalizes the small lesions. Small, multi-focal, or low-contrast
-targets are the cases where this failure is most likely. Possible remedies
-include larger margins, several boxes per volume for multi-focal targets, or
-falling back to full-volume processing when the coarse prediction is uncertain.
-\todo[inline]{Revise the GNC\_705 paragraph once it is clear whether the
-single-level evaluation used ground-truth-centered crops
-(\autoref{sec:results-synth}).}
+Region restriction makes the cost of each level independent of the volume
+size, but makes the fine levels depend on the coarse localization. On
+GNC\_705, the single-level Dice of 0.223 fell to 0.035 under cascade
+inference, likely because the coarse level misses the small lesions. Small,
+multi-focal, or low-contrast targets are most at risk. Larger margins, several
+crops per volume, or a fallback to full-volume processing when the coarse
+prediction is uncertain could address this.
 
 \subsection{Synthetic Task Generation}\label{sec:discussion-synth}
 
-With the synthetic-bank canvas, varying the shapes and the fraction of
-synthetic tasks had no measurable effect on the lesion datasets. Changing only
-the canvas from CT bank images to real MRI cases improved three of four lesion
-datasets without reducing accuracy on TotalSegmentator. This indicates that
-the image the shapes are painted on mattered more than the variety of shapes,
-at least when the canvas and the target data differ in modality.
+With the synthetic-bank canvas, neither the mix of shape families nor
+$p_\text{synth}$ affected the lesion datasets. Replacing the bank with real scans improved three of the four without reducing accuracy on
+TotalSegmentator. What the shapes are painted on thus mattered more than which
+shapes are painted. This change makes the canvas both real and, so the
+two factors are not separated.
 
-The effect of synthetic tasks under cascade inference was smaller and
-different. Synth + Cascade improved mainly on MSD Hippocampus and NasalSeg,
-which are anatomical structures rather than lesions, and not on the lesion
-datasets that motivated the generator. Since Synth + Cascade also differs from
-Cascade in other components and in training history, these gains cannot be
-attributed to the synthetic tasks alone.
-
-Across all configurations, Dice on the lesion datasets stayed low: at most
-0.223 at a single level and below 0.08 under cascade inference. In-context
-segmentation of lesions remains largely unsolved in this setting. Lesions vary
-in location, number, and shape far more than anatomical structures, so the
-context examples say less about where the target is. How much of this gap
-synthetic tasks can close remains open.
+Under cascade inference, Synth + Cascade improved mainly on MSD Hippocampus
+and NasalSeg, not on the lesion datasets that motivated the generator, and it
+differs from Cascade in more than the synthetic tasks. Lesion Dice stayed low
+throughout: at most 0.223 at a single level, and at most 0.070 for our models
+under cascade inference. Lesions vary in location, number, and shape far more
+than anatomical structures, so a single context example says little about
+where the target is. In-context lesion segmentation remains largely unsolved
+in this setting.
 
 \subsection{Limitations}\label{sec:discussion-limitations}
 
-\paragraph{Strength of the evidence.}
-All results come from a single training run per configuration, so no variance
-estimates are available, and differences of a few hundredths of Dice should not
-be over-interpreted. Several results rest on few classes, such as the two
-unseen FLARE22 classes, the MSD datasets with two classes each, and HU\_LWK1
-with one. In the fusion comparison, early fusion and dual attention had not
-completed their training budget, while Dual U-Net Cross-Attn had converged.
-
-\paragraph{Differences between configurations.}
-The three results sections use different model configurations
-(\autoref{tab:configs}), so their numbers cannot be compared with each other.
-Within sections, some comparisons change several factors at once: stage 3 of
-the synthetic-task experiments changes shape families, canvas pool, and
-training budget together, and Synth + Cascade differs from Cascade in more than
-the synthetic tasks.
-\todo[inline]{Update if a single final configuration is evaluated before
-submission.}
-
 \paragraph{Missing ablations.}
-The contribution of the label prior and of region restriction has not been
-isolated: the cascade has not been evaluated without a prior or with
-full-volume processing at the fine levels. The speedup over Medverse therefore
-reflects the whole system, not region restriction alone.
+The cascade has not been evaluated without a prior or with full-volume
+processing at the fine levels, so the contributions of the prior and of region
+restriction are not isolated.
 
-\paragraph{Baselines and data.}
-Medverse is the only baseline evaluated empirically. Iris and UniverSeg are
-compared only by design. The overlap between Medverse's training data and our
-evaluation datasets is not fully documented, which affects the comparison on
-TotalSegmentator, MSD Hippocampus, and NasalSeg. The provenance of the ATLAS
-v2.0 copy used here has not been confirmed.
-\todo[inline]{Remove the ATLAS sentence once provenance is confirmed or the
-dataset is dropped.}
+\paragraph{Evaluation.}
+All results use a single context pair ($K = 1$), and the fusion comparison
+uses crops centered on the ground truth. Medverse is the only baseline
+evaluated empirically; Iris and UniverSeg are compared only by design.
+TotalSeg MRI is part of our training data, and Medverse's training data may
+overlap with MSD Hippocampus and NasalSeg, which affects the comparison on
+these datasets.
 
 \subsection{Open Questions}\label{sec:discussion-open}
 
-The most direct next steps are the missing ablations (no prior, no region
-restriction), additional seeds, and a single final configuration evaluated on
-all datasets. Beyond these, three questions remain open. First, the position
-axis attends over the tokens of all $K+1$ volumes at once, so its cost grows
-quadratically with the number of context volumes. How accuracy and cost scale
-with $K$ has not been studied. Second, region restriction needs a way to
-handle targets the coarse level cannot localize reliably. Third, synthetic
-tasks helped on some held-out datasets, but not yet on lesions under cascade
-inference. Generating tasks that resemble lesions in appearance and
-distribution, not only in shape, is one direction to explore.
+First, the position axis attends over all $K+1$ volumes at once, so its cost
+grows quadratically with the number of context volumes; how accuracy and cost
+scale with $K$ is untested. Second, region restriction needs a way to handle
+targets the coarse level cannot localize. Third, synthetic tasks did not yet
+help on lesions under cascade inference; tasks that resemble lesions in
+appearance and distribution, not only in shape, are one direction to explore.

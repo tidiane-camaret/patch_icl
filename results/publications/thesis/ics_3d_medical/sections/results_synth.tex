@@ -1,48 +1,44 @@
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-This section evaluates the synthetic task generator, mainly on the four
-lesion datasets it targets: ISLES22, Shifts-MS, ATLAS v2.0, and GNC\_705. They
-are the most difficult evaluation datasets, since their targets are lesions on
-MRI with no counterpart among the training classes. Under cascade inference,
-the comparison widens to all nine held-out datasets used in
-\autoref{sec:results-cascade}.
+This section evaluates the synthetic task generator, first at a single level
+on the four lesion datasets it targets (ISLES22, Shifts-MS, ATLAS v2.0,
+GNC\_705), then under cascade inference on all nine held-out datasets. The
+lesion datasets are the hardest in the evaluation: their targets are lesions
+on MRI with no counterpart among the training classes.
+
 
 \paragraph{Synthetic-bank canvas.}
-The baseline is the Synth configuration trained with $p_\text{synth} = 0.5$
-and the synthetic-bank canvas. It reaches Dice between 0.008 and 0.082 on the
-four datasets (\autoref{tab:synth-realhost-ood}). Changing the mix of shape
-families or $p_\text{synth}$ with this canvas did not change these results
-beyond run-to-run variation.   The bank's images are synthesized from label maps of CT scans, whereas all
-  four target datasets are real MRI. This suggested that the canvas, rather
-  than the variety of shapes, limits transfer.
-\todo[inline]{Show the family-mix and $p_\text{synth}$ runs (appendix table)}
+The baseline is the Synth configuration ($p_\text{synth} = 0.5$,
+synthetic-bank canvas). It reaches Dice between 0.008 and 0.082 on the four
+lesion datasets (\autoref{tab:synth-realhost-ood}). With this canvas, changing
+the mix of shape families or $p_\text{synth}$ did not change these results
+beyond seed-to-seed variation. Since the bank's images are synthesized from CT
+label maps, whereas all four lesion datasets are real MRI, we hypothesized
+that the canvas rather than the shapes limits transfer.
+
 
 \paragraph{Real-host canvas.}
-To test this, we continued training from the baseline checkpoint in two runs
-that differ only in the canvas: the synthetic bank (stage 1) or real scans from TotalSegmentator (stage 2). Both use only the scatter-field family, with
-the same $p_\text{synth}$ and training budget. The real canvas improves Dice on
-three of the four datasets: ISLES22 from 0.045 to 0.098, Shifts-MS from 0.011
-to 0.058, and GNC\_705 from 0.070 to 0.105. ATLAS v2.0 is unchanged (0.033
-vs.\ 0.032). ATLAS v2.0 mostly contains single compact lesions, whereas
-scatter-field shapes consist of many small components, which may explain why
-it does not benefit. Absolute Dice remains low on all four datasets.
-\todo[inline]{Confirm that stages 1 and 2 are continued from the baseline
-checkpoint, and what distinguishes stage 1 from the baseline.}
+To test this, we continued training from the baseline in two runs that differ
+only in the canvas: the synthetic bank (stage 1) or real TotalSegmentator
+CT and MRI scans (stage 2). Both use only the scatter-field family, with the same
+$p_\text{synth}$ and training budget. The real canvas improves Dice on three of
+the four datasets: ISLES22 (0.045 to 0.098), Shifts-MS (0.011 to 0.058), and
+GNC\_705 (0.070 to 0.105). ATLAS v2.0 is unchanged (0.033 vs.\ 0.032).
+Absolute Dice stays below 0.11 on all four.
 
-In stage 3, the real-host canvas is extended to all seven shape families and to
-all TotalSegmentator subjects (CT and MRI, all organs), and training runs
-longer. This raises Dice on GNC\_705 to 0.223, while ISLES22, Shifts-MS, and ATLAS
-v2.0 all drop slightly below their stage-2 values. Because stage 3 changes
-three factors at once, the result cannot be attributed to any one of them.
+Stage 3 extends the real-host canvas to all seven shape families and to all
+TotalSegmentator subjects (CT and MRI, all organs), and trains longer. This
+raises GNC\_705 to 0.223, while the other three datasets fall slightly below
+their stage-2 values. Since stage 3 changes three factors at once, neither the
+gain nor the drops can be attributed to a single one.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Dice on the lesion datasets for successive synthetic-task
-  configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
-  shape families, all TotalSegmentator subjects as canvas, and a longer
-  training budget. Bold marks the best configuration per dataset, as in
-  \autoref{tab:synth-cascade-realhost}.}
+  \caption{Single-level Dice on the lesion datasets for successive
+  synthetic-task configurations. Stages 1 and 2 differ only in the canvas.
+  Stage 3 adds all shape families, all TotalSegmentator subjects as canvas,
+  and a longer training budget.}
   \label{tab:synth-realhost-ood}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -58,37 +54,26 @@ three factors at once, the result cannot be attributed to any one of them.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the four datasets, weighted by each one's
-  own number of evaluated tasks (46 for Shifts-MS to 1490 for GNC\_705,
-  identical across all four configurations). GNC\_705 alone is 61\% of the
-  total weight, so this mean tracks GNC\_705 closely; the unweighted mean
-  (Baseline 0.042, stage 1 0.040, stage 2 0.073, stage 3 0.097) ranks the four
-  configurations the same way, but with a much smaller stage-3 lead.
+  $^{\dagger}$Weighted by the number of evaluated tasks per dataset (46 for
+  Shifts-MS to 1490 for GNC\_705, which carries 61\% of the weight). The
+  unweighted mean (0.042, 0.040, 0.073, 0.097) gives the same ranking with a
+  smaller stage-3 lead.
 \end{table}
 
 \paragraph{Effect on TotalSegmentator.}
 \autoref{tab:synth-realhost-indist} reports TotalSegmentator validation Dice
-for the same checkpoints, split by modality and class membership. Stages 1
-and 2 change it by at most 0.023 in any row (TotalSeg CT, unseen) relative to
-the baseline, so the gains of stage 2 on the lesion datasets do not reduce
-accuracy on the training distribution. Stage 3 improves all four values, and
-the sample-weighted mean rises from 0.434 to 0.505. Given its longer training
-budget, this gain likely reflects the additional training rather than the
+for the same checkpoints. Stages 1 and 2 stay within 0.022 of the baseline in
+every row, so the lesion gains of stage 2 do not cost accuracy on the training
+distribution. Stage 3 improves all four rows (mean 0.434 to 0.505), which
+likely reflects its longer training and larger canvas pool rather than the
 synthetic tasks themselves.
+
 
 \begin{table}[t]
   \centering
   \small
   \caption{TotalSegmentator validation Dice for the checkpoints of
-  \autoref{tab:synth-realhost-ood}, by modality and class membership,
-  computed the same way as every other results table (macro: per-class mean,
-  then averaged over classes). This differs from an earlier version of this
-  table, whose MRI/CT rows were computed as a flat per-sample mean instead
-  (matching \texttt{train.py}'s own internal logging); under that
-  convention TotalSeg MRI scored below TotalSeg CT overall, but splitting
-  seen from unseen first, as here, reverses that (MRI-seen scores above
-  CT-seen at every stage) --- a composition effect, not a correction of an
-  error.}
+  \autoref{tab:synth-realhost-ood}, by modality and class membership.}
   \label{tab:synth-realhost-indist}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -104,42 +89,29 @@ synthetic tasks themselves.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the four rows, weighted by each one's own
-  number of evaluated tasks (155 for TotalSeg MRI, unseen to 273 for TotalSeg
-  MRI, seen, identical across all four configurations); the unweighted mean
-  (Baseline 0.426, stage 1 0.426, stage 2 0.422, stage 3 0.494) ranks the
-  configurations the same way, though Baseline and stage 1 are within 0.0002
-  of each other under either weighting and should be read as tied.
+  $^{\dagger}$Weighted by the number of evaluated tasks per row (155 to 273).
+  Unweighted: 0.426, 0.426, 0.422, 0.494. Baseline and stage 1 are tied under
+  either weighting.
 \end{table}
 
 \paragraph{Cascade inference.}
 Synth + Cascade continues the stage-3 checkpoint with 20 epochs of cascade
-training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
-uses no synthetic tasks, and with step-matched Medverse on the nine held-out
-datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
+training.
+\autoref{tab:synth-cascade-realhost} compares both with step-matched Medverse.
+Synth + Cascade improves over Cascade on MSD Hippocampus (0.303 to 0.518) and
 NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
-($-0.012$), and differs by at most 0.011 on the other datasets. On the
-sample-weighted mean of the five non-lesion datasets, Synth + Cascade is
-highest (0.615), ahead of Medverse (0.552) and Cascade (0.531); this ordering
-is driven by MSD Hippocampus and NasalSeg, the two datasets where Cascade
-trails both other models by the largest margins. It remains
-below Medverse on MSD Hippocampus, NasalSeg, and Shifts-MS, where Medverse's
-step-matched result (0.098) is the best of the three despite this being one
-of the four lesion datasets that motivated the synthetic-task generator. The
-two models differ in more
-than the synthetic tasks: Synth + Cascade also uses register carry and a
-pooling token, and has a different training history. The differences can
-therefore not be attributed to the synthetic tasks alone.
+($-0.012$), and stays within 0.011 elsewhere. These two gains put it ahead on
+the non-lesion mean (0.615, vs.\ 0.552 for Medverse and 0.531 for Cascade),
+although it still trails Medverse on both datasets. On the lesion datasets,
+the synthetic tasks have little effect under cascade inference: all three
+models stay below 0.1, and Medverse is best on Shifts-MS (0.098).
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Dice on the held-out datasets under cascade inference. Medverse:
-  released weights, step-matched autoregressive inference
-  (\autoref{sec:results-cascade}). Cascade and Synth + Cascade use the same
-  per-dataset ladder (identical sample counts confirmed for every dataset), so
-  differences are not a ladder confound; Medverse uses its own depth-matched
-  ladder from \autoref{tab:cascade-medverse}.}
+  \caption{Dice on the held-out datasets under cascade inference. Cascade and
+  Synth + Cascade use the same spacings per dataset; Medverse is step-matched
+  as in \autoref{tab:cascade-medverse}.}
   \label{tab:synth-cascade-realhost}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -161,74 +133,50 @@ therefore not be attributed to the synthetic tasks alone.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the five datasets above the second
-  midrule, each weighted by its own number of evaluated tasks (36 for
-  HU\_LWK1 to 650 for FLARE22, identical across all three models here); the
-  unweighted mean-of-datasets ranks the three models the same way (Cascade
-  0.426, Synth + Cascade 0.480, Medverse 0.432). The four lesion datasets
-  below the second midrule are excluded (all three models score below 0.1 on
-  every one of them).
+  $^{\dagger}$Over the five datasets above the second midrule, weighted by the
+  number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22). Unweighted:
+  0.426, 0.480, 0.432 (same ranking). The lesion datasets are excluded, since
+  all three models score below 0.1 on all of them.
 \end{table}
 
-The gain on GNC\_705 at a single level (0.223,
-\autoref{tab:synth-realhost-ood}) does not carry over to cascade inference,
-where both models score below 0.04. A likely cause is localization: on this
-dataset, the coarse predictions follow bright regions rather than the lesions,
-so the region-restricted fine levels process crops that miss the lesion. This
-illustrates the limitation of region restriction noted in
-\autoref{sec:methodology-cascade}: small targets that the coarse level
-mislocalizes cannot be recovered. \autoref{fig:gnc-localization-fail} shows one
-such case: the lesion is a handful of voxels at the edge of the kidney
-(yellow circle, added for visibility, on the ground-truth panel), and the
-region-restricted finest level predicts nothing in that same location
-(Dice 0.00).
+The stage-3 gain on GNC\_705 (0.223 at a single level) is lost under cascade
+inference, where Synth + Cascade reaches 0.035. A likely cause is
+localization: small lesions that the coarse level misses fall outside the
+region-restricted fine crops and cannot be recovered
+(\autoref{sec:methodology-cascade}). \autoref{fig:gnc-localization-fail} shows
+one such case: the lesion is a handful of voxels at the edge of the kidney,
+and the finest level predicts nothing there (Dice 0.00). Since the single-level results use crops centered on the ground truth, part of this drop reflects the loss of ground-truth localization.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{gnc_localization_fail.png}
-  \caption{GNC\_705, class hypo\_mask\_r, subject 100014\_v30 (Cascade
-  checkpoint), coarse (6\,mm) and mid (3\,mm) level images shown for context:
-  the lesion (yellow circle) is a handful of voxels at the edge of the
-  kidney; the finest (1.2\,mm) level, restricted to its own region, predicts
-  nothing there (Dice 0.00).}
+  \caption{GNC\_705, class hypo\_mask\_r, subject 100014\_v30 (Cascade), with
+  the coarse (6\,mm) and middle (3\,mm) levels shown for context. The lesion
+  (yellow circle) is a handful of voxels at the edge of the kidney; the finest
+  (1.2\,mm) level predicts nothing there (Dice 0.00).}
   \label{fig:gnc-localization-fail}
 \end{figure}
-\todo[inline]{Support this further with the containment of the coarse box on
-GNC\_705 across all samples, not just this one case (currently a single
-qualitative example, re-rendered directly from \texttt{cascade.run\_cascade}
-on this one (subject, context, class) triple, not a systematic worst-case
-search), instead of the reference to
-\texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
-uses ground-truth-centered crops, the drop may mainly reflect the loss of
-ground-truth localization; state which is the case.}
+
 
 \paragraph{Final comparison: Synth + Cascade vs.\ Medverse.}
-\autoref{tab:synth-cascade-medverse-final} adds NSD and latency to the Dice
-comparison above, restricted to our best cascade configuration, Synth +
-Cascade, against step-matched Medverse. On the sample-weighted mean of the
-five non-lesion datasets, Synth + Cascade leads on both Dice (0.615 vs.\
-0.552) and NSD (0.729 vs.\ 0.631) while being $15\times$ faster (179 vs.\
-2697\,ms per sample), consistent with the $15$--$17\times$ latency gap already
-reported for Cascade in \autoref{sec:results-cascade}. NSD moves in the same
-direction as Dice on seven of the nine datasets; the exceptions are
-Shifts-MS, where Medverse's Dice lead (0.098 vs.\ 0.019) is even larger on NSD
-(0.136 vs.\ 0.123), and ATLAS v2.0, where Synth + Cascade's Dice lead (0.032
-vs.\ 0.024) is much larger still on NSD (0.044 vs.\ 0.012). On the four lesion
-datasets, absolute scores stay below 0.1 Dice for both models on every one of
-them, and Medverse is faster only on MSD Hippocampus, the one dataset run at a
-single level rather than a cascade.
-\autoref{tab:synth-cascade-medverse-perclass} in the appendix breaks this
-comparison down to every individual class on all nine datasets.
+\autoref{tab:synth-cascade-medverse-final} adds NSD and latency for Synth +
+Cascade and step-matched Medverse. NSD agrees with Dice on which model is
+better on all nine datasets. On the non-lesion mean, Synth + Cascade leads in
+Dice (0.615 vs.\ 0.552) and NSD (0.729 vs.\ 0.631) and is $15\times$ faster
+(179 vs.\ 2697\,ms per sample); Medverse is faster only on MSD Hippocampus, the
+one single-level dataset. Against Medverse at native depth
+(\autoref{tab:medverse-matched-native}), Synth + Cascade wins only FLARE22 and
+HU\_LWK1 among the non-lesion datasets, but stays ahead on the sample-weighted
+mean (0.615 vs.\ 0.586). \autoref{tab:synth-cascade-medverse-perclass} in the
+appendix gives per-class results.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Final comparison, Synth + Cascade (ours) vs.\ Medverse: Dice, NSD,
-  and mean latency per sample on all nine held-out datasets. Medverse:
-  released weights, autoregressive inference with its number of steps matched
-  to our number of levels per dataset (\autoref{sec:results-cascade}). Bold
-  marks the best value per row for Dice and NSD; latency is bolded only in
-  the sample-weighted mean row. MV: Medverse.}
+  \caption{Synth + Cascade (Ours) vs.\ step-matched Medverse (MV): Dice, NSD,
+  and mean latency per sample on the nine held-out datasets. Bold marks the
+  better value per row for Dice and NSD, and for latency only in the mean
+  row.}
   \label{tab:synth-cascade-medverse-final}
   \begin{tabular}{@{}lccc c cc c cc@{}}
     \toprule
@@ -252,15 +200,8 @@ comparison down to every individual class on all nine datasets.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the five datasets above the second
-  midrule, each weighted by its own number of evaluated tasks (36 for
-  HU\_LWK1 to 650 for FLARE22, identical across both models here); the
-  unweighted mean-of-datasets ranks the two models the same way on every
-  metric (Dice: Synth + Cascade 0.480, Medverse 0.432. NSD: 0.536, 0.482.
-  Latency: 232, 3436\,ms). The four lesion datasets below the second midrule
-  are excluded from the means (both models score below 0.1 Dice on every one
-  of them). Dice and NSD are macro (per-class mean, then averaged over
-  classes, as in \autoref{sec:results-setup}); latency is a flat mean over
-  samples.
+  $^{\dagger}$Over the five datasets above the second midrule, weighted by the
+  number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22). Unweighted:
+  Dice 0.480 vs.\ 0.432, NSD 0.536 vs.\ 0.482, latency 232 vs.\ 3436\,ms. Dice
+  and NSD are macro-averaged over classes; latency is a mean over samples.
 \end{table}
-

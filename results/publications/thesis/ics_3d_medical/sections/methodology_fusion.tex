@@ -21,7 +21,7 @@ shared-encoder design used in this thesis.
   shows the two ways of adding label information that we compare.}
   \label{fig:fusion-family}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
+
 
 \paragraph{Token array.}
 We arrange all tokens of a task in an array
@@ -33,20 +33,20 @@ each of the two axes of this array in turn, following the general pattern of
 the dual attention network of Fu et al.~\cite{fuDualAttentionNetwork2019},
 which combines position-wise and channel-wise attention for scene
 segmentation.
-\todo[inline]{Confirm: register and pooling rows also have an entry in both
-streams (implied by the $c{=}2$ layout). How are they initialized in the label
-stream?}
+
 
 \paragraph{Layer structure.}
 Each of the $L = 4$ layers applies three residual blocks, each preceded by
 RMS normalization:
 %
-\begin{align}
+\begin{equation}
+\begin{aligned}
   Z &\leftarrow Z + \mathrm{Attn}_{\text{mod}}\big(\mathrm{RMSNorm}_1(Z)\big), \\
   Z &\leftarrow Z + \mathrm{Attn}_{\text{pos}}\big(\mathrm{RMSNorm}_2(Z)\big), \\
   Z &\leftarrow Z + \mathrm{MLP}\big(\mathrm{RMSNorm}_3(Z)\big).
-  \label{eq:dual-layer}
-\end{align}
+\end{aligned}
+\label{eq:dual-layer}
+\end{equation}
 %
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
   \item \textbf{Modality axis} ($\mathrm{Attn}_{\text{mod}}$). Within each
@@ -55,7 +55,7 @@ RMS normalization:
     row, so its cost grows linearly with $S$.
   \item \textbf{Position axis} ($\mathrm{Attn}_{\text{pos}}$). Within each
     stream, the tokens of all rows attend to each other: image tokens attend
-    to the image tokens of all cells, volumes, and registers, and label tokens
+    to the image tokens of all cells and volumes, and label tokens
     likewise to label tokens. The two streams use the same attention weights
     but are processed as separate sequences of length $S$. Attention is
     unmasked, so every row attends to every other row, including context rows
@@ -68,10 +68,6 @@ RMS normalization:
 \end{itemize}
 %
 All attention operations use 12 heads with a token dimension of $D = 768$.
-\todo[inline]{Confirm: (1) the position axis shares its weights between the
-two streams (implied by batching the streams into the batch dimension);
-(2) how RoPE is applied to register and pooling rows, which have no spatial
-position.}
 
 The two streams exchange information only in the modality axis, which is local
 to a cell. Matching across cells and volumes happens within each stream.
@@ -82,8 +78,8 @@ Since attention is unmasked, the context tokens also depend on the target:
 the context is encoded anew for each target, rather than once per task as in
 Iris.
 
-\paragraph{Single-axis attention baseline.}
-As a baseline, the single-axis attention variant (\autoref{fig:fusion-axis}, top)
+\paragraph{Single axis attention baseline.}
+As a baseline, the single axis attention variant (\autoref{fig:fusion-axis}, top)
 merges the image and label token of each cell into a single token before the
 attention layers, using a pixel shuffle--unshuffle operation similar to the one
 Iris uses in its context encoder. The array then has a single column, and each
@@ -92,24 +88,20 @@ information of a cell is thus combined once, before any attention, rather than
 in every layer. Without the modality axis and the second stream, a layer costs
 roughly half as much, so this variant uses $L = 9$ layers to match the compute
 of dual attention (\autoref{sec:results-fusion}).
-\todo[inline]{Describe the merge precisely: is the $8^3$ mask patch unshuffled
-into channels and concatenated with the coarse features before the projection
-$W_{\text{img}}$? Otherwise the same block structure (RMSNorm, MLP, 12 heads)?}
+
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{arch_fusion_axis.pdf}
-  \caption{The two variants of the shared-encoder design compared in
-  \autoref{sec:results-fusion}, shown for one context volume and three of its
-  $N$ cells. Top: early fusion (baseline). Image and label tokens are merged
+  \caption{The two variants of the shared encoder design compared in
+  \autoref{sec:results-fusion}. Top: Single axis attention. Image and label tokens are merged
   once ($\oplus$), and the fused tokens attend across cells and volumes for
-  $L$ layers. Bottom: dual attention. Image and label tokens stay in separate
+  $L$ layers. Bottom: Dual axis attention. Image and label tokens stay in separate
   streams. In each of the $L$ layers, the two tokens of a cell attend to each
   other (modality axis), and then each stream attends across all cells and
-  volumes (position axis). The target's label token (gray) holds the prior of
-  \autoref{sec:methodology-cascade}, not ground truth.}
+  volumes (position axis).}
   \label{fig:fusion-axis}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled. The position-axis panel should show two separate attentions, one per stream, not one joint attention over image and label tokens.}
+
 
 % <<< end sections/methodology_fusion.tex

@@ -1,1 +1,33 @@
 \section*{Zusammenfassung}
+\begin{otherlanguage}{ngerman}
+In-Context-Segmentierung sagt die Maske einer Zielstruktur anhand weniger
+annotierter Beispiele vorher, sodass ein einzelnes Modell neue Klassen ohne
+erneutes Training segmentieren kann. Bei medizinischen 3D-Bildern wird der
+Rechenaufwand zur zentralen Einschränkung, da die Kosten dichter Attention
+zwischen Ziel und Kontext quadratisch mit der Anzahl der Voxel wachsen. Diese
+Arbeit entwickelt ein effizientes Modell zur 3D-In-Context-Segmentierung
+entlang dreier Fragen: wie Bild- und Labelinformation kombiniert werden
+sollte, wofür Rechenaufwand eingesetzt werden sollte und wie sich
+Trainingsaufgaben über die annotierten Klassen hinaus gewinnen lassen.
+
+Erstens schlagen wir Dual Attention vor, bei der Bild- und Label-Tokens in
+getrennten Strömen verbleiben, die in jeder Schicht miteinander interagieren.
+Bei gleichem Rechenaufwand und mit weniger Parametern übertrifft sie eine
+einmalige Fusion beider Ströme in 12 von 13 Evaluationsgruppen, mit den
+größten Zugewinnen bei neuen Zielstrukturen. Zweitens schlagen wir eine
+Coarse-to-Fine-Kaskade vor, in der jede Stufe einen einzelnen Ausschnitt
+verarbeitet, der anhand der Vorhersage der vorherigen Stufe platziert wird;
+diese Vorhersage geht zudem als Prior in die Label-Tokens des Ziels ein. Das
+Training mit den eigenen Vorhersagen des Modells als Prior übertrifft das
+Training mit gestörten Ground-Truth-Masken. Drittens schlagen wir einen
+Generator synthetischer Aufgaben vor, der prozedurale Formen in reale
+Aufnahmen einzeichnet. Verglichen mit vollständig synthetischen Bildern als
+Untergrund verbessert er die Ergebnisse auf drei von vier Läsionsdatensätzen.
+
+Wir evaluieren das Modell auf TotalSegmentator und neun weiteren, nicht im
+Training verwendeten Datensätzen und vergleichen es mit Medverse. Bei gleicher
+Anzahl an Verfeinerungsschritten ist unser finales Modell 15-mal schneller und
+im Mittel über die Datensätze ohne Läsionen genauer (Dice 0,615 gegenüber
+0,552), während Medverse auf zwei dieser Datensätze genauer bleibt. Läsionen
+bleiben für beide Modelle schwierig und sind das zentrale offene Problem.
+\end{otherlanguage}

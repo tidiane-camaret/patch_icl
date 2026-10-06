@@ -65,7 +65,6 @@
 \end{table}
 
 
-\begin{comment}
 \begin{table}[t]
   \centering
   \small
@@ -89,14 +88,7 @@
 \end{table}
 
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.6\linewidth]{arch_medverse.pdf}
-  \caption{Medverse's architecture: dual U-Net cross-attention, shown for comparison against our architecture (\autoref{fig:overview}).}
-  \label{fig:overview-medverse}
-\end{figure}
 
-\end{comment}
 
 \begin{longtable}{@{}llcccc@{}}
   \caption{Per-class Dice and NSD, Synth + Cascade (ours) vs.\ Medverse,
@@ -174,3 +166,133 @@
    & Hypo mask L & \textbf{0.033} & 0.008 & \textbf{0.038} & 0.004 \\
    & Hypo mask R & \textbf{0.033} & 0.010 & \textbf{0.036} & 0.008 \\
 \end{longtable}
+\subsection*{\iflanguage{english}{Additional qualitative examples}{Zus\"atzliche qualitative Beispiele}}\label{sec:appendix-qualitative}
+
+Two additional context/ground-truth/prediction examples (Ours vs.\ Medverse) per held-out dataset, beyond the ones in \autoref{sec:results-cascade}.
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/hu_lwk1_1.png}
+  \caption{HU\_LWK1, example 1.}
+  \label{fig:qual-hu_lwk1-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/hu_lwk1_2.png}
+  \caption{HU\_LWK1, example 2.}
+  \label{fig:qual-hu_lwk1-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/isles22_1.png}
+  \caption{ISLES22, example 1.}
+  \label{fig:qual-isles22-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/isles22_2.png}
+  \caption{ISLES22, example 2.}
+  \label{fig:qual-isles22-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/shifts_ms_1.png}
+  \caption{Shifts-MS, example 1.}
+  \label{fig:qual-shifts_ms-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/shifts_ms_2.png}
+  \caption{Shifts-MS, example 2.}
+  \label{fig:qual-shifts_ms-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_hippocampus_1.png}
+  \caption{MSD Hippocampus, example 1.}
+  \label{fig:qual-msd_hippocampus-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_hippocampus_2.png}
+  \caption{MSD Hippocampus, example 2.}
+  \label{fig:qual-msd_hippocampus-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_prostate_1.png}
+  \caption{MSD Prostate, example 1.}
+  \label{fig:qual-msd_prostate-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_prostate_2.png}
+  \caption{MSD Prostate, example 2.}
+  \label{fig:qual-msd_prostate-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/atlas_v2_1.png}
+  \caption{ATLAS v2.0, example 1.}
+  \label{fig:qual-atlas_v2-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/atlas_v2_2.png}
+  \caption{ATLAS v2.0, example 2.}
+  \label{fig:qual-atlas_v2-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/gnc_kidney_1.png}
+  \caption{GNC\_705, example 1.}
+  \label{fig:qual-gnc_kidney-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/gnc_kidney_2.png}
+  \caption{GNC\_705, example 2.}
+  \label{fig:qual-gnc_kidney-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/flare22_1.png}
+  \caption{FLARE22, example 1.}
+  \label{fig:qual-flare22-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/flare22_2.png}
+  \caption{FLARE22, example 2.}
+  \label{fig:qual-flare22-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/nasalseg_1.png}
+  \caption{NasalSeg, example 1.}
+  \label{fig:qual-nasalseg-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/nasalseg_2.png}
+  \caption{NasalSeg, example 2.}
+  \label{fig:qual-nasalseg-2}
+\end{figure}
+

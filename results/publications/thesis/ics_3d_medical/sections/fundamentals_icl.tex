@@ -3,8 +3,9 @@
 Given a target image $I^t$ and a context set
 $\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image--mask pairs showing the same class,
 in-context segmentation predicts a target mask $\hat{L}^t$ in a single forward
-pass, without gradient updates or class-specific parameters. The setting is well-suited to medical imaging :  First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
-Second, new anatomical structures and pathologies are defined much faster than 
-large-scale supervised datasets can be curated for them. 
-Finally, significant differences in acquisition protocols often limit how well a 
-closed-set model trained at one site transfers to another.
+pass, without gradient updates or class-specific parameters. This suits medical imaging for three reasons. First, annotation requires
+scarce domain expertise and is expensive. Second, new structures and
+pathologies are defined faster than large supervised datasets can be curated
+for them. Third, differences in acquisition protocols limit how well a
+closed-set model trained at one site transfers to another, whereas context
+examples can come from the target site itself.

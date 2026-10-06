@@ -57,6 +57,7 @@
 \lstset{commentstyle=\color{cd_blue}\bfseries}
 \usepackage[section]{placeins}  % To keep all figures inside there section
 \usepackage[nomain]{glossaries-extra}
+\usepackage{glossary-longextra} % provides the long-name-desc-loc style
 \usepackage{pdfpages} % to include PDFs
 \usepackage[nottoc]{tocbibind}  % Add References and others to the table of contents
 \usepackage{orcidlink}  % ORCID is an unique identifier for scientists
@@ -180,7 +181,6 @@ Albert-Ludwigs-Universität Freiburg
 
 \endgroup
 % <<< end sections/information.tex
-\todo[inline]{Enter your data int the Declaration.}
 % >>> begin sections/declaration_german.tex
 \begingroup
 \setlength{\parindent}{0pt}
@@ -224,9 +224,66 @@ auszugsweise, bereits für eine andere Prüfung angefertigt wurde
 % <<< end sections/quote.tex
 % >>> begin sections/abstract.tex
 \section*{Abstract}
-% <<< end sections/abstract.tex
+
+In-context segmentation predicts the mask of a target structure from a few
+annotated examples, so a single model can segment new classes without
+retraining. For 3D medical images, compute becomes a central constraint,
+since the cost of dense attention between target and context grows
+quadratically with the number of voxels. This thesis develops an efficient 3D
+in-context segmentation model around three questions: how to combine image
+and label information, where to spend compute, and how to obtain training
+tasks beyond the annotated classes.
+
+First, we propose dual attention, which keeps image and label tokens in
+separate streams that interact in every layer. At matched compute and with
+fewer parameters, it outperforms merging the two once on 12 of 13 evaluation
+splits, with the largest gains on new targets. Second, we propose a
+coarse-to-fine cascade in which each level processes a single crop placed by
+the previous level's prediction, which also enters the target's label tokens
+as a prior. Training with the model's own predictions as prior outperforms
+training with perturbed ground-truth masks. Third, we propose a synthetic
+task generator that paints procedural shapes onto real scans; compared with a
+fully synthetic canvas, it improves three of four lesion datasets.
+
+We evaluate the model on TotalSegmentator and nine held-out datasets and
+compare it with Medverse. With matched refinement steps, our final model is
+15 times faster and more accurate on average over the non-lesion datasets
+(Dice 0.615 vs.\ 0.552), while Medverse remains more accurate on two of them.
+Lesions remain difficult for both models and are the main open problem.% <<< end sections/abstract.tex
 % >>> begin sections/zusammenfassung.tex
 \section*{Zusammenfassung}
+\begin{otherlanguage}{ngerman}
+In-Context-Segmentierung sagt die Maske einer Zielstruktur anhand weniger
+annotierter Beispiele vorher, sodass ein einzelnes Modell neue Klassen ohne
+erneutes Training segmentieren kann. Bei medizinischen 3D-Bildern wird der
+Rechenaufwand zur zentralen Einschränkung, da die Kosten dichter Attention
+zwischen Ziel und Kontext quadratisch mit der Anzahl der Voxel wachsen. Diese
+Arbeit entwickelt ein effizientes Modell zur 3D-In-Context-Segmentierung
+entlang dreier Fragen: wie Bild- und Labelinformation kombiniert werden
+sollte, wofür Rechenaufwand eingesetzt werden sollte und wie sich
+Trainingsaufgaben über die annotierten Klassen hinaus gewinnen lassen.
+
+Erstens schlagen wir Dual Attention vor, bei der Bild- und Label-Tokens in
+getrennten Strömen verbleiben, die in jeder Schicht miteinander interagieren.
+Bei gleichem Rechenaufwand und mit weniger Parametern übertrifft sie eine
+einmalige Fusion beider Ströme in 12 von 13 Evaluationsgruppen, mit den
+größten Zugewinnen bei neuen Zielstrukturen. Zweitens schlagen wir eine
+Coarse-to-Fine-Kaskade vor, in der jede Stufe einen einzelnen Ausschnitt
+verarbeitet, der anhand der Vorhersage der vorherigen Stufe platziert wird;
+diese Vorhersage geht zudem als Prior in die Label-Tokens des Ziels ein. Das
+Training mit den eigenen Vorhersagen des Modells als Prior übertrifft das
+Training mit gestörten Ground-Truth-Masken. Drittens schlagen wir einen
+Generator synthetischer Aufgaben vor, der prozedurale Formen in reale
+Aufnahmen einzeichnet. Verglichen mit vollständig synthetischen Bildern als
+Untergrund verbessert er die Ergebnisse auf drei von vier Läsionsdatensätzen.
+
+Wir evaluieren das Modell auf TotalSegmentator und neun weiteren, nicht im
+Training verwendeten Datensätzen und vergleichen es mit Medverse. Bei gleicher
+Anzahl an Verfeinerungsschritten ist unser finales Modell 15-mal schneller und
+im Mittel über die Datensätze ohne Läsionen genauer (Dice 0,615 gegenüber
+0,552), während Medverse auf zwei dieser Datensätze genauer bleibt. Läsionen
+bleiben für beide Modelle schwierig und sind das zentrale offene Problem.
+\end{otherlanguage}
 % <<< end sections/zusammenfassung.tex
 
 % >>> begin sections/table_of_contents.tex
@@ -263,14 +320,15 @@ This thesis addresses three questions that arise when building an efficient
     a single fusion operation. We instead keep image and label tokens as
     separate streams and let them exchange information at every layer through
     \emph{dual attention} (\autoref{sec:methodology-fusion}).
-  \item \textbf{Where should compute be spent?}
+   \item \textbf{Where should compute be spent?}
     Medverse~\cite{huMedverseUniversalModel2025a} refines its prediction by
     processing the entire volume with a sliding window at every resolution
-    step, including regions that the previous step has already ruled out. We
-    use a \emph{coarse-to-fine cascade} in which each level processes only the
-    region localized by the previous level and receives that level's
-    prediction as a prior (\autoref{sec:methodology-cascade}).
-  \todo{talk about query prior injection instead of localized processing}
+    step, including regions that the previous step has already ruled out, and
+    passes the previous prediction through a separate network branch. We use a
+    \emph{coarse-to-fine cascade} in which each level processes only the region
+    localized by the previous level, and the previous prediction enters the
+    target's label tokens directly as a prior
+    (\autoref{sec:methodology-cascade}).
   \item \textbf{Where can training data come from beyond the annotated classes?}
     Real image--mask pairs cover only the classes and appearance range of the
     training cohort. We generate additional training tasks with a
@@ -290,20 +348,20 @@ This thesis addresses three questions that arise when building an efficient
     next level as a prior and restricts fine-level processing to the localized
     region. We compare predicted priors with perturbed ground-truth priors, and
     compare accuracy and latency with Medverse's coarse-to-fine approach.
-  \item A synthetic task generator that paints procedural shapes onto real CT
-    and MRI scans. We evaluate it against training on real data only and study
-    its effect on real tasks.
-  \item An evaluation on nine datasets covering
-    unseen tasks such as lesions, a non-anatomical target region, and MRI as a
-    held-out modality.
+  \item A synthetic task generator that paints procedural shapes onto real
+    scans. We compare it with a SynthSeg-style synthetic canvas and evaluate
+    its effect on lesion datasets and on TotalSegmentator.
+  \item An evaluation on TotalSegmentator and nine held-out datasets, covering
+    lesions, new anatomical structures, a non-anatomical target region, and,
+    for the fusion comparison, MRI as an unseen modality.
 \end{itemize}
 
 \paragraph{Outline.}
 \autoref{sec:fundamentals} introduces in-context segmentation, the volumetric
-encoders and attention mechanisms the model builds on, and positions related methods with respect to the three
-questions above. \autoref{sec:methodology} describes the model.
-\autoref{sec:results} evaluates each component in turn.
-\autoref{sec:discussion} discusses the findings and their limitations.% <<< end sections/motivation.tex
+encoders and attention mechanisms the model builds on, and related methods.
+\autoref{sec:methodology} describes the model, \autoref{sec:results} evaluates
+each component, \autoref{sec:discussion} discusses the findings and their
+limitations, and \autoref{sec:conclusion} concludes.% <<< end sections/motivation.tex
 % >>> begin sections/fundamentals.tex
 \section{\iflanguage{english}{Fundamentals}{Grundlagen}}\label{sec:fundamentals}
 
@@ -313,11 +371,12 @@ questions above. \autoref{sec:methodology} describes the model.
 Given a target image $I^t$ and a context set
 $\{(I^c_k, L^c_k)\}_{k=1}^{K}$ of image--mask pairs showing the same class,
 in-context segmentation predicts a target mask $\hat{L}^t$ in a single forward
-pass, without gradient updates or class-specific parameters. The setting is well-suited to medical imaging :  First, medical annotation requires scarce domain expertise and is prohibitively expensive. 
-Second, new anatomical structures and pathologies are defined much faster than 
-large-scale supervised datasets can be curated for them. 
-Finally, significant differences in acquisition protocols often limit how well a 
-closed-set model trained at one site transfers to another.% <<< end sections/fundamentals_icl.tex
+pass, without gradient updates or class-specific parameters. This suits medical imaging for three reasons. First, annotation requires
+scarce domain expertise and is expensive. Second, new structures and
+pathologies are defined faster than large supervised datasets can be curated
+for them. Third, differences in acquisition protocols limit how well a
+closed-set model trained at one site transfers to another, whereas context
+examples can come from the target site itself.% <<< end sections/fundamentals_icl.tex
 % >>> begin sections/fundamentals_backbone.tex
 \subsection{Volumetric Encoders and Attention}\label{sec:fundamentals-backbone}
 
@@ -357,12 +416,11 @@ indices. Our coarse-to-fine approach relies on this property, since its levels o
 
 Domain randomization trains a model on procedurally varied synthetic data
 so it does not overfit to the narrow appearance distribution of a single
-acquisition protocol or training cohort. SynthSeg~\cite{billot2023synthseg}
-demonstrated this at scale for medical segmentation: training pairs are
-generated by sampling a random Gaussian-mixture appearance conditioned
-only on a label map, so the resulting segmentation network never sees a
-real image of any specific contrast during training yet generalizes
-across MRI contrasts and resolutions. \todo{say what it motivates us to generate tasks on real scans}% <<< end sections/fundamentals_synthdata.tex
+acquisition protocol or training cohort. SynthSeg~\cite{billot2023synthseg} randomizes the appearance of whole images to make a model independent
+of contrast. Synthetic tasks for in-context segmentation serve a different
+purpose: they add new target classes, while the anatomy and appearance around
+the target can remain realistic. We therefore compare a SynthSeg-style canvas
+with painting synthetic shapes onto real scans (\autoref{sec:methodology-synth}).% <<< end sections/fundamentals_synthdata.tex
 % >>> begin sections/fundamentals_relatedwork.tex
 \subsection{Related Work}\label{sec:fundamentals-relatedwork}
 
@@ -397,7 +455,13 @@ a single bidirectional cross-attention step in the mask decoder, and the
 embedding is reused across queries. Large volumes are processed via a sliding window approach, without
 refinement across scales.
 
-\todo{focus more on the single img-lbl fusion point}
+\paragraph{Image--label fusion.}
+All three models fuse image and label information once, before target and
+context interact: UniverSeg and Medverse concatenate each context image with
+its mask as input channels, and Iris merges them in its context encoder. From
+then on, label information is carried only in fused features. Dual attention
+instead keeps a separate label stream throughout
+(\autoref{sec:methodology-fusion}).
 
 \paragraph{Coarse-to-fine approaches.}
 Deep Neural Patchworks~\cite{reisertDeepNeuralPatchworks2022a} segments large
@@ -418,13 +482,13 @@ ground-truth mask stands in for this prediction.
   \caption{Design choices of 3D in-context segmentation models on the three
     questions of \autoref{sec:motivation}.}
   \label{tab:relatedwork}
-  \begin{tabular}{@{} l p{4.5cm} p{4.5cm} p{4cm} @{}}
+  \begin{tabular}{@{} l p{4.2cm} p{4.4cm} p{3.4cm} @{}}
     \toprule
     & Image--label fusion & Coarse-to-fine prior & Synthetic tasks \\
     \midrule
-    Iris & Before attention (pixel shuffle) & No & No \\
-    Medverse & Before attention (channel concatenation) & Ground truth mask & Procedural shapes \\
-    \textbf{Ours} & dual attention at every layer & Previous level prediction & Procedural shapes, painted on real scans \\
+    Iris & Once, in the context encoder (pixel shuffle) & None (sliding window) & No \\
+    Medverse & Once, at the input (channel concatenation) & Previous prediction in a separate branch; ground truth in training & Procedural shapes \\
+    \textbf{Ours} & In every layer (dual attention) & Previous prediction in the label tokens; own prediction in training & Procedural shapes on real scans \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -454,7 +518,7 @@ small field of view at high resolution: at 6\,mm spacing the grid spans
 768\,mm per side, at 1.5\,mm only 192\,mm. During training, the spacing is
 sampled from a range rather than fixed to the levels used at inference
 (\autoref{sec:methodology-cascade}).
-\todo[inline]{Give the training spacing range in the results settings}
+
 
 \begin{figure}[t]
   \centering
@@ -464,7 +528,7 @@ sampled from a range rather than fixed to the levels used at inference
   by dual attention; a decoder produces the target mask.}
   \label{fig:overview}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize labels/scale once the architecture is settled.}
+
 
 \paragraph{Shared encoder.}
 All $K+1$ images of a task pass through the same encoder, a plain
@@ -480,9 +544,7 @@ volume, and concatenated along the channel dimension. Each cell therefore
 covers $p^3 = 8^3$ voxels of the input grid, with $p = 128/R$. The attention
 layers always operate on this fixed grid, while the decoder can still produce
 a mask at the full $128^3$ resolution.
-\todo[inline]{\autoref{sec:results-fusion} says the fusion arms warm-start the
-encoder and decoder from a shared checkpoint. Is that a checkpoint of this
-model, itself trained from scratch? If so, say so there.}
+
 
 \paragraph{Tokens.}
 Each cell $i$ of each volume $v$ is represented by two tokens of dimension
@@ -541,7 +603,7 @@ shared-encoder design used in this thesis.
   shows the two ways of adding label information that we compare.}
   \label{fig:fusion-family}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled.}
+
 
 \paragraph{Token array.}
 We arrange all tokens of a task in an array
@@ -553,20 +615,20 @@ each of the two axes of this array in turn, following the general pattern of
 the dual attention network of Fu et al.~\cite{fuDualAttentionNetwork2019},
 which combines position-wise and channel-wise attention for scene
 segmentation.
-\todo[inline]{Confirm: register and pooling rows also have an entry in both
-streams (implied by the $c{=}2$ layout). How are they initialized in the label
-stream?}
+
 
 \paragraph{Layer structure.}
 Each of the $L = 4$ layers applies three residual blocks, each preceded by
 RMS normalization:
 %
-\begin{align}
+\begin{equation}
+\begin{aligned}
   Z &\leftarrow Z + \mathrm{Attn}_{\text{mod}}\big(\mathrm{RMSNorm}_1(Z)\big), \\
   Z &\leftarrow Z + \mathrm{Attn}_{\text{pos}}\big(\mathrm{RMSNorm}_2(Z)\big), \\
   Z &\leftarrow Z + \mathrm{MLP}\big(\mathrm{RMSNorm}_3(Z)\big).
-  \label{eq:dual-layer}
-\end{align}
+\end{aligned}
+\label{eq:dual-layer}
+\end{equation}
 %
 \begin{itemize}[leftmargin=1.4em,itemsep=0.1em]
   \item \textbf{Modality axis} ($\mathrm{Attn}_{\text{mod}}$). Within each
@@ -575,7 +637,7 @@ RMS normalization:
     row, so its cost grows linearly with $S$.
   \item \textbf{Position axis} ($\mathrm{Attn}_{\text{pos}}$). Within each
     stream, the tokens of all rows attend to each other: image tokens attend
-    to the image tokens of all cells, volumes, and registers, and label tokens
+    to the image tokens of all cells and volumes, and label tokens
     likewise to label tokens. The two streams use the same attention weights
     but are processed as separate sequences of length $S$. Attention is
     unmasked, so every row attends to every other row, including context rows
@@ -588,10 +650,6 @@ RMS normalization:
 \end{itemize}
 %
 All attention operations use 12 heads with a token dimension of $D = 768$.
-\todo[inline]{Confirm: (1) the position axis shares its weights between the
-two streams (implied by batching the streams into the batch dimension);
-(2) how RoPE is applied to register and pooling rows, which have no spatial
-position.}
 
 The two streams exchange information only in the modality axis, which is local
 to a cell. Matching across cells and volumes happens within each stream.
@@ -602,8 +660,8 @@ Since attention is unmasked, the context tokens also depend on the target:
 the context is encoded anew for each target, rather than once per task as in
 Iris.
 
-\paragraph{Single-axis attention baseline.}
-As a baseline, the single-axis attention variant (\autoref{fig:fusion-axis}, top)
+\paragraph{Single axis attention baseline.}
+As a baseline, the single axis attention variant (\autoref{fig:fusion-axis}, top)
 merges the image and label token of each cell into a single token before the
 attention layers, using a pixel shuffle--unshuffle operation similar to the one
 Iris uses in its context encoder. The array then has a single column, and each
@@ -612,25 +670,21 @@ information of a cell is thus combined once, before any attention, rather than
 in every layer. Without the modality axis and the second stream, a layer costs
 roughly half as much, so this variant uses $L = 9$ layers to match the compute
 of dual attention (\autoref{sec:results-fusion}).
-\todo[inline]{Describe the merge precisely: is the $8^3$ mask patch unshuffled
-into channels and concatenated with the coarse features before the projection
-$W_{\text{img}}$? Otherwise the same block structure (RMSNorm, MLP, 12 heads)?}
+
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{arch_fusion_axis.pdf}
-  \caption{The two variants of the shared-encoder design compared in
-  \autoref{sec:results-fusion}, shown for one context volume and three of its
-  $N$ cells. Top: early fusion (baseline). Image and label tokens are merged
+  \caption{The two variants of the shared encoder design compared in
+  \autoref{sec:results-fusion}. Top: Single axis attention. Image and label tokens are merged
   once ($\oplus$), and the fused tokens attend across cells and volumes for
-  $L$ layers. Bottom: dual attention. Image and label tokens stay in separate
+  $L$ layers. Bottom: Dual axis attention. Image and label tokens stay in separate
   streams. In each of the $L$ layers, the two tokens of a cell attend to each
   other (modality axis), and then each stream attends across all cells and
-  volumes (position axis). The target's label token (gray) holds the prior of
-  \autoref{sec:methodology-cascade}, not ground truth.}
+  volumes (position axis).}
   \label{fig:fusion-axis}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the layer factorization is settled. The position-axis panel should show two separate attentions, one per stream, not one joint attention over image and label tokens.}
+
 
 % <<< end sections/methodology_fusion.tex% <<< end sections/methodology_fusion.tex
 % >>> begin sections/methodology_cascade.tex
@@ -658,16 +712,17 @@ level then overwrites the region covered by its crop.
 
 \paragraph{Prediction as prior.}
 At level $\ell > 1$, the target's label tokens are computed from the previous
-prediction, cell by cell as in \autoref{eq:lbl-token}:
+prediction instead of the placeholder:
 %
 \begin{equation}
-  z^{\text{lbl}}_{\ell,0} = \mathrm{LblEmbed}\big(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1})\big),
+  z^{\text{lbl}}_{t,i} = \mathrm{LblEmbed}\big(m_i(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1}))\big),
   \label{eq:query-prior}
 \end{equation}
 %
-where $\hat{L}^t_{\ell-1}$ is the sigmoid probability map of level $\ell{-}1$,
-detached from the computation graph, and $\mathrm{Warp}$ resamples it onto the
-crop grid of level $\ell$. The prior thus enters the same stream as the
+where $t$ indexes the target volume, $m_i(\cdot)$ extracts the $p^3$ voxels of
+cell $i$ as in \autoref{eq:lbl-token}, $\hat{L}^t_{\ell-1}$ is the sigmoid
+probability map of level $\ell{-}1$, detached from the computation graph, and
+$\mathrm{Warp}$ resamples it onto the crop grid of level $\ell$. The prior thus enters the same stream as the
 context masks, instead of a separate branch as in Medverse
 (\autoref{sec:fundamentals-relatedwork}); see \autoref{fig:query-prior}.
 
@@ -679,7 +734,7 @@ context masks, instead of a separate branch as in Medverse
   prediction $\hat{L}^t_1$.}
   \label{fig:query-prior}
 \end{figure}
-\todo{Draft diagram, ported from the conference draft; finalize once the number of levels $M$ is settled.}
+
 
 \paragraph{Training.}
 All $M$ levels are processed in one forward pass. The first crop is centered
@@ -687,11 +742,9 @@ on the ground truth (at inference: on the volume center), later crops on the
 previous prediction, at its centroid or at a random foreground point. The
 coarsest spacing is drawn per batch, and each finer spacing log-uniformly
 between the previous spacing and a lower bound, with a minimum ratio between
-levels. The prior is either the model's own prediction (predicted prior) or
-the downsampled ground-truth mask; \autoref{sec:results-cascade} compares both.
-\todo[inline]{Values: $M$, spacing range, lower bound, minimum ratio,
-centroid vs.\ random-point probability, foreground threshold, perturbation
-magnitudes. Confirm inference always uses the centroid.}% <<< end sections/methodology_cascade.tex
+levels. The prior is either the model's own prediction (predicted prior) or a
+perturbed ground-truth mask (ground-truth prior); \autoref{sec:results-cascade} compares both.
+% <<< end sections/methodology_cascade.tex
 % >>> begin sections/methodology_synth.tex
 % >>> begin sections/methodology_synth.tex
 \subsection{Synthetic Task Generation}\label{sec:methodology-synth}
@@ -738,8 +791,7 @@ is drawn, and $K+1$ different subjects containing it are sampled; the shape is
 placed within $\pm 30$\,mm per axis of the host structure's centroid. Since the
 volumes of a task are different scans, the target cannot be found by comparing
 it with the context images voxel by voxel.
-The \emph{synthetic-bank} canvas uses a bank of label maps from segmented CT
-scans of about 21 datasets. A class is drawn, and $K+1$ label maps containing
+The \emph{synthetic-bank} canvas uses TotalSegmentator training masks. A class is drawn, and $K+1$ label maps containing
 it are selected, optionally preferring maps of similar geometry. As in
 SynthSeg~\cite{billot2023synthseg}, the image is synthesized from the label
 map with Gaussian-mixture intensities, and the shape is painted into it, with
@@ -755,16 +807,9 @@ $\sigma$ of the host image:
   \label{eq:paint}
 \end{equation}
 %
-with the contrast $c$ drawn once per task. The range covers the
-lesion-to-tissue contrast we measured on seven of the evaluation datasets
-(10th to 90th percentile: $-0.87$ to $2.00$), widened symmetrically because
-the sign of the contrast is not known for an arbitrary host. The texture
+with the contrast $c$ drawn once per task. The texture
 $n(x)$ is fractal value noise with unit variance: four octaves of random grids,
-starting from 15\,mm cells and halving the cell size per octave, weighted by
-$0.5^k$.
-\todo[inline]{Over which region are $\mu$ and $\sigma$ computed (a ring
-around the shape?) Which seven datasets were used for the contrast
-calibration?}
+starting from 15\,mm cells and halving the cell size per octave.
 % <<< end sections/methodology_synth.tex% <<< end sections/methodology_synth.tex
 % >>> begin sections/methodology_objective.tex
 \subsection{Training Objective}\label{sec:methodology-objective}
@@ -797,19 +842,12 @@ TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}
 Data Commons). Training uses 61 of the 117 classes, chosen to balance
 anatomical categories and structure thickness: 12 abdominal and pelvic organs,
 8 thoracic, head, and spinal organs, 5 muscles (one side of each pair), 6 limb,
-shoulder, and pelvic bones, 11 vertebrae spanning all spine regions, 9 ribs
+shoulder, and pelvic bones, 10 vertebrae spanning all spine regions and the sacrum, 9 ribs
 and sternal structures, and 10 vessels. The remaining 56 classes form the
-unseen split. (\autoref{tab:totalseg-classes}) It includes structures close to training classes, such as the
+unseen split (\autoref{tab:totalseg-classes}). It includes structures close to training classes, such as the
 contralateral side of each training muscle. On MRI, 31 of the 61 training
 classes are available.
 
-\paragraph{Model configurations.}
-The experiments were run at different stages of development, so the three
-results sections use different model configurations
-(\autoref{tab:configs}). Numbers from different sections are therefore not
-directly comparable. In particular, TotalSegmentator MRI is a held-out
-modality for the fusion experiments, which train on CT only, but part of the
-training data in the other two sections.
 
 \begin{table}[t]
   \centering
@@ -827,8 +865,7 @@ training data in the other two sections.
     \bottomrule
   \end{tabular}
 \end{table}
-\todo[inline]{Resolve before submission: report a single final configuration,
-or keep this split?}
+
 
 \paragraph{Baselines.}
 The external baseline is Medverse~\cite{huMedverseUniversalModel2025a} with
@@ -836,8 +873,7 @@ its released weights (\autoref{sec:results-cascade},
 \autoref{sec:results-synth}). In \autoref{sec:results-fusion}, we additionally
 train Medverse's architecture from its released weights with our training
 recipe.
-\todo[inline]{No Iris baseline exists yet; the comparison in
-\autoref{sec:fundamentals-relatedwork} remains architectural, not empirical.}
+
 
 \paragraph{Evaluation protocol.}
 Each target is segmented with a single context pair ($K = 1$). The context
@@ -845,10 +881,8 @@ subject is drawn at random, with a fixed seed per target, from the same dataset
 and split as the target, among the subjects that contain the target class.
 Every subject that contains a class serves once as a target for that class. For each model, we use the checkpoint with the best
 Dice on the in-distribution validation split; no evaluation dataset is used for
-checkpoint selection.
-\todo[inline]{See open points: MRI validation split, $n$ in
-\autoref{tab:ood-sources}, $K$ during training.}
-
+checkpoint selection. Results of our models and of Dual U-Net Cross-Attn are means over three
+training seeds; the released Medverse weights are a single model.
 
 \paragraph{Metrics.}
 Accuracy is reported as Dice, computed per class and averaged over classes
@@ -856,8 +890,7 @@ unless stated otherwise, and as Normalized Surface Dice (NSD) with a tolerance
 of 3\,mm. Compute is reported as GFLOPs per forward pass and as latency per
 sample. All training and evaluation runs on a single NVIDIA
 RTX PRO 6000 Blackwell Server Edition GPU (96\,GB).
-\todo[inline]{Precision of the latency measurements in
-\autoref{tab:cascade-medverse} (fp32 as in \autoref{tab:fusion-staircase}?).}
+
 
 \paragraph{Datasets.}
 \autoref{tab:ood-sources} lists the evaluation datasets, grouped by their
@@ -892,12 +925,12 @@ training vocabulary, even if their dataset is held out).
     Shifts-MS~\cite{malininShifts20Extending2022} & MRI FLAIR & MS lesions & 46 & 1 \\
     MSD Hippocampus~\cite{antonelliMedicalSegmentationDecathlon2022} & MRI T1 & hippocampus & 260 & 2 \\
     MSD Prostate~\cite{antonelliMedicalSegmentationDecathlon2022} & MRI T2 + ADC & prostate zones & 64 & 2 \\
-    ATLAS v2.0$^{*}$~\cite{liewLargeCuratedOpensource2022} & MRI T1 & chronic stroke lesion & 654 & 1 \\
+    ATLAS v2.0~\cite{liewLargeCuratedOpensource2022} & MRI T1 & chronic stroke lesion & 654 & 1 \\
     GNC\_705 & MRI Dixon & kidney lesions & 610 & 13 \\
     NasalSeg~\cite{zhangNasalSegDataset2024} & CT & nasal cavity and sinuses & 107 & 5 \\
     \midrule
     \multicolumn{5}{@{}l}{\itshape Non-anatomical target} \\
-    HU\_LWK1 & CT & center of L1 vertebrae & 36 & 1 \\
+    HU\_LWK1 & CT & center of L1 vertebra & 36 & 1 \\
     \midrule
     \multicolumn{5}{@{}l}{\itshape Additional modality (unseen in \autoref{sec:results-fusion})} \\
     TotalSeg MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025} & MRI & full-body 
@@ -906,16 +939,25 @@ training vocabulary, even if their dataset is held out).
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{*}$Obtained from an unofficial mirror; provenance not yet confirmed.
+  GNC\_705 and HU\_LWK1 are unpublished, locally curated clinical cohorts, used
+  under institutional permission; neither has a public release or citation.
+  GNC\_705 draws 610 annotated visits from the German National Cohort, a
+  large population-based epidemiological study, each with hand-drawn kidney
+  lesion masks (hyperdense, hypodense, and complex cystic subtypes) on
+  four-channel Dixon MRI. HU\_LWK1 is a local trauma CT cohort in which a
+  small region at the L1 vertebral body is manually marked for an HU-density
+  measurement rather than delineated as an anatomical structure, making it
+  the one target in this evaluation that is a measurement region rather than
+  an anatomical object.
 \end{table}
 % <<< end sections/results_setup.tex
 % >>> begin sections/results_fusion.tex
 \subsection{Image--Label Fusion}\label{sec:results-fusion}
 
 This section compares three architectures. The comparison between Dual U-Net
-Cross-Attn and early fusion tests the change from two U-Nets coupled by
+ and shared-encoder architectures tests the change from two U-Nets coupled by
 cross-attention to a shared encoder with attention layers. The comparison
-between early fusion and dual attention tests whether, within the
+between single axis and dual axis attention tests whether, within the
 shared-encoder design, keeping image and label tokens separate improves over
 merging them once.
 
@@ -924,7 +966,7 @@ merging them once.
 (\autoref{sec:fundamentals-relatedwork}), initialized from the released weights
 and then trained with our recipe. It is therefore a different model from the
 released Medverse baseline used in \autoref{sec:results-cascade}.
-\emph{Early fusion} and \emph{dual attention} are the two variants shown in
+\emph{Single axis} and \emph{Dual axis attention} are the two variants shown in
 \autoref{fig:fusion-axis}. Early fusion uses $L{=}9$ layers to match the compute of dual attention (\autoref{sec:methodology-fusion}).
 This gives both variants similar compute (3973 vs.\ 3892 GFLOPs). Parameter
 count could not be matched at the same time, and early fusion has 52\% more
@@ -933,13 +975,10 @@ parameters. Dual U-Net Cross-Attn is not compute-matched to either variant.
 \paragraph{Training.}
 All three architectures use the same training recipe
 (\autoref{tab:fusion-trainsettings}), data pipeline, and augmentations. They
-are trained on the CT cases and training classes of TotalSegmentator, without
-synthetic tasks, at a single level. Their initialization differs. Dual U-Net
+are trained on the CT cases and training classes of TotalSegmentator, at a single spacing level randomly sampled in the range 1.5--6\,mm. 
+Dual U-Net
 Cross-Attn starts from Medverse's weights. Early fusion and dual attention
-are randomly initialized. Dual U-Net Cross-Attn completed its training
-budget; early fusion and dual attention were stopped before completing
-theirs, so the comparison also reflects this difference in training progress,
-not only initialization.
+are randomly initialized.
 
 \begin{table}[t]
   \centering
@@ -962,12 +1001,10 @@ not only initialization.
 \end{table}
 
 \paragraph{Evaluation.}
-All three architectures are evaluated at a single level with 3\,mm spacing, in
-fp32, using the best checkpoint of each.
-\autoref{tab:fusion-staircase} reports the results, grouped as in
-\autoref{tab:ood-sources}.
-\todo[inline]{Specify where the 3\,mm crops are placed (centered on the ground
-truth?).}
+All three architectures are evaluated at a single level with 3\,mm spacing,
+with crops centered on the ground truth, so localization is not tested here.
+\autoref{tab:fusion-staircase} reports the results.
+
 
 \begin{table}[t]
   \centering
@@ -977,7 +1014,7 @@ truth?).}
   \label{tab:fusion-staircase}
   \begin{tabular}{@{}lccc@{}}
     \toprule
-    & Dual U-Net Cross-Attn & Early fusion & Dual attention \\
+    & Dual U-Net & Single axis Attn & Dual Axis Attn \\
     \midrule
     TotalSeg CT, seen      & 0.348 & 0.574 & \textbf{0.582} \\
     TotalSeg CT, unseen    & 0.221 & 0.408 & \textbf{0.426} \\
@@ -1018,66 +1055,46 @@ truth?).}
 \end{table}
 
 \paragraph{Results.}
-Early fusion outperforms Dual U-Net Cross-Attn on the classes from the
-training vocabulary, by 0.16 to 0.23 Dice on TotalSegmentator and FLARE22, and
-by a smaller margin on the unseen-modality TotalSeg MRI (0.232 vs.\ 0.178). It
-is worse on the three sources with new or non-anatomical targets: MSD
-Prostate, MSD Hippocampus, and HU\_LWK1.
+Replacing the two U-Nets with a shared encoder raises Dice by 0.16 to 0.23 on
+the seen and unseen classes of TotalSegmentator and FLARE22, and from 0.178 to
+0.232 on the unseen modality TotalSeg MRI. On all eight datasets with targets
+outside the training vocabulary, however, single-axis attention is below Dual
+U-Net Cross-Attn.
 
-Dual attention improves over early fusion on seven of the eight rows. The
-gains are small on the other in-vocabulary rows (0.008 to 0.018) and larger on
-the new targets and the unseen modality: MSD Hippocampus ($+0.062$), MSD
-Prostate ($+0.042$), TotalSeg MRI ($+0.027$), and HU\_LWK1 ($+0.023$). The
-exception is the unseen FLARE22 classes, where dual attention scores 0.028
-lower.
+Dual attention improves over single-axis attention on 12 of the 13 rows; the
+exception is the two unseen FLARE22 classes ($-0.028$). The gains are small on
+the in-vocabulary rows (at most 0.018) and largest on new targets: NasalSeg
+($+0.086$), Shifts-MS ($+0.071$), MSD Hippocampus ($+0.062$), and MSD Prostate
+($+0.042$).
 
-Compared with Dual U-Net Cross-Attn, dual attention is better on six of the
-eight rows, including MSD Hippocampus (0.184 vs.\ 0.172), but remains worse on
-MSD Prostate (0.247 vs.\ 0.377) and HU\_LWK1 (0.102 vs.\ 0.146).
+Compared with Dual U-Net Cross-Attn, dual attention is better on the four
+in-vocabulary rows, TotalSeg MRI, MSD Hippocampus, and Shifts-MS, and worse on
+the other six new-target datasets, most clearly MSD Prostate ($-0.130$) and
+NasalSeg ($-0.076$). Its higher held-out mean (0.201 vs.\ 0.187) is thus
+driven by FLARE22 and TotalSeg MRI, whose classes are largely in the training
+vocabulary; on the remaining eight datasets, Dual U-Net Cross-Attn leads
+(unweighted mean 0.167 vs.\ 0.136). Part of this lead may come from its
+initialization with Medverse's weights.
 
-On the five lesion and cavity datasets in \autoref{tab:fusion-staircase}
-(ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, NasalSeg), the pattern reverses:
-Dual U-Net Cross-Attn is best of the three on four of five, losing only on
-Shifts-MS, where dual attention is best (0.109 vs.\ 0.087). Dual attention's
-margin behind Dual U-Net Cross-Attn on the other four is at most 0.076
-(NasalSeg).
-
-On the sample-weighted mean over all ten held-out sources, early fusion is
-below Dual U-Net Cross-Attn (0.174 vs.\ 0.187), while dual attention is above
-it (0.201); the unweighted mean-of-datasets and the fully pooled per-task mean
-rank the three architectures the same way. This aggregate advantage for dual
-attention comes from the first five sources, not the lesion and cavity ones,
-where Dual U-Net Cross-Attn wins more often. The shared-encoder design alone
-thus improves accuracy on the training vocabulary, and dual attention improves
-on held-out sources in aggregate, though not on every individual source.
-
-Dual attention has the fewest parameters of the three (48.7M). Its compute is
-similar to early fusion by construction and 65\% higher than Dual U-Net
-Cross-Attn. Latency is nearly identical for all three (72.5 to 73.2\,ms)
-despite these differences in GFLOPs.
-
-% <<< end sections/results_fusion.tex
+Dual attention has the fewest parameters (48.7M); its compute is similar to
+single-axis attention by construction and 65\% higher than Dual U-Net
+Cross-Attn. Latency is nearly identical for all three (72.5 to 73.2\,ms).% <<< end sections/results_fusion.tex
 % >>> begin sections/results_cascade.tex
 \subsection{Coarse-to-Fine Cascade}\label{sec:results-cascade}
 
-This section evaluates the Cascade configuration (\autoref{tab:configs}). We
-first examine how accuracy develops across levels and how well the coarse level
-localizes the target. We then compare with Medverse in accuracy and latency,
-compare the two sources of the label prior, and finally test a register-carry
-variant.
+This section evaluates the Cascade configuration (\autoref{tab:configs}): how
+accuracy develops across levels, how well the coarse level localizes the
+target, how the cascade compares with Medverse in accuracy and latency, and
+which prior works better during training.
 
 \paragraph{Accuracy across levels.}
-When the crop is centered on the ground truth, reducing the spacing from 4\,mm
-to 1.5\,mm raises macro Dice on TotalSegmentator from 0.361 to 0.538 (117
-classes, 3897 samples). Because these crops use the ground-truth position, this
-shows the benefit of finer resolution, not of the cascade.
-\autoref{tab:cascade-levels} therefore reports the Dice of each level when its
-crop is placed using the previous level's prediction. Dice still increases from
-level to level on every dataset, for example from 0.603 to 0.718 to 0.751 on
-FLARE22.
-\todo[inline]{This shows that the cascade works without ground-truth
-localization, but not that it beats a single fine-resolution pass over the
-whole volume. The planned $-$region-restriction ablation answers this.}
+\autoref{tab:cascade-levels} reports the Dice of each level, with each crop
+placed from the previous level's prediction. Dice increases from level to
+level on every dataset, e.g.\ from 0.603 to 0.751 on FLARE22 and from 0.065
+to 0.152 on HU\_LWK1. The stitched mask keeps the coarser predictions outside
+the finest crop. This recovers target parts on TotalSeg MRI (0.495 to 0.503),
+adds false positives on MSD Prostate (0.381 to 0.375), and changes nothing
+where the coarser levels predict no foreground outside the finest crop.
 
 \begin{table}[t]
   \centering
@@ -1099,40 +1116,44 @@ whole volume. The planned $-$region-restriction ablation answers this.}
   \end{tabular}
 \end{table}
 
- Outside the finest crop, the stitched mask contains the predictions of
-  coarser levels, so its Dice can be higher than the finest level's (TotalSeg
-  MRI), lower (MSD Prostate), or unchanged (HU\_LWK1, FLARE22,
-  NasalSeg) when the target lies entirely inside the finest crop and there is
-  nothing outside it for a coarser prediction to add.
-  
+\autoref{fig:c2f-hu-lwk1} and \autoref{fig:c2f-flare22} show the crop
+placement for Cascade and for Medverse run through the same cascade.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{c2f_hu_lwk1.png}
+  \caption{HU\_LWK1: Cascade's box tracks the vertebra center across all
+  three levels; Medverse's drifts off by level 1, so its finest crop no
+  longer contains the target.}
+  \label{fig:c2f-hu-lwk1}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{c2f_flare22.png}
+  \caption{FLARE22: both models' boxes converge on the spleen by level 1.}
+  \label{fig:c2f-flare22}
+\end{figure}
+
+
 \paragraph{Localization.}
-  On TotalSeg CT (117 classes), at the coarsest level, the crop of the middle
-  level, placed at the centroid of the coarse prediction, contains on average
-  92.2\% of the target's voxels; placed at the ground-truth centroid, the same
-  crop contains 97.0\%. Across classes, this
-containment correlates only weakly with the Dice gain from the finer levels
-($r = -0.22$, $p = 0.018$, $n = 117$, $r^2 \approx 0.05$). This measures only
-the coarsest-to-middle transition, not the middle-to-finest one. Since most of
-the target already lies inside the box at this first step, most of the
-remaining error at this step arises within the fine crops rather than from
-localization; whether the same holds for the middle-to-finest transition is
-not tested here.
+On TotalSeg CT, a middle-level crop centered at the centroid of the coarse
+prediction contains on average 92.2\% of the target's voxels, compared with
+97.0\% when centered at the ground-truth centroid. Localization thus loses
+about 5\% of the target at this transition, and most of the remaining error
+arises within the fine crops. The middle-to-finest transition is not measured.
 
 \paragraph{Comparison with Medverse.}
-\autoref{tab:cascade-medverse} compares Ours with Medverse's released
-weights, using its own autoregressive coarse-to-fine inference with the
-number of steps matched to our number of levels per dataset (Medverse's
-native, unmatched depth is compared separately in
-\autoref{sec:results-cascade-medverse-depth}). Four lesion datasets (ISLES22,
-Shifts-MS, ATLAS v2.0, GNC\_705), where both numbers are below 0.1, appear at
-the bottom of the table. TotalSeg CT is not included in this comparison (see
-the table's \texttt{\textbackslash todo}). MSD Hippocampus is processed at a
-single level, so its row compares the base models without a cascade.
+\autoref{tab:cascade-medverse} compares Cascade with Medverse's released
+weights, run with its own autoregressive inference and with its number of
+steps matched to our number of levels per dataset; its native depth is
+compared below. MSD Hippocampus runs at a single level, so its row compares
+the two models without a cascade. Medverse is not evaluated on TotalSeg CT.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Ours vs.\ Medverse: macro Dice and mean latency per sample.
+  \caption{Cascade vs.\ Medverse: macro Dice and mean latency per sample.
   Medverse is evaluated with its number of autoregressive steps matched to our
   number of levels per dataset.}
   \label{tab:cascade-medverse}
@@ -1140,11 +1161,10 @@ single level, so its row compares the base models without a cascade.
     \toprule
     & & \multicolumn{2}{c}{Dice} & & \multicolumn{2}{c}{Latency (ms)} \\
     \cmidrule(lr){3-4} \cmidrule(lr){6-7}
-    Dataset & Spacings (mm) & Ours & Medverse & & Ours & Medverse \\
+    Dataset & Spacings (mm) & Cascade & Medverse & & Cascade & Medverse \\
     \midrule
-    % TotalSeg CT     & $[6, 3, 1.5]$    & \textbf{0.585} & --    & & 206 & --   \\ % removed for final paper (see TODO.md)
     FLARE22         & $[6, 3, 2.5]$    & \textbf{0.751} & 0.359 & & 311 & 4894 \\
-    MSD Prostate    & $[3, 1.5, 0.75]$ & 0.375 & 0.357 & & 279 & 5006 \\
+    MSD Prostate    & $[3, 1.5, 0.75]$ & \textbf{0.375} & 0.357 & & 279 & 5006 \\
     MSD Hippocampus & $[0.5]$          & 0.303 & \textbf{0.686} & & 99  & 50   \\
     HU\_LWK1        & $[6, 3, 1]$      & \textbf{0.152} & 0.020 & & 439 & 5336 \\
     TotalSeg MRI    & $[6, 3, 1.5]$    & \textbf{0.503} & 0.055 & & 194 & 5188 \\
@@ -1160,47 +1180,34 @@ single level, so its row compares the base models without a cascade.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Dice and latency are both sample-weighted, each dataset weighted
-  by its own number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22).
-  Ours and Medverse are both averaged over the same six datasets above the
-  second midrule (Ours: Dice 0.526, unweighted 0.439; latency 206\,ms,
-  unweighted 247\,ms. Medverse: Dice 0.393, unweighted 0.369; latency
-  3491\,ms, unweighted 3727\,ms). The four lesion datasets below the second
-  midrule are excluded from both means (both models score below 0.1 on every
-  one of them).
+  $^{\dagger}$Over the six datasets above the second midrule, each weighted by
+  its number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22).
+  Unweighted: Dice 0.439 vs.\ 0.369, latency 247 vs.\ 3727\,ms. The four
+  lesion datasets are excluded, since both models score below 0.1 on all of
+  them.
 \end{table}
-\todo[inline]{TotalSeg CT is commented out of this table (and of
-\autoref{tab:cascade-levels} and \autoref{tab:medverse-matched-native}) ---
-decided out of scope for the final paper. Its numbers, where they exist, are
-still available if this changes: see \texttt{TODO.md} for what is and isn't
-archived (our own model's TotalSeg CT cascade run is done; Medverse's matched
-and native cells there never completed).}
 
-Against Medverse with matched steps, Ours is more accurate on seven of the
-ten datasets: FLARE22, MSD Prostate, HU\_LWK1, TotalSeg
-MRI, ISLES22, ATLAS v2.0, and GNC\_705.
-Medverse is more accurate on MSD Hippocampus, reportedly part of its training
-classes but not of ours, on NasalSeg, which neither model saw during
-training, and on Shifts-MS.
+On the six non-lesion datasets, Cascade is more accurate on four (FLARE22,
+MSD Prostate, HU\_LWK1, TotalSeg MRI) and Medverse on two (MSD Hippocampus,
+NasalSeg); the sample-weighted means are 0.526 and 0.393. The largest gaps in
+our favor are on TotalSeg MRI, which is part of our training data, and on
+FLARE22, whose classes are mostly in our training vocabulary. Medverse's two
+wins, in contrast, are on datasets that neither model saw during training. On
+the four lesion datasets, both models stay below 0.1 Dice.
 
-\autoref{fig:cascade-medverse-qual} shows one case from each side of this
-comparison, using the context, ground truth, and prediction of both models on
-the same target subject (Medverse run in its native-autoregressive mode, not
-the step-matched mode of \autoref{tab:cascade-medverse}; see
-\autoref{sec:results-cascade-medverse-depth}). Ground truth is shown in
-green, Ours in blue, Medverse's in orange throughout this section. On FLARE22
-gallbladder, Ours recovers the organ's shape (Dice 0.79) while Medverse
-predicts a small mislocated fragment (Dice 0.00). On MSD Hippocampus, the
-pattern reverses: Ours is fragmented into disconnected blobs (Dice 0.34),
-while Medverse produces a single contiguous region closer to the
-ground-truth shape (Dice 0.70).
+\autoref{fig:cascade-medverse-qual} and \autoref{fig:cascade-medverse-qual-fail}
+show one case from each side, with Medverse at its native depth. Ground truth
+is shown in green, Cascade in blue, and Medverse in orange. On a FLARE22
+gallbladder, Cascade recovers the organ (Dice 0.79), while Medverse predicts a
+small, mislocated fragment (0.00). On MSD Hippocampus, Cascade's prediction
+breaks into disconnected blobs (0.34), while Medverse's is a single region
+close to the ground truth (0.70).
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{flare22_gallbladder_win.png}
-  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Ours recovers
-  the organ shape where Medverse's native-autoregressive prediction misses
-  almost entirely.}
+  \caption{FLARE22 gallbladder, subject FLARE22\_Tr\_0001: Cascade recovers
+  the organ, while Medverse (native depth) misses it almost entirely.}
   \label{fig:cascade-medverse-qual}
 \end{figure}
 
@@ -1208,59 +1215,41 @@ ground-truth shape (Dice 0.70).
   \centering
   \includegraphics[width=0.85\linewidth]{msd_hippocampus_fail.png}
   \caption{MSD Hippocampus, posterior class, subject hippocampus\_001:
-  Ours fragments into disconnected blobs, while Medverse's
-  native-autoregressive prediction stays a single contiguous region.}
+  Cascade's prediction breaks into disconnected blobs, while Medverse (native
+  depth) predicts a single contiguous region.}
   \label{fig:cascade-medverse-qual-fail}
 \end{figure}
-\todo[inline]{Both panels are re-rendered directly from run\_cascade /
-model.predict() outputs on these two (target, context) pairs -- checkpoints
-and settings matching
-\texttt{2026-09-26\_147\_cascade\_randomfg\_predprior\_regon\_flare22\_ood} /
-\texttt{2026-09-15\_medverse\_ar\_flare22} and
-\texttt{2026-09-24\_146\_cascade\_randomfg\_predprior\_regoff\_msd\_hippocampus\_ood}
-/ \texttt{2026-09-14\_medverse\_ar\_msd\_hippocampus} -- rather than the
-harness's own saved diagnostic panels, so the color scheme could be made
-consistent across models (green/blue/orange). Each sample is the first the
-eval loader hit for its class, not a systematic best/worst search.}
+% Provenance: re-rendered from run_cascade / model.predict() on these
+% (target, context) pairs. FLARE22: 2026-09-26_147_cascade_randomfg_predprior_regon_flare22_ood
+% vs. 2026-09-15_medverse_ar_flare22. Hippocampus:
+% 2026-09-24_146_cascade_randomfg_predprior_regoff_msd_hippocampus_ood vs.
+% 2026-09-14_medverse_ar_msd_hippocampus. First sample the eval loader hit
+% per class, not a best/worst search.
 
-Ours is about $17\times$ faster than step-matched Medverse, sample-weighted
-over the six datasets in \autoref{tab:cascade-medverse} (206 vs.\ 3491\,ms per
-sample; unweighted, $15\times$: 247 vs.\ 3727\,ms). Our model
-runs one forward pass per level, whereas Medverse slides a window over the
-whole volume at each step; this difference and the architectures are not
-separated here. On MSD Hippocampus, where neither model uses a cascade,
-Medverse is faster (50 vs.\ 99\,ms).
+Cascade is about $17\times$ faster than step-matched Medverse (206 vs.\
+3491\,ms per sample, sample-weighted; $15\times$ unweighted, 247 vs.\
+3727\,ms). At a single level (MSD Hippocampus), Medverse is faster (50 vs.\
+99\,ms). The speedup therefore comes from processing one crop per level
+instead of sliding a window over the whole volume at each step, not from a
+cheaper forward pass.
 
-TotalSeg MRI is part of our training data. The large difference there
-therefore partly reflects training data, not only architecture.
-\todo[inline]{State what Medverse was trained on, including whether MSD
-Hippocampus is actually among its training classes (currently asserted above
-without a citation) and whether its training data includes TotalSegmentator.
-Its matched Dice of 0.055 on TotalSeg MRI is very low; if Medverse's training
-data includes TotalSegmentator, check preprocessing (orientation, intensity
-normalization, spacing) before reporting these numbers.}
-
-\begin{comment}
-
-\paragraph{Medverse: matched vs.\ native depth.}\label{sec:results-cascade-medverse-depth}
-Medverse's own released weights default to more autoregressive refinement
-steps than our number of cascade levels per dataset; \autoref{tab:medverse-matched-native}
-compares its accuracy at both depths, holding the model fixed and varying
-only how many steps it is given.
+\paragraph{Medverse at native depth.}
+By default, Medverse runs more autoregressive steps than our cascade has
+levels. \autoref{tab:medverse-matched-native} compares its Dice at both
+depths.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Medverse's own macro Dice at its number of autoregressive steps
-  matched to our number of levels per dataset (matched, repeated from
-  \autoref{tab:cascade-medverse}) vs.\ its native, unmatched number of steps
+  \caption{Medverse's macro Dice with its number of autoregressive steps
+  matched to our number of levels (matched, as in
+  \autoref{tab:cascade-medverse}) and at its default number of steps
   (native).}
   \label{tab:medverse-matched-native}
   \begin{tabular}{@{}lccc@{}}
     \toprule
     Dataset & Spacings (mm) & Matched & Native \\
     \midrule
-    % TotalSeg CT     & $[6, 3, 1.5]$    & -- & -- \\ % removed for final paper (see TODO.md)
     FLARE22         & $[6, 3, 2.5]$    & 0.359 & \textbf{0.440} \\
     MSD Prostate    & $[3, 1.5, 0.75]$ & 0.357 & \textbf{0.423} \\
     MSD Hippocampus & $[0.5]$          & 0.686 & \textbf{0.691} \\
@@ -1276,143 +1265,44 @@ only how many steps it is given.
   \end{tabular}
 \end{table}
 
-Matching the number of steps to ours lowers Medverse's accuracy on seven of
-the ten datasets with both values, most clearly on FLARE22 (0.440 to 0.359)
-and MSD Prostate (0.423 to 0.357); it raises accuracy on NasalSeg, ISLES22,
-and ATLAS v2.0, each by 0.006 or less. Against Medverse at its native depth,
-Ours (\autoref{tab:cascade-medverse}) is still more accurate on six (FLARE22,
-HU\_LWK1, TotalSeg MRI, ISLES22, ATLAS v2.0, GNC\_705) and less accurate on
-four (MSD Prostate, MSD Hippocampus, NasalSeg, Shifts-MS) --- a similar
-picture to the matched comparison, just with Medverse given more steps. Of
-the eight matched/native values across the four lesion datasets, only one
-exceeds 0.1: Medverse's native Shifts-MS result (0.152).
+Matching lowers Medverse's Dice on seven of the ten datasets, most on FLARE22
+($-0.081$) and MSD Prostate ($-0.066$), and raises it on the other three by at
+most 0.006. At native depth, Medverse overtakes Cascade on MSD Prostate (0.423
+vs.\ 0.375), so the two models split the non-lesion datasets three to three,
+and it exceeds 0.1 on one lesion dataset, Shifts-MS (0.152). The accuracy
+comparison therefore depends on how Medverse is run. The latency advantage
+does not, since native depth only adds steps.
 
 \paragraph{Medverse with our cascade.}
 We also ran Medverse's weights inside our cascade inference
-(\autoref{sec:methodology-cascade}), with and without its coarse prediction
-passed on as a prior, on these seven eval-expansion sources: HU\_LWK1,
-ISLES22, Shifts-MS, MSD Hippocampus, MSD Prostate, ATLAS v2.0, and GNC\_705
-(distinct from \autoref{tab:cascade-medverse}'s six datasets, which instead
-include FLARE22, TotalSeg MRI, and NasalSeg). Each source uses
-its own multi-level ladder, e.g.\ $[6,3,0.5]$\,mm for MSD Hippocampus; unlike
-our own model, which runs MSD Hippocampus single-level in
-\autoref{tab:cascade-medverse}, Medverse is given an actual cascade here on
-every source, so the two MSD Hippocampus numbers come from different
-evaluation setups. \autoref{tab:medverse-prior-appendix} in the appendix
-reports the full results; passing the prior lowered Dice on six of the seven,
-and on HU\_LWK1, Dice is 0.0 in both cases. The largest drop is on MSD
-Hippocampus, from 0.691 to 0.050. Errors of Medverse's coarse prediction
-therefore propagate strongly through its prior.
-
-\autoref{fig:cascade-vs-medverse-cascade} shows two cases from this
-comparison. To make the coarse-to-fine progression directly comparable, both
-models are run on a common ladder for each figure (rather than each model's
-own ladder from \autoref{tab:medverse-prior-appendix}, which differ in depth
-and spacing), one column per shared physical spacing. On MSD Prostate TZ
-(ladder $[6,3,1.5,0.75]$\,mm, common to both), Cascade's prediction grows to
-fill the zone's shape across the four levels (Dice 0.69) while Medverse's box
-tracks the same region but never produces a prediction at any level (Dice
-0.00). On MSD Hippocampus (ladder $[6,3,0.5]$\,mm, common to both -- Cascade
-is forced through this cascade here, whereas \autoref{tab:cascade-medverse}
-runs it single-level), Medverse's box is again placed correctly at every
-level but stays empty throughout (Dice 0.00), while Cascade's prediction
-appears already at the coarsest level and refines into a fragmented but
-non-empty final mask (Dice 0.43). This pattern is not universal:
-\autoref{fig:cascade-vs-medverse-cascade-atlas} shows the clearest
-counter-example found, an ATLAS v2.0 case (ladder $[6,3,1.9]$\,mm, common to
-both -- Cascade normally runs $[3.8,1.9]$\,mm here) where Cascade's predicted
-region shrinks to almost nothing by its finest level (Dice 0.01) while
-Medverse's prior-conditioned prediction grows to cover much of the lesion
-(Dice 0.42) -- well above ATLAS v2.0's aggregate Prior Dice of 0.020 in
-\autoref{tab:medverse-prior-appendix}, so this single sample should not be
-read as typical of that row.
-
-\end{comment}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{msd_prostate_cascade_win.png}
-  \caption{MSD Prostate, TZ class, subject prostate\_00\_adc, common
-  $[6,3,1.5,0.75]$\,mm ladder for both models: Cascade's prediction grows to
-  fill the zone's shape while Medverse's stays empty at every level.}
-  \label{fig:cascade-vs-medverse-cascade}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{msd_hippocampus_cascade_prior_fail.png}
-  \caption{MSD Hippocampus, posterior class, subject hippocampus\_001, common
-  $[6,3,0.5]$\,mm ladder for both models: Medverse's box is placed correctly
-  at every level but its prediction collapses to empty throughout, consistent
-  with the aggregate drop from 0.691 (no prior) to 0.050 (prior) in
-  \autoref{tab:medverse-prior-appendix}. Cascade's prediction, forced through
-  the same 3-level ladder for this figure only, is fragmented but present at
-  every level.}
-  \label{fig:cascade-vs-medverse-cascade-hip}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{atlas_v2_cascade_medverse_win.png}
-  \caption{ATLAS v2.0, stroke lesion, subject sub-r004s004, common
-  $[6,3,1.9]$\,mm ladder for both models: Cascade's predicted region shrinks
-  to almost nothing by its finest level while Medverse's prior-conditioned
-  prediction grows to cover much of the lesion. This sample scores far above
-  ATLAS v2.0's aggregate Prior Dice (0.42 vs.\ 0.020) and was chosen
-  specifically to show that the prior does not hurt Medverse uniformly, not
-  as a representative case. This particular Dice value is also unstable
-  across reruns of Medverse's cascade-mode prediction on this exact sample
-  (0.42--0.88 observed, see the todo below) --- read it as illustrating the
-  direction of the effect, not as a precise number.}
-  \label{fig:cascade-vs-medverse-cascade-atlas}
-\end{figure}
-\todo[inline]{Single-sample illustrations, not aggregate-representative cases
-(MSD Prostate's aggregate ``prior'' Dice is 0.251, not 0.00; the ATLAS v2.0
-sample is an extreme outlier the other way, 0.42 vs.\ an aggregate of 0.020 --
-both were picked to illustrate a pattern, not summarize the row). All three
-panels are re-rendered directly from \texttt{cascade.run\_cascade} on these
-specific (subject, context, class) triples -- not the harness's own saved
-diagnostic panels -- so the color scheme is consistent (green GT / blue
-Cascade / orange Medverse) and every level of a shared, common ladder is
-shown for both models, not just the finest. Forcing Cascade onto a ladder it
-was not evaluated on for the main tables (MSD Hippocampus's 3-level ladder;
-ATLAS v2.0's $[6,3,1.9]$\,mm instead of $[3.8,1.9]$\,mm) changes its Dice from
-the officially reported number (e.g.\ MSD Hippocampus 0.34$\to$0.43,
-ATLAS v2.0 0.02$\to$0.01) -- expected since the crop geometry differs, but
-worth being explicit that these two figures' Cascade numbers are not the ones
-in \autoref{tab:cascade-medverse}. Checkpoints:
-\texttt{2026-09-24\_146\_cascade\_randomfg\_predprior\_regoff/best.pt}
-(Cascade, released weights for Medverse). The ATLAS v2.0 and common-ladder
-(subject, context) pairs were not among the sources' saved figures at all and
-required rerunning \texttt{run\_cascade} outside the full eval sweep;
-Medverse's cascade-mode prediction on the ATLAS v2.0 sample is noticeably
-unstable across reruns (0.42--0.88 Dice observed across otherwise-identical
-reruns, plausibly bf16-autocast sensitivity compounding across its two
-feedback steps) -- worth flagging as a finding in its own right, and reason
-for caution reading any single Medverse-in-cascade number too precisely.}
+(\autoref{sec:methodology-cascade}) on seven held-out datasets, with and
+without its coarse prediction passed on as a prior
+(\autoref{tab:medverse-prior-appendix}). Here Medverse runs a multi-level
+cascade on every dataset, including MSD Hippocampus ($[6, 3, 0.5]$\,mm), so
+these numbers are not directly comparable with \autoref{tab:cascade-medverse}.
+The prior lowers Dice on six of the seven datasets, most on MSD Hippocampus
+(0.691 to 0.050) and ATLAS v2.0 (0.126 to 0.020); on HU\_LWK1, Dice is 0 in
+both cases (\autoref{fig:c2f-hu-lwk1}). Medverse is trained with a downsampled
+ground-truth mask as prior, so its own coarse errors are out of distribution
+for this input.
 
 \paragraph{Source of the label prior.}
 \autoref{tab:cascade-ablation} compares two models that differ only in the
 prior used during training: the model's own prediction from the previous
-level, or a perturbed ground-truth mask. At inference, both use their own
-predicted prior, since no ground truth is available then. On TotalSeg CT, the predicted prior is better on
-99 of 117 classes (median difference $+0.043$ Dice) and also improves NSD
-(0.631 vs.\ 0.576). FLARE22, also part of the training vocabulary, shows the
-same direction (0.731 to 0.751). MSD Hippocampus runs a single level, so no
-prior is passed; its row reflects the two checkpoints, not the prior, and is
-excluded from the counts below. On the remaining eight datasets outside the
-training vocabulary (class-level held-out, \autoref{sec:results-setup}; this
-excludes FLARE22 as well as TotalSeg CT, both already covered above), the
-predicted prior is better on five and
-worse on three: Shifts-MS, ATLAS v2.0, and GNC\_705. These three, together with ISLES22, are lesion datasets
-on which both priors score below 0.1; among these four, only ISLES22 favors
-the predicted prior.
+level, or a perturbed ground-truth mask. Both use their own prediction at
+inference. The predicted prior is better on the three datasets from the
+training vocabulary; on TotalSeg CT, it is better on 99 of 117 classes
+(median $+0.043$) and raises NSD from 0.576 to 0.631. On the seven datasets
+outside the training vocabulary, it is better on MSD Prostate, HU\_LWK1, and
+NasalSeg, by 0.053 to 0.148. On the four lesion datasets, both priors stay
+below 0.07 Dice and differ by at most 0.004.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Macro Dice of models trained with a ground-truth target mask prior or
-  with their own predicted prior.}
+  \caption{Macro Dice of Cascade models trained with a perturbed ground-truth
+  prior or with their own predicted prior. Both use their own prediction as
+  prior at inference.}
   \label{tab:cascade-ablation}
   \begin{tabular}{@{}lcc@{}}
     \toprule
@@ -1421,85 +1311,61 @@ the predicted prior.
     TotalSeg CT     & 0.543 & \textbf{0.585} \\
     TotalSeg MRI    & 0.449 & \textbf{0.503} \\
     FLARE22         & 0.731 & \textbf{0.751} \\
+    \midrule
     MSD Prostate    & 0.310 & \textbf{0.375} \\
-    % MSD Hippocampus$^{*}$ & 0.319 & 0.303 \\
     HU\_LWK1        & 0.099 & \textbf{0.152} \\
     NasalSeg        & 0.399 & \textbf{0.547} \\
+    \midrule
     ISLES22         & 0.067 & \textbf{0.069} \\
     Shifts-MS       & \textbf{0.035} & 0.031 \\
     ATLAS v2.0      & \textbf{0.029} & 0.026 \\
     GNC\_705        & \textbf{0.027} & 0.024 \\
     \bottomrule
   \end{tabular}
-  \par\vspace{0.5em}
-  \raggedright\footnotesize
-  % $^{*}$MSD Hippocampus runs a single level, so no prior is passed; this row   reflects the two checkpoints, not the prior, and is excluded from the counts in the text.
 \end{table}
-\todo[inline]{Planned ablations: no prior at all, and no region restriction
-(full-volume sliding window at fine levels, same checkpoint). Checkpoint 145's
-TotalSeg CT/MRI numbers (0.543/0.449 above) are untraceable to any archived
-run, same gap as checkpoint 146 had before the 2026-09-30 gap-fill (see
-\autoref{tab:cascade-medverse}'s todo) --- 145 was not part of that batch and
-still needs the equivalent re-run.}
-
-\begin{comment}
-\paragraph{Register carry.}
-A variant that additionally carries the register tokens across levels was
-tested against the same predicted-prior checkpoint, with a mixed effect on
-nine datasets (HU\_LWK1, ISLES22, Shifts-MS, ATLAS v2.0, GNC\_705, MSD
-Prostate, MSD Hippocampus, FLARE22, and NasalSeg --- a different nine from
-the ``eight'' just above: this set includes FLARE22 and MSD Hippocampus but,
-like every comparison in this paragraph, excludes TotalSeg CT/MRI, which
-were not part of this ablation's OOD sweep): it lowers Dice on six (most on
-MSD Prostate, $-0.016$) and raises it on three (most on NasalSeg, $+0.061$,
-and MSD Hippocampus, $+0.097$).
-\end{comment}% <<< end sections/results_cascade.tex
+% <<< end sections/results_cascade.tex
 % >>> begin sections/results_synth.tex
 \subsection{Synthetic Task Generation}\label{sec:results-synth}
 
-This section evaluates the synthetic task generator, mainly on the four
-lesion datasets it targets: ISLES22, Shifts-MS, ATLAS v2.0, and GNC\_705. They
-are the most difficult evaluation datasets, since their targets are lesions on
-MRI with no counterpart among the training classes. Under cascade inference,
-the comparison widens to all nine held-out datasets used in
-\autoref{sec:results-cascade}.
+This section evaluates the synthetic task generator, first at a single level
+on the four lesion datasets it targets (ISLES22, Shifts-MS, ATLAS v2.0,
+GNC\_705), then under cascade inference on all nine held-out datasets. The
+lesion datasets are the hardest in the evaluation: their targets are lesions
+on MRI with no counterpart among the training classes.
+
 
 \paragraph{Synthetic-bank canvas.}
-The baseline is the Synth configuration trained with $p_\text{synth} = 0.5$
-and the synthetic-bank canvas. It reaches Dice between 0.008 and 0.082 on the
-four datasets (\autoref{tab:synth-realhost-ood}). Changing the mix of shape
-families or $p_\text{synth}$ with this canvas did not change these results
-beyond run-to-run variation.   The bank's images are synthesized from label maps of CT scans, whereas all
-  four target datasets are real MRI. This suggested that the canvas, rather
-  than the variety of shapes, limits transfer.
-\todo[inline]{Show the family-mix and $p_\text{synth}$ runs (appendix table)}
+The baseline is the Synth configuration ($p_\text{synth} = 0.5$,
+synthetic-bank canvas). It reaches Dice between 0.008 and 0.082 on the four
+lesion datasets (\autoref{tab:synth-realhost-ood}). With this canvas, changing
+the mix of shape families or $p_\text{synth}$ did not change these results
+beyond seed-to-seed variation. Since the bank's images are synthesized from CT
+label maps, whereas all four lesion datasets are real MRI, we hypothesized
+that the canvas rather than the shapes limits transfer.
+
 
 \paragraph{Real-host canvas.}
-To test this, we continued training from the baseline checkpoint in two runs
-that differ only in the canvas: the synthetic bank (stage 1) or real scans from TotalSegmentator (stage 2). Both use only the scatter-field family, with
-the same $p_\text{synth}$ and training budget. The real canvas improves Dice on
-three of the four datasets: ISLES22 from 0.045 to 0.098, Shifts-MS from 0.011
-to 0.058, and GNC\_705 from 0.070 to 0.105. ATLAS v2.0 is unchanged (0.033
-vs.\ 0.032). ATLAS v2.0 mostly contains single compact lesions, whereas
-scatter-field shapes consist of many small components, which may explain why
-it does not benefit. Absolute Dice remains low on all four datasets.
-\todo[inline]{Confirm that stages 1 and 2 are continued from the baseline
-checkpoint, and what distinguishes stage 1 from the baseline.}
+To test this, we continued training from the baseline in two runs that differ
+only in the canvas: the synthetic bank (stage 1) or real TotalSegmentator
+CT and MRI scans (stage 2). Both use only the scatter-field family, with the same
+$p_\text{synth}$ and training budget. The real canvas improves Dice on three of
+the four datasets: ISLES22 (0.045 to 0.098), Shifts-MS (0.011 to 0.058), and
+GNC\_705 (0.070 to 0.105). ATLAS v2.0 is unchanged (0.033 vs.\ 0.032).
+Absolute Dice stays below 0.11 on all four.
 
-In stage 3, the real-host canvas is extended to all seven shape families and to
-all TotalSegmentator subjects (CT and MRI, all organs), and training runs
-longer. This raises Dice on GNC\_705 to 0.223, while ISLES22, Shifts-MS, and ATLAS
-v2.0 all drop slightly below their stage-2 values. Because stage 3 changes
-three factors at once, the result cannot be attributed to any one of them.
+Stage 3 extends the real-host canvas to all seven shape families and to all
+TotalSegmentator subjects (CT and MRI, all organs), and trains longer. This
+raises GNC\_705 to 0.223, while the other three datasets fall slightly below
+their stage-2 values. Since stage 3 changes three factors at once, neither the
+gain nor the drops can be attributed to a single one.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Dice on the lesion datasets for successive synthetic-task
-  configurations. Stages 1 and 2 differ only in the canvas. Stage 3 adds all
-  shape families, all TotalSegmentator subjects as canvas, and a longer
-  training budget. Bold marks the best configuration per dataset, as in
-  \autoref{tab:synth-cascade-realhost}.}
+  \caption{Single-level Dice on the lesion datasets for successive
+  synthetic-task configurations. Stages 1 and 2 differ only in the canvas.
+  Stage 3 adds all shape families, all TotalSegmentator subjects as canvas,
+  and a longer training budget.}
   \label{tab:synth-realhost-ood}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -1515,37 +1381,26 @@ three factors at once, the result cannot be attributed to any one of them.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the four datasets, weighted by each one's
-  own number of evaluated tasks (46 for Shifts-MS to 1490 for GNC\_705,
-  identical across all four configurations). GNC\_705 alone is 61\% of the
-  total weight, so this mean tracks GNC\_705 closely; the unweighted mean
-  (Baseline 0.042, stage 1 0.040, stage 2 0.073, stage 3 0.097) ranks the four
-  configurations the same way, but with a much smaller stage-3 lead.
+  $^{\dagger}$Weighted by the number of evaluated tasks per dataset (46 for
+  Shifts-MS to 1490 for GNC\_705, which carries 61\% of the weight). The
+  unweighted mean (0.042, 0.040, 0.073, 0.097) gives the same ranking with a
+  smaller stage-3 lead.
 \end{table}
 
 \paragraph{Effect on TotalSegmentator.}
 \autoref{tab:synth-realhost-indist} reports TotalSegmentator validation Dice
-for the same checkpoints, split by modality and class membership. Stages 1
-and 2 change it by at most 0.023 in any row (TotalSeg CT, unseen) relative to
-the baseline, so the gains of stage 2 on the lesion datasets do not reduce
-accuracy on the training distribution. Stage 3 improves all four values, and
-the sample-weighted mean rises from 0.434 to 0.505. Given its longer training
-budget, this gain likely reflects the additional training rather than the
+for the same checkpoints. Stages 1 and 2 stay within 0.022 of the baseline in
+every row, so the lesion gains of stage 2 do not cost accuracy on the training
+distribution. Stage 3 improves all four rows (mean 0.434 to 0.505), which
+likely reflects its longer training and larger canvas pool rather than the
 synthetic tasks themselves.
+
 
 \begin{table}[t]
   \centering
   \small
   \caption{TotalSegmentator validation Dice for the checkpoints of
-  \autoref{tab:synth-realhost-ood}, by modality and class membership,
-  computed the same way as every other results table (macro: per-class mean,
-  then averaged over classes). This differs from an earlier version of this
-  table, whose MRI/CT rows were computed as a flat per-sample mean instead
-  (matching \texttt{train.py}'s own internal logging); under that
-  convention TotalSeg MRI scored below TotalSeg CT overall, but splitting
-  seen from unseen first, as here, reverses that (MRI-seen scores above
-  CT-seen at every stage) --- a composition effect, not a correction of an
-  error.}
+  \autoref{tab:synth-realhost-ood}, by modality and class membership.}
   \label{tab:synth-realhost-indist}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -1561,42 +1416,29 @@ synthetic tasks themselves.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the four rows, weighted by each one's own
-  number of evaluated tasks (155 for TotalSeg MRI, unseen to 273 for TotalSeg
-  MRI, seen, identical across all four configurations); the unweighted mean
-  (Baseline 0.426, stage 1 0.426, stage 2 0.422, stage 3 0.494) ranks the
-  configurations the same way, though Baseline and stage 1 are within 0.0002
-  of each other under either weighting and should be read as tied.
+  $^{\dagger}$Weighted by the number of evaluated tasks per row (155 to 273).
+  Unweighted: 0.426, 0.426, 0.422, 0.494. Baseline and stage 1 are tied under
+  either weighting.
 \end{table}
 
 \paragraph{Cascade inference.}
 Synth + Cascade continues the stage-3 checkpoint with 20 epochs of cascade
-training. \autoref{tab:synth-cascade-realhost} compares it with Cascade, which
-uses no synthetic tasks, and with step-matched Medverse on the nine held-out
-datasets. Synth + Cascade improves on MSD Hippocampus (0.303 to 0.518) and
+training.
+\autoref{tab:synth-cascade-realhost} compares both with step-matched Medverse.
+Synth + Cascade improves over Cascade on MSD Hippocampus (0.303 to 0.518) and
 NasalSeg (0.547 to 0.644), is worse on HU\_LWK1 ($-0.028$) and Shifts-MS
-($-0.012$), and differs by at most 0.011 on the other datasets. On the
-sample-weighted mean of the five non-lesion datasets, Synth + Cascade is
-highest (0.615), ahead of Medverse (0.552) and Cascade (0.531); this ordering
-is driven by MSD Hippocampus and NasalSeg, the two datasets where Cascade
-trails both other models by the largest margins. It remains
-below Medverse on MSD Hippocampus, NasalSeg, and Shifts-MS, where Medverse's
-step-matched result (0.098) is the best of the three despite this being one
-of the four lesion datasets that motivated the synthetic-task generator. The
-two models differ in more
-than the synthetic tasks: Synth + Cascade also uses register carry and a
-pooling token, and has a different training history. The differences can
-therefore not be attributed to the synthetic tasks alone.
+($-0.012$), and stays within 0.011 elsewhere. These two gains put it ahead on
+the non-lesion mean (0.615, vs.\ 0.552 for Medverse and 0.531 for Cascade),
+although it still trails Medverse on both datasets. On the lesion datasets,
+the synthetic tasks have little effect under cascade inference: all three
+models stay below 0.1, and Medverse is best on Shifts-MS (0.098).
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Dice on the held-out datasets under cascade inference. Medverse:
-  released weights, step-matched autoregressive inference
-  (\autoref{sec:results-cascade}). Cascade and Synth + Cascade use the same
-  per-dataset ladder (identical sample counts confirmed for every dataset), so
-  differences are not a ladder confound; Medverse uses its own depth-matched
-  ladder from \autoref{tab:cascade-medverse}.}
+  \caption{Dice on the held-out datasets under cascade inference. Cascade and
+  Synth + Cascade use the same spacings per dataset; Medverse is step-matched
+  as in \autoref{tab:cascade-medverse}.}
   \label{tab:synth-cascade-realhost}
   \begin{tabular}{@{}lcccc@{}}
     \toprule
@@ -1618,74 +1460,50 @@ therefore not be attributed to the synthetic tasks alone.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the five datasets above the second
-  midrule, each weighted by its own number of evaluated tasks (36 for
-  HU\_LWK1 to 650 for FLARE22, identical across all three models here); the
-  unweighted mean-of-datasets ranks the three models the same way (Cascade
-  0.426, Synth + Cascade 0.480, Medverse 0.432). The four lesion datasets
-  below the second midrule are excluded (all three models score below 0.1 on
-  every one of them).
+  $^{\dagger}$Over the five datasets above the second midrule, weighted by the
+  number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22). Unweighted:
+  0.426, 0.480, 0.432 (same ranking). The lesion datasets are excluded, since
+  all three models score below 0.1 on all of them.
 \end{table}
 
-The gain on GNC\_705 at a single level (0.223,
-\autoref{tab:synth-realhost-ood}) does not carry over to cascade inference,
-where both models score below 0.04. A likely cause is localization: on this
-dataset, the coarse predictions follow bright regions rather than the lesions,
-so the region-restricted fine levels process crops that miss the lesion. This
-illustrates the limitation of region restriction noted in
-\autoref{sec:methodology-cascade}: small targets that the coarse level
-mislocalizes cannot be recovered. \autoref{fig:gnc-localization-fail} shows one
-such case: the lesion is a handful of voxels at the edge of the kidney
-(yellow circle, added for visibility, on the ground-truth panel), and the
-region-restricted finest level predicts nothing in that same location
-(Dice 0.00).
+The stage-3 gain on GNC\_705 (0.223 at a single level) is lost under cascade
+inference, where Synth + Cascade reaches 0.035. A likely cause is
+localization: small lesions that the coarse level misses fall outside the
+region-restricted fine crops and cannot be recovered
+(\autoref{sec:methodology-cascade}). \autoref{fig:gnc-localization-fail} shows
+one such case: the lesion is a handful of voxels at the edge of the kidney,
+and the finest level predicts nothing there (Dice 0.00). Since the single-level results use crops centered on the ground truth, part of this drop reflects the loss of ground-truth localization.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{gnc_localization_fail.png}
-  \caption{GNC\_705, class hypo\_mask\_r, subject 100014\_v30 (Cascade
-  checkpoint), coarse (6\,mm) and mid (3\,mm) level images shown for context:
-  the lesion (yellow circle) is a handful of voxels at the edge of the
-  kidney; the finest (1.2\,mm) level, restricted to its own region, predicts
-  nothing there (Dice 0.00).}
+  \caption{GNC\_705, class hypo\_mask\_r, subject 100014\_v30 (Cascade), with
+  the coarse (6\,mm) and middle (3\,mm) levels shown for context. The lesion
+  (yellow circle) is a handful of voxels at the edge of the kidney; the finest
+  (1.2\,mm) level predicts nothing there (Dice 0.00).}
   \label{fig:gnc-localization-fail}
 \end{figure}
-\todo[inline]{Support this further with the containment of the coarse box on
-GNC\_705 across all samples, not just this one case (currently a single
-qualitative example, re-rendered directly from \texttt{cascade.run\_cascade}
-on this one (subject, context, class) triple, not a systematic worst-case
-search), instead of the reference to
-\texttt{docs/datasets/gnc\_kidney\_lesions.md}. If the single-level evaluation
-uses ground-truth-centered crops, the drop may mainly reflect the loss of
-ground-truth localization; state which is the case.}
+
 
 \paragraph{Final comparison: Synth + Cascade vs.\ Medverse.}
-\autoref{tab:synth-cascade-medverse-final} adds NSD and latency to the Dice
-comparison above, restricted to our best cascade configuration, Synth +
-Cascade, against step-matched Medverse. On the sample-weighted mean of the
-five non-lesion datasets, Synth + Cascade leads on both Dice (0.615 vs.\
-0.552) and NSD (0.729 vs.\ 0.631) while being $15\times$ faster (179 vs.\
-2697\,ms per sample), consistent with the $15$--$17\times$ latency gap already
-reported for Cascade in \autoref{sec:results-cascade}. NSD moves in the same
-direction as Dice on seven of the nine datasets; the exceptions are
-Shifts-MS, where Medverse's Dice lead (0.098 vs.\ 0.019) is even larger on NSD
-(0.136 vs.\ 0.123), and ATLAS v2.0, where Synth + Cascade's Dice lead (0.032
-vs.\ 0.024) is much larger still on NSD (0.044 vs.\ 0.012). On the four lesion
-datasets, absolute scores stay below 0.1 Dice for both models on every one of
-them, and Medverse is faster only on MSD Hippocampus, the one dataset run at a
-single level rather than a cascade.
-\autoref{tab:synth-cascade-medverse-perclass} in the appendix breaks this
-comparison down to every individual class on all nine datasets.
+\autoref{tab:synth-cascade-medverse-final} adds NSD and latency for Synth +
+Cascade and step-matched Medverse. NSD agrees with Dice on which model is
+better on all nine datasets. On the non-lesion mean, Synth + Cascade leads in
+Dice (0.615 vs.\ 0.552) and NSD (0.729 vs.\ 0.631) and is $15\times$ faster
+(179 vs.\ 2697\,ms per sample); Medverse is faster only on MSD Hippocampus, the
+one single-level dataset. Against Medverse at native depth
+(\autoref{tab:medverse-matched-native}), Synth + Cascade wins only FLARE22 and
+HU\_LWK1 among the non-lesion datasets, but stays ahead on the sample-weighted
+mean (0.615 vs.\ 0.586). \autoref{tab:synth-cascade-medverse-perclass} in the
+appendix gives per-class results.
 
 \begin{table}[t]
   \centering
   \small
-  \caption{Final comparison, Synth + Cascade (ours) vs.\ Medverse: Dice, NSD,
-  and mean latency per sample on all nine held-out datasets. Medverse:
-  released weights, autoregressive inference with its number of steps matched
-  to our number of levels per dataset (\autoref{sec:results-cascade}). Bold
-  marks the best value per row for Dice and NSD; latency is bolded only in
-  the sample-weighted mean row. MV: Medverse.}
+  \caption{Synth + Cascade (Ours) vs.\ step-matched Medverse (MV): Dice, NSD,
+  and mean latency per sample on the nine held-out datasets. Bold marks the
+  better value per row for Dice and NSD, and for latency only in the mean
+  row.}
   \label{tab:synth-cascade-medverse-final}
   \begin{tabular}{@{}lccc c cc c cc@{}}
     \toprule
@@ -1709,174 +1527,109 @@ comparison down to every individual class on all nine datasets.
   \end{tabular}
   \par\vspace{0.5em}
   \raggedright\footnotesize
-  $^{\dagger}$Sample-weighted over the five datasets above the second
-  midrule, each weighted by its own number of evaluated tasks (36 for
-  HU\_LWK1 to 650 for FLARE22, identical across both models here); the
-  unweighted mean-of-datasets ranks the two models the same way on every
-  metric (Dice: Synth + Cascade 0.480, Medverse 0.432. NSD: 0.536, 0.482.
-  Latency: 232, 3436\,ms). The four lesion datasets below the second midrule
-  are excluded from the means (both models score below 0.1 Dice on every one
-  of them). Dice and NSD are macro (per-class mean, then averaged over
-  classes, as in \autoref{sec:results-setup}); latency is a flat mean over
-  samples.
-\end{table}
-
-% <<< end sections/results_synth.tex
+  $^{\dagger}$Over the five datasets above the second midrule, weighted by the
+  number of evaluated tasks (36 for HU\_LWK1 to 650 for FLARE22). Unweighted:
+  Dice 0.480 vs.\ 0.432, NSD 0.536 vs.\ 0.482, latency 232 vs.\ 3436\,ms. Dice
+  and NSD are macro-averaged over classes; latency is a mean over samples.
+\end{table}% <<< end sections/results_synth.tex
 % <<< end sections/results.tex
 % >>> begin sections/discussion.tex
 \section{\iflanguage{english}{Discussion}{Diskussion}}\label{sec:discussion}
 
-This chapter summarizes what the experiments show for each of the three
-questions raised in \autoref{sec:motivation}, discusses the limitations of the
-evidence, and outlines open questions.
+This chapter discusses the results for each of the three questions of
+\autoref{sec:motivation}, the limitations of the evidence, and open questions.
 
 \subsection{Image--Label Fusion}\label{sec:discussion-fusion}
 
-Replacing Medverse's two U-Nets with a shared encoder and attention layers
-improved accuracy on classes from the training vocabulary by a large margin,
-between 0.16 and 0.23 Dice on TotalSegmentator and FLARE22
-(\autoref{tab:fusion-staircase}). On new targets, this change alone did not
-help: early fusion was below Dual U-Net Cross-Attn on MSD Prostate, MSD
-Hippocampus, and HU\_LWK1. Dual attention changed this pattern only partly.
-Its gains over early fusion were small on in-vocabulary classes and larger on
-new targets and on the unseen modality, and it was the only variant above Dual
-U-Net Cross-Attn on the sample-weighted mean over held-out sources. This
-aggregate advantage does not hold source-by-source: on the five lesion and
-cavity datasets, Dual U-Net Cross-Attn wins more often (four of five), so the
-mean is driven by the first five, more anatomical, held-out sources.
+Replacing Medverse's two U-Nets with a shared encoder improved accuracy on the
+training vocabulary by 0.16 to 0.23 Dice, but not on new targets: there,
+single-axis attention was below Dual U-Net Cross-Attn on all eight datasets.
+Dual attention improved over single-axis attention on 12 of 13 rows, most on
+new targets. Letting image and label tokens interact in every layer thus seems
+to help most when the model has to extract the target from the context masks
+rather than recognize a trained class, although the results do not test this
+mechanism directly.
 
-One interpretation is that repeated interaction between image and label tokens
-matters most when the model cannot rely on having seen the class during
-training and has to extract the target from the context masks. This is
-consistent with the results, but they do not test it directly. Dual attention
-also remained well below Dual U-Net Cross-Attn on MSD Prostate and HU\_LWK1.
-Dual U-Net Cross-Attn starts from Medverse's weights, which were trained on
-different data; part of its advantage on these datasets may come from that
-pretraining rather than from its architecture.
-
-Dual attention reached these results with the fewest parameters of the three
-variants. The GFLOPs of the three variants differ by up to 65\%, but their
-latency is nearly identical, so GFLOPs did not predict latency in this
-setting.
-\todo[inline]{Check where the time goes (e.g.\ encoder, data movement) before
-drawing conclusions about compute.}
+Against Dual U-Net Cross-Attn, dual attention led on the held-out mean, but
+this lead came from FLARE22 and TotalSeg MRI, whose classes are largely in the
+training vocabulary. On the eight datasets with new targets, Dual U-Net
+Cross-Attn was better on six. Its initialization from Medverse's weights,
+trained on different data, may explain part of this; training both from the
+same initialization would separate the two. Dual attention reached its results
+with the fewest parameters of the three variants.
 
 \subsection{Coarse-to-Fine Cascade}\label{sec:discussion-cascade}
 
-When each level's crop is placed from the previous level's prediction, Dice
-still increases from level to level on every dataset
-(\autoref{tab:cascade-levels}). On TotalSeg CT, the coarse level localizes the
-target well enough for the first, coarsest-to-middle step: a box at its
-predicted centroid contains 92\% of the target's voxels on average, compared
-with 97\% for a box at the ground-truth centroid, and most of the remaining
-error at this step arises within the fine crops rather than from
-localization; the middle-to-finest step is not measured this way.
+Placing each crop from the previous level's prediction works: Dice increases
+from level to level on every dataset (\autoref{tab:cascade-levels}), and on
+TotalSeg CT the coarse prediction places the middle-level crop almost as well
+as the ground truth does (92\% vs.\ 97\% of the target's voxels contained).
 
-The clearest advantage over Medverse is speed. Cascade is about 17 times faster
-than Medverse with the same number of refinement steps, sample-weighted over
-the six datasets where both latencies are measured. The accuracy comparison
-depends on how Medverse is run. With matched
-steps, Cascade is more accurate on seven of the ten datasets with a matched
-value; against Medverse at its native number
-of steps, it is more accurate on six of the same ten (FLARE22, HU\_LWK1,
-TotalSeg MRI, ISLES22, ATLAS v2.0, and GNC\_705). The efficiency result is thus
-better supported than the accuracy result. TotalSeg CT is not part of this
-comparison (\autoref{sec:results-cascade}).
+The clearest advantage over Medverse is speed: Cascade is more than an order
+of magnitude faster. Since Medverse is faster at a single level, this comes
+from processing one crop per level instead of the whole volume, not from the
+architecture. The accuracy comparison is less clear. On the non-lesion datasets, Cascade leads on four of six against step-matched
+Medverse but only on three of six at Medverse's native depth. Its largest
+leads are on datasets from its training vocabulary, whereas Medverse leads on
+MSD Hippocampus and NasalSeg, which neither model saw during training.
 
-Training with the model's own predictions as prior worked better than training
-with perturbed ground-truth masks on the training distribution (99 of 117
-classes) and was mixed on datasets outside the training vocabulary (five of
-eight). A plausible
-explanation is that a model trained on its own predictions sees, during
-training, the kind of errors it will encounter at inference, which a
-hand-designed perturbation of the ground truth only approximates. Whether the
-prior helps at all compared with no prior has not been tested yet. The
-experiment with Medverse inside our cascade shows that a prior can also hurt:
-passing Medverse's coarse prediction forward lowered its Dice on six of seven
-datasets.
+Training with the model's own prediction as prior was better than training
+with a perturbed ground-truth mask, both on the training vocabulary and on the
+three non-lesion datasets outside it. A likely reason is that the model sees
+its own errors during training, which a hand-designed perturbation only
+approximates. Medverse, trained with a ground-truth prior, shows the opposite
+case: inside our cascade, passing on its own coarse prediction lowered its
+Dice on six of seven datasets. Whether a prior helps at all compared with none
+remains untested.
 
-Region restriction makes the cost of the fine levels depend on the size of the
-target rather than the size of the volume, but it makes the fine levels depend
-on the coarse localization. GNC\_705 shows the consequence: its single-level
-Dice of 0.223 dropped below 0.04 under cascade inference, likely because the
-coarse level mislocalizes the small lesions. Small, multi-focal, or low-contrast
-targets are the cases where this failure is most likely. Possible remedies
-include larger margins, several boxes per volume for multi-focal targets, or
-falling back to full-volume processing when the coarse prediction is uncertain.
-\todo[inline]{Revise the GNC\_705 paragraph once it is clear whether the
-single-level evaluation used ground-truth-centered crops
-(\autoref{sec:results-synth}).}
+Region restriction makes the cost of each level independent of the volume
+size, but makes the fine levels depend on the coarse localization. On
+GNC\_705, the single-level Dice of 0.223 fell to 0.035 under cascade
+inference, likely because the coarse level misses the small lesions. Small,
+multi-focal, or low-contrast targets are most at risk. Larger margins, several
+crops per volume, or a fallback to full-volume processing when the coarse
+prediction is uncertain could address this.
 
 \subsection{Synthetic Task Generation}\label{sec:discussion-synth}
 
-With the synthetic-bank canvas, varying the shapes and the fraction of
-synthetic tasks had no measurable effect on the lesion datasets. Changing only
-the canvas from CT bank images to real MRI cases improved three of four lesion
-datasets without reducing accuracy on TotalSegmentator. This indicates that
-the image the shapes are painted on mattered more than the variety of shapes,
-at least when the canvas and the target data differ in modality.
+With the synthetic-bank canvas, neither the mix of shape families nor
+$p_\text{synth}$ affected the lesion datasets. Replacing the bank with real scans improved three of the four without reducing accuracy on
+TotalSegmentator. What the shapes are painted on thus mattered more than which
+shapes are painted. This change makes the canvas both real and, so the
+two factors are not separated.
 
-The effect of synthetic tasks under cascade inference was smaller and
-different. Synth + Cascade improved mainly on MSD Hippocampus and NasalSeg,
-which are anatomical structures rather than lesions, and not on the lesion
-datasets that motivated the generator. Since Synth + Cascade also differs from
-Cascade in other components and in training history, these gains cannot be
-attributed to the synthetic tasks alone.
-
-Across all configurations, Dice on the lesion datasets stayed low: at most
-0.223 at a single level and below 0.08 under cascade inference. In-context
-segmentation of lesions remains largely unsolved in this setting. Lesions vary
-in location, number, and shape far more than anatomical structures, so the
-context examples say less about where the target is. How much of this gap
-synthetic tasks can close remains open.
+Under cascade inference, Synth + Cascade improved mainly on MSD Hippocampus
+and NasalSeg, not on the lesion datasets that motivated the generator, and it
+differs from Cascade in more than the synthetic tasks. Lesion Dice stayed low
+throughout: at most 0.223 at a single level, and at most 0.070 for our models
+under cascade inference. Lesions vary in location, number, and shape far more
+than anatomical structures, so a single context example says little about
+where the target is. In-context lesion segmentation remains largely unsolved
+in this setting.
 
 \subsection{Limitations}\label{sec:discussion-limitations}
 
-\paragraph{Strength of the evidence.}
-All results come from a single training run per configuration, so no variance
-estimates are available, and differences of a few hundredths of Dice should not
-be over-interpreted. Several results rest on few classes, such as the two
-unseen FLARE22 classes, the MSD datasets with two classes each, and HU\_LWK1
-with one. In the fusion comparison, early fusion and dual attention had not
-completed their training budget, while Dual U-Net Cross-Attn had converged.
-
-\paragraph{Differences between configurations.}
-The three results sections use different model configurations
-(\autoref{tab:configs}), so their numbers cannot be compared with each other.
-Within sections, some comparisons change several factors at once: stage 3 of
-the synthetic-task experiments changes shape families, canvas pool, and
-training budget together, and Synth + Cascade differs from Cascade in more than
-the synthetic tasks.
-\todo[inline]{Update if a single final configuration is evaluated before
-submission.}
-
 \paragraph{Missing ablations.}
-The contribution of the label prior and of region restriction has not been
-isolated: the cascade has not been evaluated without a prior or with
-full-volume processing at the fine levels. The speedup over Medverse therefore
-reflects the whole system, not region restriction alone.
+The cascade has not been evaluated without a prior or with full-volume
+processing at the fine levels, so the contributions of the prior and of region
+restriction are not isolated.
 
-\paragraph{Baselines and data.}
-Medverse is the only baseline evaluated empirically. Iris and UniverSeg are
-compared only by design. The overlap between Medverse's training data and our
-evaluation datasets is not fully documented, which affects the comparison on
-TotalSegmentator, MSD Hippocampus, and NasalSeg. The provenance of the ATLAS
-v2.0 copy used here has not been confirmed.
-\todo[inline]{Remove the ATLAS sentence once provenance is confirmed or the
-dataset is dropped.}
+\paragraph{Evaluation.}
+All results use a single context pair ($K = 1$), and the fusion comparison
+uses crops centered on the ground truth. Medverse is the only baseline
+evaluated empirically; Iris and UniverSeg are compared only by design.
+TotalSeg MRI is part of our training data, and Medverse's training data may
+overlap with MSD Hippocampus and NasalSeg, which affects the comparison on
+these datasets.
 
 \subsection{Open Questions}\label{sec:discussion-open}
 
-The most direct next steps are the missing ablations (no prior, no region
-restriction), additional seeds, and a single final configuration evaluated on
-all datasets. Beyond these, three questions remain open. First, the position
-axis attends over the tokens of all $K+1$ volumes at once, so its cost grows
-quadratically with the number of context volumes. How accuracy and cost scale
-with $K$ has not been studied. Second, region restriction needs a way to
-handle targets the coarse level cannot localize reliably. Third, synthetic
-tasks helped on some held-out datasets, but not yet on lesions under cascade
-inference. Generating tasks that resemble lesions in appearance and
-distribution, not only in shape, is one direction to explore.% <<< end sections/discussion.tex
+First, the position axis attends over all $K+1$ volumes at once, so its cost
+grows quadratically with the number of context volumes; how accuracy and cost
+scale with $K$ is untested. Second, region restriction needs a way to handle
+targets the coarse level cannot localize. Third, synthetic tasks did not yet
+help on lesions under cascade inference; tasks that resemble lesions in
+appearance and distribution, not only in shape, are one direction to explore.% <<< end sections/discussion.tex
 % >>> begin sections/conclusion.tex
 \section{\iflanguage{english}{Conclusion}{Fazit}}\label{sec:conclusion}
 
@@ -1885,36 +1638,24 @@ three questions: how to combine image and label information, where to spend
 compute, and how to obtain training data beyond the annotated classes.
 
 For the first question, we proposed dual attention, which keeps image and label
-tokens separate and lets them interact in every layer. In a comparison trained
-on TotalSegmentator CT, dual attention improved over merging the two once,
-mainly on new targets and on an unseen modality, and it did so with the fewest
-parameters of the compared variants. It was also the only shared-encoder
-variant above a retrained Medverse architecture on the mean over held-out
-datasets, although not on every dataset.
+tokens separate and lets them interact in every layer. Trained on
+TotalSegmentator CT, dual attention improved over merging the two once on 12
+of 13 evaluation rows, most on new targets, and with the fewest parameters of
+the compared variants. A retrained Medverse architecture, initialized from its
+released weights, remained better on most datasets with new targets.
 
 For the second question, we proposed a coarse-to-fine cascade in which each
 level receives the previous level's prediction as a prior and processes only
-the region that prediction localizes. The cascade was about 17 times faster
-than Medverse with the same number of refinement steps. It was more accurate
-than step-matched Medverse on seven of ten datasets, but the comparison with
-Medverse at its native depth was mixed. Training with the model's own
-predictions as prior worked better than training with perturbed ground-truth
-masks on the training distribution.
+the region that prediction localizes. The cascade was more than an order of
+magnitude faster than Medverse, while the accuracy comparison depended on how
+Medverse was run. Training with the model's own predictions as prior worked
+better than training with perturbed ground-truth masks.
 
 For the third question, we proposed a synthetic task generator that paints
-procedural shapes onto scans. The modality of the image the shapes are painted
-on mattered more than the variety of shapes: painting onto real MRI cases
-improved three of four lesion datasets at a single level without reducing
-accuracy on TotalSegmentator. Under cascade inference, synthetic tasks helped
-on held-out anatomical structures but not on lesions.
-
-All results come from single training runs, and several comparisons are not
-fully controlled; \autoref{sec:discussion-limitations} lists the main
-limitations and the ablations still missing. Segmenting lesions from a few
-examples remains the hardest case in this setting and the clearest direction
-for future work.
-\todo[inline]{Update the numbers and claims once the pending re-runs and
-ablations are complete.}% <<< end sections/conclusion.tex
+procedural shapes onto scans. The canvas mattered more than the variety of
+shapes: painting onto real scans improved three of four lesion datasets
+at a single level without reducing accuracy on TotalSegmentator. Under cascade
+inference, however, lesion segmentation remained largely unsolved.% <<< end sections/conclusion.tex
 
 \pagenumbering{Roman}
 % >>> begin sections/symbols.tex
@@ -2010,7 +1751,6 @@ ablations are complete.}% <<< end sections/conclusion.tex
 \end{table}
 
 
-\begin{comment}
 \begin{table}[t]
   \centering
   \small
@@ -2034,14 +1774,7 @@ ablations are complete.}% <<< end sections/conclusion.tex
 \end{table}
 
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.6\linewidth]{arch_medverse.pdf}
-  \caption{Medverse's architecture: dual U-Net cross-attention, shown for comparison against our architecture (\autoref{fig:overview}).}
-  \label{fig:overview-medverse}
-\end{figure}
 
-\end{comment}
 
 \begin{longtable}{@{}llcccc@{}}
   \caption{Per-class Dice and NSD, Synth + Cascade (ours) vs.\ Medverse,
@@ -2119,6 +1852,136 @@ ablations are complete.}% <<< end sections/conclusion.tex
    & Hypo mask L & \textbf{0.033} & 0.008 & \textbf{0.038} & 0.004 \\
    & Hypo mask R & \textbf{0.033} & 0.010 & \textbf{0.036} & 0.008 \\
 \end{longtable}
+\subsection*{\iflanguage{english}{Additional qualitative examples}{Zus\"atzliche qualitative Beispiele}}\label{sec:appendix-qualitative}
+
+Two additional context/ground-truth/prediction examples (Ours vs.\ Medverse) per held-out dataset, beyond the ones in \autoref{sec:results-cascade}.
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/hu_lwk1_1.png}
+  \caption{HU\_LWK1, example 1.}
+  \label{fig:qual-hu_lwk1-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/hu_lwk1_2.png}
+  \caption{HU\_LWK1, example 2.}
+  \label{fig:qual-hu_lwk1-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/isles22_1.png}
+  \caption{ISLES22, example 1.}
+  \label{fig:qual-isles22-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/isles22_2.png}
+  \caption{ISLES22, example 2.}
+  \label{fig:qual-isles22-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/shifts_ms_1.png}
+  \caption{Shifts-MS, example 1.}
+  \label{fig:qual-shifts_ms-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/shifts_ms_2.png}
+  \caption{Shifts-MS, example 2.}
+  \label{fig:qual-shifts_ms-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_hippocampus_1.png}
+  \caption{MSD Hippocampus, example 1.}
+  \label{fig:qual-msd_hippocampus-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_hippocampus_2.png}
+  \caption{MSD Hippocampus, example 2.}
+  \label{fig:qual-msd_hippocampus-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_prostate_1.png}
+  \caption{MSD Prostate, example 1.}
+  \label{fig:qual-msd_prostate-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/msd_prostate_2.png}
+  \caption{MSD Prostate, example 2.}
+  \label{fig:qual-msd_prostate-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/atlas_v2_1.png}
+  \caption{ATLAS v2.0, example 1.}
+  \label{fig:qual-atlas_v2-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/atlas_v2_2.png}
+  \caption{ATLAS v2.0, example 2.}
+  \label{fig:qual-atlas_v2-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/gnc_kidney_1.png}
+  \caption{GNC\_705, example 1.}
+  \label{fig:qual-gnc_kidney-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/gnc_kidney_2.png}
+  \caption{GNC\_705, example 2.}
+  \label{fig:qual-gnc_kidney-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/flare22_1.png}
+  \caption{FLARE22, example 1.}
+  \label{fig:qual-flare22-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/flare22_2.png}
+  \caption{FLARE22, example 2.}
+  \label{fig:qual-flare22-2}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/nasalseg_1.png}
+  \caption{NasalSeg, example 1.}
+  \label{fig:qual-nasalseg-1}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.85\linewidth]{appendix_pairs/nasalseg_2.png}
+  \caption{NasalSeg, example 2.}
+  \label{fig:qual-nasalseg-2}
+\end{figure}
+
 % <<< end sections/appendix.tex
 
 \end{document}
