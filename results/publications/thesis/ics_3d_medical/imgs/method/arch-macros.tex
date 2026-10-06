@@ -174,10 +174,15 @@
 % called once near the top of a figure (after \input{arch-macros.tex}).
 % \archarrow keeps its classic small size by default for any arch_*.tex
 % figure that never calls \archarrowset -- this block is purely additive.
-%   \archflowstyle              -- current draw options (head + line
+%   archflowstyle (tikz key, NOT a macro -- use bare, no backslash) --
+%                                  current draw options (head + line
 %                                  width), for a hand-rolled elbow \draw
 %                                  that \archarrow's straight "--" can't
-%                                  express (e.g. "-|" routing)
+%                                  express (e.g. "-|" routing). Must be a
+%                                  /.style key rather than a \def'd macro:
+%                                  pgf's arrow-tip parser doesn't split on
+%                                  a comma embedded in a plain macro's
+%                                  expansion when used as a \draw option.
 %   \archflowNeutral/Target/Context -- the only 3 colors a plain dataflow
 %                                  arrow should use: generic same-role
 %                                  passthrough; target's own real output
@@ -193,11 +198,11 @@
 % ---------------------------------------------------------------
 \newcommand{\archarrowset}[1]{%
   \ifthenelse{\equal{#1}{detailed}}{%
-    \def\archflowstyle{-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt}%
+    \tikzset{archflowstyle/.style={-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt}}%
   }{%
-    \def\archflowstyle{-{Latex[length=2.4mm,width=2mm]},line width=2.2pt}%
+    \tikzset{archflowstyle/.style={-{Latex[length=2.4mm,width=2mm]},line width=2.2pt}}%
   }%
-  \renewcommand{\archarrow}[3]{\draw[\archflowstyle,##3] ##1 -- ##2;}%
+  \renewcommand{\archarrow}[3]{\draw[archflowstyle,##3] ##1 -- ##2;}%
 }
 \newcommand{\archflowNeutral}{black!30}
 \newcommand{\archflowTarget}{archTargetAccent}

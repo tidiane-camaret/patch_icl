@@ -1,5 +1,6 @@
 \documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
+\usepackage{amsmath}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
 \archarrowset{compact}
@@ -134,7 +135,8 @@
 \begin{scope}[scale=0.75]
 
   \pgfmathsetmacro{\xB}{\xA+\boxw+\panelgap}
-  \pgfmathsetmacro{\boxAcenter}{\xA+\boxw/2}
+  % \boxAcenter is set later, once \boxwFuse (the Fuse box's own, narrower
+  % width) is known
   \pgfmathsetmacro{\boxBcenter}{\xB+\boxw/2}
 
   \pgfmathsetmacro{\outerLeftBase}{\xB-0.50}
@@ -149,16 +151,32 @@
   \pgfmathsetmacro{\outerLeft}{\xC-0.50}
   \pgfmathsetmacro{\outerRight}{\xD+\boxw+0.50}
 
-  \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
+  % raised along with \boxTop below -- the "Modality axis"/"Position axis"
+  % (and "Fuse"/"Position axis") titles sit above the inner boxes at
+  % \boxTop+0.20, so this dashed wrapper needs enough headroom past that
+  % to fully contain the title text, not just the inner box itself
+  \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+1.10}
   \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
 
   \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
+  % shared top edge for all 4 inner boxes (Fuse/Position axis in the top
+  % panel, Modality axis/Position axis in the bottom panel) -- raised
+  % slightly above the plain \boxpad margin so each box's
+  % $Z^{\text{img}}$/$Z^{\text{lbl}}$ superscript labels have enough
+  % headroom (same fix as arch_fusion_family.tex's Fuse box)
+  \pgfmathsetmacro{\boxTop}{\yTgt+\clusterhalf+\boxpad+0.15}
 
   \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}
-  \pgfmathsetmacro{\xFusedTop}{\xlblTop+2.0}
+  % Fuse box narrowed to stop shortly after the lbl column -- the fused
+  % column (\xFusedTop) sits just OUTSIDE it, not inside it (mirrors the
+  % same fix in arch_fusion_family.tex's Fuse box). Right margin (past
+  % \xlblTop) matches the left margin (\xA to \ximgTop) exactly, so the
+  % img/lbl column pair sits centered in the box rather than right-hung
+  \pgfmathsetmacro{\boxwFuse}{\xlblTop+\ximgTop-2*\xA}
+  \pgfmathsetmacro{\boxAcenter}{\xA+\boxwFuse/2}
+  \pgfmathsetmacro{\xFusedTop}{\xA+\boxwFuse+1.0}
 
   \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
-  \pgfmathsetmacro{\xFuseArrowStart}{\xFuseOp+0.35}
   \pgfmathsetmacro{\yMid}{\rowpitch/2}
 
   \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
@@ -179,16 +197,16 @@
       ({\outerLeftBase},{\outerBot}) rectangle ({\outerRightBase},{\outerTop});
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      (\xA,\yCtx-\clusterhalf-\boxpad) rectangle ({\xA+\boxw},\yTgt+\clusterhalf+\boxpad);
+      (\xA,\yCtx-\clusterhalf-\boxpad) rectangle ({\xA+\boxwFuse},{\boxTop});
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},\yTgt+\clusterhalf+\boxpad);
+      ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxw},{\boxTop});
 
-    \node[anchor=south] at ({\boxAcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
-    \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Position axis};
+    \node[anchor=south] at ({\boxAcenter},{\boxTop+0.20}) {\archboxlabel Fuse};
+    \node[anchor=south] at ({\boxBcenter},{\boxTop+0.20}) {\archboxlabel Position axis};
 
-    \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
-
-    \archflow{({\xA+\boxw+0.50},{\yMid})}{({\xB-0.50},{\yMid})}{neutral}
+    % starts just past the (now externalized) fused column, not the old
+    % full-width box edge
+    \archflow{({\xFusedTop+\tsz/2+0.28},{\yMid})}{({\xB-0.50},{\yMid})}{neutral}
 
     \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
     \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
@@ -221,8 +239,6 @@
 
     \node[font=\huge] at ({\xFuseOp},{\yTgt}) {$\oplus$};
     \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
-    \fusearrow{({\xFuseArrowStart},{\yTgt})}{({\xFusedTop-\tsz/2-0.18},{\yTgt})}{black!55}
-    \fusearrow{({\xFuseArrowStart},{\yCtx})}{({\xFusedTop-\tsz/2-0.18},{\yCtx})}{black!55}
 
     \tabpfnattn{\xFusedPatchTop}
 
@@ -273,14 +289,12 @@
       ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxwMod},\yTgt+\clusterhalf+\boxpad);
+      (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxwMod},{\boxTop});
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxwPos},\yTgt+\clusterhalf+\boxpad);
+      ({\xD},\yCtx-\clusterhalf-\boxpad) rectangle ({\xD+\boxwPos},{\boxTop});
 
-    \node[anchor=south] at ({\boxCcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Modality axis};
-    \node[anchor=south] at ({\boxDcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Position axis};
-
-    \node[anchor=north east] at ({\outerRight-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
+    \node[anchor=south] at ({\boxCcenter},{\boxTop+0.20}) {\archboxlabel Modality axis};
+    \node[anchor=south] at ({\boxDcenter},{\boxTop+0.20}) {\archboxlabel Position axis};
 
     \node[anchor=south,font=\normalsize] at ({\ximgBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
     \node[anchor=south,font=\normalsize] at ({\xlblBot},\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};

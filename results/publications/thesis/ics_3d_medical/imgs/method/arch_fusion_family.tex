@@ -1,6 +1,7 @@
 \documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
-\usetikzlibrary{arrows.meta,calc,positioning}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,calc,positioning,decorations.pathreplacing}
 \input{arch-macros.tex}
 \archarrowset{compact}
 
@@ -50,12 +51,15 @@
 % bespoke drawing: the encoder's single output arrow becomes an "img"
 % token cluster (\tpcluster) once inside the box, a separate "lbl"
 % cluster sits beside it (gray/content-free for target's placeholder
-% prior, solid archContextAccent for context's real mask), and oplus
-% feeds a split "fused" cluster (\tpclustersplit) -- the SAME cluster
-% then reappears inside the "Attn." (cross-attention) box, carried over
-% by one more arrow, exactly like the old Fuse->Patch-axis pair did. HOW
-% exactly the combination happens (concat / sum / MLP / attention) is
-% deliberately left generic here -- that is exactly what
+% prior, solid archContextAccent for context's real mask). ONLY img/lbl
+% sit inside the Fuse box, though -- oplus's output, the split "fused"
+% cluster (\tpclustersplit), lands just OUTSIDE the box's right edge,
+% in the gap before "Attn.", since it is the box's result rather than
+% one of its inputs. The SAME cluster then reappears inside the "Attn."
+% (cross-attention) box, carried over by one more arrow, exactly like
+% the old Fuse->Patch-axis pair did. HOW exactly the combination happens
+% (concat / sum / MLP / attention) is deliberately left generic here --
+% that is exactly what
 % arch_fusion_axis.tex reveals next.
 %
 % Context DOES get a real mask cube, though, drawn below its image
@@ -67,15 +71,13 @@
 % slot is a placeholder prior, not a real input.
 %
 % Panels are stacked top (Medverse) over bottom (generic), with their
-% image-input cubes column-aligned (both at \xIn/\xCubeImg). Their
-% predicted-mask outputs are ALSO aligned, by construction rather than
-% accident: Medverse's U-Net is stretched wider than its natural
-% proportions (\bw, well beyond what its own content needs) and the
-% generic panel's Fuse/Attn. boxes and inter-stage gaps are tightened as
-% far as legibility allows (Attn. only needs room for its token column +
-% fan, not a full box's worth of padding) -- the two meet close to the
-% same column without literally matching every intermediate stage,
-% which the two families don't share.
+% image-input cubes column-aligned (both at \xIn/\xCubeImg). The Medverse
+% box and the generic panel's Fuse/Attn. boxes are pinned EXACTLY, not
+% just visually close: the Medverse box's left edge = the Fuse box's left
+% edge, and its right edge = the Attn. box's right edge (\bcx, \bw are
+% derived from \xFuseBoxLeft/\xB/\boxwXattn below, not from Medverse's own
+% cube position). Predicted-mask outputs are pinned the same way: \xOut
+% is set equal to \xPredCube rather than reached via a tuned gap.
 % ---------------------------------------------------------------------------
 
 % \tpsq{x}{y}{fill}{ring} -- one token, a filled square with a role ring.
@@ -194,16 +196,24 @@
   \pgfmathsetmacro{\xFuseBoxLeft}{\xEnc+\encw+0.8}
   \pgfmathsetmacro{\ximgTok}{\xFuseBoxLeft+0.8}
   \pgfmathsetmacro{\xlblTok}{\ximgTok+1.5}
-  \pgfmathsetmacro{\xfusedTok}{\xlblTok+1.0}
-  \pgfmathsetmacro{\boxwFuse}{\xfusedTok+0.6-\xFuseBoxLeft}
+  % box stops right after the lbl column -- the fused column sits OUTSIDE
+  % the Fuse box, in the gap before Attn., not inside it
+  \pgfmathsetmacro{\boxwFuse}{\xlblTok+0.6-\xFuseBoxLeft}
+  \pgfmathsetmacro{\xFuseBoxRight}{\xFuseBoxLeft+\boxwFuse}
   \pgfmathsetmacro{\xFuseOp}{(\ximgTok+\xlblTok)/2}
 
   % Cross-attention box: tightened the same way -- the token column + fan
   % don't need much width, narrowing it makes room for the decoder +
   % predicted-mask cube after it.
   \pgfmathsetmacro{\boxwXattn}{2.9}
-  \pgfmathsetmacro{\xB}{\xFuseBoxLeft+\boxwFuse+0.9}
+  % kept independent of \xfusedTok (numerically identical to this
+  % figure's long-standing Attn.-box position) so the fused column below
+  % can be centered in the Fuse/Attn. gap without moving Attn. itself
+  \pgfmathsetmacro{\xB}{\xFuseBoxRight+1.9}
   \pgfmathsetmacro{\boxBcenter}{\xB+\boxwXattn/2}
+  % fused column: exactly midway between the Fuse box and the Attn box,
+  % now that it is drawn outside the Fuse box rather than inside it
+  \pgfmathsetmacro{\xfusedTok}{(\xFuseBoxRight+\xB)/2}
 
   \pgfmathsetmacro{\decw}{0.9}
   \pgfmathsetmacro{\decwn}{0.55}
@@ -219,20 +229,23 @@
   % =========================================================================
   \begin{scope}[yshift=0cm]
 
-    % Wider than Medverse's own natural proportions -- stretched so this
-    % panel's \xOut lines up with the generic panel's \xPredCube below
-    % (both have image-input cubes at the same x already; this closes
-    % the gap on the output side without changing the coupling arrows'
-    % 4 fixed fractional positions, {0.20,0.40,0.50,0.75}).
-    \pgfmathsetmacro{\bw}{8.0}
+    % \bcx/\bw are derived, not independent: the box's left edge (\bcx-0.5)
+    % is pinned to the generic panel's Fuse box left edge (\xFuseBoxLeft),
+    % and its right edge (\bcx+\bw+0.5) to the generic panel's Attn. box
+    % right edge (\xB+\boxwXattn) -- this keeps the coupling arrows' 4
+    % fixed fractional positions, {0.20,0.40,0.50,0.75}, meaningful while
+    % making the box exactly as wide as the Fuse+Attn. span below it.
     \pgfmathsetmacro{\bh}{2.0}
     \pgfmathsetmacro{\bpinch}{0.7}
-    \pgfmathsetmacro{\bcx}{\xIn+\cubew+1.3}
+    \pgfmathsetmacro{\bcx}{\xFuseBoxLeft+0.5}
+    \pgfmathsetmacro{\bw}{\xB+\boxwXattn-\xFuseBoxLeft-1.0}
     \pgfmathsetmacro{\waistX}{\bcx+\bw/2}
     \pgfmathsetmacro{\bcyTgt}{\yTgt-\bh/2}
     \pgfmathsetmacro{\bcyCtx}{\yCtx-\bh/2}
     \pgfmathsetmacro{\xOutArrowStart}{\bcx+\bw+0.5}
-    \pgfmathsetmacro{\xOut}{\xOutArrowStart+1.3+\cubew/2}
+    % pinned equal to the generic panel's own pred-mask cube center, not a
+    % tuned gap, so the two rows' outputs land in the same column
+    \pgfmathsetmacro{\xOut}{\xPredCube}
 
     \pgfmathsetmacro{\boxLeft}{\bcx-0.5}
     \pgfmathsetmacro{\boxRight}{\bcx+\bw+0.5}
@@ -316,14 +329,22 @@
 
     \pgfmathsetmacro{\xFusedPatchTop}{\boxBcenter}
 
-    \pgfmathsetmacro{\outerLeftBase}{\xB-0.50}
-    \pgfmathsetmacro{\outerRightBase}{\xB+\boxwXattn+0.50}
+    % tight margin -- this dashed panel marks the xL-repeated region
+    % around the inner Attn. box, not the whole generic panel, so it
+    % should hug that inner box rather than float well past it
+    \pgfmathsetmacro{\outerLeftBase}{\xB-0.15}
+    \pgfmathsetmacro{\outerRightBase}{\xB+\boxwXattn+0.15}
     \pgfmathsetmacro{\outerTop}{\yTgt+\clusterhalf+\boxpad+0.85}
     \pgfmathsetmacro{\outerBot}{\yCtx-\clusterhalf-\boxpad-0.40}
     \pgfmathsetmacro{\methodTitleY}{\outerTop+0.50}
+    % context's mask lane y, needed early now that the "context" label
+    % below is centered between the image row (\yCtx) and this mask row
+    \pgfmathsetmacro{\yMask}{\yCtx-\rowpitch}
 
     \node[anchor=east,font=\normalsize] at (\xlab,\yTgt) {target};
-    \node[anchor=east,font=\normalsize] at (\xlab,\yCtx) {context};
+    % vertically centered between the image cube (\yCtx) and mask cube
+    % (\yMask) below, since this row's "context" label now covers both
+    \node[anchor=east,font=\normalsize] at (\xlab,{(\yCtx+\yMask)/2}) {context};
 
     \node[anchor=south] at ({(\xCubeImg+\xPredCube+\cubew/2)/2},{\methodTitleY})
       {\archtitle Shared encoder + cross-attn};
@@ -342,9 +363,15 @@
     % into the Fuse box's context "lbl" cluster below; the arrow is drawn
     % later (just before that cluster) so it disappears under the column
     % background and the bottom token, exactly like arch_patchset.tex's
-    % routed arrow vanishes under its Ctx Lbl token grid.
-    \pgfmathsetmacro{\yMask}{\yCtx-\rowpitch}
+    % routed arrow vanishes under its Ctx Lbl token grid. (\yMask is set
+    % earlier now, alongside the other geometry constants above.)
     \archvolcube{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{predmask}{mask}
+
+    % curly brace grouping the image+mask pair under the single "context"
+    % label -- mirrored so its tip points left, toward the label, with the
+    % curved side hugging the two cubes on the right
+    \draw[black!50,decorate,decoration={brace,amplitude=3mm,mirror}]
+      ({\xCubeImg-0.20},{\yCtx+\cubeh/2}) -- ({\xCubeImg-0.20},{\yMask-\cubeh/2});
 
     % ---- shared encoder: one funnel per row, same weights both rows --
     % image only, matching arch_query_prior.tex's cube->funnel->attention
@@ -363,9 +390,14 @@
     \archflow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft-0.50},{\yTgt})}{neutral}
     \archflow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft-0.50},{\yCtx})}{neutral}
 
+    % top edge raised slightly above the usual \boxpad margin (unlike the
+    % Attn. box) -- the $Z^{\text{img}}$/$Z^{\text{lbl}}$ superscript
+    % labels below sit taller than plain text, and the plain \boxpad gap
+    % was clipping them
+    \pgfmathsetmacro{\fuseBoxTop}{\yTgt+\clusterhalf+\boxpad+0.15}
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
-      ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},\yTgt+\clusterhalf+\boxpad);
-    \node[anchor=south] at ({\xFuseBoxLeft+\boxwFuse/2},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Fuse};
+      ({\xFuseBoxLeft},\yCtx-\clusterhalf-\boxpad) rectangle ({\xFuseBoxLeft+\boxwFuse},{\fuseBoxTop});
+    \node[anchor=south] at ({\xFuseBoxLeft+\boxwFuse/2},{\fuseBoxTop+0.20}) {\archboxlabel Fuse};
 
     \node[anchor=south,font=\normalsize] at (\ximgTok,\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
     \node[anchor=south,font=\normalsize] at (\xlblTok,\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
@@ -373,7 +405,7 @@
     % context mask -> context "lbl" cluster, routed under the Fuse box
     % and up into the column from below (drawn now, before the column
     % background/tokens below, so those layer on top of its approach)
-    \draw[\archflowstyle,\archflowContext]
+    \draw[archflowstyle,\archflowContext]
       ({\xCubeImg+\cubew+0.15},{\yMask}) -| ({\xlblTok},{\yCtx-\toff-\tsz/2-0.10});
 
     \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
@@ -392,11 +424,14 @@
     }
     \node[font=\huge] at ({\xFuseOp},{\yTgt}) {$\oplus$};
     \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
-    \fusearrow{({\xFuseOp+0.35},{\yTgt})}{({\xfusedTok-\tsz/2-0.18},{\yTgt})}{black!55}
-    \fusearrow{({\xFuseOp+0.35},{\yCtx})}{({\xfusedTok-\tsz/2-0.18},{\yCtx})}{black!55}
 
-    \archflow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yTgt})}{({\xB-0.20},{\yTgt})}{neutral}
-    \archflow{({\xFuseBoxLeft+\boxwFuse+0.20},{\yCtx})}{({\xB-0.20},{\yCtx})}{neutral}
+    % single arrow, vertically centered between the two rows (\yMid) --
+    % both rows' fused columns funnel into one path entering Attn., rather
+    % than two parallel same-y arrows. Starts just past the fused column's
+    % cluster background, now that the column sits midway in the
+    % Fuse/Attn. gap rather than at a fixed offset from the (removed) box
+    % edge
+    \archflow{({\xfusedTok+\tsz/2+0.28},{\yMid})}{({\xB-0.20},{\yMid})}{neutral}
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxwXattn},\yTgt+\clusterhalf+\boxpad);
