@@ -54,7 +54,7 @@
         % mask-like tensor entering fusion, same role as context's mask
         \node[anchor=east,font=\normalsize] at (-0.2,4.45) {$\hat L^t_1$};
         \archvolcube{0}{3.8}{1.15}{1.3}{archTargetAccent}{predmask}{}
-        \draw[archflowstyle,\archflowContext] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
+        \draw[archflowstyle,\archflowNeutral] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
       }
 
       % ---- lane 2: context image (always real) ----
@@ -68,7 +68,7 @@
       % ---- lane 3: context mask (always real) ----
       \node[anchor=east,font=\normalsize] at (-0.2,0.9) {$L^c$};
       \archvolcube{0}{0.4}{1.15}{1.0}{archContextAccent}{predmask}{}
-      \draw[archflowstyle,\archflowContext] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
+      \draw[archflowstyle,\archflowNeutral] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
 
 
       % -------------------------------------------------------------------------
@@ -95,10 +95,10 @@
       % -------------------------------------------------------------------------
       % Output & Decoder Routing
       % -------------------------------------------------------------------------
-      \archflow{(5.7, 4.55)}{(6.6, 4.55)}{target}
+      \archflow{(5.7, 4.55)}{(6.6, 4.55)}{neutral}
 
       \archfunnel{6.7}{3.9}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
-      \archflow{(7.45, 4.55)}{(7.95, 4.55)}{target}
+      \archflow{(7.45, 4.55)}{(7.95, 4.55)}{neutral}
       \archvolcube{8.05}{3.9}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
 
       % Level 1 specific Crop Bounding Box

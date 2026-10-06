@@ -3,6 +3,12 @@
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
 
+% Dataflow arrows in this figure all use archArrowPale (a pale-green tint
+% from arch-macros.tex); override it to light grey here, local to this
+% standalone compilation only -- arch_medverse.tex also uses archArrowPale
+% but compiles separately, so its own color is untouched.
+\colorlet{archArrowPale}{black!30}
+
 % Bigger arrows than the shared default (local override only -- other
 % arch_*.tex figures keep the thinner \archarrow from arch-macros.tex).
 \renewcommand{\archarrow}[3]{%

@@ -294,7 +294,7 @@
 
     % predicted mask (target row only -- context's own decoder output is
     % internal, never exposed)
-    \archflow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{target}
+    \archflow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{neutral}
     \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
@@ -405,7 +405,7 @@
     % context mask -> context "lbl" cluster, routed under the Fuse box
     % and up into the column from below (drawn now, before the column
     % background/tokens below, so those layer on top of its approach)
-    \draw[archflowstyle,\archflowContext]
+    \draw[archflowstyle,\archflowNeutral]
       ({\xCubeImg+\cubew+0.15},{\yMask}) -| ({\xlblTok},{\yCtx-\toff-\tsz/2-0.10});
 
     \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
@@ -455,9 +455,9 @@
     % only and never decoded, exactly like Medverse's context decoder
     % output above) -- OUTSIDE the xL wrapper, since decoding runs once,
     % after L layers of cross-attention, not once per layer
-    \archflow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{target}
+    \archflow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{neutral}
     \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
-    \archflow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{target}
+    \archflow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{neutral}
     \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
 
   \end{scope}
