@@ -268,8 +268,8 @@
     % Context: image+mask, 2 input channels. Target: image alone --
     % Medverse's TargetEncoder never receives a mask channel, not even a
     % zero placeholder, which is why its cube uses the plain "ct" icon.
-    \archvolcube{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image (1ch)}
-    \archvolcube{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ctmask}{image$\,\oplus\,$mask (2ch)}
+    \archvolcube{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{$I^t$ (1ch)}
+    \archvolcube{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ctmask}{$I^c$\,\oplus\,$L^c$ (2ch)}
 
     \archflow{({\xIn+\cubew+0.15},{\yTgt})}{({\bcx-0.55},{\yTgt})}{neutral}
     \archflow{({\xIn+\cubew+0.15},{\yCtx})}{({\bcx-0.55},{\yCtx})}{neutral}
@@ -295,7 +295,7 @@
     % predicted mask (target row only -- context's own decoder output is
     % internal, never exposed)
     \archflow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{neutral}
-    \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
+    \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{$\hat{y}^t$}
 
   \end{scope}
 
@@ -354,8 +354,8 @@
 
     % ---- input VOLUME, for parity with Medverse's image cube above --
     % only the image, since only the image is encoded (see header comment)
-    \archvolcube{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{image}
-    \archvolcube{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ct}{image}
+    \archvolcube{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{$I^t$}
+    \archvolcube{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ct}{$I^c$}
 
     % ---- context's real mask, its own cube in its own lane below the
     % image row (like arch_patchset.tex's $L^c$) -- no target counterpart,
@@ -365,7 +365,7 @@
     % background and the bottom token, exactly like arch_patchset.tex's
     % routed arrow vanishes under its Ctx Lbl token grid. (\yMask is set
     % earlier now, alongside the other geometry constants above.)
-    \archvolcube{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{predmask}{mask}
+    \archvolcube{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{predmask}{$L^c$}
 
     % curly brace grouping the image+mask pair under the single "context"
     % label -- mirrored so its tip points left, toward the label, with the
@@ -458,7 +458,7 @@
     \archflow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{neutral}
     \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
     \archflow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{neutral}
-    \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{pred.\ mask}
+    \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{$\hat{y}^t$}
 
   \end{scope}
 

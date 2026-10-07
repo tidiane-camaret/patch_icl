@@ -90,6 +90,33 @@
 }
 
 % ---------------------------------------------------------------
+% \archvolcubeimg{x}{y}{w}{h}{topcolor}{imgpath}{label} -- same cube as
+% \archvolcube, but the front face shows a real raster image (clipped to
+% exactly fill the face, aspect ratio not preserved) instead of one of
+% \archvolcube's procedural ct/ctmask/predmask blobs. Needs graphicx
+% loaded by the including figure. A separate macro rather than a new
+% \archvolcube content mode, so existing ct/ctmask/predmask figures are
+% untouched.
+% ---------------------------------------------------------------
+\newcommand{\archvolcubeimg}[7]{%
+  \begin{scope}
+    \pgfmathsetmacro{\cx}{#1}\pgfmathsetmacro{\cy}{#2}%
+    \pgfmathsetmacro{\w}{#3}\pgfmathsetmacro{\h}{#4}%
+    \fill[#5] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \fill[#5!60!black] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \begin{scope}
+      \clip (\cx,\cy) rectangle ++(\w,\h);
+      \node[anchor=south west, inner sep=0pt] at (\cx,\cy)
+        {\includegraphics[width=\w cm,height=\h cm]{#6}};
+    \end{scope}
+    \draw[black,thin] (\cx,\cy) rectangle ++(\w,\h);
+    \draw[black,thin] (\cx,\cy+\h) -- ++(\archdx,\archdy) -- ++(\w,0) -- ++(-\archdx,-\archdy) -- cycle;
+    \draw[black,thin] (\cx+\w,\cy) -- ++(\archdx,\archdy) -- ++(0,\h) -- ++(-\archdx,-\archdy) -- cycle;
+    \node[anchor=north,align=center] at (\cx+\w/2,\cy-0.1) {#7};
+  \end{scope}
+}
+
+% ---------------------------------------------------------------
 % \archfeatcube{x}{y}{w}{h}{color}{label} -- flat-colored feature volume
 % ---------------------------------------------------------------
 \newcommand{\archfeatcube}[6]{%

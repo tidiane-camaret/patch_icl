@@ -1,19 +1,83 @@
 \documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
 \usepackage{amsmath}
+\usepackage{graphicx}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
+
+% Real cube-face content: a vertebrae_T9 (target, context) pair from
+% TotalSegmentator -- full-body scans, so a wide-FOV level shows real
+% surrounding anatomy, unlike FLARE22 (abdomen-only, used in an earlier
+% version of this figure). target=s0482, context=s0994, loaded directly
+% via TotalSegInContextDataset._load_crop (bypasses the random
+% target/context pairing, which is not spacing-invariant, so the standard
+% DataLoader path can't guarantee the same two subjects at two spacings).
+% The SAME pair at two real spacings -- Level 1 = 3mm (wide FOV, torso
+% cross-section around the vertebra), Level 2 = 1mm (narrow FOV,
+% vertebra fills the frame) -- axial slice with the most foreground voxels,
+% axis 2 (verified against axes 0/1, which give sagittal/coronal spine-
+% chain strips here, not axial cross-sections -- see
+% /tmp .../scratchpad/check_axes.py). Render script:
+% /tmp .../scratchpad/render_ts_vert_fixed.py. The Level-2 (crop) pair
+% re-crops from NATIVE data with pred_center set to the class's own
+% native-space voxel centroid (not the provider's default bbox-cache
+% center), AND with ds.crop_jitter forced to 0 -- _load_crop otherwise
+% adds random jitter on top of any explicit pred_center, so repeated
+% calls with the identical center landed at different, non-reproducible
+% positions. That random jitter, not a geometric issue, was the actual
+% cause of both earlier bugs here: the black-edge bug (fixed by re-
+% cropping instead of post-hoc shifting the raster -- shifting pushed
+% real tissue off one edge and padded the vacated side with black) and
+% the off-center bug now (with jitter disabled, pred_center alone lands
+% within 1% of dead center for both subjects, no correction needed).
+% Slice selection is plain max-foreground throughout (same as everywhere
+% else in this figure): a "most-centered among slices with enough
+% foreground" variant was tried and reverted -- it picked a thin,
+% unrepresentative slice near the vertebra's z-extent edge purely for
+% its better 2D centering, and the resulting shape no longer read as a
+% vertebra cross-section at all. See
+% /tmp .../scratchpad/recrop_l2_proper.py.
+% Level 1's context image+mask are then shifted right by 30px
+% (shift_ctx_wide.py) -- a deliberate,
+% non-physical nudge so target's and context's crop boxes sit at visibly
+% different coordinates in Column A below, making the point that the two
+% are cropped independently rather than from one shared position.
+\newcommand{\archimgTgtCT}{ts_vertebra_target_ct.png}
+\newcommand{\archimgCtxCT}{ts_vertebra_context_ct.png}
+\newcommand{\archimgCtxMask}{ts_vertebra_context_mask.png}
+\newcommand{\archimgTgtCTCrop}{ts_vertebra_target_ct_crop.png}
+\newcommand{\archimgCtxCTCrop}{ts_vertebra_context_ct_crop.png}
+\newcommand{\archimgCtxMaskCrop}{ts_vertebra_context_mask_crop.png}
+% \hat{y}^t is a continuous sigmoid probability map (methodology_cascade.tex's
+% eq:query-prior), not a thresholded binary mask -- so every lane/cube that
+% stands for a PREDICTION (not a real ground-truth mask) uses these
+% Gaussian-blurred, continuous-valued versions of the target mask. There is
+% no binary \archimgTgtMask macro -- nothing in this figure shows the
+% target's prediction as a hard mask. Context's own mask (\archimgCtxMask,
+% \archimgCtxMaskCrop above) is real ground truth, so it stays binary.
+% The Level-2 OUTPUT blur radius (2) is much smaller than Level-1's (4) --
+% the refined, finer-level prediction should read as sharper/more
+% confident than the coarse one it was cropped from. But Level 2's INPUT
+% prior (lane 1, the crop of Level 1's own prediction warped in via
+% eq:query-prior) is the CARRIED-OVER coarse prediction, not L2's own
+% refined result -- it gets a separate, blurrier radius (7), so the two
+% don't look identical even though they're drawn from the same crop.
+\newcommand{\archimgTgtMaskCropPrior}{ts_vertebra_target_mask_crop_prior.png}
+\newcommand{\archimgTgtMaskSoft}{ts_vertebra_target_mask_soft.png}
+\newcommand{\archimgTgtMaskSoftCrop}{ts_vertebra_target_mask_crop_soft.png}
 
 % ---------------------------------------------------------------------------
 % Query prior across 2 cascade levels, WITH the model's own input/output flow
 % (arch.md §5) -- each level is a compact version of arch_patchset.tex's
-% pipeline (image -> Encoder -> feature -> tokens -> attention -> Decoder ->
-% predicted mask), stacked as lanes: target-image, target-PRIOR, context
-% -image, context-mask. Level 1's prior lane is an empty/dashed placeholder
-% (support-mean, no real input yet); level 2's is a real cube, produced by
-% CROPPING level 1's own prediction around its centroid. That side-by-side
-% contrast IS the figure's point -- the target "catches up" to having a
-% second (mask-like) lane, exactly like context always had.
+% pipeline, but without the encoder/decoder: this figure is about the
+% query-prior mechanism, not the backbone, so each of the four lanes
+% (target-image, target-PRIOR, context-image, context-mask) routes its cube
+% directly into attention, which routes directly to the predicted mask.
+% Level 1's prior lane is an empty/dashed placeholder (support-mean, no real
+% input yet); level 2's is a real cube, produced by CROPPING level 1's own
+% prediction around its centroid. That side-by-side contrast IS the figure's
+% point -- the target "catches up" to having a second (mask-like) lane,
+% exactly like context always had.
 % ---------------------------------------------------------------------------
 
 % Bigger arrows than the shared default -- shared \archflow vocabulary
@@ -26,19 +90,30 @@
   % -------------------------------------------------------------------------
   % 2 Cascade Levels (Compact & Simplified)
   % -------------------------------------------------------------------------
-  \foreach \L/\xs/\rname in {1/0/{Level 1}, 
-                             2/11.5/{Level 2}} {
+  \foreach \L/\xs/\rname in {1/0/{Level 1},
+                             2/9.60/{Level 2}} {
     \begin{scope}[xshift=\xs cm]
-      
-      \node[anchor=west,black!80] at (0,7.3) {\archtitle \rname};
+
+      % Centered over this level's content span (label column at x=-0.2 to
+      % the output cube's right edge at 5.80 -> midpoint 2.80), not
+      % left-aligned at the scope origin.
+      \node[black!80] at (2.80,7.3) {\archtitle \rname};
 
       % ---- lane 0: target image (always real) ----
-      \node[anchor=east,font=\normalsize] at (-0.2,6.15) {$I^t$};
-      \archvolcube{0}{5.5}{1.15}{1.3}{archTargetGreen}{ct}{}
-      \archflow{(1.25,6.15)}{(1.6,6.15)}{neutral}
-      \archfunnel{1.7}{5.5}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
-      % Direct compact route to Attention
-      \draw[archflowstyle,\archflowNeutral] (2.45,6.15) -| (3.1,5.0) -- (3.5,5.0);
+      % Label only at L1 -- the four labels for L2's lanes live on Column
+      % A instead (before the crop stage, not after it).
+      \ifthenelse{\equal{\L}{1}}{\node[anchor=east,font=\normalsize] at (-0.2,6.15) {$I^t$};}{}
+      % L2 shows the re-cropped image (see "Between the levels" below) --
+      % L1 shows the full, uncropped one.
+      \ifthenelse{\equal{\L}{1}}{
+        \archvolcubeimg{0}{5.5}{1.15}{1.3}{archTargetGreen}{\archimgTgtCT}{}
+      }{
+        \archvolcubeimg{0}{5.5}{1.15}{1.3}{archTargetGreen}{\archimgTgtCTCrop}{}
+      }
+      % No encoder funnel -- this compact figure is about the query-prior
+      % mechanism, not the backbone (see arch_patchset.tex for that); the
+      % cube routes directly into the attention block below.
+      \draw[archflowstyle,\archflowNeutral] (1.25,6.15) -| (1.45,5.2) -- (2.15,5.2);
 
       % ---- lane 1: target PRIOR ----
       \ifthenelse{\equal{\L}{1}}{
@@ -48,73 +123,136 @@
         \node[align=center, black!40] at (0.575, 4.45) {\archnote support\\mean};
         % Ghosted routing arrow directly into Attention -- intentionally
         % NOT \archflowContext: there is no real prior yet at L1
-        \draw[archflowstyle,black!20] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
+        \draw[archflowstyle,black!20] (1.25,4.45) -| (1.45,4.3) -- (2.15,4.3);
       }{
         % Level 2: REAL prior cube (receives crop from Level 1) -- a real
-        % mask-like tensor entering fusion, same role as context's mask
-        \node[anchor=east,font=\normalsize] at (-0.2,4.45) {$\hat L^t_1$};
-        \archvolcube{0}{3.8}{1.15}{1.3}{archTargetAccent}{predmask}{}
-        \draw[archflowstyle,\archflowNeutral] (1.25,4.45) -| (2.8,4.1) -- (3.5,4.1);
+        % mask-like tensor entering fusion, same role as context's mask.
+        % No label here -- see Column A instead.
+        \archvolcubeimg{0}{3.8}{1.15}{1.3}{archTargetAccent}{\archimgTgtMaskCropPrior}{}
+        \draw[archflowstyle,\archflowNeutral] (1.25,4.45) -| (1.45,4.3) -- (2.15,4.3);
       }
 
       % ---- lane 2: context image (always real) ----
-      \node[anchor=east,font=\normalsize] at (-0.2,2.75) {$I^c$};
-      \archvolcube{0}{2.1}{1.15}{1.3}{archContextPink}{ct}{}
-      \archflow{(1.25,2.75)}{(1.6,2.75)}{neutral}
-      \archfunnel{1.7}{2.1}{1.3}{0.75}{0.5}{1}{archEncGray}{Enc}
-      % Direct route to Attention
-      \draw[archflowstyle,\archflowNeutral] (2.45,2.75) -- (3.5,2.75);
+      \ifthenelse{\equal{\L}{1}}{\node[anchor=east,font=\normalsize] at (-0.2,2.75) {$I^c$};}{}
+      \ifthenelse{\equal{\L}{1}}{
+        \archvolcubeimg{0}{2.1}{1.15}{1.3}{archContextPink}{\archimgCtxCT}{}
+      }{
+        \archvolcubeimg{0}{2.1}{1.15}{1.3}{archContextPink}{\archimgCtxCTCrop}{}
+      }
+      % No encoder funnel here either -- straight into the attention block.
+      \draw[archflowstyle,\archflowNeutral] (1.25,2.75) -- (2.15,2.75);
 
       % ---- lane 3: context mask (always real) ----
-      \node[anchor=east,font=\normalsize] at (-0.2,0.9) {$L^c$};
-      \archvolcube{0}{0.4}{1.15}{1.0}{archContextAccent}{predmask}{}
-      \draw[archflowstyle,\archflowNeutral] (1.25,0.9) -| (3.1,1.4) -- (3.5,1.4);
+      % Same 1.3 height as the other three lanes -- the old 1.0 put its
+      % center at 0.9, off the 1.7-spaced pattern the others share
+      % (6.15, 4.45, 2.75, ...); 1.3 lands it on 1.05, back on pattern.
+      \ifthenelse{\equal{\L}{1}}{\node[anchor=east,font=\normalsize] at (-0.2,1.05) {$L^c$};}{}
+      \ifthenelse{\equal{\L}{1}}{
+        \archvolcubeimg{0}{0.4}{1.15}{1.3}{archContextAccent}{\archimgCtxMask}{}
+      }{
+        \archvolcubeimg{0}{0.4}{1.15}{1.3}{archContextAccent}{\archimgCtxMaskCrop}{}
+      }
+      \draw[archflowstyle,\archflowNeutral] (1.25,1.05) -| (1.45,1.65) -- (2.15,1.65);
 
 
       % -------------------------------------------------------------------------
-      % Compact Single-Block Attention
+      % Compact Single-Block Attention -- shrunk to just wrap its own
+      % content (cell 0.7->0.55, margins tightened to ~0.22-0.25) now that
+      % it sits right next to the four lane cubes with no encoder between.
       % -------------------------------------------------------------------------
       % Background and Border
-      \fill[archAttnBlue!10, rounded corners=4pt] (3.5, 1.1) rectangle (5.7, 5.9);
-      \draw[archAttnBlue!70!black, thin, dashed, rounded corners=4pt] (3.5, 1.1) rectangle (5.7, 5.9);
-      
+      \fill[archAttnBlue!10, rounded corners=4pt] (2.15, 1.39) rectangle (3.73, 5.48);
+      \draw[archAttnBlue!70!black, thin, dashed, rounded corners=4pt] (2.15, 1.39) rectangle (3.73, 5.48);
+
       % Label
-      \node[align=center, archAttnBlue!70!black] at (4.6, 6.25) {\archboxlabel attention};
+      \node[align=center, archAttnBlue!70!black] at (2.94, 5.83) {\archboxlabel attention};
 
-      % Internal 6x2 Token Grid
-      \archtokengrid{3.8}{3.5}{3}{1}{0.7}{archTargetGreen}         % Tgt Img
+      % Internal 6x2 Token Grid (same centers as the old 0.7-cell grid,
+      % just drawn smaller: stack height 1.974 -> 1.551). Lighter tints
+      % than the lane cubes outside -- same !40!white convention
+      % arch_patchset.tex uses for its own inside-attention token grids,
+      % to read as "tokens" rather than "volumes".
+      \archtokengrid{2.40}{3.71}{3}{1}{0.55}{archTargetGreen!40!white}    % Tgt Img
       \ifthenelse{\equal{\L}{1}}{
-        \archtokengrid{4.7}{3.5}{3}{1}{0.7}{black!15}              % Tgt Lbl (ghosted for L1)
+        \archtokengrid{3.03}{3.71}{3}{1}{0.55}{black!15}                 % Tgt Lbl (ghosted for L1)
       }{
-        \archtokengrid{4.7}{3.5}{3}{1}{0.7}{archTargetAccent}      % Tgt Lbl (active for L2)
+        \archtokengrid{3.03}{3.71}{3}{1}{0.55}{archTargetAccent!40!white} % Tgt Lbl (active for L2)
       }
-      \archtokengrid{3.8}{1.4}{3}{1}{0.7}{archContextPink}         % Ctx Img
-      \archtokengrid{4.7}{1.4}{3}{1}{0.7}{archContextAccent}       % Ctx Lbl
+      \archtokengrid{2.40}{1.61}{3}{1}{0.55}{archContextPink!40!white}   % Ctx Img
+      \archtokengrid{3.03}{1.61}{3}{1}{0.55}{archContextAccent!40!white} % Ctx Lbl
 
 
       % -------------------------------------------------------------------------
-      % Output & Decoder Routing
+      % Output Routing -- no decoder funnel; one direct arrow from
+      % attention to the predicted mask, same simplification as the lanes
       % -------------------------------------------------------------------------
-      \archflow{(5.7, 4.55)}{(6.6, 4.55)}{neutral}
-
-      \archfunnel{6.7}{3.9}{1.3}{0.75}{0.5}{-1}{archEncGray}{Dec}
-      \archflow{(7.45, 4.55)}{(7.95, 4.55)}{neutral}
-      \archvolcube{8.05}{3.9}{1.15}{1.3}{archTargetGreen}{predmask}{$\hat L^t_{\L}$}
-
-      % Level 1 specific Crop Bounding Box
+      \archflow{(3.73, 4.55)}{(4.55, 4.55)}{neutral}
+      % L2's own prediction is over the cropped field it actually processed,
+      % so it gets the cropped mask image too, not the full one.
       \ifthenelse{\equal{\L}{1}}{
-        % Dashed box directly on the centroid of Level 1's output mask
-        \draw[archCtxYellow, line width=1.5pt, dashed] (8.325, 4.25) rectangle ++(0.6, 0.6);
-      }{}
+        \archvolcubeimg{4.65}{3.9}{1.15}{1.3}{archTargetAccent}{\archimgTgtMaskSoft}{$\hat y^t_{\L}$}
+      }{
+        \archvolcubeimg{4.65}{3.9}{1.15}{1.3}{archTargetAccent}{\archimgTgtMaskSoftCrop}{$\hat y^t_{\L}$}
+      }
+
     \end{scope}
   }
 
+  % Vertical dashed divider between Level 1 and the re-crop step, in place
+  % of the yellow hand-off arrow that used to connect them -- a boundary
+  % marker, not a flow connector (the "re-crop target + context" header
+  % below already says what feeds Column A).
+  \draw[black!30, dashed, line width=1pt] (6.35,0.2) -- (6.35,7.1);
+
   % -------------------------------------------------------------------------
-  % The Inter-Level Crop Arrow
+  % Between the levels: re-crop ALL FOUR volumes -- not only the
+  % prediction -- around Level 1's predicted centroid, at the new, finer
+  % spacing. This is \autoref{eq:query-prior}'s Warp made explicit for
+  % every lane, not only the mask that feeds the prior.
+  %   Column A: the four full volumes (same ones Level 1 used), each
+  %     marked with its crop sub-region (the dashed square below) and
+  %     connected by two lines straight into Level 2's own four input
+  %     cubes -- those already stand in for "the actual inputs to
+  %     Level 2", so there is no separate zoomed/cropped column here.
   % -------------------------------------------------------------------------
-  \draw[-{Latex[length=3.8mm,width=3.4mm]},line width=2.5pt,archCtxYellow!90!black]
-    (9.25, 4.65) to[bend left=18] (11.4, 4.45);
-  \node[align=center,archCtxYellow!90!black] at (10.35, 5.3) {\archtitle crop};
+  \def\xColA{7.30}
+
+  % Per-cube symbol labels live here, before the crop stage, rather than
+  % on Level 2's own (post-crop) cubes -- clear of any line now that the
+  % yellow hand-off arrow is gone, unlike the cramped gap Level 2's lanes
+  % sit in against the incoming connector lines.
+  \node[anchor=south,align=center,font=\archnote,black!55] at ({\xColA+0.575},7.0) {re-crop target\\+ context};
+  \node[anchor=east,font=\normalsize] at ({\xColA-0.2},6.15) {$I^t$};
+  \archvolcubeimg{\xColA}{5.5}{1.15}{1.3}{archTargetGreen}{\archimgTgtCT}{}
+  \node[anchor=east,font=\normalsize] at ({\xColA-0.2},4.45) {$\hat y^t_1$};
+  \archvolcubeimg{\xColA}{3.8}{1.15}{1.3}{archTargetAccent}{\archimgTgtMaskSoft}{}
+  \node[anchor=east,font=\normalsize] at ({\xColA-0.2},2.75) {$I^c$};
+  \archvolcubeimg{\xColA}{2.1}{1.15}{1.3}{archContextPink}{\archimgCtxCT}{}
+  \node[anchor=east,font=\normalsize] at ({\xColA-0.2},1.05) {$L^c$};
+  \archvolcubeimg{\xColA}{0.4}{1.15}{1.3}{archContextAccent}{\archimgCtxMask}{}
+
+  % Crop markers: a dashed square on the SUB-region actually cropped out
+  % of each full cube, centered on each subject's own mask centroid in
+  % the wide-FOV (3mm) image -- target centroid (frac_x=0.33,frac_y=0.47)
+  % for the two target cubes, context centroid (0.55,0.51) for the two
+  % context cubes. The two target cubes share one box (same subject, same
+  % frame) and likewise for context, rather than one box forced onto all
+  % four. Context's image+mask were shifted right (shift_ctx_wide.py) so
+  % the two boxes land at visibly different coordinates -- the figure's
+  % point is that target and context are cropped independently, not from
+  % one shared position. Two connector lines per row, from THIS small
+  % box's near (right) corners to the cropped Level-2 cube's near (left)
+  % corners, replace the old bent yellow arrows + "crop" label.
+  \foreach \ycube in {5.5,3.8} {
+    \draw[archCtxYellow, line width=1.3pt, dashed] (\xColA+0.085,\ycube+0.287) rectangle ++(0.58,0.65);
+    \draw[archCtxYellow, dashed, line width=1pt] (\xColA+0.665,\ycube+0.937) -- (9.60,\ycube+1.3);
+    \draw[archCtxYellow, dashed, line width=1pt] (\xColA+0.665,\ycube+0.287) -- (9.60,\ycube);
+  }
+  \foreach \ycube in {2.1,0.4} {
+    \draw[archCtxYellow, line width=1.3pt, dashed] (\xColA+0.338,\ycube+0.338) rectangle ++(0.58,0.65);
+    \draw[archCtxYellow, dashed, line width=1pt] (\xColA+0.918,\ycube+0.988) -- (9.60,\ycube+1.3);
+    \draw[archCtxYellow, dashed, line width=1pt] (\xColA+0.918,\ycube+0.338) -- (9.60,\ycube);
+  }
 
 \end{tikzpicture}
 \end{document}

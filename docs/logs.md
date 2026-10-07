@@ -10858,3 +10858,32 @@ Saved to `results/publications/thesis/experiments/2d_cascade_medverse_gaps/` (`r
 an `incomplete_runs` block recording the 3 failed wandb attempts, + `samples.csv` for the 8
 finished runs via `extract_run_results.py`). Not yet merged into `results_cascade.tex`'s
 `tab:cascade-levels`/`tab:cascade-medverse`/`tab:cascade-ablation` or their prose.
+
+## 2026-10-07 — synthetic-task illustration figures for the thesis methodology section
+
+`methodology_synth.tex` described shape families and the two canvases (synthetic-bank,
+real-host) in text + one table, with no figure. Added two new figures, generated with two
+new scripts (`experiments/3d/plot_synth_family_gallery.py`,
+`experiments/3d/plot_synth_canvas_compare.py`), both built on top of the existing
+`experiments/3d/plot_shape_items.py` + `plot_dataset_items.py` visualization helpers
+(`SynthGmmProvider`/`SynthGmmMaisiDataset` for the bank canvas, `RealHostShapeProvider` for
+the real-host canvas, reusing `_best_slice`/`_overlay`/`_BINARY_COLOUR`).
+
+`plot_synth_family_gallery.py`: one row per shape family (blob/disk/splatter/scatter_field/
+cylinder/vessel/torus), 3 example target crops per row on the synthetic-bank canvas -- a
+visual counterpart to `tab:synth-shapes`.
+
+`plot_synth_canvas_compare.py`: target + K=2 context task (scatter_field family, the one
+family actually routed through `real_host_families` in the 163+ real-host training configs)
+rendered on both canvases side by side.
+
+Native crops are unresampled (anisotropic native spacing), so mixing bank crops (fixed
+96^3 cube) with real-host crops (variable native shape) in one grid produced wildly
+inconsistent panel sizes/aspect ratios on the first pass -- fixed by resampling every 2D
+display slice to a fixed `DISPLAY_SIZE=160` grid (bilinear for image, nearest for mask)
+before overlay (`_display_slice` in `plot_synth_canvas_compare.py`).
+
+Both figures wired into `methodology_synth.tex` as `fig:synth-families` (after the shape
+table) and `fig:synth-canvas` (after the Canvas paragraph), with `\autoref` references added
+inline. Not compiled (user preference, see `feedback_no_latex_compile` memory) -- PNGs
+inspected directly via Read/SendUserFile instead.

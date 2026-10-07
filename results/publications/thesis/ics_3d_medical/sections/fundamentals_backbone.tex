@@ -11,7 +11,7 @@ query, a weighted average of value vectors. The weights are given by the
 similarity between the query and each key:
 %
 \begin{equation}
-  \mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V,
+  \mathrm{Attn}(\mathcal{Q},\mathcal{K},\mathcal{V}) = \mathrm{softmax}\!\left(\frac{\mathcal{Q}\mathcal{K}^\top}{\sqrt{d}}\right)\mathcal{V},
   \label{eq:attention}
 \end{equation}
 %

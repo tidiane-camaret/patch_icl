@@ -57,21 +57,25 @@ features at that cell,
 %
 where $f_{v,i}$ denotes the resampled stage-2 and stage-3 features of cell $i$.
 The label token embeds the part of the mask that falls into the cell. We
-flatten the $p^3 = 512$ mask voxels of cell $i$ into a vector $m_{v,i}$ and
-project it linearly:
+define $m_i(\cdot)$ as the function that extracts and flattens the
+$p^3 = 512$ mask voxels of cell $i$ from a mask array, and write $m_{v,i}$ for
+$m_i(\cdot)$ applied to volume $v$'s mask. We project $m_{v,i}$ linearly:
 %
 \begin{equation}
   z^{\text{lbl}}_{v,i} = \mathrm{LblEmbed}(m_{v,i}) = W_{\text{lbl}} \, m_{v,i} + b_{\text{lbl}}.
   \label{eq:lbl-token}
 \end{equation}
 %
-For a context volume, $m_{v,i}$ is taken from the ground-truth mask $L^c_k$.
-For the target, the mask is unknown. At the first cascade level, every target
-cell receives the same placeholder: the average of $m_{v,i}$ over all cells of
-all context volumes, embedded with $\mathrm{LblEmbed}$. It carries the average
-amount of foreground in the context masks, but no information about where the
-target is. At later levels, the target's label tokens are computed from the
-previous level's prediction instead (\autoref{sec:methodology-cascade}).
+We call the array supplying $m_{v,i}$ volume $v$'s \emph{mask source}: whatever
+it is, the label token is formed the same way, by \autoref{eq:lbl-token}. For
+a context volume, the mask source is the ground-truth mask $L^c_k$. For the
+target, the mask is unknown. At the first cascade level, every target cell
+receives the same placeholder as mask source: the average of $m_{v,i}$ over
+all cells of all context volumes, embedded with $\mathrm{LblEmbed}$. It
+carries the average amount of foreground in the context masks, but no
+information about where the target is. At later levels, the target's mask
+source is the previous level's prediction instead
+(\autoref{sec:methodology-cascade}).
 
 Learned embeddings mark each token as belonging to the target or to a context
 volume. Eight learned register tokens, shared across all volumes, are

@@ -21,16 +21,17 @@ The coarsest prediction is pasted into the original volume first; each finer
 level then overwrites the region covered by its crop.
 
 \paragraph{Prediction as prior.}
-At level $\ell > 1$, the target's label tokens are computed from the previous
+At level $\ell > 1$, the target's mask source becomes the previous level's
 prediction instead of the placeholder:
 %
 \begin{equation}
-  z^{\text{lbl}}_{t,i} = \mathrm{LblEmbed}\big(m_i(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{L}^t_{\ell-1}))\big),
+  z^{\text{lbl}}_{t,i} = \mathrm{LblEmbed}\big(m_i(\mathrm{Warp}_{\ell-1 \to \ell}(\hat{y}^t_{\ell-1}))\big),
   \label{eq:query-prior}
 \end{equation}
 %
-where $t$ indexes the target volume, $m_i(\cdot)$ extracts the $p^3$ voxels of
-cell $i$ as in \autoref{eq:lbl-token}, $\hat{L}^t_{\ell-1}$ is the sigmoid
+where $t$ indexes the target volume, $m_i(\cdot)$ is the cell-extraction
+function of \autoref{eq:lbl-token}, here applied to the warped prediction
+rather than to a stored per-volume mask, $\hat{y}^t_{\ell-1}$ is the sigmoid
 probability map of level $\ell{-}1$, detached from the computation graph, and
 $\mathrm{Warp}$ resamples it onto the crop grid of level $\ell$. The prior thus enters the same stream as the
 context masks, instead of a separate branch as in Medverse
@@ -41,7 +42,7 @@ context masks, instead of a separate branch as in Medverse
   \includegraphics[width=\linewidth]{arch_query_prior.pdf}
   \caption{Label prior across two cascade levels. At level 1, the target's
   label tokens hold a placeholder (dashed); at level 2, a crop of the level-1
-  prediction $\hat{L}^t_1$.}
+  prediction $\hat{y}^t_1$.}
   \label{fig:query-prior}
 \end{figure}
 

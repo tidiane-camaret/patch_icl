@@ -13,7 +13,7 @@ merging them once.
 and then trained with our recipe. It is therefore a different model from the
 released Medverse baseline used in \autoref{sec:results-cascade}.
 \emph{Single axis} and \emph{Dual axis attention} are the two variants shown in
-\autoref{fig:fusion-axis}. Early fusion uses $L{=}9$ layers to match the compute of dual attention (\autoref{sec:methodology-fusion}).
+\autoref{fig:fusion-axis}. Early fusion uses $N_\text{layer}{=}9$ layers to match the compute of dual attention (\autoref{sec:methodology-fusion}).
 This gives both variants similar compute (3973 vs.\ 3892 GFLOPs). Parameter
 count could not be matched at the same time, and early fusion has 52\% more
 parameters. Dual U-Net Cross-Attn is not compute-matched to either variant.

@@ -17,7 +17,7 @@ shared-encoder design used in this thesis.
   stages (blue arrows). Bottom: the shared-encoder design used in this thesis.
   Only images pass through the encoder. Label information is added to the
   encoded tokens afterwards, the tokens attend across cells and volumes for
-  $L$ layers, and a shared decoder produces the mask. \autoref{fig:fusion-axis}
+  $N_\text{layer}$ layers, and a shared decoder produces the mask. \autoref{fig:fusion-axis}
   shows the two ways of adding label information that we compare.}
   \label{fig:fusion-family}
 \end{figure}
@@ -36,7 +36,7 @@ segmentation.
 
 
 \paragraph{Layer structure.}
-Each of the $L = 4$ layers applies three residual blocks, each preceded by
+Each of the $N_\text{layer} = 4$ layers applies three residual blocks, each preceded by
 RMS normalization:
 %
 \begin{equation}
@@ -86,7 +86,7 @@ Iris uses in its context encoder. The array then has a single column, and each
 layer applies only the position axis and the MLP. The image and label
 information of a cell is thus combined once, before any attention, rather than
 in every layer. Without the modality axis and the second stream, a layer costs
-roughly half as much, so this variant uses $L = 9$ layers to match the compute
+roughly half as much, so this variant uses $N_\text{layer} = 9$ layers to match the compute
 of dual attention (\autoref{sec:results-fusion}).
 
 
@@ -96,8 +96,8 @@ of dual attention (\autoref{sec:results-fusion}).
   \caption{The two variants of the shared encoder design compared in
   \autoref{sec:results-fusion}. Top: Single axis attention. Image and label tokens are merged
   once ($\oplus$), and the fused tokens attend across cells and volumes for
-  $L$ layers. Bottom: Dual axis attention. Image and label tokens stay in separate
-  streams. In each of the $L$ layers, the two tokens of a cell attend to each
+  $N_\text{layer}$ layers. Bottom: Dual axis attention. Image and label tokens stay in separate
+  streams. In each of the $N_\text{layer}$ layers, the two tokens of a cell attend to each
   other (modality axis), and then each stream attends across all cells and
   volumes (position axis).}
   \label{fig:fusion-axis}
