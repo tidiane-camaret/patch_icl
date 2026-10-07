@@ -10887,3 +10887,16 @@ Both figures wired into `methodology_synth.tex` as `fig:synth-families` (after t
 table) and `fig:synth-canvas` (after the Canvas paragraph), with `\autoref` references added
 inline. Not compiled (user preference, see `feedback_no_latex_compile` memory) -- PNGs
 inspected directly via Read/SendUserFile instead.
+
+## 2026-10-07 (cont.) — synth-task figures revised to K=1 + separate image/mask panels, wired into methodology_synth.tex
+
+User feedback on the first pass (overlay, K=2): don't touch the .tex yet, show only one
+context volume, and plot image and mask as separate panels instead of a blended overlay.
+Reverted `methodology_synth.tex` to HEAD, reworked both scripts:
+`plot_synth_canvas_compare.py` default `context_size` 2->1, columns are now
+(image, mask) pairs per volume instead of one overlay column (`_plot_volumes` helper,
+`cmap="gray"`/`cmap="hot"` instead of `_overlay`). `plot_synth_family_gallery.py` same
+image/mask-pair change (`--n_examples`, was `--n_cols`). Iterated on scratch PNGs first
+(sent via SendUserFile) before regenerating into `imgs/method/` and re-adding the two
+`\begin{figure}` blocks (`fig:synth-families`, `fig:synth-canvas`) with captions updated
+for K=1 and the separate panels. Still not compiled.
