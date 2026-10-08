@@ -114,7 +114,7 @@
 }
 % \tabpfnattn{x} -- Fully connected, right-side routed attention with cascading transparency
 \newcommand{\tabpfnattn}[1]{
-  \def\attnstyle{[{Latex[length=3.0mm,width=2.5mm]}-{Latex[length=3.0mm,width=2.5mm]}, line width=1.5pt, archBrightBlue]}
+  \def\attnstyle{[{Latex[length=1.0mm,width=0.8mm]}-{Latex[length=1.0mm,width=0.8mm]}, line width=1.0pt, archBrightBlue]}
   \def\ax{#1+\tsz/2+0.05}
 
   \draw\attnstyle (\ax, \yTgt+\toff) to[bend left=30] (\ax, \yTgt);
@@ -387,8 +387,8 @@
     % output arrow becomes an "img" token cluster once inside the box;
     % the "lbl" cluster beside it is gray/content-free for target's
     % placeholder prior, solid archContextAccent for context's real mask.
-    \archflow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft-0.50},{\yTgt})}{neutral}
-    \archflow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft-0.50},{\yCtx})}{neutral}
+    \archflow{({\xEnc+\encw+0.15},{\yTgt})}{({\xFuseBoxLeft},{\yTgt})}{neutral}
+    \archflow{({\xEnc+\encw+0.15},{\yCtx})}{({\xFuseBoxLeft},{\yCtx})}{neutral}
 
     % top edge raised slightly above the usual \boxpad margin (unlike the
     % Attn. box) -- the $Z^{\text{img}}$/$Z^{\text{lbl}}$ superscript
@@ -436,7 +436,6 @@
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxwXattn},\yTgt+\clusterhalf+\boxpad);
     \node[anchor=south] at ({\boxBcenter},\yTgt+\clusterhalf+\boxpad+0.20) {\archboxlabel Attn.};
-    \node[anchor=north east] at ({\outerRightBase-0.20},{\outerTop-0.20}) {\archtitle $\times L$};
 
     \foreach \y in {\yTgt,\yCtx} {
       \foreach \doff in {-\toff,0,\toff} {

@@ -113,7 +113,7 @@
       % No encoder funnel -- this compact figure is about the query-prior
       % mechanism, not the backbone (see arch_patchset.tex for that); the
       % cube routes directly into the attention block below.
-      \draw[archflowstyle,\archflowNeutral] (1.25,6.15) -| (1.45,5.2) -- (2.15,5.2);
+      \draw[archflowstyle,\archflowNeutral] (1.25,6.15) -| (1.45,5.2) -- (2.45,5.2);
 
       % ---- lane 1: target PRIOR ----
       \ifthenelse{\equal{\L}{1}}{
@@ -123,13 +123,13 @@
         \node[align=center, black!40] at (0.575, 4.45) {\archnote support\\mean};
         % Ghosted routing arrow directly into Attention -- intentionally
         % NOT \archflowContext: there is no real prior yet at L1
-        \draw[archflowstyle,black!20] (1.25,4.45) -| (1.45,4.3) -- (2.15,4.3);
+        \draw[archflowstyle,black!20] (1.25,4.45) -| (1.45,4.3) -- (2.45,4.3);
       }{
         % Level 2: REAL prior cube (receives crop from Level 1) -- a real
         % mask-like tensor entering fusion, same role as context's mask.
         % No label here -- see Column A instead.
         \archvolcubeimg{0}{3.8}{1.15}{1.3}{archTargetAccent}{\archimgTgtMaskCropPrior}{}
-        \draw[archflowstyle,\archflowNeutral] (1.25,4.45) -| (1.45,4.3) -- (2.15,4.3);
+        \draw[archflowstyle,\archflowNeutral] (1.25,4.45) -| (1.45,4.3) -- (2.45,4.3);
       }
 
       % ---- lane 2: context image (always real) ----
@@ -140,7 +140,7 @@
         \archvolcubeimg{0}{2.1}{1.15}{1.3}{archContextPink}{\archimgCtxCTCrop}{}
       }
       % No encoder funnel here either -- straight into the attention block.
-      \draw[archflowstyle,\archflowNeutral] (1.25,2.75) -- (2.15,2.75);
+      \draw[archflowstyle,\archflowNeutral] (1.25,2.75) -- (2.45,2.75);
 
       % ---- lane 3: context mask (always real) ----
       % Same 1.3 height as the other three lanes -- the old 1.0 put its
@@ -152,7 +152,7 @@
       }{
         \archvolcubeimg{0}{0.4}{1.15}{1.3}{archContextAccent}{\archimgCtxMaskCrop}{}
       }
-      \draw[archflowstyle,\archflowNeutral] (1.25,1.05) -| (1.45,1.65) -- (2.15,1.65);
+      \draw[archflowstyle,\archflowNeutral] (1.25,1.05) -| (1.45,1.65) -- (2.45,1.65);
 
 
       % -------------------------------------------------------------------------
@@ -161,32 +161,32 @@
       % it sits right next to the four lane cubes with no encoder between.
       % -------------------------------------------------------------------------
       % Background and Border
-      \fill[archAttnBlue!10, rounded corners=4pt] (2.15, 1.39) rectangle (3.73, 5.48);
-      \draw[archAttnBlue!70!black, thin, dashed, rounded corners=4pt] (2.15, 1.39) rectangle (3.73, 5.48);
+      \fill[archAttnBlue!10, rounded corners=4pt] (2.45, 1.39) rectangle (4.03, 5.48);
+      \draw[archAttnBlue!70!black, thin, dashed, rounded corners=4pt] (2.45, 1.39) rectangle (4.03, 5.48);
 
       % Label
-      \node[align=center, archAttnBlue!70!black] at (2.94, 5.83) {\archboxlabel attention};
+      \node[align=center, archAttnBlue!70!black] at (3.24, 5.83) {\archboxlabel backbone};
 
       % Internal 6x2 Token Grid (same centers as the old 0.7-cell grid,
       % just drawn smaller: stack height 1.974 -> 1.551). Lighter tints
       % than the lane cubes outside -- same !40!white convention
       % arch_patchset.tex uses for its own inside-attention token grids,
       % to read as "tokens" rather than "volumes".
-      \archtokengrid{2.40}{3.71}{3}{1}{0.55}{archTargetGreen!40!white}    % Tgt Img
+      \archtokengrid{2.70}{3.71}{3}{1}{0.55}{archTargetGreen!40!white}    % Tgt Img
       \ifthenelse{\equal{\L}{1}}{
-        \archtokengrid{3.03}{3.71}{3}{1}{0.55}{black!15}                 % Tgt Lbl (ghosted for L1)
+        \archtokengrid{3.33}{3.71}{3}{1}{0.55}{black!15}                 % Tgt Lbl (ghosted for L1)
       }{
-        \archtokengrid{3.03}{3.71}{3}{1}{0.55}{archTargetAccent!40!white} % Tgt Lbl (active for L2)
+        \archtokengrid{3.33}{3.71}{3}{1}{0.55}{archTargetAccent!40!white} % Tgt Lbl (active for L2)
       }
-      \archtokengrid{2.40}{1.61}{3}{1}{0.55}{archContextPink!40!white}   % Ctx Img
-      \archtokengrid{3.03}{1.61}{3}{1}{0.55}{archContextAccent!40!white} % Ctx Lbl
+      \archtokengrid{2.70}{1.61}{3}{1}{0.55}{archContextPink!40!white}   % Ctx Img
+      \archtokengrid{3.33}{1.61}{3}{1}{0.55}{archContextAccent!40!white} % Ctx Lbl
 
 
       % -------------------------------------------------------------------------
       % Output Routing -- no decoder funnel; one direct arrow from
       % attention to the predicted mask, same simplification as the lanes
       % -------------------------------------------------------------------------
-      \archflow{(3.73, 4.55)}{(4.55, 4.55)}{neutral}
+      \archflow{(4.03, 4.55)}{(4.55, 4.55)}{neutral}
       % L2's own prediction is over the cropped field it actually processed,
       % so it gets the cropped mask image too, not the full one.
       \ifthenelse{\equal{\L}{1}}{
@@ -221,7 +221,7 @@
   % on Level 2's own (post-crop) cubes -- clear of any line now that the
   % yellow hand-off arrow is gone, unlike the cramped gap Level 2's lanes
   % sit in against the incoming connector lines.
-  \node[anchor=south,align=center,font=\archnote,black!55] at ({\xColA+0.575},7.0) {re-crop target\\+ context};
+  \node[anchor=south,align=center,font=\archnote,black!55] at (9.03,7.0) {resample + crop};
   \node[anchor=east,font=\normalsize] at ({\xColA-0.2},6.15) {$I^t$};
   \archvolcubeimg{\xColA}{5.5}{1.15}{1.3}{archTargetGreen}{\archimgTgtCT}{}
   \node[anchor=east,font=\normalsize] at ({\xColA-0.2},4.45) {$\hat y^t_1$};
