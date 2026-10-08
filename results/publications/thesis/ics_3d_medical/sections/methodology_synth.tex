@@ -10,8 +10,8 @@ own image. Shape, size, and position vary between volumes with ratios of 0.3,
 independently.
 
 \paragraph{Shapes.}
-Masks come from seven procedural families (\autoref{tab:synth-shapes},
-\autoref{fig:synth-families}). The scatter field places many small components
+Masks come from seven procedural families (\autoref{tab:synth-shapes}). The
+scatter field places many small components
 across a region to imitate multi-focal lesions, which few structures in the
 training cohort resemble.
 Sizes are defined in millimeters and converted to voxels at each cascade
@@ -36,16 +36,6 @@ level, so a shape is the same physical object at every level.
     \bottomrule
   \end{tabular}
 \end{table}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{synth_family_gallery.png}
-  \caption{Shape families on the synthetic-bank canvas (\autoref{tab:synth-shapes}),
-  two examples per family, image and mask shown separately. The image is
-  GMM-synthesized from a TotalSegmentator label map, with the procedural shape
-  painted into it.}
-  \label{fig:synth-families}
-\end{figure}
 
 \paragraph{Canvas.}
 We compare two sources for the images (\autoref{fig:synth-canvas}).
