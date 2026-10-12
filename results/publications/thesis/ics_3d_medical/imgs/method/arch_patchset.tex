@@ -1,7 +1,20 @@
 \documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
+\usepackage{graphicx}
 \usetikzlibrary{arrows.meta,calc,positioning}
 \input{arch-macros.tex}
+
+% Real cube-face content, reused from arch_query_prior.tex's Level 2 (the
+% narrow-FOV, 1mm-spacing crop) instead of \archvolcube's procedural
+% ct/ctmask/predmask placeholders -- same vertebrae_T9 TotalSegmentator
+% pair (target=s0482, context=s0994; see that file's header comment for
+% the render provenance). $\hat{y}^t$ reuses Level 2's own predicted-mask
+% crop for the same reason noted there: it is a continuous probability
+% map, not a thresholded binary mask.
+\newcommand{\archimgTgtCTCrop}{ts_vertebra_target_ct_crop.png}
+\newcommand{\archimgCtxCTCrop}{ts_vertebra_context_ct_crop.png}
+\newcommand{\archimgCtxMaskCrop}{ts_vertebra_context_mask_crop.png}
+\newcommand{\archimgTgtMaskSoftCrop}{ts_vertebra_target_mask_crop_soft.png}
 
 % Dataflow arrows in this figure all use archArrowPale (a pale-green tint
 % from arch-macros.tex); override it to light grey here, local to this
@@ -73,10 +86,14 @@
 \begin{tikzpicture}[x=1cm,y=1cm]
 
   % ---- lane 1: target image ----
-  \archvolcube{0}{4.45}{1.6}{1.6}{archTargetGreen}{ct}{$I^t$}
+  \archvolcubeimg{0}{4.45}{1.6}{1.6}{archTargetGreen}{\archimgTgtCTCrop}{$I^t$}
   \archarrow{(1.7,5.25)}{(2.35,5.25)}{archArrowPale}
-  \archfunnel{2.45}{4.45}{1.6}{1.9}{1.0}{1}{archEncGray}{Enc}
-  \archarrow{(4.45,5.25)}{(5.00,5.25)}{archArrowPale}
+  % Width (the \ww arg) narrowed 1.9 -> 1.1 -- the exit arrow below is
+  % lengthened (3.65 -> 5.00, was 4.45 -> 5.00) to bridge the gap the
+  % narrower funnel opens up, rather than moving the feature cube and
+  % everything after it.
+  \archfunnel{2.45}{4.45}{1.6}{1.1}{0.6}{1}{archEncGray}{Enc}
+  \archarrow{(3.65,5.25)}{(5.00,5.25)}{archArrowPale}
   \archfeatcube{5.10}{4.70}{1.0}{1.1}{archTargetGreen}{$F^t$}
   \archarrow{(6.20,5.25)}{(6.95,5.25)}{archArrowPale}
   
@@ -95,15 +112,16 @@
   \node[anchor=south,font=\normalsize] at (8.284,6.525) {$Z^{\text{lbl}}$};
 
   % ---- lane 3: context mask -- fed to attention as its own token stream
-  \archvolcube{0}{-0.8}{1.6}{1.6}{archContextAccent}{predmask}{$L^c$}
+  \archvolcubeimg{0}{-0.8}{1.6}{1.6}{archContextAccent}{\archimgCtxMaskCrop}{$L^c$}
   % Route Context Mask to the bottom center of the large Ctx Lbl token grid
   \draw[-{Latex[length=3.6mm,width=3.2mm]},line width=3.2pt,archArrowPale] (1.7,0.00) -| (8.28,1.25);
 
   % ---- lane 2: context image ----
-  \archvolcube{0}{1.825}{1.6}{1.6}{archContextPink}{ct}{$I^c$}
+  \archvolcubeimg{0}{1.825}{1.6}{1.6}{archContextPink}{\archimgCtxCTCrop}{$I^c$}
   \archarrow{(1.7,2.625)}{(2.35,2.625)}{archArrowPale}
-  \archfunnel{2.45}{1.825}{1.6}{1.9}{1.0}{1}{archEncGray}{Enc}
-  \archarrow{(4.45,2.625)}{(5.00,2.625)}{archArrowPale}
+  % Same width reduction as lane 1's Enc above.
+  \archfunnel{2.45}{1.825}{1.6}{1.1}{0.6}{1}{archEncGray}{Enc}
+  \archarrow{(3.65,2.625)}{(5.00,2.625)}{archArrowPale}
   \archfeatcube{5.10}{2.075}{1.0}{1.1}{archContextPink}{$F^c$}
   \archarrow{(6.20,2.625)}{(6.95,2.625)}{archArrowPale}
   
@@ -113,12 +131,20 @@
   \archtokengrid{7.925}{1.3125}{3}{1}{0.875}{archContextAccent}
 
   % ---- dual attention block ----
-  % Centered arrow entering the block -- shortened to a 0.16 shaft after
-  % widening Modality axis leftward; still gapped ~0.10 off the Tgt/Ctx
-  % Lbl grid's right edge (8.6425) and the wrapper's left edge (9.00) --
-  % this is the hard limit on how far left the inner boxes can grow
-  % without disturbing the fixed pre-attention content to their left.
-  \archarrow{(8.74,3.9375)}{(8.90,3.9375)}{archArrowPale}
+  % Centered arrow entering the block -- the whole block below (and
+  % everything after it) is now pushed +0.3925 to the right (via the
+  % xshift scope it's wrapped in), widening this entry gap to match the
+  % exit gap on the other side (0.75, the same as wrapper-right-edge to
+  % the output grids' left edge): gapped 0.10 off the Tgt/Ctx Lbl grid's
+  % right edge (8.6425, fixed) and the wrapper's NEW left edge (9.3925).
+  \archarrow{(8.74,3.9375)}{(9.2925,3.9375)}{archArrowPale}
+
+  % Everything from here to the end of the figure (attention block,
+  % output grids, decoder, final cube) keeps its original literal
+  % coordinates below -- this scope's xshift is what actually moves it
+  % +0.3925 to the right, so e.g. the wrapper drawn at 9.00 below renders
+  % at 9.3925.
+  \begin{scope}[xshift=0.3925cm]
 
   % Outer Attention wrapper -- same green dashed/filled box as
   % arch_fusion_axis.tex's "Dual attention" panel wrapper, grown 0.20
@@ -204,18 +230,23 @@
 
   % ---- output decoder (fed from Target Label only) ----
   \archarrow{(18.45,5.25)}{(18.95,5.25)}{archArrowPale}
-  \archfunnel{19.05}{4.45}{1.6}{1.9}{1.0}{-1}{archEncGray}{Dec}
+  % Width narrowed 1.9 -> 1.1, same as the Enc funnels above -- the exit
+  % arrow below is lengthened to bridge the gap instead of moving the
+  % output cube.
+  \archfunnel{19.05}{4.45}{1.6}{1.1}{0.6}{-1}{archEncGray}{Dec}
 
-  % Standard-length shaft (0.55), gapped 0.10 off the decoder funnel's true
-  % right edge (19.05+1.9=20.95) and the output cube (pushed out an extra
-  % 0.35 below so the gap has room for a full-size arrow, not just the tip)
-  \archarrow{(21.05,5.25)}{(21.60,5.25)}{archArrowPale}
+  % Lengthened shaft, gapped 0.10 off the decoder funnel's true right edge
+  % (19.05+1.1=20.15) and the output cube (pushed out an extra 0.35 below
+  % so the gap has room for a full-size arrow, not just the tip)
+  \archarrow{(20.25,5.25)}{(21.60,5.25)}{archArrowPale}
   % This figure shows a single cascade level, so its output is the
   % per-level recurrent state \hat{y}^t_\ell (methodology_cascade.tex's
   % eq:query-prior), not the final stitched \hat{L}^t reported in results --
   % using \hat{L}^t here would reintroduce the exact ambiguity that symbol
   % split was meant to remove.
-  \archvolcube{21.70}{4.45}{1.6}{1.6}{archTargetGreen}{predmask}{$\hat{y}^t$}
+  \archvolcubeimg{21.70}{4.45}{1.6}{1.6}{archTargetGreen}{\archimgTgtMaskSoftCrop}{$\hat{y}^t$}
+
+  \end{scope}
 
 \end{tikzpicture}
 \end{document}

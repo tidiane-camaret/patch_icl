@@ -80,3 +80,14 @@ git push origin main
   needed. It's tracked, so it syncs like any other file above.
 - Never run `pdflatex`/`lualatex` on the thesis sources after editing —
   compilation is the user's own step.
+- **Deletions don't propagate on their own.** `rsync --files-from` only adds/
+  updates files in the list — it never removes anything from the destination.
+  If a file was deleted on the source side (e.g. `git rm`'d in `patch_icl`,
+  or removed on Overleaf), the normal sync step above will silently leave the
+  stale copy sitting on the other side. After the rsync step, explicitly
+  remove it too, e.g.:
+  ```bash
+  cd "$CLONE"   # or $DEST, whichever side still has the stale file
+  git rm path/to/the/deleted/file
+  git add -A && git commit -m "..." && git push   # (or push origin main)
+  ```

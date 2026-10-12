@@ -1,9 +1,25 @@
 \documentclass[tikz,border=4pt,12pt]{standalone}
 \usepackage{ifthen}
 \usepackage{amsmath}
+\usepackage{graphicx}
 \usetikzlibrary{arrows.meta,calc,positioning,decorations.pathreplacing}
 \input{arch-macros.tex}
 \archarrowset{compact}
+
+% Real cube-face content, reused from arch_query_prior.tex's Level 2 (the
+% narrow-FOV, 1mm-spacing crop) instead of \archvolcube's procedural
+% ct/ctmask/predmask placeholders -- same vertebrae_T9 TotalSegmentator
+% pair (target=s0482, context=s0994; see that file's header comment for
+% the render provenance). Medverse's own channel-concatenated $I^c\oplus
+% L^c$ cube uses a composited real asset too (\archimgCtxOverlayCrop): the
+% real context CT crop with its real mask tinted archCtxYellow (E8D24C) at
+% 50% alpha, built by /tmp/.../scratchpad/make_ctx_overlay.py from the
+% same two crops used separately everywhere else in this figure.
+\newcommand{\archimgTgtCTCrop}{ts_vertebra_target_ct_crop.png}
+\newcommand{\archimgCtxCTCrop}{ts_vertebra_context_ct_crop.png}
+\newcommand{\archimgCtxMaskCrop}{ts_vertebra_context_mask_crop.png}
+\newcommand{\archimgCtxOverlayCrop}{ts_vertebra_context_ct_mask_overlay_crop.png}
+\newcommand{\archimgTgtMaskSoftCrop}{ts_vertebra_target_mask_crop_soft.png}
 
 % Define a vibrant, brighter blue for all attention arrows
 \definecolor{archBrightBlue}{HTML}{3B82F6}
@@ -52,12 +68,10 @@
 % token cluster (\tpcluster) once inside the box, a separate "lbl"
 % cluster sits beside it (gray/content-free for target's placeholder
 % prior, solid archContextAccent for context's real mask). ONLY img/lbl
-% sit inside the Fuse box, though -- oplus's output, the split "fused"
-% cluster (\tpclustersplit), lands just OUTSIDE the box's right edge,
-% in the gap before "Attn.", since it is the box's result rather than
-% one of its inputs. The SAME cluster then reappears inside the "Attn."
-% (cross-attention) box, carried over by one more arrow, exactly like
-% the old Fuse->Patch-axis pair did. HOW exactly the combination happens
+% sit inside the Fuse box -- oplus's output is not drawn as its own
+% token column in the gap before "Attn."; one long arrow carries it
+% straight into the fused cluster that reappears inside the "Attn."
+% (cross-attention) box. HOW exactly the combination happens
 % (concat / sum / MLP / attention) is deliberately left generic here --
 % that is exactly what
 % arch_fusion_axis.tex reveals next.
@@ -206,14 +220,10 @@
   % don't need much width, narrowing it makes room for the decoder +
   % predicted-mask cube after it.
   \pgfmathsetmacro{\boxwXattn}{2.9}
-  % kept independent of \xfusedTok (numerically identical to this
-  % figure's long-standing Attn.-box position) so the fused column below
-  % can be centered in the Fuse/Attn. gap without moving Attn. itself
+  % numerically identical to this figure's long-standing Attn.-box
+  % position, kept as a fixed offset from the Fuse box's right edge
   \pgfmathsetmacro{\xB}{\xFuseBoxRight+1.9}
   \pgfmathsetmacro{\boxBcenter}{\xB+\boxwXattn/2}
-  % fused column: exactly midway between the Fuse box and the Attn box,
-  % now that it is drawn outside the Fuse box rather than inside it
-  \pgfmathsetmacro{\xfusedTok}{(\xFuseBoxRight+\xB)/2}
 
   \pgfmathsetmacro{\decw}{0.9}
   \pgfmathsetmacro{\decwn}{0.55}
@@ -268,8 +278,8 @@
     % Context: image+mask, 2 input channels. Target: image alone --
     % Medverse's TargetEncoder never receives a mask channel, not even a
     % zero placeholder, which is why its cube uses the plain "ct" icon.
-    \archvolcube{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{$I^t$ (1ch)}
-    \archvolcube{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ctmask}{$I^c$\,\oplus\,$L^c$ (2ch)}
+    \archvolcubeimg{\xIn}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{\archimgTgtCTCrop}{$I^t$ (1ch)}
+    \archvolcubeimg{\xIn}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{\archimgCtxOverlayCrop}{$I^c$\,\oplus\,$L^c$ (2ch)}
 
     \archflow{({\xIn+\cubew+0.15},{\yTgt})}{({\bcx-0.55},{\yTgt})}{neutral}
     \archflow{({\xIn+\cubew+0.15},{\yCtx})}{({\bcx-0.55},{\yCtx})}{neutral}
@@ -295,7 +305,7 @@
     % predicted mask (target row only -- context's own decoder output is
     % internal, never exposed)
     \archflow{({\bcx+\bw+0.15},{\yTgt})}{({\xOut-\cubew/2-0.15},{\yTgt})}{neutral}
-    \archvolcube{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{$\hat{y}^t$}
+    \archvolcubeimg{{\xOut-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{\archimgTgtMaskSoftCrop}{$\hat{y}^t$}
 
   \end{scope}
 
@@ -354,8 +364,8 @@
 
     % ---- input VOLUME, for parity with Medverse's image cube above --
     % only the image, since only the image is encoded (see header comment)
-    \archvolcube{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{ct}{$I^t$}
-    \archvolcube{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{ct}{$I^c$}
+    \archvolcubeimg{\xCubeImg}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen}{\archimgTgtCTCrop}{$I^t$}
+    \archvolcubeimg{\xCubeImg}{{\yCtx-\cubeh/2}}{\cubew}{\cubeh}{archContextPink}{\archimgCtxCTCrop}{$I^c$}
 
     % ---- context's real mask, its own cube in its own lane below the
     % image row (like arch_patchset.tex's $L^c$) -- no target counterpart,
@@ -365,7 +375,7 @@
     % background and the bottom token, exactly like arch_patchset.tex's
     % routed arrow vanishes under its Ctx Lbl token grid. (\yMask is set
     % earlier now, alongside the other geometry constants above.)
-    \archvolcube{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{predmask}{$L^c$}
+    \archvolcubeimg{\xCubeImg}{{\yMask-\cubeh/2}}{\cubew}{\cubeh}{archContextAccent}{\archimgCtxMaskCrop}{$L^c$}
 
     % curly brace grouping the image+mask pair under the single "context"
     % label -- mirrored so its tip points left, toward the label, with the
@@ -408,7 +418,7 @@
     \draw[archflowstyle,\archflowNeutral]
       ({\xCubeImg+\cubew+0.15},{\yMask}) -| ({\xlblTok},{\yCtx-\toff-\tsz/2-0.10});
 
-    \foreach \x in {\ximgTok, \xlblTok, \xfusedTok} {
+    \foreach \x in {\ximgTok, \xlblTok} {
       \foreach \y in {\yTgt, \yCtx} {
         \fill[black!15,rounded corners=3pt]
           ({\x-\tsz/2-0.18},{\y-\toff-\tsz/2-0.10}) rectangle
@@ -420,18 +430,15 @@
                                        \yCtx/archContextPink/archContextAccent} {
       \tpcluster{\ximgTok}{\y}{\imgfill}{black!70}
       \tpcluster{\xlblTok}{\y}{\lblfill}{black!70}
-      \tpclustersplit{\xfusedTok}{\y}{\imgfill}{\lblfill}{black!70}
     }
     \node[font=\huge] at ({\xFuseOp},{\yTgt}) {$\oplus$};
     \node[font=\huge] at ({\xFuseOp},{\yCtx}) {$\oplus$};
 
     % single arrow, vertically centered between the two rows (\yMid) --
-    % both rows' fused columns funnel into one path entering Attn., rather
-    % than two parallel same-y arrows. Starts just past the fused column's
-    % cluster background, now that the column sits midway in the
-    % Fuse/Attn. gap rather than at a fixed offset from the (removed) box
-    % edge
-    \archflow{({\xfusedTok+\tsz/2+0.28},{\yMid})}{({\xB-0.20},{\yMid})}{neutral}
+    % both rows' fused outputs funnel into one path entering Attn., rather
+    % than two parallel same-y arrows. Spans the full Fuse/Attn. gap now
+    % that no token column sits in between.
+    \archflow{({\xFuseBoxRight+0.25},{\yMid})}{({\xB-0.20},{\yMid})}{neutral}
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       ({\xB},\yCtx-\clusterhalf-\boxpad) rectangle ({\xB+\boxwXattn},\yTgt+\clusterhalf+\boxpad);
@@ -457,7 +464,7 @@
     \archflow{({\xB+\boxwXattn+0.15},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{neutral}
     \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
     \archflow{({\xDecLeft+\decw+0.15},{\yTgt})}{({\xPredCube-\cubew/2-0.15},{\yTgt})}{neutral}
-    \archvolcube{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{predmask}{$\hat{y}^t$}
+    \archvolcubeimg{{\xPredCube-\cubew/2}}{{\yTgt-\cubeh/2}}{\cubew}{\cubeh}{archTargetGreen!40!black}{\archimgTgtMaskSoftCrop}{$\hat{y}^t$}
 
   \end{scope}
 

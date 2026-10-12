@@ -111,7 +111,7 @@
 \def\toff{0.80}
 \def\rowpitch{2.40}
 \def\colpitch{2.4}
-\def\panelgap{2.6}
+\def\panelgap{1.0}
 \def\clusterhalf{1.10}
 \def\pairpitch{1.1}
 
@@ -119,10 +119,22 @@
 \def\yTgt{\rowpitch}
 \def\yCtx{0}
 
-\def\boxw{6.0}
+\def\boxw{5.0}
 \def\xA{-0.30}
 \def\ximgTop{1.0}
 \def\boxpad{0.60}
+
+% ---- Enc/Dec bookend funnels -- see the comment at each panel's own
+% Enc/Dec block below for why these are here and why Dec is target-only.
+% Sized to match the Enc/Dec funnels in arch_fusion_family.tex, for a
+% consistent look across the figure family.
+\def\encw{0.9}
+\def\encwn{0.55}
+\def\ench{1.4}
+\def\decw{0.9}
+\def\decwn{0.55}
+\def\dech{1.4}
+\def\encdecOpacity{0.55}
 
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
@@ -167,14 +179,19 @@
   \pgfmathsetmacro{\boxTop}{\yTgt+\clusterhalf+\boxpad+0.15}
 
   \pgfmathsetmacro{\xlblTop}{\ximgTop+1.4}
-  % Fuse box narrowed to stop shortly after the lbl column -- the fused
-  % column (\xFusedTop) sits just OUTSIDE it, not inside it (mirrors the
-  % same fix in arch_fusion_family.tex's Fuse box). Right margin (past
-  % \xlblTop) matches the left margin (\xA to \ximgTop) exactly, so the
-  % img/lbl column pair sits centered in the box rather than right-hung
+  % Fuse box narrowed to stop shortly after the lbl column. Right margin
+  % (past \xlblTop) matches the left margin (\xA to \ximgTop) exactly, so
+  % the img/lbl column pair sits centered in the box rather than right-hung
   \pgfmathsetmacro{\boxwFuse}{\xlblTop+\ximgTop-2*\xA}
   \pgfmathsetmacro{\boxAcenter}{\xA+\boxwFuse/2}
-  \pgfmathsetmacro{\xFusedTop}{\xA+\boxwFuse+1.0}
+
+  % Baseline panel's Enc/Dec placement -- Enc sits directly left of the
+  % (un-wrapped) Fuse box; Dec sits past the Position-axis box's OWN xL
+  % wrapper (\outerRightBase), with extra clearance so it doesn't crowd
+  % that dashed boundary. Computed here (outer level, not panel-local) so
+  % the divider line below the panel can also reach past them.
+  \pgfmathsetmacro{\xEncLeft}{\xA-0.60-\encw}
+  \pgfmathsetmacro{\xDecLeft}{\outerRightBase+0.60}
 
   \pgfmathsetmacro{\xFuseOp}{(\ximgTop+\xlblTop)/2}
   \pgfmathsetmacro{\yMid}{\rowpitch/2}
@@ -196,6 +213,24 @@
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeftBase},{\outerBot}) rectangle ({\outerRightBase},{\outerTop});
 
+    % Enc/Dec bookends -- this figure is a zoomed-in fusion/attention
+    % detail (per the header comment, deliberately no input cubes or
+    % encoder/decoder, unlike arch_fusion_family.tex's own token-grid
+    % style), so these are a light, secondary reminder of where the
+    % tokens shown here sit within the larger Enc -> Fuse/Attn -> Dec
+    % pipeline that figure draws in full -- hence the slight fill
+    % opacity, to stay visually subordinate to the real content. Dec is
+    % target-row only: context is read-only and its post-attention state
+    % is never decoded, same rule as every other arch_fusion_*.tex panel.
+    \begin{scope}[fill opacity=\encdecOpacity]
+      \archfunnel{\xEncLeft}{{\yTgt-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+      \archfunnel{\xEncLeft}{{\yCtx-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+      \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
+    \end{scope}
+    \archflow{({\xEncLeft+\encw+0.05},{\yTgt})}{({\xA-0.05},{\yTgt})}{neutral}
+    \archflow{({\xEncLeft+\encw+0.05},{\yCtx})}{({\xA-0.05},{\yCtx})}{neutral}
+    \archflow{({\outerRightBase+0.05},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{neutral}
+
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       (\xA,\yCtx-\clusterhalf-\boxpad) rectangle ({\xA+\boxwFuse},{\boxTop});
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
@@ -204,14 +239,15 @@
     \node[anchor=south] at ({\boxAcenter},{\boxTop+0.20}) {\archboxlabel Fuse};
     \node[anchor=south] at ({\boxBcenter},{\boxTop+0.20}) {\archboxlabel Position axis};
 
-    % starts just past the (now externalized) fused column, not the old
-    % full-width box edge
-    \archflow{({\xFusedTop+\tsz/2+0.28},{\yMid})}{({\xB-0.50},{\yMid})}{neutral}
+    % starts just past the Fuse box's own (narrowed) edge -- no fused
+    % token column sits between the two blocks any more. Margins widened
+    % (0.30 -> 0.55) to shorten the arrow itself now that the gap is tight.
+    \archflow{({\xA+\boxwFuse+0.55},{\yMid})}{({\xB-0.55},{\yMid})}{neutral}
 
     \node[anchor=south,font=\normalsize] at (\ximgTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{img}}$};
     \node[anchor=south,font=\normalsize] at (\xlblTop,\yTgt+\clusterhalf+0.05) {$Z^{\text{lbl}}$};
 
-    \foreach \x in {\ximgTop, \xlblTop, \xFusedTop} {
+    \foreach \x in {\ximgTop, \xlblTop} {
       \foreach \y in {\yTgt, \yCtx} {
         \fill[black!15,rounded corners=3pt]
           ({\x-\tsz/2-0.18},{\y-\toff-\tsz/2-0.10}) rectangle
@@ -233,7 +269,6 @@
                                        \yCtx/archContextPink/archContextAccent} {
       \tpcluster{\ximgTop}{\y}{\imgfill}{black!70}
       \tpcluster{\xlblTop}{\y}{\lblfill}{black!70}
-      \tpclustersplit{\xFusedTop}{\y}{\imgfill}{\lblfill}{black!70}
       \tpclustersplit{\xFusedPatchTop}{\y}{\imgfill}{\lblfill}{black!70}
     }
 
@@ -248,8 +283,12 @@
   % =========================================================================
   % Divider between Baseline and Ours
   % =========================================================================
-  \pgfmathsetmacro{\divY}{\outerBot - 1.2}
-  \draw[black!20,dashed,line width=1pt] ({\xA-1.0},{\divY}) -- ({\xB+\boxw+1.0},{\divY});
+  % raised from the old -1.2 offset -- that put it only ~0.5 above the
+  % bottom panel's "Dual axis attention" title (methodTitleY + yshift),
+  % close enough to visually overlap it; -0.7 keeps it clear of both that
+  % title below and the top panel's own wrapper/boxes above
+  \pgfmathsetmacro{\divY}{\outerBot - 0.7}
+  \draw[black!20,dashed,line width=1pt] ({\xEncLeft-0.30},{\divY}) -- ({\xDecLeft+\decw+0.30},{\divY});
 
 
   % =========================================================================
@@ -287,6 +326,20 @@
 
     \draw[archTargetGreen!60!black,fill=archTargetGreen!10,dashed,rounded corners=8pt,line width=1pt]
       ({\outerLeft},{\outerBot}) rectangle ({\outerRight},{\outerTop});
+
+    % Enc/Dec bookends -- see the matching note in the Baseline panel
+    % above. Reuses that panel's OWN \xEncLeft/\xDecLeft (not this
+    % panel's narrower wrapper) so the two rows' Enc/Dec funnels line up
+    % in the same x-columns, top to bottom, like every other shared
+    % x-coordinate in this figure (\xA, \yTgt/\yCtx, etc).
+    \begin{scope}[fill opacity=\encdecOpacity]
+      \archfunnel{\xEncLeft}{{\yTgt-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+      \archfunnel{\xEncLeft}{{\yCtx-\ench/2}}{\ench}{\encw}{\encwn}{1}{archEncGray}{Enc}
+      \archfunnel{\xDecLeft}{{\yTgt-\dech/2}}{\dech}{\decw}{\decwn}{-1}{archEncGray}{Dec}
+    \end{scope}
+    \archflow{({\xEncLeft+\encw+0.05},{\yTgt})}{({\outerLeft-0.05},{\yTgt})}{neutral}
+    \archflow{({\xEncLeft+\encw+0.05},{\yCtx})}{({\outerLeft-0.05},{\yCtx})}{neutral}
+    \archflow{({\outerRight+0.05},{\yTgt})}{({\xDecLeft-0.05},{\yTgt})}{neutral}
 
     \draw[black!30,fill=white,rounded corners=5pt,line width=0.8pt]
       (\xC,\yCtx-\clusterhalf-\boxpad) rectangle ({\xC+\boxwMod},{\boxTop});
