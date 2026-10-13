@@ -185,14 +185,25 @@ A comparison script (new, reuses `cascade.evaluate_cascade` twice — once
 with `data.cascade_n_patches=1`, once with `>1` — against the same
 checkpoint, same eval seed) run on:
 
-- **ISLES22** (multi-focal stroke lesions, `src/providers/isles22.py`) —
-  already has a measured single-patch cascade Dice in memory
-  (`project_gnc_kidney_lesions`: "cascade [6,3,1.2] Dice 0.0189 ... worse,
-  ISLES22-style localization failure").
-- **GNC_kidney cysts** (`src/providers/gnc_kidney.py`) — memory
-  `project_gnc_kidney_lesions`: single-level Dice 0.0585, cascade Dice
-  0.0189 (cascade currently *hurts* here) — the most direct regression
-  target: does multi-patch recover some of what single-point re-crop loses.
+- **FLARE22** (`src/providers/flare22.py`, `dataset=flare22` in `eval.py`,
+  13 abdominal organ classes: liver, kidney L/R, spleen, pancreas, aorta,
+  IVC, adrenal L/R, gallbladder, esophagus, stomach, duodenum, native
+  anisotropic ~0.8×0.8×2.5mm). Unlike ISLES22/GNC_kidney (multi-focal
+  lesions), FLARE22's organs are mostly solid single-focus structures — this
+  is an **unseen-acquisition-centre generalization check**, not a
+  diffuse-ROI stress test: does sampling N windows from a continuous
+  probability field help or hurt ordinary organ localization under domain
+  shift (different scanner/protocol than TotalSegmentator), where a single
+  well-centered window is already close to sufficient. A regression here
+  (multi-patch underperforms single-patch on solid organs) would be as
+  informative as a win on a diffuse ROI — it would mean the generalization
+  needs a training-time fix (support window diversity, decode
+  disambiguation) before being safe to turn on universally, consistent
+  with the §1 note that attention across many same-content windows is new
+  territory the checkpoint wasn't trained against. `duodenum`/`esophagus`
+  (thin, elongated — closer to the diffuse case) and `liver`/`spleen`
+  (large solid, closest to today's working case) are worth separating out
+  in the per-class breakdown rather than only looking at the macro mean.
 
 Report per-class Dice/NSD deltas (`n_patches=1` vs `n_patches∈{2,4}`,
 sweeping `n` is cheap since it's inference-only) and a qualitative pass over
