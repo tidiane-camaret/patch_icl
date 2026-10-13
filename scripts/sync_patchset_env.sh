@@ -33,8 +33,9 @@ rsync -rltm --delete --no-owner --no-group \
   --exclude='*' \
   "$REPO/" "$BUNDLE/"
 
-# Console launcher: run the env's Python on the bundled CLI. Path is resolved relative to the
-# launcher so the env stays relocatable.
+# Console launcher: run the env's Python on the bundled CLI. Path is resolved relative to
+# the launcher so the env stays relocatable. One binary, two modes (--target vs --manifest
+# -- see infer_cli.py's own docstring), so one launcher.
 cat > "$LAUNCHER" <<'EOF'
 #!/usr/bin/env bash
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
