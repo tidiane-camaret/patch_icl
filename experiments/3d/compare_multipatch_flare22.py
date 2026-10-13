@@ -35,7 +35,7 @@ from common import make_eval_loader
 from src.providers.flare22 import resolve_flare22_classes
 
 
-@hydra.main(config_path="../../configs", config_name="config", version_base=None)
+@hydra.main(config_path="../../configs/experiment/3d", config_name="eval", version_base="1.3")
 def main(cfg):
     OmegaConf.set_struct(cfg, False)
     cfg.data.source = "flare22"
