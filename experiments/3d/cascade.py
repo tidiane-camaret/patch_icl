@@ -159,6 +159,45 @@ def _random_fg_point(logit_b1ghw, T, is_prob, thr, *, seed, step, level):
     return out
 
 
+def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
+    """Per-b, sample `n` points via a probability-weighted multinomial over the
+    CONCATENATION of `fields` (a list of M (B,1,T,T,T) logit/prob tensors, one per
+    level-i window) -- the multi-window generalization of _random_fg_point/
+    _centroid_from_logit. A voxel's weight is its own predicted probability (not a
+    thresholded indicator), so overlapping/agreeing windows naturally accumulate more
+    sampling mass where both predict foreground -- no separate native-space stitch step.
+
+    Returns, per b, a list of n (window_idx, (d,h,w)) pairs, or n `None` entries when
+    every field's mass is ~0 for that b (same empty-mask fallback convention as
+    _random_fg_point). Seeded off f"{seed}_{step}_{level}_{b}_mfg" via random.Random,
+    the same string-seeding convention _random_fg_point uses -- reproducible across
+    runs/python-version-stable (unlike builtin hash(), which is NOT process-stable
+    under PYTHONHASHSEED randomization)."""
+    probs = []
+    for f in fields:
+        p = f.float().clamp(0, 1) if is_prob else torch.sigmoid(f.float())
+        if p.shape[-1] != T:
+            p = F.interpolate(p, size=(T, T, T), mode="trilinear", align_corners=False)
+        probs.append(p[:, 0].reshape(p.shape[0], -1))            # (B, T^3)
+    flat = torch.cat(probs, dim=1)                                # (B, M*T^3)
+    B = flat.shape[0]
+    out = []
+    for b in range(B):
+        weights = flat[b].tolist()
+        if sum(weights) < 1.0:
+            out.append([None] * n)
+            continue
+        rng = random.Random(f"{seed}_{step}_{level}_{b}_mfg")
+        picks = rng.choices(range(len(weights)), weights=weights, k=n)
+        pts = []
+        for idx in picks:
+            w_idx, local = divmod(idx, T ** 3)
+            d, h, w = np.unravel_index(local, (T, T, T))
+            pts.append((w_idx, (int(d), int(h), int(w))))
+        out.append(pts)
+    return out
+
+
 _CENTER_MODES = ("com", "random_fg")
 
 

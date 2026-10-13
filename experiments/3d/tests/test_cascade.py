@@ -1101,6 +1101,72 @@ def test_random_fg_point_is_seeded_reproducibly():
     assert tuple(a[0].tolist()) == tuple(b[0].tolist())
 
 
+# ---------------------------------------------------------------------------
+# Multi-window probability-weighted point sampler
+# ---------------------------------------------------------------------------
+from cascade import _prob_weighted_points_multi
+
+
+def test_prob_weighted_points_multi_single_window_single_voxel():
+    """M=1 field, one hot voxel: every one of n draws must land on that voxel."""
+    T = 6
+    field = torch.full((1, 1, T, T, T), -10.0)
+    field[0, 0, 2, 3, 4] = 10.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=3,
+                                      seed=0, step=0, level=0)
+    assert len(out) == 1 and len(out[0]) == 3
+    for window_idx, (d, h, w) in out[0]:
+        assert window_idx == 0
+        assert (d, h, w) == (2, 3, 4)
+
+
+def test_prob_weighted_points_multi_covers_both_windows():
+    """Two windows, each with ALL its mass on a different voxel: with n=8 draws from a
+    concatenated multinomial, both windows' voxels must appear at least once (this is
+    exactly the failure mode a single-point re-crop can't express -- both windows'
+    content gets a chance to be sampled, not just one)."""
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f0[0, 0, 1, 1, 1] = 10.0
+    f1 = torch.full((1, 1, T, T, T), -10.0)
+    f1[0, 0, 4, 4, 4] = 10.0
+    out = _prob_weighted_points_multi([f0, f1], T, is_prob=False, n=8,
+                                      seed=0, step=0, level=0)
+    picks = {(w, pt) for w, pt in out[0]}
+    assert (0, (1, 1, 1)) in picks
+    assert (1, (4, 4, 4)) in picks
+
+
+def test_prob_weighted_points_multi_empty_returns_none():
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f1 = torch.full((1, 1, T, T, T), -10.0)
+    out = _prob_weighted_points_multi([f0, f1], T, is_prob=False, n=3,
+                                      seed=0, step=0, level=0)
+    assert out == [[None, None, None]]
+
+
+def test_prob_weighted_points_multi_is_seeded_reproducibly():
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f0[0, 0, 1, 1, 1] = 10.0
+    f0[0, 0, 4, 4, 4] = 10.0
+    a = _prob_weighted_points_multi([f0], T, is_prob=False, n=4, seed=7, step=3, level=1)
+    b = _prob_weighted_points_multi([f0], T, is_prob=False, n=4, seed=7, step=3, level=1)
+    assert a == b
+
+
+def test_prob_weighted_points_multi_batch_rows_independent():
+    T = 6
+    field = torch.full((2, 1, T, T, T), -10.0)
+    field[0, 0, 1, 1, 1] = 10.0
+    field[1, 0, 5, 5, 5] = 10.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=2,
+                                      seed=0, step=0, level=0)
+    assert all(pt == (1, 1, 1) for _, pt in out[0])
+    assert all(pt == (5, 5, 5) for _, pt in out[1])
+
+
 class _TwoBlobModel(torch.nn.Module):
     """Two disjoint one-hot cells at logit resolution == T (no upsample blur): a
     'non-convex' mask whose COM (their midpoint) is NOT itself a foreground voxel."""
