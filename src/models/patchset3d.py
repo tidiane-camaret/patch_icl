@@ -890,8 +890,15 @@ class PatchSet3D(nn.Module):
                 context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
                 size=(S, S, S), mode="trilinear", align_corners=False).reshape(B, K, S, S, S)
             if query_prior is not None:
-                qry_mask = F.interpolate(query_prior.float(), size=(S, S, S), mode="trilinear",
-                                         align_corners=False)               # (B,M,S,S,S) — Task 3
+                if query_prior.dim() == 6:                    # (B,M,1,D,H,W)
+                    Bq, Mq = query_prior.shape[0], query_prior.shape[1]
+                    qry_mask = F.interpolate(
+                        query_prior.reshape(Bq * Mq, 1, *query_prior.shape[-3:]).float(),
+                        size=(S, S, S), mode="trilinear", align_corners=False
+                    ).reshape(Bq, Mq, S, S, S)
+                else:                                          # legacy (B,1,D,H,W)
+                    qry_mask = F.interpolate(query_prior.float(), size=(S, S, S),
+                                             mode="trilinear", align_corners=False)
             else:
                 qry_mask = sup_mask.mean(dim=1, keepdim=True).expand(-1, qry_feat.shape[1], -1, -1, -1)
 
@@ -941,7 +948,12 @@ class PatchSet3D(nn.Module):
         mask_support = self._sample_mask(B, K * N, self.token_mask_ratio_support, dev)
         mask_query = self._sample_mask(B, M * N, self.token_mask_ratio_query, dev)
         if query_prior is not None:                          # cascade: coarse-level prediction
-            qry_occ = self._prior_occupancy(query_prior).to(sup_occ.dtype)
+            if query_prior.dim() == 6:                        # (B,M,1,D,H,W) -- per-window priors
+                qry_occ = torch.cat(
+                    [self._prior_occupancy(query_prior[:, m]) for m in range(query_prior.shape[1])],
+                    dim=1).to(sup_occ.dtype)
+            else:                                             # legacy (B,1,D,H,W)
+                qry_occ = self._prior_occupancy(query_prior).to(sup_occ.dtype)
         else:
             qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, M * N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)

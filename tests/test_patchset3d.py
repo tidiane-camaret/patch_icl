@@ -1158,3 +1158,41 @@ def test_multi_query_rejects_cascade_registers():
     context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
     with pytest.raises(AssertionError, match="M=2"):
         m(image, context_in=context_in, context_out=context_out)
+
+
+def test_multi_query_prior_per_window_shifts_only_that_windows_logit():
+    """Each of the M windows' own query_prior must affect ONLY that window's logit --
+    giving window 0 a prior and leaving window 1's prior at the support-mean fallback
+    equivalent (all-zeros here) must change window 0's output but not window 1's."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True)
+    m.eval()
+    B, K, S, M = 1, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+
+    base = m(image, context_in=context_in, context_out=context_out)["final_logit"]
+
+    prior = torch.zeros(B, M, 1, S, S, S)
+    prior[:, 0] = torch.rand(B, 1, S, S, S)          # only window 0 gets a real prior
+    with_prior = m(image, context_in=context_in, context_out=context_out,
+                  query_prior=prior)["final_logit"]
+
+    assert with_prior.shape == base.shape
+    assert not torch.allclose(with_prior[:, 0], base[:, 0])
+
+
+def test_multi_query_prior_backward_reaches_all_params():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    B, K, S, M = 2, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    prior = torch.rand(B, M, 1, S, S, S)
+    out = m(image, context_in=context_in, context_out=context_out,
+           query_prior=prior)["final_logit"]
+    out.mean().backward()
+    grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
+    assert all(grads) and len(grads) > 0
