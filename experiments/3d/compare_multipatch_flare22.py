@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 from cascade import evaluate_cascade
 from eval import _build_model
 from common import make_eval_loader
+from src.providers.flare22 import resolve_flare22_classes
 
 
 @hydra.main(config_path="../../configs", config_name="config", version_base=None)
@@ -41,8 +42,8 @@ def main(cfg):
     assert sweep[0] == 1, "the first sweep value must be 1 (the baseline)"
 
     model = _build_model(cfg)
-    loader = make_eval_loader(cfg, split=cfg.eval.get("split", "val"))
-    classes = list(loader.dataset.provider.ALL_CLASSES)
+    classes = resolve_flare22_classes(cfg.data.get("val_classes", "all"))
+    loader = make_eval_loader(cfg, classes, split=cfg.eval.get("split", "val"))
 
     baseline = None
     for n in sweep:
