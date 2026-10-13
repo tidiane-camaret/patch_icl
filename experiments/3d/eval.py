@@ -200,7 +200,14 @@ def _build_model(cfg: DictConfig):
         from train import build_model
         if not cfg.eval.get("checkpoint"):
             raise ValueError(f"eval.checkpoint is required for {name}")
-        ckpt = torch.load(cfg.eval.checkpoint, map_location=DEVICE, weights_only=False)
+        # map_location="cpu", not DEVICE: a training checkpoint also carries optimizer/
+        # scheduler/rng state (often >1x the model's own size, e.g. Adam's two moment
+        # buffers) that eval/inference never uses. Loading straight to DEVICE used to
+        # transiently materialize ALL of it on the GPU before only ckpt["model"] got used
+        # below -- wasted GPU memory for no benefit. load_state_dict copies CPU tensors
+        # into the (already-DEVICE) model's params automatically below, so this is a
+        # behavior-free fix.
+        ckpt = torch.load(cfg.eval.checkpoint, map_location="cpu", weights_only=False)
         arch = ckpt.get("arch")
         from omegaconf import open_dict
         with open_dict(cfg):

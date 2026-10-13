@@ -19,13 +19,15 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.totalseg_classes import resolve_classes, resolve_more_labels_classes
+# TotalSegMoreLabelsDataset/ChemoToxBCDataset/SynthGenMaisiDataset: lazy-imported at their
+# own data.source== branch inside build_dataset() below instead of here -- each pulls in a
+# heavy transitive chain (scipy.ndimage, pydicom, ...) that every OTHER caller of this
+# module (incl. inference's `from common import DEVICE`, which uses none of them) paid for
+# on every import regardless of which source it actually needed.
 from src.totalseg_dataloader_incontext import (
     TotalSegInContextDataset,
     incontext_collate_fn,
 )
-from src.totalseg_more_labels_dataset import TotalSegMoreLabelsDataset
-from src.chemotox_dataset import ChemoToxBCDataset, BC_NAMES
-from src.synth_gen_maisi_dataset import SynthGenMaisiDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -695,6 +697,7 @@ def build_dataset(cfg, split: str):
             max_subjects=(cfg.data.get("max_train_subjects") if is_train
                           else cfg.data.get("max_val_subjects")))
     if cfg.data.get("source") == "totalseg_more_labels":
+        from src.totalseg_more_labels_dataset import TotalSegMoreLabelsDataset
         d = cfg.data
         root = cfg.paths.get("totalseg_more_labels")
         classes = resolve_more_labels_classes(root, d.val_classes)
@@ -710,6 +713,7 @@ def build_dataset(cfg, split: str):
             raw_ct=d.get("raw_ct", False),
         )
     if cfg.data.get("source") == "chemotox_bc":
+        from src.chemotox_dataset import ChemoToxBCDataset, BC_NAMES
         d = cfg.data
         root = cfg.paths.get("chemotox")
         return ChemoToxBCDataset(
@@ -721,6 +725,7 @@ def build_dataset(cfg, split: str):
             crop_jitter=cfg.get("eval", {}).get("crop_jitter", None),
         )
     if cfg.data.get("source") == "synth_gen_maisi":
+        from src.synth_gen_maisi_dataset import SynthGenMaisiDataset
         d = cfg.data
         root = cfg.paths.get("synth_gen_maisi")
         if root is None:

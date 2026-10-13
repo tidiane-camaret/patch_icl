@@ -59,7 +59,6 @@ import hydra
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from tqdm import tqdm
 
@@ -1392,6 +1391,10 @@ def main(cfg: DictConfig) -> None:
     lawa_keys = ({n for n, p in net.named_parameters() if p.requires_grad}
                  if lawa_queue is not None else None)
 
+    # Lazy -- top-level `import wandb` cost every `from train import build_model` caller
+    # (e.g. inference's eval._build_model) ~0.9s of pure import time for a training-only
+    # dependency they never use. wandb is only ever touched inside this function.
+    import wandb
     wb_on = bool(cfg.wandb.get("project"))
     # Config-group selections (dataset=, augmentations=, model=, cluster=, experiment=) are
     # packaged `_global_`, so they merge into data:/paths:/... and leave no key of their own in

@@ -16,9 +16,6 @@ import json
 import time
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -147,6 +144,9 @@ def save_eval_figure(target_img, gt, pred, ctx_img, ctx_gt, out_path: Path, titl
     visibly black next to the falsely-brightened GT/pred panels (same background, but with the
     old bug's near-white tint layered on). Caught evaluating ISLES22 DWI, docs/logs.md
     2026-09-12; fixes every source, not just MRI."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     z, z_ctx = _best_slice(gt), _best_slice(ctx_gt)
     fig, axes = plt.subplots(1, 4, figsize=(16, 4), gridspec_kw={"wspace": 0.04})
     _overlay(axes[0], ctx_img[z_ctx], [(ctx_gt[z_ctx], "red", 0.45)])
@@ -214,6 +214,9 @@ def save_cascade_figure(out_path: Path, *,
     Boxes are (center(3,), size(3,)) in coarse-grid voxels. GT=lime, pred=red,
     fine box=yellow, oracle box=cyan. The context row's cols 2/4 repeat the prompt (GT),
     col 5 is blank (target-only refit)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     s0, s1 = spacings
     GT, PR = "lime", "red"
     zc  = _best_slice(np.asarray(gt_coarse))
