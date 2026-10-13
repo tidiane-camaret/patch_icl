@@ -1234,6 +1234,20 @@ def test_run_cascade_n_patches_training_raises():
                     training=True, step=0, seed=0, n_patches=2)
 
 
+def test_run_cascade_n_patches_realize_crop_raises():
+    with pytest.raises(AssertionError, match="gpu_realize_crop"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=False, step=0, seed=0, n_patches=2, realize_crop=True)
+
+
+def test_run_cascade_n_patches_query_prior_hard_raises():
+    with pytest.raises(AssertionError, match="cascade_query_prior_hard"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=False, step=0, seed=0, n_patches=2, query_prior_hard=True)
+
+
 class _TwoBlobMultiQueryModel(torch.nn.Module):
     """Echoes back M one-hot blobs (one per query window) so the test can assert BOTH
     level-0 blobs get covered by level 1's n=2 windows -- the exact failure mode a
