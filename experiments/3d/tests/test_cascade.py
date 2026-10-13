@@ -1280,7 +1280,7 @@ def test_run_cascade_n_patches_two_covers_two_disjoint_blobs():
                       training=False, step=0, seed=0, jitter=0, n_patches=2)
     assert res.n_patches == [1, 2]
     assert res.logits[1].shape == (B, 2, 1, G, G, G)
-    assert res.geoms[1].shape[0] == B           # (B, n, 4, 3) -- one geom per sampled window
+    assert res.geoms[1].shape == (B, 2, 4, 3)   # one geom per sampled window
 
 
 def test_run_cascade_n_patches_context_tasks_scale_with_n():
@@ -1293,6 +1293,54 @@ def test_run_cascade_n_patches_context_tasks_scale_with_n():
                training=False, step=0, seed=0, jitter=0, n_patches=2)
     ctx_calls = [c for c in prov.calls if c["center"] is None]
     assert len(ctx_calls) == B * K * 2
+
+
+class _MultiPriorSpyModel(torch.nn.Module):
+    """Like _PriorSpyModel but supports the (B,M,1,D,H,W) multi-query image shape (Task
+    2/3) and records the query_prior tensor it receives at every level, including when
+    it carries the (B,n,1,T,T,T) multi-window shape (Task 3). Echoes blobs like
+    _TwoBlobMultiQueryModel so the n_patches>1 re-crop sampler has something to sample."""
+    spacing_aware = False
+
+    def __init__(self, G, blobs):
+        super().__init__()
+        self.G, self.blobs, self.priors = G, blobs, []
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        self.priors.append(None if query_prior is None else query_prior.detach().clone())
+        legacy = image.dim() == 5           # (B,1,D,H,W); matches PatchSet3D.forward
+        M = 1 if legacy else image.shape[1]
+        B = image.shape[0]
+        lg = torch.full((B, M, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        for m in range(M):
+            c = self.blobs[m % len(self.blobs)]
+            lg[:, m, :, c[0], c[1], c[2]] = 10.0
+        lg = lg + self.p.to(image.device)
+        if legacy:
+            lg = lg[:, 0]
+        return {"final_logit": lg}
+
+
+def test_run_cascade_n_patches_query_prior_tracks_through_levels():
+    """Regression guard for the bug where the prior-build gate checked `prev_logit`
+    (only set right after a this_n==1 level) instead of `prev_fields` (set after every
+    level): with a 3-level cascade and n_patches=2, level 2's query_prior would silently
+    never build once level 1 went multi-window, even though prior_modes_used recorded
+    'pred' as if it had. Asserts BOTH level 1's and level 2's query_prior are real,
+    full (B,n,1,T,T,T) tensors -- not None."""
+    B, T = 2, 8
+    blobs = ((1, 1, 1), (2, 2, 2))
+    model = _MultiPriorSpyModel(4, blobs)
+    prov = _FakeProvider(T=T)
+    run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+               spacings=[3.0, 1.5, 0.75], device=torch.device("cpu"),
+               training=False, step=0, seed=0, jitter=0, n_patches=2,
+               query_prior="pred")
+    assert model.priors[0] is None                       # level 0 never gets a prior
+    assert model.priors[1] is not None and model.priors[1].shape == (B, 2, 1, T, T, T)
+    assert model.priors[2] is not None and model.priors[2].shape == (B, 2, 1, T, T, T)
 
 
 def test_run_cascade_center_mode_invalid_raises():

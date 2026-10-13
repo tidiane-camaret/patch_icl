@@ -81,12 +81,26 @@ PERTURB_OFFSET = 13_000_000  # query-prior perturbation seed (per level; train-o
 
 @dataclass
 class CascadeResult:
-    logits: list                  # per level: (B,1,G,G,G)
-    targets: list                 # per level: grid GT (target_like)
-    geoms: list                   # per level: (B,4,3) target crop_geom
-    centers: list                 # len N: centers[0] == [None]*B; centers[i] native COM|None per b
-    hard_preds: list | None       # per level: (B,T,T,T) binary; only when want_hard_preds
-    empty_frac: float             # fraction of (level>=1, b) COM inversions that hit the fallback
+    logits: list                  # per level: (B,1,G,G,G); when n_patches[i]>1, (B,n,1,G,G,G)
+    targets: list                 # per level: grid GT (target_like); when n_patches[i]>1,
+    #                                (B*n,1,G,G,G) -- flattened (B,n) into the leading axis,
+    #                                UNLIKE logits[i]'s own (B,n,1,...) (asymmetric on purpose:
+    #                                target_like pools GT down to logit's spatial size and
+    #                                doesn't need to keep B and n separate)
+    geoms: list                   # per level: (B,4,3) target crop_geom; when n_patches[i]>1,
+    #                                (B,n,4,3)
+    centers: list                 # n_patches<=1 (whole run): len N, centers[0] == [None]*B,
+    #                                centers[i] native COM|None per b. n_patches>1 (whole run):
+    #                                len 1 (just the [None]*B sentinel) -- the n_patches>1
+    #                                re-crop path computes each level's target points fresh via
+    #                                _points_for_level_multi and never appends to this list.
+    hard_preds: list | None       # per level: (B,T,T,T) binary; only when want_hard_preds.
+    #                                when n_patches[i]>1, (B,n,T,T,T)
+    empty_frac: float             # fraction of (level>=1, b) COM inversions that hit the
+    #                                fallback -- ONLY meaningful on the n_patches<=1 path; always
+    #                                0.0 when n_patches>1 (that path never increments
+    #                                empty_total/empty_hits -- it has no single-point inversion
+    #                                fallback to measure)
     figure_levels: list | None = None  # per level: {img,gt,ctx_img,ctx_gt} (B,T,T,T) np; only
     #                                    when want_figure_arrays (post-aug target + 1st context)
     prior_modes_used: list | None = None  # len N: [0]=None; [i>0]=query_prior mode this level
@@ -386,8 +400,9 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
 
 
 def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, level,
-                        jitter, n, realize_crop=False, mask_downsample="occupancy",
-                        occ_thr=0.1, ct_spec=None, device=None, center_mode="random_fg"):
+                        jitter, n, recrop_workers=1, realize_crop=False,
+                        mask_downsample="occupancy", occ_thr=0.1, ct_spec=None,
+                        device=None, center_mode="random_fg"):
     """Build one level-i v2 batch with n target windows (centers from
     target_points[b], a length-n list of (window_idx, native (d,h,w) tuple | None) pairs
     -- already resolved by the caller via _points_for_level_multi; only the native center
@@ -427,7 +442,7 @@ def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, 
             return provider.load(subj, clss[_b], req, modality=mod)
         return provider.load(subj, clss[_b], req)
 
-    results = [_load(t) for t in tasks]
+    results = _run_pool(_load, tasks, recrop_workers)
 
     tgt_slots = [[None] * n for _ in range(len(subs))]
     ctx_slots = [[[None] * n for _ in ctxs[b]] for b in range(len(subs))]
@@ -498,23 +513,29 @@ def _build_query_prior_multi(mode, prev_fields, prev_geoms_list, cg_cur, target_
     per _points_for_level_multi's window_idx) previous-level prediction onto this window's
     grid via _warp_prior_cropgeom -- the no-aug crop-geom-only path (eval-only call sites
     never pass an augmentor, so there is no aug grid to compose through). Returns
-    (B,n,1,T,T,T) for PatchSet3D's generalized query_prior (Task 3)."""
+    (B,n,1,T,T,T) for PatchSet3D's generalized query_prior (Task 3).
+
+    Mirrors _build_query_prior's fp32/detach discipline: the geometric warp runs with
+    autocast off (sub-voxel precision under bf16) and `src` is detached (each level keeps
+    its own loss -- the prior is never a gradient path back into level i-1)."""
     assert mode == "pred", f"cascade_n_patches>1 only supports cascade_query_prior='pred', got {mode!r}"
     B = prev_fields[0].shape[0]
     n = len(target_points[0])
-    out = torch.zeros(B, n, 1, T, T, T, device=prev_fields[0].device)
-    for b in range(B):
-        for j, (w_idx, nc) in enumerate(target_points[b]):
-            if nc is None:
-                continue
-            src = prev_fields[w_idx][b:b + 1].float()
-            src = src.clamp(0, 1) if is_prob else torch.sigmoid(src)
-            if src.shape[-1] != T:
-                src = F.interpolate(src, size=(T, T, T), mode="trilinear", align_corners=False)
-            warped = _warp_prior_cropgeom(src, prev_geoms_list[w_idx][b:b + 1],
-                                          cg_cur[b:b + 1, j], T)
-            out[b, j] = warped[0]
-    return out
+    dev = prev_fields[0].device
+    with torch.autocast(device_type=dev.type, enabled=False):
+        out = torch.zeros(B, n, 1, T, T, T, device=dev)
+        for b in range(B):
+            for j, (w_idx, nc) in enumerate(target_points[b]):
+                if nc is None:
+                    continue
+                src = prev_fields[w_idx][b:b + 1].detach().float()
+                src = src.clamp(0, 1) if is_prob else torch.sigmoid(src)
+                if src.shape[-1] != T:
+                    src = F.interpolate(src, size=(T, T, T), mode="trilinear", align_corners=False)
+                warped = _warp_prior_cropgeom(src, prev_geoms_list[w_idx][b:b + 1],
+                                              cg_cur[b:b + 1, j], T)
+                out[b, j] = warped[0]
+        return out
 
 
 def _forward_level(model, batch, spacing, query_prior=None, cascade_regs=None):
@@ -782,6 +803,11 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     assert not (training and n_patches > 1), (
         "data.cascade_n_patches>1 is eval-only for now -- see docs/superpowers/specs/"
         "2026-10-13-multipatch-cascade-design.md")
+    assert not (n_patches > 1 and realize_crop), (
+        "data.cascade_n_patches>1 does not support gpu_realize_crop=true yet -- "
+        "pass data.gpu_realize_crop=false")
+    assert not (n_patches > 1 and query_prior_hard), (
+        "data.cascade_query_prior_hard is not supported with cascade_n_patches>1 yet")
     _train_mode, _eval_mode = _resolve_center_mode(center_mode)
     center_mode = _train_mode if training else _eval_mode
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
@@ -829,8 +855,11 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                     seed=seed, step=step, level=i)
                 cur = _recrop_level_multi(provider, batch, target_points, spacings[i],
                                           step=step, seed=seed, level=i, jitter=jitter,
-                                          n=n_patches, mask_downsample=mask_downsample,
+                                          n=n_patches, recrop_workers=recrop_workers,
+                                          mask_downsample=mask_downsample,
                                           occ_thr=occ_thr, ct_spec=ct_spec, device=device,
+                                          # forced random_fg -- "com" would make all n
+                                          # context windows per subject identical crops
                                           center_mode="random_fg")
             cur = _to_device(cur, device)   # no-op for realize output (already on device)
         capture = augmentor is not None and i < N - 1
@@ -855,7 +884,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             else:
                 mode_i = prior_spec.eval_mode
             prior_modes_used.append(mode_i)
-            if mode_i != "none" and prev_logit is not None:
+            if mode_i != "none" and prev_fields is not None:
                 cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
                 if this_n == 1:
                     prior = _build_query_prior(
@@ -877,8 +906,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         geoms.append(cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"])
         prev_logit = logit if this_n == 1 else None     # legacy single-window field, n=1 only
         prev_geo, prev_label, prev_regs = geo, cur["label"], regs
-        prev_fields = ([logit[:, m] for m in range(this_n)] if this_n > 1
-                       else [logit if logit.dim() == 5 else logit])
+        prev_fields = ([logit[:, m] for m in range(this_n)] if this_n > 1 else [logit])
         prev_geo_list = [geo] * this_n                   # same captured aug grid for every window
         prev_geoms_list = ([geoms[i][:, m] for m in range(this_n)] if this_n > 1
                            else [geoms[i]])
