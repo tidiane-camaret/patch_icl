@@ -1456,3 +1456,59 @@ def test_run_cascade_registers_inert_for_models_without_support():
                       spacings=[3.0, 1.5], device=torch.device("cpu"),
                       training=True, step=0, seed=0)
     assert len(res.logits) == 2   # no crash
+
+
+# --- Task 6: evaluate_cascade / _stitched_native_metrics_and_levels with n_patches>1 -----
+
+from evaluate import _stitched_native_metrics_and_levels
+
+
+def _packed(mask, geom):
+    return (np.packbits(mask), mask.shape, geom)
+
+
+def test_stitched_native_metrics_accepts_single_tuple_unchanged(tmp_path):
+    """Regression: the pre-existing single-(packed,shape,geom)-tuple contract (n=1
+    levels) must still work byte-identically."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.zeros((8, 8, 8), dtype=bool)
+    gt[2:5, 2:5, 2:5] = True
+    np.save(subj_dir / "label.npy", gt.astype(np.uint8))
+    geom = np.array([[0, 0, 0], [8, 8, 8], [8, 8, 8], [0, 0, 0]])
+    pred = np.zeros((8, 8, 8), dtype=bool)
+    pred[2:5, 2:5, 2:5] = True
+    class_idx = {"organ": 1}
+    gt_u8 = np.load(subj_dir / "label.npy")
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): _packed(pred, geom)}], tmp_path, class_idx=class_idx)
+    # class_idx path reads label.npy == idx; write it with the real class value (1)
+    np.save(subj_dir / "label.npy", (gt_u8 * 1))
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): _packed(pred, geom)}], tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+
+def test_stitched_native_metrics_accepts_list_of_windows(tmp_path):
+    """n_patches>1: pg_levels[li][key] is a LIST of (packed,shape,geom) -- two windows,
+    each covering a DIFFERENT, DISJOINT native half (own geom/starts, matching how real
+    n>1 windows land at different sampled locations), must stitch to full coverage
+    (overwrite-paste, same semantics as across-level stitching). NOTE: this uses two
+    distinct geoms rather than one shared full-volume geom for both windows -- with a
+    single shared full-volume geom, "later paste wins" would make the second window's
+    paste wholesale replace the first everywhere (same region), which cannot union to
+    full coverage; disjoint geoms are what overwrite-paste is actually designed for, and
+    is what real sampled windows at different locations give you."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.ones((8, 8, 8), dtype=np.uint8)  # both halves foreground
+    np.save(subj_dir / "label.npy", gt)
+    geom_a = np.array([[0, 0, 0], [4, 8, 8], [4, 8, 8], [0, 0, 0]])  # native rows 0:4
+    geom_b = np.array([[4, 0, 0], [4, 8, 8], [4, 8, 8], [0, 0, 0]])  # native rows 4:8
+    pred_a = np.ones((4, 8, 8), dtype=bool)  # window A covers the top half
+    pred_b = np.ones((4, 8, 8), dtype=bool)  # window B covers the bottom half
+    class_idx = {"organ": 1}
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): [_packed(pred_a, geom_a), _packed(pred_b, geom_b)]}],
+        tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)

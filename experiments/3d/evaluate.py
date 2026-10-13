@@ -1071,13 +1071,17 @@ def _stitched_native_metrics_and_levels(pg_levels, root, tol_mm: float | None = 
             gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
         composite = np.zeros(gt.shape, dtype=bool) if want_full else None
         for li in present:
-            p, geom = _unpack_pred(pg_levels[li][key])
-            placed = _place_patch(p, geom)
+            entries = pg_levels[li][key]
+            if not isinstance(entries, list):
+                entries = [entries]
             solo = np.zeros(gt.shape, dtype=bool)
-            if placed is not None:
-                if want_full:
-                    _paste(composite, *placed)
-                _paste(solo, *placed)
+            for entry in entries:
+                p, geom = _unpack_pred(entry)
+                placed = _place_patch(p, geom)
+                if placed is not None:
+                    if want_full:
+                        _paste(composite, *placed)
+                    _paste(solo, *placed)
             inter = 2.0 * np.logical_and(solo, gt).sum()
             denom = int(solo.sum()) + int(gt.sum())
             per_level[li][key] = inter / denom if denom > 0 else 1.0

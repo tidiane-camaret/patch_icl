@@ -1032,6 +1032,7 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                               ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
                               center_mode=cfg.data.get("cascade_center_mode", "com"),
                               center_fg_thr=float(cfg.data.get("cascade_center_fg_thr", 0.5)),
+                              n_patches=int(cfg.data.get("cascade_n_patches", 1)),
                               want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()
@@ -1056,9 +1057,18 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
             order.append((key, cmod, cc))
             times[key] = round(per_sample_ms, 1)
             for li in range(N):
-                hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
-                geom = res.geoms[li][b].cpu().numpy()
-                pg_levels[li][key] = (np.packbits(hp), tuple(hp.shape), geom)
+                n_li = res.n_patches[li] if res.n_patches is not None else 1
+                if n_li <= 1:
+                    hp = res.hard_preds[li][b].cpu().numpy().astype(bool)
+                    geom = res.geoms[li][b].cpu().numpy()
+                    pg_levels[li][key] = (np.packbits(hp), tuple(hp.shape), geom)
+                else:
+                    pg_levels[li][key] = [
+                        (np.packbits(res.hard_preds[li][b, j].cpu().numpy().astype(bool)),
+                        tuple(res.hard_preds[li][b, j].shape),
+                        res.geoms[li][b, j].cpu().numpy())
+                        for j in range(n_li)
+                    ]
             if clss[b] in fig_want:                        # first sample of a requested class
                 fig_want.discard(clss[b])
                 T = res.hard_preds[0].shape[-1]
