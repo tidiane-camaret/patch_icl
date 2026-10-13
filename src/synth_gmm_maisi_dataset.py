@@ -19,14 +19,12 @@ from torch.utils.data import Dataset
 
 from data.maisi_classes import MAISI_IDX_TO_CLASS
 from src.gmm_cohort_sampler import CohortSampler
+from src.gmm_constants import GMM_MEAN, GMM_STD  # noqa: F401 -- re-exported, see that module
 from src.gpu_gmm_intensity import maisi_ids_to_indices, resolve_between_ratio, sample_grouped_uniform
 from src.totalseg_dataloader_incontext import (organ_crop_arrays, place_image, place_label,
                                                 resample_binary)
 
 BODY_ID = 200
-# fixed 0-255 -> ~zero-mean/unit-std bridge (uniform-ish over 0..255: mean 128, std ~74).
-# fixed (not per-volume) so the cohort-shared appearance survives normalization.
-GMM_MEAN, GMM_STD = 128.0, 74.0
 
 
 class SynthGmmMaisiDataset(Dataset):

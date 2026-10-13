@@ -11,7 +11,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from src.synth_gmm_maisi_dataset import GMM_MEAN, GMM_STD
+# Straight from gmm_constants, not synth_gmm_maisi_dataset -- this module (on the inference
+# cascade path via cascade.py) only needs these 2 floats, not that module's full GMM-sampling
+# machinery (src.gpu_gmm_intensity -> scipy), which every inference call would otherwise pay
+# import cost for.
+from src.gmm_constants import GMM_MEAN, GMM_STD
 from src.totalseg_dataloader_incontext import _area_pool_3d
 
 
