@@ -1205,6 +1205,96 @@ def test_run_cascade_center_mode_random_fg_lands_on_a_masked_voxel():
     assert len(tgt_calls) == B
 
 
+# --- Task 5: data.cascade_n_patches -- N-patch re-crop branch ----------------------------
+
+def test_run_cascade_n_patches_default_is_byte_identical_to_main():
+    """n_patches unset (defaults to 1) must take the EXACT existing single-point code
+    path -- same centers, same logits -- as a regression guard that the generalization
+    is additive, not a behavior change at the default."""
+    B, T, G = 2, 8, 4
+    model, prov = _FakeModel(G=G, hot=(1, 1, 1)), _FakeProvider(T=T)
+    res_default = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                              spacings=[3.0, 1.5], device=torch.device("cpu"),
+                              training=True, step=0, seed=0, jitter=0)
+    model2, prov2 = _FakeModel(G=G, hot=(1, 1, 1)), _FakeProvider(T=T)
+    res_explicit = run_cascade(model2, prov2, _v2_batch(B=B, T=T), augmentor=None,
+                               spacings=[3.0, 1.5], device=torch.device("cpu"),
+                               training=True, step=0, seed=0, jitter=0, n_patches=1)
+    assert res_default.n_patches == [1, 1]
+    assert res_explicit.n_patches == [1, 1]
+    for a, b in zip(res_default.logits, res_explicit.logits):
+        assert torch.equal(a, b)
+    assert res_default.centers == res_explicit.centers
+
+
+def test_run_cascade_n_patches_training_raises():
+    with pytest.raises(AssertionError, match="cascade_n_patches"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=True, step=0, seed=0, n_patches=2)
+
+
+class _TwoBlobMultiQueryModel(torch.nn.Module):
+    """Echoes back M one-hot blobs (one per query window) so the test can assert BOTH
+    level-0 blobs get covered by level 1's n=2 windows -- the exact failure mode a
+    single-point re-crop can't express. Accepts the model's new (B,M,1,D,H,W) image
+    shape and returns (B,M,1,G,G,G)."""
+    spacing_aware = False
+
+    def __init__(self, G, blobs):
+        super().__init__()
+        self.G, self.blobs = G, blobs
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        # legacy single-query shape is (B,1,D,H,W) -- 5 dims, matching
+        # PatchSet3D.forward's own `legacy_image = image.dim() == 5` (src/models/
+        # patchset3d.py); the new (B,M,1,D,H,W) multi-query shape is 6 dims.
+        legacy = image.dim() == 5
+        M = 1 if legacy else image.shape[1]
+        B = image.shape[0]
+        lg = torch.full((B, M, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        for m in range(M):
+            c = self.blobs[m % len(self.blobs)]
+            lg[:, m, :, c[0], c[1], c[2]] = 10.0
+        lg = lg + self.p.to(image.device)
+        if legacy:
+            lg = lg[:, 0]
+        return {"final_logit": lg}
+
+
+def test_run_cascade_n_patches_two_covers_two_disjoint_blobs():
+    """At level 0 a single FakeProvider crop is loaded (M=1, as always); level 1 asks
+    for n_patches=2 windows. The model always predicts two disjoint one-hot blobs
+    regardless of M, so level 1's sampler (fed level 0's single M=1 field) must still
+    land its 2 drawn points on voxels that are plausible under level 0's own prediction
+    -- this test's real purpose is exercising the n_patches>1 PLUMBING end-to-end
+    (shapes, no crash, n_patches recorded) rather than re-proving the sampler's own
+    coverage math (already covered by Task 1's unit tests)."""
+    B, T, G = 2, 8, 4
+    blobs = ((1, 1, 1), (2, 2, 2))
+    model, prov = _TwoBlobMultiQueryModel(G, blobs), _FakeProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=False, step=0, seed=0, jitter=0, n_patches=2)
+    assert res.n_patches == [1, 2]
+    assert res.logits[1].shape == (B, 2, 1, G, G, G)
+    assert res.geoms[1].shape[0] == B           # (B, n, 4, 3) -- one geom per sampled window
+
+
+def test_run_cascade_n_patches_context_tasks_scale_with_n():
+    """Each of K context subjects contributes n independently-centred windows per level,
+    so the provider sees K*n context loads per b at level>0 (was K)."""
+    B, K, T = 2, 3, 8
+    model, prov = _TwoBlobMultiQueryModel(4, ((1, 1, 1), (2, 2, 2))), _FakeProvider(T=T)
+    run_cascade(model, prov, _v2_batch(B=B, K=K, T=T), augmentor=None,
+               spacings=[3.0, 1.5], device=torch.device("cpu"),
+               training=False, step=0, seed=0, jitter=0, n_patches=2)
+    ctx_calls = [c for c in prov.calls if c["center"] is None]
+    assert len(ctx_calls) == B * K * 2
+
+
 def test_run_cascade_center_mode_invalid_raises():
     with pytest.raises(ValueError, match="cascade_center_mode"):
         run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,

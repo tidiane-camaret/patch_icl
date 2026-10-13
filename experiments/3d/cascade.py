@@ -91,6 +91,7 @@ class CascadeResult:
     #                                    when want_figure_arrays (post-aug target + 1st context)
     prior_modes_used: list | None = None  # len N: [0]=None; [i>0]=query_prior mode this level
     #                                       actually ran (a fixed mode, or the per-step draw)
+    n_patches: list | None = None       # per level: 1 (level 0, always) or n (level i>=1)
 
 
 def _gen(seed_int, device):
@@ -384,6 +385,138 @@ def _recrop_level(provider, batch, centers, spacing, *, step, seed, level, jitte
     return incontext_collate_fn(items)
 
 
+def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, level,
+                        jitter, n, realize_crop=False, mask_downsample="occupancy",
+                        occ_thr=0.1, ct_spec=None, device=None, center_mode="random_fg"):
+    """Build one level-i v2 batch with n target windows (centers from
+    target_points[b], a length-n list of (window_idx, native (d,h,w) tuple | None) pairs
+    -- already resolved by the caller via _points_for_level_multi; only the native center
+    is used here, window_idx is for _build_query_prior_multi) and n*K context windows (n
+    independently-seeded random_fg draws per original context subject, center=None +
+    center_mode so the provider's own _resolve_center samples a fresh foreground voxel
+    each time). Returns a batch dict shaped like _recrop_level's, but with image:
+    (B,n,1,T,T,T), context_in/context_out: (B,K*n,...), AND label: (B,n,T,T,T) (one GT per
+    target window, since each has its own crop).
+
+    realize_crop is NOT supported here (eval-only n_patches>1 call sites use the plain
+    provider.load path below) -- asserted, not silently ignored."""
+    assert not realize_crop, "data.cascade_n_patches>1 does not support gpu_realize_crop yet"
+    subs, ctxs, clss = batch["subjects"], batch["context_subjects"], batch["label_names"]
+    sp = float(spacing)
+    tmods = batch.get("tgt_modality")
+    cmods = batch.get("ctx_modality")
+
+    tasks = []                     # (b, role, j, subj, center, rk, mod); role: "tgt" | "ctx"
+    for b in range(len(subs)):
+        tmod = tmods[b] if tmods is not None else None
+        cmod = cmods[b] if cmods is not None else None
+        pts = target_points[b]
+        for j in range(n):
+            center = pts[j][1] if pts is not None and pts[j][1] is not None else None
+            tasks.append((b, "tgt", j, subs[b], center, f"{seed}_{step}_{level}_{b}_{j}", tmod))
+        for k, cs in enumerate(ctxs[b]):
+            for j in range(n):
+                tasks.append((b, "ctx", (k, j), cs, None,
+                             f"{seed}_{step}_{level}_{b}_{k}_{j}", cmod))
+
+    def _load(t):
+        _b, _role, _j, subj, center, rk, mod = t
+        req = LoadRequest(rng=random.Random(rk), crop_spacing_mm=sp,
+                          center=center, jitter=jitter, center_mode=center_mode)
+        if mod is not None:
+            return provider.load(subj, clss[_b], req, modality=mod)
+        return provider.load(subj, clss[_b], req)
+
+    results = [_load(t) for t in tasks]
+
+    tgt_slots = [[None] * n for _ in range(len(subs))]
+    ctx_slots = [[[None] * n for _ in ctxs[b]] for b in range(len(subs))]
+    for (b, role, j, *_rest), r in zip(tasks, results):
+        if role == "tgt":
+            tgt_slots[b][j] = r
+        else:
+            k, jj = j
+            ctx_slots[b][k][jj] = r
+
+    items = []
+    for b in range(len(subs)):
+        img = torch.stack([tgt_slots[b][j].image for j in range(n)])          # (n,1,T,T,T)
+        lbl = torch.stack([tgt_slots[b][j].label for j in range(n)])          # (n,T,T,T)
+        cin = torch.stack([torch.stack([ctx_slots[b][k][j].image for j in range(n)])
+                           for k in range(len(ctxs[b]))]).reshape(-1, *img.shape[-4:])
+        cout = torch.stack([torch.stack([ctx_slots[b][k][j].label for j in range(n)])
+                            for k in range(len(ctxs[b]))]).reshape(-1, *lbl.shape[-3:])
+        items.append({
+            "image": img, "label": lbl, "context_in": cin, "context_out": cout,
+            "subject": subs[b], "context_subjects": list(ctxs[b]),
+            "label_name": clss[b], "spacing": tgt_slots[b][0].spacing,
+            "crop_geom": torch.stack([tgt_slots[b][j].crop_geom for j in range(n)]),
+        })
+    return {
+        "image": torch.stack([it["image"] for it in items]),
+        "label": torch.stack([it["label"] for it in items]),
+        "context_in": torch.stack([it["context_in"] for it in items]),
+        "context_out": torch.stack([it["context_out"] for it in items]),
+        "subjects": list(subs), "context_subjects": [list(c) for c in ctxs],
+        "label_names": list(clss),
+        "crop_geom": torch.stack([it["crop_geom"] for it in items]),       # (B,n,4,3)
+        "aug_mode": torch.zeros(len(subs), dtype=torch.long),
+    }
+
+
+def _points_for_level_multi(prev_fields, T, is_prob, n, prev_geo_list, prev_geoms_list,
+                            *, seed, step, level):
+    """level i-1's `len(prev_fields)` windows' own logits -> n native centers per b for
+    level i's target re-crop, via _prob_weighted_points_multi (grid-space, concatenated
+    multinomial) then invert_geo_center per sampled point through ITS OWN originating
+    window's geo/geom. Returns, per b, a list of n (window_idx, native (d,h,w) | None)
+    pairs -- window_idx is threaded through so _build_query_prior_multi can pick the
+    same originating window's prediction as its warp source, without re-deriving it."""
+    picks = _prob_weighted_points_multi(prev_fields, T, is_prob, n,
+                                        seed=seed, step=step, level=level)
+    B = prev_fields[0].shape[0]
+    out = []
+    for b in range(B):
+        row = []
+        for p in picks[b]:
+            if p is None:
+                row.append((0, None))
+                continue
+            w_idx, cen = p
+            geo = prev_geo_list[w_idx]
+            gr = geo.grid[b] if geo is not None and geo.grid is not None else None
+            fl = geo.flips[b] if geo is not None and geo.grid is not None else torch.zeros(3, dtype=torch.bool)
+            nc = invert_geo_center(np.array(cen, dtype=float), gr, fl,
+                                   prev_geoms_list[w_idx][b], T)
+            row.append((w_idx, nc))
+        out.append(row)
+    return out
+
+
+def _build_query_prior_multi(mode, prev_fields, prev_geoms_list, cg_cur, target_points, T, is_prob):
+    """Per current-level window j, warp its ORIGIN window's (from target_points, tracked
+    per _points_for_level_multi's window_idx) previous-level prediction onto this window's
+    grid via _warp_prior_cropgeom -- the no-aug crop-geom-only path (eval-only call sites
+    never pass an augmentor, so there is no aug grid to compose through). Returns
+    (B,n,1,T,T,T) for PatchSet3D's generalized query_prior (Task 3)."""
+    assert mode == "pred", f"cascade_n_patches>1 only supports cascade_query_prior='pred', got {mode!r}"
+    B = prev_fields[0].shape[0]
+    n = len(target_points[0])
+    out = torch.zeros(B, n, 1, T, T, T, device=prev_fields[0].device)
+    for b in range(B):
+        for j, (w_idx, nc) in enumerate(target_points[b]):
+            if nc is None:
+                continue
+            src = prev_fields[w_idx][b:b + 1].float()
+            src = src.clamp(0, 1) if is_prob else torch.sigmoid(src)
+            if src.shape[-1] != T:
+                src = F.interpolate(src, size=(T, T, T), mode="trilinear", align_corners=False)
+            warped = _warp_prior_cropgeom(src, prev_geoms_list[w_idx][b:b + 1],
+                                          cg_cur[b:b + 1, j], T)
+            out[b, j] = warped[0]
+    return out
+
+
 def _forward_level(model, batch, spacing, query_prior=None, cascade_regs=None):
     """Returns (logit, registers). `registers` is the model's own "registers" output
     (arch.cascade_registers; None for every model that doesn't return that key) -- the
@@ -629,7 +762,8 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                 recrop_workers=1, query_prior=False, query_prior_hard=False,
                 want_figure_arrays=False, realize_crop=False,
                 mask_downsample="occupancy", occ_thr=0.1, ct_spec=None,
-                prior_perturb=None, center_mode="com", center_fg_thr=0.5):
+                prior_perturb=None, center_mode="com", center_fg_thr=0.5,
+                n_patches=1):
     """center_mode (data.cascade_center_mode): "com" (default, byte-identical to pre-
     random_fg behavior) picks each level>0's re-crop centre as the prob-weighted centroid
     of the previous level's prediction (_centroid_from_logit); "random_fg" instead draws a
@@ -645,6 +779,9 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     provider's precomputed centroid (today's default); "random_fg" -> a random voxel from
     that task's own GT mask (providers/totalseg.py _resolve_center)."""
     assert len(spacings) >= 2, "cascade needs >=2 spacings"
+    assert not (training and n_patches > 1), (
+        "data.cascade_n_patches>1 is eval-only for now -- see docs/superpowers/specs/"
+        "2026-10-13-multipatch-cascade-design.md")
     _train_mode, _eval_mode = _resolve_center_mode(center_mode)
     center_mode = _train_mode if training else _eval_mode
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
@@ -673,14 +810,28 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
     # opposite -- query_prior/center are both severed on purpose).
     prev_regs = None
 
+    n_patches_used = []
+    prev_fields = None                       # list[Tensor] -- level i-1's M windows' logits
+    prev_geoms_list = None                   # list[Tensor] -- level i-1's M windows' geoms (per b)
+    prev_geo_list = None                     # list[GeoState|None] -- level i-1's M windows' aug geo
     cur = _to_device(dict(batch), device)
     for i in range(N):
         if i > 0:
-            cur = _recrop_level(provider, batch, centers[i], spacings[i],
-                                step=step, seed=seed, level=i, jitter=jitter,
-                                recrop_workers=recrop_workers, realize_crop=realize_crop,
-                                mask_downsample=mask_downsample, occ_thr=occ_thr,
-                                ct_spec=ct_spec, device=device, center_mode=center_mode)
+            if n_patches <= 1:
+                cur = _recrop_level(provider, batch, centers[i], spacings[i],
+                                    step=step, seed=seed, level=i, jitter=jitter,
+                                    recrop_workers=recrop_workers, realize_crop=realize_crop,
+                                    mask_downsample=mask_downsample, occ_thr=occ_thr,
+                                    ct_spec=ct_spec, device=device, center_mode=center_mode)
+            else:
+                target_points = _points_for_level_multi(
+                    prev_fields, T, is_prob, n_patches, prev_geo_list, prev_geoms_list,
+                    seed=seed, step=step, level=i)
+                cur = _recrop_level_multi(provider, batch, target_points, spacings[i],
+                                          step=step, seed=seed, level=i, jitter=jitter,
+                                          n=n_patches, mask_downsample=mask_downsample,
+                                          occ_thr=occ_thr, ct_spec=ct_spec, device=device,
+                                          center_mode="random_fg")
             cur = _to_device(cur, device)   # no-op for realize output (already on device)
         capture = augmentor is not None and i < N - 1
         if augmentor is not None:
@@ -691,6 +842,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         else:
             geo = None
 
+        this_n = 1 if i == 0 else n_patches
         prior = None
         if i > 0:
             # One mode per level>0: a fixed spec runs its single mode; a mixture draws once
@@ -705,53 +857,74 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             prior_modes_used.append(mode_i)
             if mode_i != "none" and prev_logit is not None:
                 cg_cur = cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"]
-                prior = _build_query_prior(
-                    mode_i, bool(query_prior_hard), prev_logit, prev_label, cur["label"],
-                    prev_geo, geoms[i - 1], cg_cur, T, is_prob,
-                    perturb_cfg=(prior_perturb if training else None),
-                    spacing_mm=spacings[i],
-                    perturb_gen=_gen(geo_seed + PERTURB_OFFSET + i, device))
+                if this_n == 1:
+                    prior = _build_query_prior(
+                        mode_i, bool(query_prior_hard), prev_logit, prev_label, cur["label"],
+                        prev_geo, geoms[i - 1], cg_cur, T, is_prob,
+                        perturb_cfg=(prior_perturb if training else None),
+                        spacing_mm=spacings[i],
+                        perturb_gen=_gen(geo_seed + PERTURB_OFFSET + i, device))
+                else:
+                    prior = _build_query_prior_multi(
+                        mode_i, prev_fields, prev_geoms_list, cg_cur, target_points, T, is_prob)
 
         logit, regs = _forward_level(model, cur, spacings[i], query_prior=prior,
                                      cascade_regs=prev_regs)
-        tgt = target_like(cur["label"].unsqueeze(1).float(), logit)
+        tgt = target_like(
+            cur["label"].reshape(-1, 1, *cur["label"].shape[-3:]).float(),
+            logit.reshape(-1, 1, *logit.shape[-3:]))
         logits.append(logit); targets.append(tgt)
         geoms.append(cur["crop_geom"] if "crop_geom" in cur else batch["crop_geom"])
-        prev_logit, prev_geo, prev_label, prev_regs = logit, geo, cur["label"], regs
+        prev_logit = logit if this_n == 1 else None     # legacy single-window field, n=1 only
+        prev_geo, prev_label, prev_regs = geo, cur["label"], regs
+        prev_fields = ([logit[:, m] for m in range(this_n)] if this_n > 1
+                       else [logit if logit.dim() == 5 else logit])
+        prev_geo_list = [geo] * this_n                   # same captured aug grid for every window
+        prev_geoms_list = ([geoms[i][:, m] for m in range(this_n)] if this_n > 1
+                           else [geoms[i]])
+        n_patches_used.append(this_n)
         if want_hard_preds:
-            hard.append(_hard_pred_native(logit, T, is_prob))
+            hard.append(_hard_pred_native(
+                logit.reshape(-1, 1, *logit.shape[-3:]), T, is_prob
+            ).reshape(B, this_n, T, T, T) if this_n > 1 else _hard_pred_native(logit, T, is_prob))
         if want_figure_arrays:
             # Post-aug target volume + 1st context, on this level's T³ grid (CPU numpy).
             figs.append({
-                "img":     cur["image"][:, 0].detach().float().cpu().numpy(),
+                "img":     cur["image"][:, 0].detach().float().cpu().numpy() if this_n == 1
+                          else cur["image"][:, 0, 0].detach().float().cpu().numpy(),
                 "gt":      cur["label"].detach().float().cpu().numpy(),
                 "ctx_img": cur["context_in"][:, 0, 0].detach().float().cpu().numpy(),
                 "ctx_gt":  cur["context_out"][:, 0].detach().float().cpu().numpy(),
             })
 
         if i < N - 1:
-            cens = (_random_fg_point(logit, T, is_prob, center_fg_thr,
-                                     seed=seed, step=step, level=i)
-                    if center_mode == "random_fg" else
-                    _centroid_from_logit(logit, T, is_prob))
-            row = []
-            for b in range(B):
-                empty_total += 1
-                if geo is not None and geo.grid is not None:
-                    gr = geo.grid[b]          # per-task target grid, geo.grid is (B, T, T, T, 3)
-                    fl = geo.flips[b]         # geo.flips is (B, 3)
-                else:
-                    gr, fl = None, torch.zeros(3, dtype=torch.bool)
-                nc = invert_geo_center(cens[b], gr, fl, geoms[i][b], T)
-                if nc is None:
-                    empty_hits += 1
-                row.append(nc)
-            centers.append(row)
+            if n_patches <= 1:
+                cens = (_random_fg_point(logit, T, is_prob, center_fg_thr,
+                                         seed=seed, step=step, level=i)
+                        if center_mode == "random_fg" else
+                        _centroid_from_logit(logit, T, is_prob))
+                row = []
+                for b in range(B):
+                    empty_total += 1
+                    if geo is not None and geo.grid is not None:
+                        gr = geo.grid[b]          # per-task target grid, geo.grid is (B, T, T, T, 3)
+                        fl = geo.flips[b]         # geo.flips is (B, 3)
+                    else:
+                        gr, fl = None, torch.zeros(3, dtype=torch.bool)
+                    nc = invert_geo_center(cens[b], gr, fl, geoms[i][b], T)
+                    if nc is None:
+                        empty_hits += 1
+                    row.append(nc)
+                centers.append(row)
+            # n_patches > 1: next level's target_points are computed fresh at the top of
+            # the next iteration (via _points_for_level_multi, reading prev_fields/
+            # prev_geo_list/prev_geoms_list set above), not accumulated into `centers`.
 
     return CascadeResult(logits=logits, targets=targets, geoms=geoms, centers=centers,
                          hard_preds=hard,
                          empty_frac=(empty_hits / empty_total if empty_total else 0.0),
-                         figure_levels=figs, prior_modes_used=prior_modes_used)
+                         figure_levels=figs, prior_modes_used=prior_modes_used,
+                         n_patches=n_patches_used)
 
 
 def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
