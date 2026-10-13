@@ -240,3 +240,28 @@ def test_rejects_center_mode_mapping_bad_eval_mode():
     with pytest.raises(ValueError, match="cascade_center_mode"):
         _assert_cascade_supported(_cfg(data={"cascade_center_mode":
                                              {"mode": "com", "eval_mode": "bogus"}}))
+
+
+# --- data.cascade_n_patches ---------------------------------------------------
+
+def test_allows_n_patches_default():
+    _assert_cascade_supported(_cfg())                          # no raise, default is 1
+
+
+def test_allows_n_patches_explicit():
+    _assert_cascade_supported(_cfg(data={"cascade_n_patches": 4}))
+
+
+def test_rejects_n_patches_zero():
+    with pytest.raises(ValueError, match="cascade_n_patches"):
+        _assert_cascade_supported(_cfg(data={"cascade_n_patches": 0}))
+
+
+def test_rejects_n_patches_negative():
+    with pytest.raises(ValueError, match="cascade_n_patches"):
+        _assert_cascade_supported(_cfg(data={"cascade_n_patches": -1}))
+
+
+def test_rejects_n_patches_non_int():
+    with pytest.raises(ValueError, match="cascade_n_patches"):
+        _assert_cascade_supported(_cfg(data={"cascade_n_patches": 1.5}))
