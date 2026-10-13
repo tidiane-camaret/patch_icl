@@ -26,11 +26,12 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling eval/evaluate/common
 
-from src.totalseg_dataset import normalize_ct
+from src.totalseg_dataset import normalize_ct, resolve_ct_norm
 from src.totalseg_dataloader_incontext import (
     organ_crop_arrays, place_image, place_label, resample_binary,
 )
 from src.incontext_dataset_v2 import LoadRequest, LoadResult
+from src.providers.totalseg import NativeCrop, build_native_crop  # noqa: F401 (NativeCrop: return-type annotation)
 from eval import _build_model, _warn_uninherited_data
 from evaluate import _write_native, dice_binary
 from cascade import run_cascade, _recrop_level
@@ -74,24 +75,35 @@ def mask_centroid(mask):
     return tuple(int(a.mean()) for a in idx)
 
 
-def prep_target(ct, sp, center, *, T, crop_mm):
-    """Native CT (normalised) + centre -> (img_t (1,T,T,T), crop_geom (4,3)).
+def prep_target(ct, sp, center, *, T, crop_mm, normalize_fn=None):
+    """Native CT + centre -> (img_t (1,T,T,T), crop_geom (4,3)).
 
     No target label, so ct doubles as the label array for organ_crop_arrays (its
-    crop_lbl output is discarded). rng is unused at jitter=0 (centred crop)."""
+    crop_lbl output is discarded). rng is unused at jitter=0 (centred crop).
+    `normalize_fn`, when given, maps the raw cropped slice to model input space
+    BEFORE placement (crop_and_place's own pattern) -- `ct` is raw HU, not
+    pre-normalized, so the GPU realize path (which normalizes its own un-normalized
+    NativeCrop.image) sees the exact same un-normalized source."""
     crop_ct, _, out_sizes, pad_lo, geom = organ_crop_arrays(
         ct, ct, center, sp, image_size=(T, T, T), crop_mm=crop_mm,
         jitter=0, rng=random.Random(0))
+    crop_ct = np.ascontiguousarray(crop_ct)
+    if normalize_fn is not None:
+        crop_ct = normalize_fn(crop_ct)
     return place_image(crop_ct, out_sizes, pad_lo, T), geom
 
 
-def prep_context(ct, mask, sp, center, *, T, crop_mm, mask_downsample, occ_thr):
+def prep_context(ct, mask, sp, center, *, T, crop_mm, mask_downsample, occ_thr,
+                 normalize_fn=None):
     """Native (CT, binary mask) + centre -> (img_t (1,T,T,T), mask_t (T,T,T) long,
-    crop_geom (4,3))."""
+    crop_geom (4,3)). `ct` is raw HU; see prep_target's normalize_fn note."""
     assert ct.shape == mask.shape, f"context ct {ct.shape} != mask {mask.shape}"
     crop_ct, crop_mask, out_sizes, pad_lo, geom = organ_crop_arrays(
         ct, mask, center, sp, image_size=(T, T, T), crop_mm=crop_mm,
         jitter=0, rng=random.Random(0))
+    crop_ct = np.ascontiguousarray(crop_ct)
+    if normalize_fn is not None:
+        crop_ct = normalize_fn(crop_ct)
     img_t = place_image(crop_ct, out_sizes, pad_lo, T)
     mask_small = resample_binary(np.asarray(crop_mask) > 0, tuple(out_sizes),
                                  mode=mask_downsample, occ_thr=occ_thr)
@@ -109,37 +121,134 @@ class NiftiProvider:
     falls back to the volume centre; run_cascade passes an explicit native-voxel centre for
     every finer level. Contexts always self-centre on their own mask centroid."""
 
-    def __init__(self, tgt_ct, tgt_sp, contexts, *, T, mask_downsample, occ_thr):
-        self.tgt_ct = tgt_ct
+    def __init__(self, tgt_ct, tgt_sp, contexts, *, T, mask_downsample, occ_thr, ct_spec=None):
+        self.tgt_ct = tgt_ct                           # RAW HU -- see load()/load_native_crop
         self.tgt_sp = list(tgt_sp)
-        self.contexts = contexts                      # [(ct_norm, id_mask, spacing), ...]
+        self.contexts = contexts                      # [(ct_raw, id_mask, spacing), ...] -- RAW HU
         self.T = int(T)
         self.mask_downsample = mask_downsample
         self.occ_thr = float(occ_thr)
+        self.ct_spec = resolve_ct_norm(ct_spec)
         self.tgt_center0 = tuple(s // 2 for s in tgt_ct.shape)
+        # Dummy all-zero "label" for the GPU path's organ_crop_arrays call on the target (it
+        # needs SOME label array to crop alongside the image) -- built once, reused for every
+        # target load_native_crop call. Unlike the CPU prep_target's trick of reusing `ct`
+        # itself as a throwaway label array (safe there because its crop_lbl output is
+        # discarded outright), build_native_crop DOES check `crop_lbl == class_idx` to build
+        # has_fg/label_frac, so it needs a label array that is genuinely always zero, not one
+        # that merely goes unused.
+        self._tgt_zero_label = np.zeros(tgt_ct.shape, dtype=np.uint8)
+        # Multi-label mode calls load() for EVERY label in a chunk, but the target's level-0
+        # crop (center=None -> self.tgt_center0, independent of `cls`) is byte-identical
+        # across all of them -- without this, a 20-label run was re-running the native CPU
+        # resample of the full target volume 20 times for what is provably the same output
+        # (prep_target's result depends only on (tgt_ct, tgt_sp, center, T, sp), none of
+        # which vary by cls at level 0; inference also never jitters -- jitter=0 throughout
+        # predict_nifti -- so there's no RNG dependence to worry about either). Keyed on the
+        # RESOLVED center (post center_mode resolution upstream), not cls, so it also catches
+        # the (rarer) case of two different labels' predicted centroids at level>0 landing on
+        # the exact same voxel. Cloned on return so no caller can mutate the cached tensors.
+        self._load_cache: dict = {}
+        # (subject, cls) -> binmask / centroid, spacing- and level-independent (see the
+        # context branch of load() below for why these are cached separately from
+        # _load_cache, which is keyed on the resolved center and so can't dedupe the work
+        # that PRODUCES that center in the first place).
+        self._binmask_cache: dict = {}
+        self._centroid_cache: dict = {}
 
     def subjects_for(self, cls):                      # unused on the run_cascade path
         return ["tgt"]
 
+    def _resolve_ctx_binmask_center(self, subject, cls, c_idmask, req):
+        """Shared by load() and load_native_crop(): context always self-centres on its OWN
+        mask (req.center is always None for context tasks, every level -- see
+        _recrop_level), so binmask/centroid are recomputed from scratch at EVERY cascade
+        level even though they don't depend on level/spacing at all -- cache both, keyed on
+        (subject, cls) alone. The centroid itself is only cached when center_mode=="com"
+        (the deterministic path); "random_fg" draws a fresh random in-mask voxel each call
+        on purpose, so it's deliberately excluded (binmask is still safe to reuse either
+        way -- it's just the fixed (c_idmask==cls) comparison)."""
+        bkey = (subject, cls)
+        binmask = self._binmask_cache.get(bkey)
+        if binmask is None:
+            binmask = (c_idmask > 0) if cls == _FG else (c_idmask == int(cls))
+            self._binmask_cache[bkey] = binmask
+        if req.center is None and req.center_mode != "random_fg":
+            center = self._centroid_cache.get(bkey)
+            if center is None:
+                center = _resolve_context_center(req, binmask)
+                self._centroid_cache[bkey] = center
+        else:
+            center = _resolve_context_center(req, binmask)
+        return binmask, center
+
     def load(self, subject, cls, req: LoadRequest) -> LoadResult:
         sp = float(req.crop_spacing_mm)
         spacing = torch.full((3,), sp, dtype=torch.float32)
+        normalize_fn = lambda a: normalize_ct(a, self.ct_spec)  # noqa: E731
         if subject == "tgt":
             center = req.center if req.center is not None else self.tgt_center0
-            img_t, geom = prep_target(self.tgt_ct, self.tgt_sp, center, T=self.T, crop_mm=sp)
+            key = ("tgt", None, tuple(float(c) for c in center), sp)
+            cached = self._load_cache.get(key)
+            if cached is not None:
+                img_t, geom = cached
+            else:
+                img_t, geom = prep_target(self.tgt_ct, self.tgt_sp, center, T=self.T,
+                                          crop_mm=sp, normalize_fn=normalize_fn)
+                self._load_cache[key] = (img_t, geom)
+            img_t = img_t.clone()
             label_t = torch.zeros((self.T, self.T, self.T), dtype=torch.long)
         else:
             k = int(subject[3:])                      # 'ctx0' -> 0
             c_ct, c_idmask, c_sp = self.contexts[k]
-            binmask = (c_idmask > 0) if cls == _FG else (c_idmask == int(cls))
-            center = _resolve_context_center(req, binmask)
-            img_t, label_t, geom = prep_context(
-                c_ct, binmask, c_sp, center, T=self.T, crop_mm=sp,
-                mask_downsample=self.mask_downsample, occ_thr=self.occ_thr)
+            binmask, center = self._resolve_ctx_binmask_center(subject, cls, c_idmask, req)
+            key = (subject, cls, tuple(float(c) for c in center), sp)
+            cached = self._load_cache.get(key)
+            if cached is not None:
+                img_t, label_t, geom = cached
+            else:
+                img_t, label_t, geom = prep_context(
+                    c_ct, binmask, c_sp, center, T=self.T, crop_mm=sp,
+                    mask_downsample=self.mask_downsample, occ_thr=self.occ_thr,
+                    normalize_fn=normalize_fn)
+                self._load_cache[key] = (img_t, label_t, geom)
+            img_t, label_t = img_t.clone(), label_t.clone()
+        # Copy geom too, cache hit or not -- torch.as_tensor on a numpy array can be a
+        # zero-copy view, so a cached numpy geom reused across calls could otherwise let one
+        # caller's in-place edit corrupt every other cache hit's "geom" silently.
+        geom = np.array(geom, copy=True) if not torch.is_tensor(geom) else geom.clone()
         if not torch.is_tensor(geom):
-            geom = torch.as_tensor(np.asarray(geom), dtype=torch.long)
+            geom = torch.as_tensor(geom, dtype=torch.long)
         return LoadResult(image=img_t, label=label_t, spacing=spacing,
                           crop_geom=geom.long())
+
+    def load_native_crop(self, subject, cls, req: LoadRequest) -> NativeCrop:
+        """GPU-realize counterpart to load() -- same crop geometry (organ_crop_arrays with
+        the SAME args), but returns an un-normalized, un-resampled NativeCrop payload for
+        cascade._recrop_level's realize_crop=True path (src.gpu_realize_crop.
+        realize_native_crops) to finish on `device` instead of here on CPU. Reuses the exact
+        same center/binmask caches as load() -- both paths resolve centers identically, so
+        results from the two paths should match to the <2e-2 tolerance documented in
+        test_gpu_realize_crop.py (decimation + area-pool ordering differs slightly from
+        direct trilinear, not a bug)."""
+        sp = float(req.crop_spacing_mm)
+        jitter = req.jitter or 0
+        if subject == "tgt":
+            center = req.center if req.center is not None else self.tgt_center0
+            crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+                self.tgt_ct, self._tgt_zero_label, center, self.tgt_sp,
+                image_size=(self.T, self.T, self.T), crop_mm=sp, jitter=jitter, rng=req.rng)
+            class_idx = 1   # irrelevant: crop_lbl is genuinely all-zero, so has_fg is always False
+        else:
+            k = int(subject[3:])                      # 'ctx0' -> 0
+            c_ct, c_idmask, c_sp = self.contexts[k]
+            binmask, center = self._resolve_ctx_binmask_center(subject, cls, c_idmask, req)
+            crop_ct, crop_lbl, out_sizes, pad_lo, geom = organ_crop_arrays(
+                c_ct, binmask.astype(np.uint8), center, c_sp,
+                image_size=(self.T, self.T, self.T), crop_mm=sp, jitter=jitter, rng=req.rng)
+            class_idx = 1   # binmask is already {0,1} -- matches load()'s own pre-binarized mask
+        return build_native_crop(crop_ct, crop_lbl, class_idx, out_sizes, pad_lo, geom,
+                                 crop_spacing_mm=sp, norm=self.ct_spec)
 
 
 def _resample_gt(gt, shape):
@@ -256,7 +365,7 @@ def _output_label_table(gt_path, context_pairs, keep_ids):
 
 
 def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
-                  gt_path=None, out_path=None, explicit_data_keys=None):
+                  gt_path=None, out_path=None, explicit_data_keys=None, model=None):
     """Run the v2 coarse->fine in-context cascade on nifti files (GT-free target).
 
     Wraps cascade.run_cascade over an in-memory NiftiProvider: level 0 crops the target on
@@ -306,13 +415,32 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
                          eval._explicitly_overridden. Needed because this function is reached
                          via a programmatic hydra.compose(), where the Hydra-CLI-override
                          detection eval.py's own callers rely on isn't available.
+    model          : pre-built model (from eval._build_model(cfg)), to reuse across many
+                     calls against the same checkpoint in one process (infer_cli.py's
+                     --manifest mode) instead of re-loading/rebuilding it per target. None
+                     (default) builds it fresh from cfg.eval.checkpoint, same as before
+                     this param existed.
     """
     if not context_pairs:
         raise ValueError("predict_nifti needs at least one context pair (in-context model)")
     t_start = time.perf_counter()
 
+    # eval.py's own @hydra.main entrypoint sets these before building/running a model, but
+    # this function is reached via infer_cli.py (and other direct callers) which bypass that
+    # entrypoint entirely -- without this, cuDNN re-autotunes its conv algorithm choice on
+    # every level instead of reusing one across same-shape (T,T,T) calls, and fp32 matmuls
+    # skip TF32 tensor cores. Idempotent; safe to set on every call.
+    if DEVICE.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     _warn_uninherited_data(cfg, explicit_keys=explicit_data_keys)
-    model = _build_model(cfg)
+    # model=: callers running many targets against the SAME checkpoint in one process
+    # (infer_cli.py's --manifest mode) build it once and pass it in here, skipping the
+    # torch.load + arch-rebuild + state_dict-copy that _build_model does on every call. Single-target
+    # callers (infer_cli.py, tests) are unaffected -- default None builds as before.
+    if model is None:
+        model = _build_model(cfg)
     if hasattr(model, "eval"):
         model.eval()
     T = int(cfg.data.image_size[0])
@@ -329,21 +457,36 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
     recrop_workers = int(cfg.data.get("cascade_recrop_workers", 1))
     center_mode = cfg.data.get("cascade_center_mode", "com")
     center_fg_thr = float(cfg.data.get("cascade_center_fg_thr", 0.5))
+    # gpu_realize_crop: opt-in (default off) GPU-based crop/resample, same mechanism
+    # training already uses (cascade._recrop_level's realize_crop branch -> NativeCrop ->
+    # src.gpu_realize_crop.realize_native_crops). Off by default until proven out on real
+    # inference workloads -- the CPU path (provider.load/prep_target/prep_context) remains
+    # the default, unchanged behavior. ct_spec is resolved either way: the CPU path now
+    # also normalizes at crop time (not whole-volume load time, see below), so both paths
+    # need the same explicit spec rather than prep_target/prep_context's old implicit
+    # "already normalized" input contract.
+    realize_crop = bool(cfg.data.get("gpu_realize_crop", False))
+    ct_spec = resolve_ct_norm(cfg.data.get("ct_norm"))
     from train import model_output_is_prob
     is_prob = bool(model_output_is_prob(cfg))
     N = len(spacings)
 
     # --- load target + contexts once (arrays reused across labels) -------------
+    # RAW HU, not pre-normalized: NiftiProvider normalizes per-crop now (at prep_target/
+    # prep_context time on the CPU path, inside NativeCrop's realize step on the GPU path)
+    # instead of once over the whole volume -- normalize_ct is pointwise with fixed
+    # constants (see its own docstring), so this is mathematically identical, but a
+    # pre-normalized volume would otherwise get normalized a SECOND time by the GPU path
+    # (which expects its NativeCrop.image input to still be raw HU).
     tgt_ct, affine = load_nifti(target_path)
-    tgt_ct = normalize_ct(tgt_ct)
     tgt_sp = voxel_spacing(affine)
     shape = tgt_ct.shape
 
-    contexts = []  # (ct_norm, id_mask, spacing) shared across labels
+    contexts = []  # (ct_raw, id_mask, spacing) shared across labels
     for img_p, msk_p in context_pairs:
         c_ct, c_aff = load_nifti(img_p)
         c_msk, _ = load_nifti(msk_p)
-        contexts.append((normalize_ct(c_ct), np.asarray(c_msk), voxel_spacing(c_aff)))
+        contexts.append((c_ct, np.asarray(c_msk), voxel_spacing(c_aff)))
     K = len(contexts)
 
     multilabel = label_ids is not None
@@ -360,7 +503,7 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         raise ValueError("no labels to segment (empty label_ids / no non-zero context ids)")
 
     provider = NiftiProvider(tgt_ct, tgt_sp, contexts, T=T,
-                             mask_downsample=crop_ds, occ_thr=crop_thr)
+                             mask_downsample=crop_ds, occ_thr=crop_thr, ct_spec=ct_spec)
     tasks = [{"label": lab, "passes": []} for lab in labels]
 
     # --- coarse->fine cascade (cascade.run_cascade), batched over labels -------
@@ -371,11 +514,23 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
             "subjects": ["tgt"] * B,
             "context_subjects": [[f"ctx{k}" for k in range(K)] for _ in range(B)],
             "label_names": [(_FG if t["label"] is None else str(t["label"])) for t in chunk],
+            # realize_crop=True's branch in _recrop_level reads T off `batch["image"].shape
+            # [-1]` -- fine for its OTHER caller (run_cascade's level>0 recrops, where
+            # `batch` is a previous level's real output), but level 0 here has no prior
+            # batch to reuse, so this is a placeholder standing in for just that one shape
+            # lookup (never read as actual data; the CPU branch doesn't touch "image" here
+            # at all). Inert when realize_crop=False.
+            "image": torch.empty(1, 1, 1, 1, T),
         }
         # Level-0 batch: target on the volume centre (center=None), contexts self-centred.
+        # mask_downsample/occ_thr/ct_spec/device only matter when realize_crop=True (the
+        # CPU path reads mask_downsample/occ_thr off the provider instance instead); passed
+        # unconditionally since they're inert on the CPU branch.
         batch0 = _recrop_level(provider, meta, [None] * B, spacings[0],
                                step=0, seed=0, level=0, jitter=0,
-                               recrop_workers=recrop_workers)
+                               recrop_workers=recrop_workers, realize_crop=realize_crop,
+                               mask_downsample=crop_ds, occ_thr=crop_thr,
+                               ct_spec=ct_spec, device=DEVICE)
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         t0_chunk = time.perf_counter()
@@ -383,7 +538,8 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
             res = run_cascade(model, provider, batch0, augmentor=None, spacings=spacings,
                               device=DEVICE, training=False, step=0, seed=0, jitter=0,
                               is_prob=is_prob, want_hard_preds=True,
-                              recrop_workers=recrop_workers,
+                              recrop_workers=recrop_workers, realize_crop=realize_crop,
+                              mask_downsample=crop_ds, occ_thr=crop_thr, ct_spec=ct_spec,
                               query_prior=qp, query_prior_hard=qp_hard,
                               center_mode=center_mode, center_fg_thr=center_fg_thr)
         if DEVICE.type == "cuda":
@@ -408,10 +564,16 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         dice = coarse_only = None
         if gt_ml is not None:
             gt = _resample_gt(gt_ml > 0, shape)
-            gt_t = torch.from_numpy(gt)
+            # dice_binary is a CPU boolean reduction by default; on this native-grid size
+            # (~10M voxels) moving to DEVICE first (even counting the transfer) measured
+            # ~18x faster than computing in place on CPU. Scoped to this call site rather
+            # than dice_binary itself -- that function is shared with training/eval code
+            # where inputs are typically already on GPU, or (eval_pshape_families.py)
+            # deliberately kept on CPU by the caller.
+            gt_t = torch.from_numpy(gt).to(DEVICE)
             coarse = _native_from_passes(shape, task["passes"][:1])
-            dice = float(dice_binary(torch.from_numpy(native), gt_t))
-            coarse_only = float(dice_binary(torch.from_numpy(coarse), gt_t))
+            dice = float(dice_binary(torch.from_numpy(native).to(DEVICE), gt_t))
+            coarse_only = float(dice_binary(torch.from_numpy(coarse).to(DEVICE), gt_t))
         pred_native, out_affine = _to_original_orientation(native, target_path)
         pred_path = None
         if out_path is not None:
@@ -434,10 +596,11 @@ def predict_nifti(cfg, target_path, context_pairs, label_ids=None, batch_size=8,
         sizes[lab] = int(native.sum())
         if gt_ml is not None:
             gt = _resample_gt(gt_ml == lab, shape)
-            gt_t = torch.from_numpy(gt)
+            # See the single-organ branch above for why this moves to DEVICE first.
+            gt_t = torch.from_numpy(gt).to(DEVICE)
             coarse = _native_from_passes(shape, task["passes"][:1])
-            dice[lab] = float(dice_binary(torch.from_numpy(native), gt_t))
-            coarse_only[lab] = float(dice_binary(torch.from_numpy(coarse), gt_t))
+            dice[lab] = float(dice_binary(torch.from_numpy(native).to(DEVICE), gt_t))
+            coarse_only[lab] = float(dice_binary(torch.from_numpy(coarse).to(DEVICE), gt_t))
     macro = float(np.mean(list(dice.values()))) if dice else None
 
     # Write larger organs first so smaller ones win where predictions overlap.
