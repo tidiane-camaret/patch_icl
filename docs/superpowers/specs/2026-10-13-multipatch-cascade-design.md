@@ -131,43 +131,53 @@ Level 0 unchanged. For `i>=1`, add a `data.cascade_n_patches` config knob
 (default `1`, preserving today's exact behavior) controlling `n`, the
 number of windows sampled per role at that level.
 
-- New `_prob_weighted_points(field_b1ghw, T, is_prob, n, *, seed, step,
-  level, role)`: sibling of `_random_fg_point`/`_centroid_from_logit`.
-  Flattens the field to a probability simplex (softmax-free — the field is
-  already a probability/occupancy map, just renormalized to sum to 1) and
-  draws `n` points via `torch.multinomial(flat, n, replacement=True)`,
-  seeded the same way as the existing per-`(seed,step,level,b)` convention.
-  For the target, `field` is level `i-1`'s sigmoid prediction (continuous).
-  For support, `field` is the subject's GT occupancy (binary — `n` draws
-  reduce to `n` uniform samples over foreground, the direct generalization
-  of today's single-point `random_fg`).
+- New `_prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step,
+  level)`: sibling of `_random_fg_point`/`_centroid_from_logit`, but takes
+  `fields`, a **list of M** `(B,1,T,T,T)` logit/prob tensors (one per
+  level-`i` window) instead of one. Per `b`, flattens and concatenates all
+  `M` windows' probabilities into one length-`M*T^3` vector, renormalizes
+  to a simplex (empty → `None`, same fallback convention as
+  `_random_fg_point`), and draws `n` indices via
+  `torch.multinomial(flat, n, replacement=True)`. Each drawn flat index
+  decodes to `(window_idx, local_voxel)` via `divmod(idx, T**3)` then
+  `np.unravel_index` — so the return is, per `b`, a list of `n`
+  `(window_idx, (d,h,w))` pairs. Overlapping windows naturally accumulate
+  *more* sampling mass where both predict foreground — no separate
+  "stitch a native array" step needed, and nothing here differs between
+  train and eval (pure seeded tensor ops, like the function it generalizes).
+- `invert_geo_center` is called once per sampled point, using **that
+  point's own originating window's** `geo` (captured aug grid) and
+  `crop_geom` — `run_cascade`'s level loop already tracks one `geo`/`geom`
+  per window per `b`; for `M` windows it tracks `M` of each instead of one,
+  and `_prob_weighted_points_multi`'s `window_idx` picks which one each
+  sampled point inverts through. This is the exact mechanism already used
+  for the `M=1` case (there, `window_idx` is always `0`), so `n=1, M=1`
+  reproduces today's single-point inversion byte-for-byte.
+- Support-side sampling needs **no new sampling code at all**: GT is
+  already native and binary, so "`n` points from a continuous density"
+  *is* `n` independently-seeded calls to the existing
+  `random_fg`-mode provider path (`src/providers/totalseg.py`'s
+  `_resolve_center`, already wired for `NativeGridProvider`/FLARE22 too) —
+  same `center=None, center_mode="random_fg"` `LoadRequest`, `n` different
+  RNG seed suffixes (`f"{seed}_{step}_{level}_{b}_{k}_{j}"`, `j in
+  range(n)`) instead of one. `context_id_embed`'s per-subject tag (`ctx_id`)
+  is assigned **per original context subject `k`**, not per sampled window,
+  so all `n` windows of context subject `k` share one `ctx_id` row — matches
+  the embedding's existing semantics (distinguish *subjects*, not crops)
+  and needs no model change.
 - `_recrop_level`: currently builds one `(b, -1, subj, center, seed, mod)`
   task for the target and one `(b, k, ctx_subj, None, seed, mod)` task per
   context index `k`. Generalize to `n` target tasks per `b` (centers from
-  `_prob_weighted_points` on the target's prediction) and `n` tasks per
-  `(b, k)` context slot (centers from `_prob_weighted_points` on that
-  context's GT) — i.e. the flat task list grows from `B*(K+1)` to
-  `B*(K+1)*n`. `context_id_embed`'s per-subject tag (`ctx_id`) is assigned
-  **per original context subject `k`**, not per sampled window, so all `n`
-  windows of context subject `k` share one `ctx_id` row — this matches the
-  embedding's existing semantics (distinguish *subjects*, not crops) and
-  needs no model change (`cascade.py` just repeats the same `ctx_id` index
-  `n` times when building the batch that feeds `context_in`).
+  `_prob_weighted_points_multi` on the `M` level-`i-1` target windows'
+  predictions) and `n` tasks per `(b, k)` context slot (centers from `n`
+  independently-seeded `random_fg` provider calls) — i.e. the flat task
+  list grows from `B*(K+1)` to `B*(K+1)*n`.
 - `run_cascade`: `_forward_level` now passes `image` as `(B, n, 1, T, T, T)`
   (the `n` sampled target windows) instead of `(B,1,T,T,T)`, and
   `context_in`/`context_out` grow from `K` to `K*n` rows (same subject,
-  repeated `ctx_id`, different window).  `n=1` reproduces today's tensor
+  repeated `ctx_id`, different window). `n=1` reproduces today's tensor
   shapes exactly (`image.squeeze(1)` degenerates to the legacy 4-D shape),
   so this is a strict generalization, not a parallel code path.
-- Stitching for the **next** level's probability field: within one level,
-  the `n` target windows can physically overlap (unlike the coarse→fine
-  windows across levels, which have a well-defined "finer overwrites
-  coarser" ordering). Accumulate `sum` and `count` per native voxel across
-  the `n` windows' predictions and divide (`sum / count.clamp_min(1)`) —
-  average, not overwrite. This accumulated field (warped back through
-  `invert_geo_center`'s inverse — reuse the existing crop-geom/M2-warp
-  machinery already built for `query_prior` placement) is what level `i+1`'s
-  `_prob_weighted_points` samples from.
 - `CascadeResult` gains `n_patches: list[int]` (per level, `1` for level 0)
   so `evaluate_cascade`/figure code can tell which levels ran multi-patch.
 
@@ -225,6 +235,9 @@ investment, not to hit a target number.
   distinguishing e.g. core-vs-boundary — fine for a first probe; a
   training-recipe follow-up might want a smoother support density (e.g.
   distance-transform-weighted) if zero-shot validates the direction.
-- Average-blending overlapping windows within a level is a design choice,
-  not a proven-better one vs. e.g. max — flagged here for the validation
-  pass to actually look at, not re-litigated before trying it.
+- Letting overlapping windows' probability mass accumulate in the
+  concatenated-multinomial sampler (§2) means a region two windows agree
+  on is sampled roughly twice as often as one only one window covers —
+  a design choice, not a proven-better one vs. e.g. deduplicating by native
+  coordinate first. Flagged here for the validation pass to actually look
+  at, not re-litigated before trying it.
