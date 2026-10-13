@@ -780,20 +780,23 @@ class PatchSet3D(nn.Module):
                    .reshape(B, r * d, r * d, r * d)
                    .unsqueeze(1))
 
-    def _rope(self, K, spacing, device, n_extra=0):
+    def _rope(self, K, spacing, device, n_extra=0, M=1):
         """3D axial RoPE cos/sin for the row sequence [thinking, (cascade memory,) K·N
-        support, N query].
+        support, M·N query].
 
         Thinking rows get position (0,0,0) (no rotation); support/query use the (i,j,k)
         lattice. Positions are scaled by spacing/rope_train_mm when a spacing is given, so
         adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme.
         n_extra: cascade-memory and/or pool-token rows prepended ahead of thinking
         (arch.cascade_registers / arch.pool_token) — non-spatial like thinking rows, so they
-        get the same (0,0,0) no-rotation treatment."""
+        get the same (0,0,0) no-rotation treatment.
+        M: query VOLUME count (1 legacy, M when multiple query windows are forwarded
+        jointly) — each window re-uses the same per-volume-local ijk lattice, mirroring
+        _attn's own qry_ijk construction."""
         n_think = self.thinking.n
         pos = torch.cat([torch.zeros(n_think + n_extra, 3, device=device),
                          self.ijk_base.repeat(K, 1).float(),
-                         self.ijk_base.float()], dim=0)               # (R,3)
+                         self.ijk_base.repeat(M, 1).float()], dim=0)  # (R,3)
         if spacing is not None:
             pos = pos * (float(spacing) / self.rope_train_mm)
         return build_3d_rope_freqs_from_positions(self.head_dim, pos, self.rope_theta)
@@ -1054,7 +1057,7 @@ class PatchSet3D(nn.Module):
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
             attn_mask[:, :sep_t] = True
             attn_mask[sep_t:, sep_t:] = True
-        rope = (self._rope(K, spacing, x.device, n_extra=n_extra)
+        rope = (self._rope(K, spacing, x.device, n_extra=n_extra, M=M)
                if self.transformer_rope else None)
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
                              rope=rope, block_mask=block_mask)
@@ -1240,6 +1243,9 @@ class PatchSet3D(nn.Module):
         inside _attn from tensors already built there (see _pool_tokens_coarse); this method
         doesn't even need arch.fine_decode=True for that mode."""
         B, K = context_in.shape[0], context_in.shape[1]
+        assert image.dim() in (5, 6), (
+            f"PatchSet3D: image must be (B,1,D,H,W) [5-D] or (B,M,1,D,H,W) [6-D], "
+            f"got {image.dim()} dims")
         legacy_image = image.dim() == 5           # (B,1,D,H,W) -- single query volume
         if legacy_image:
             image = image.unsqueeze(1)             # -> (B,1,1,D,H,W), M=1

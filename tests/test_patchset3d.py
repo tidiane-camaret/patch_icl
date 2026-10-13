@@ -1196,3 +1196,25 @@ def test_multi_query_prior_backward_reaches_all_params():
     out.mean().backward()
     grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
     assert all(grads) and len(grads) > 0
+
+
+def test_multi_query_with_rope_m1_and_m2():
+    """transformer_rope=True + M>1 crashed before this fix (RoPE table was short by
+    (M-1)*N rows) -- the real checkpoint under test uses transformer_rope=True, so this
+    is not a hypothetical config."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True,
+                   transformer_rope=True)
+    m.eval()
+    B, K, S = 2, 2, 16
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+
+    img_m1 = torch.randn(B, 1, S, S, S)
+    out_m1 = m(img_m1, context_in=context_in, context_out=context_out)["final_logit"]
+    assert out_m1.shape == (B, 1, 8, 8, 8)
+
+    img_m2 = torch.randn(B, 2, 1, S, S, S)
+    out_m2 = m(img_m2, context_in=context_in, context_out=context_out)["final_logit"]
+    assert out_m2.shape == (B, 2, 1, 8, 8, 8)
