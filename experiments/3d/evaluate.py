@@ -1089,14 +1089,29 @@ def _stitched_native_metrics_and_levels(pg_levels, root, tol_mm: float | None = 
             if not isinstance(entries, list):
                 entries = [entries]
             solo = np.zeros(gt.shape, dtype=bool)
-            touched = np.zeros(gt.shape, dtype=bool)
-            for entry in entries:
-                p, geom = _unpack_pred(entry)
+            if len(entries) == 1:
+                # Fast path (every n_patches<=1 level, i.e. every pre-existing caller): a
+                # single window needs no union/touched bookkeeping -- plain slice-assign
+                # pastes, byte-identical to the union path here but ~160x cheaper at native
+                # volume size (0.14ms vs 22.8ms per (case,level) at 300x512x512, measured),
+                # because composite[touched]=solo[touched] fancy-indexes the WHOLE volume.
+                p, geom = _unpack_pred(entries[0])
                 placed = _place_patch(p, geom)
                 if placed is not None:
-                    _paste_union(solo, touched, *placed)
-            if want_full:
-                composite[touched] = solo[touched]
+                    if want_full:
+                        _paste(composite, *placed)
+                    _paste(solo, *placed)
+            else:
+                # n_patches>1: the level's windows are peers, so union them into `solo` and
+                # overwrite the cross-level composite only where this level reached.
+                touched = np.zeros(gt.shape, dtype=bool)
+                for entry in entries:
+                    p, geom = _unpack_pred(entry)
+                    placed = _place_patch(p, geom)
+                    if placed is not None:
+                        _paste_union(solo, touched, *placed)
+                if want_full:
+                    composite[touched] = solo[touched]
             inter = 2.0 * np.logical_and(solo, gt).sum()
             denom = int(solo.sum()) + int(gt.sum())
             per_level[li][key] = inter / denom if denom > 0 else 1.0
