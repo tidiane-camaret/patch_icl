@@ -168,11 +168,12 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
     sampling mass where both predict foreground -- no separate native-space stitch step.
 
     Returns, per b, a list of n (window_idx, (d,h,w)) pairs, or n `None` entries when
-    every field's mass is ~0 for that b (same empty-mask fallback convention as
-    _random_fg_point). Seeded off f"{seed}_{step}_{level}_{b}_mfg" via random.Random,
-    the same string-seeding convention _random_fg_point uses -- reproducible across
-    runs/python-version-stable (unlike builtin hash(), which is NOT process-stable
-    under PYTHONHASHSEED randomization)."""
+    every field's total predicted probability mass is negligible on average (mean < 1e-4)
+    -- a different mechanism than _random_fg_point's per-voxel threshold count, but the
+    same 'return None' fallback contract downstream code relies on. Seeded off
+    f"{seed}_{step}_{level}_{b}_mfg" via random.Random, the same string-seeding
+    convention _random_fg_point uses -- reproducible across runs/python-version-stable
+    (unlike builtin hash(), which is NOT process-stable under PYTHONHASHSEED randomization)."""
     probs = []
     for f in fields:
         p = f.float().clamp(0, 1) if is_prob else torch.sigmoid(f.float())
@@ -184,7 +185,7 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
     out = []
     for b in range(B):
         weights = flat[b].tolist()
-        if sum(weights) < 1.0:
+        if sum(weights) / len(weights) < 1e-4:
             out.append([None] * n)
             continue
         rng = random.Random(f"{seed}_{step}_{level}_{b}_mfg")
