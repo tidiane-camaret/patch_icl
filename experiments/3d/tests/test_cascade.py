@@ -1146,6 +1146,50 @@ def test_prob_weighted_points_multi_empty_returns_none():
     assert out == [[None, None, None]]
 
 
+def test_prob_weighted_points_multi_uncertainty_mode_favors_the_boundary():
+    """sample_mode="uncertainty": a field that is confidently foreground on one side
+    (p~1), confidently background on the other (p~0), and near the decision boundary
+    (p~0.5) in a thin middle band -- uncertainty weighting must concentrate draws on
+    the middle band, never on the confident p~1 or p~0 interiors (sample_mode="prob"
+    would instead concentrate on the p~1 side)."""
+    T = 9
+    field = torch.full((1, 1, T, T, T), -10.0)       # p~0 everywhere by default
+    field[0, 0, 0:3, :, :] = 10.0                    # confident foreground slab (p~1)
+    field[0, 0, 3:6, :, :] = 0.0                     # the boundary band (sigmoid(0)=0.5)
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=50,
+                                      seed=0, step=0, level=0, sample_mode="uncertainty")
+    for _w_idx, (d, h, w) in out[0]:
+        assert 3 <= d < 6, f"uncertainty draw {(d, h, w)} fell outside the boundary band"
+
+
+def test_prob_weighted_points_multi_prob_mode_favors_confident_foreground():
+    """Same field as above, sample_mode="prob" (default): the p~1 confident slab carries
+    roughly 2x the p~0.5 boundary band's total probability mass (same voxel count, p~1
+    vs p~0.5), so draws should be a clear MAJORITY in the confident slab -- not the
+    near-exclusive concentration uncertainty mode produces (p~1 isn't infinitely more
+    likely than p~0.5, just more likely), so this checks a statistical majority rather
+    than every single draw. The point is the two modes are genuinely different, not
+    accidentally the same weighting -- contrast against the uncertainty-mode test above,
+    which DOES see every draw land in the boundary band."""
+    T = 9
+    field = torch.full((1, 1, T, T, T), -10.0)
+    field[0, 0, 0:3, :, :] = 10.0
+    field[0, 0, 3:6, :, :] = 0.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=200,
+                                      seed=0, step=0, level=0, sample_mode="prob")
+    in_slab = sum(1 for _w_idx, (d, h, w) in out[0] if 0 <= d < 3)
+    in_band = sum(1 for _w_idx, (d, h, w) in out[0] if 3 <= d < 6)
+    assert in_slab > in_band, f"expected a confident-slab majority, got slab={in_slab} band={in_band}"
+
+
+def test_prob_weighted_points_multi_rejects_bad_sample_mode():
+    T = 6
+    field = torch.full((1, 1, T, T, T), 10.0)
+    with pytest.raises(AssertionError, match="sample_mode"):
+        _prob_weighted_points_multi([field], T, is_prob=False, n=1,
+                                    seed=0, step=0, level=0, sample_mode="bogus")
+
+
 def test_prob_weighted_points_multi_is_seeded_reproducibly():
     T = 6
     f0 = torch.full((1, 1, T, T, T), -10.0)

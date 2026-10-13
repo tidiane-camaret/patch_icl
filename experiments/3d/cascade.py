@@ -175,13 +175,21 @@ def _random_fg_point(logit_b1ghw, T, is_prob, thr, *, seed, step, level):
     return out
 
 
-def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
-    """Per-b, sample `n` points via a probability-weighted multinomial over the
-    CONCATENATION of `fields` (a list of M (B,1,T,T,T) logit/prob tensors, one per
-    level-i window) -- the multi-window generalization of _random_fg_point/
-    _centroid_from_logit. A voxel's weight is its own predicted probability (not a
-    thresholded indicator), so overlapping/agreeing windows naturally accumulate more
-    sampling mass where both predict foreground -- no separate native-space stitch step.
+def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level, sample_mode="prob"):
+    """Per-b, sample `n` points via a weighted multinomial over the CONCATENATION of
+    `fields` (a list of M (B,1,T,T,T) logit/prob tensors, one per level-i window) -- the
+    multi-window generalization of _random_fg_point/_centroid_from_logit.
+
+    sample_mode="prob" (default): a voxel's weight is its own predicted probability
+    (peaked at p=1), so overlapping/agreeing windows naturally accumulate more sampling
+    mass where both predict confident foreground -- no separate native-space stitch step.
+    sample_mode="uncertainty": weight is `1 - |2p-1|` (peaked at p=0.5, zero at p=0/1) --
+    samples near the DECISION BOUNDARY (where the model is unsure) instead of the
+    confident interior. Exploratory probe, see docs/logs.md uncertainty-sampling entry.
+    The empty-field fallback below is always computed from the RAW probability (not the
+    uncertainty-transformed weight) -- "nothing predicted anywhere" and "nothing
+    *uncertain* anywhere" are different questions, and the former is what should trigger
+    the same volume-center fallback the single-patch cascade already uses.
 
     Returns, per b, a list of n (window_idx, (d,h,w)) pairs, or n `None` entries when
     every field's total predicted probability mass is negligible on average (mean < 1e-4)
@@ -192,6 +200,8 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
     this file's _gen off an ARITHMETIC mix of (seed, step, level, b) + MFG_OFFSET -- no
     builtin hash() of a string anywhere (that is NOT process-stable under PYTHONHASHSEED
     randomization), so draws are reproducible across runs."""
+    assert sample_mode in ("prob", "uncertainty"), (
+        f"_prob_weighted_points_multi sample_mode={sample_mode!r} not in ('prob','uncertainty')")
     probs = []
     for f in fields:
         p = f.float().clamp(0, 1) if is_prob else torch.sigmoid(f.float())
@@ -199,16 +209,18 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
             p = F.interpolate(p, size=(T, T, T), mode="trilinear", align_corners=False)
         probs.append(p[:, 0].reshape(p.shape[0], -1))            # (B, T^3)
     flat = torch.cat(probs, dim=1)                                # (B, M*T^3)
+    weights = (1.0 - (2.0 * flat - 1.0).abs()) if sample_mode == "uncertainty" else flat
     B = flat.shape[0]
     out = []
     for b in range(B):
-        row = flat[b]
+        row = flat[b]                           # empty-fallback check: RAW probability
         if float(row.mean()) < 1e-4:
             out.append([None] * n)
             continue
+        w_row = weights[b]
         seed_int = (seed * 1_000_003 + step) * 1_000_003 + level * 1009 + b + MFG_OFFSET
         g = _gen(seed_int, row.device)
-        picks = torch.multinomial(row, n, replacement=True, generator=g)
+        picks = torch.multinomial(w_row, n, replacement=True, generator=g)
         pts = []
         for idx in picks.tolist():
             w_idx, local = divmod(idx, T ** 3)
@@ -411,9 +423,11 @@ def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, 
     target_points[b], a length-n list of (window_idx, native (d,h,w) tuple | None) pairs
     -- already resolved by the caller via _points_for_level_multi; only the native center
     is used here, window_idx is for _build_query_prior_multi) and n*K context windows (n
-    independently-seeded random_fg draws per original context subject, center=None +
-    center_mode so the provider's own _resolve_center samples a fresh foreground voxel
-    each time). Returns a batch dict shaped like _recrop_level's, but with image:
+    independently-seeded draws per original context subject, center=None + center_mode
+    so the provider's own _resolve_center samples a fresh voxel each time -- "random_fg"
+    (uniform inside the GT mask) or "random_border" (uniform on the GT mask's own
+    boundary shell, the caller's sample_mode="uncertainty" choice) depending on the
+    caller's center_mode argument). Returns a batch dict shaped like _recrop_level's, but with image:
     (B,n,1,T,T,T), context_in/context_out: (B,K*n,...), AND label: (B,n,T,T,T) (one GT per
     target window, since each has its own crop).
 
@@ -488,15 +502,21 @@ def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, 
 
 
 def _points_for_level_multi(prev_fields, T, is_prob, n, prev_geo_list, prev_geoms_list,
-                            *, seed, step, level):
+                            *, seed, step, level, sample_mode="prob"):
     """level i-1's `len(prev_fields)` windows' own logits -> n native centers per b for
     level i's target re-crop, via _prob_weighted_points_multi (grid-space, concatenated
     multinomial) then invert_geo_center per sampled point through ITS OWN originating
     window's geo/geom. Returns, per b, a list of n (window_idx, native (d,h,w) | None)
     pairs -- window_idx is threaded through so _build_query_prior_multi can pick the
-    same originating window's prediction as its warp source, without re-deriving it."""
+    same originating window's prediction as its warp source, without re-deriving it.
+
+    sample_mode forwards to _prob_weighted_points_multi ("prob" | "uncertainty") --
+    purely a TARGET-side knob here (the context side's analogous "uncertainty" behavior
+    is a different mechanism, GT-border sampling, selected by run_cascade's center_mode
+    at its _recrop_level_multi call site, not through this function)."""
     picks = _prob_weighted_points_multi(prev_fields, T, is_prob, n,
-                                        seed=seed, step=step, level=level)
+                                        seed=seed, step=step, level=level,
+                                        sample_mode=sample_mode)
     B = prev_fields[0].shape[0]
     out = []
     for b in range(B):
@@ -792,7 +812,7 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
                 want_figure_arrays=False, realize_crop=False,
                 mask_downsample="occupancy", occ_thr=0.1, ct_spec=None,
                 prior_perturb=None, center_mode="com", center_fg_thr=0.5,
-                n_patches=1):
+                n_patches=1, sample_mode="prob"):
     """center_mode (data.cascade_center_mode): "com" (default, byte-identical to pre-
     random_fg behavior) picks each level>0's re-crop centre as the prob-weighted centroid
     of the previous level's prediction (_centroid_from_logit); "random_fg" instead draws a
@@ -816,6 +836,8 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
         "pass data.gpu_realize_crop=false")
     assert not (n_patches > 1 and query_prior_hard), (
         "data.cascade_query_prior_hard is not supported with cascade_n_patches>1 yet")
+    assert sample_mode in ("prob", "uncertainty"), (
+        f"data.cascade_sample_mode={sample_mode!r} not in ('prob','uncertainty')")
     _train_mode, _eval_mode = _resolve_center_mode(center_mode)
     center_mode = _train_mode if training else _eval_mode
     assert int(batch["aug_mode"].max()) == 0, "run_cascade: v2 REAL tasks only (aug_mode==0)"
@@ -860,15 +882,23 @@ def run_cascade(model, provider, batch, augmentor, spacings, *, device, training
             else:
                 target_points = _points_for_level_multi(
                     prev_fields, T, is_prob, n_patches, prev_geo_list, prev_geoms_list,
-                    seed=seed, step=step, level=i)
+                    seed=seed, step=step, level=i, sample_mode=sample_mode)
                 cur = _recrop_level_multi(provider, batch, target_points, spacings[i],
                                           step=step, seed=seed, level=i, jitter=jitter,
                                           n=n_patches, recrop_workers=recrop_workers,
                                           mask_downsample=mask_downsample,
                                           occ_thr=occ_thr, ct_spec=ct_spec, device=device,
-                                          # forced random_fg -- "com" would make all n
-                                          # context windows per subject identical crops
-                                          center_mode="random_fg")
+                                          # forced random_fg/random_border -- "com" would
+                                          # make all n context windows per subject
+                                          # identical crops; sample_mode="uncertainty"
+                                          # samples context crops from the GT mask's own
+                                          # BORDER (random_border) instead of uniformly
+                                          # inside it (random_fg), mirroring the target
+                                          # side's prob-vs-uncertainty distinction with
+                                          # the GT-appropriate analogue (GT has no soft
+                                          # probability to compute uncertainty FROM).
+                                          center_mode=("random_border" if sample_mode == "uncertainty"
+                                                      else "random_fg"))
             cur = _to_device(cur, device)   # no-op for realize output (already on device)
         capture = augmentor is not None and i < N - 1
         if augmentor is not None:
@@ -1047,6 +1077,7 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                               center_mode=cfg.data.get("cascade_center_mode", "com"),
                               center_fg_thr=float(cfg.data.get("cascade_center_fg_thr", 0.5)),
                               n_patches=n_patches,
+                              sample_mode=cfg.data.get("cascade_sample_mode", "prob"),
                               want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()
