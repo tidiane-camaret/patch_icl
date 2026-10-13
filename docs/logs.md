@@ -1,5 +1,56 @@
 # Change log
 
+## 2026-10-13 — multi-patch cascade re-crop: N windows per role instead of 1 (`data.cascade_n_patches`)
+
+Branch `multipatch-cascade` (spec `docs/superpowers/specs/2026-10-13-multipatch-cascade-design.md`,
+plan `docs/superpowers/plans/2026-10-13-multipatch-cascade.md`, ledger
+`.superpowers/sdd/2026-10-13-multipatch-cascade/progress.md`). Generalizes the cascade's
+level-`i>=1` re-crop from "1 window per role" to "N windows per role", all processed in one
+joint forward pass, as a zero-shot (inference-only, no training change) probe of whether
+sampling several windows from a continuous probability field beats a single COM/`random_fg`
+point on diffuse, multi-focal or elongated ROIs.
+
+- `experiments/3d/cascade.py`: new `_prob_weighted_points_multi` sampler (per batch row, a
+  probability-weighted multinomial over the CONCATENATION of the previous level's M windows,
+  decoding each draw to `(window_idx, (d,h,w))` so every point inverts through its own
+  originating window's aug grid + crop geom); `_points_for_level_multi`,
+  `_recrop_level_multi` (n target windows + n independently-seeded `random_fg` windows per
+  context subject, so support grows K -> K*n rows), `_build_query_prior_multi` (per-window
+  `pred` prior, fp32/no-autocast like the single-window path); `run_cascade(..., n_patches=)`
+  with `CascadeResult.n_patches` per level. `n_patches=1` keeps today's code path untouched.
+- `src/models/patchset3d.py`: query axis generalized from exactly 1 volume to M
+  (`image` accepts `(B,1,D,H,W)` legacy or `(B,M,1,D,H,W)`; `query_prior` likewise carries M
+  per-window priors), asserting against the combinations deliberately not generalized
+  (`decoder=iris`, `seq_compress`, `cascade_registers`, `register_routed`).
+- `experiments/3d/common.py`: `_assert_cascade_supported` validates
+  `data.cascade_n_patches` (positive int, default 1).
+- `experiments/3d/evaluate.py`: `_stitched_native_metrics_and_levels` scores a LIST of
+  windows per (subject, class) per level.
+- Eval-only for now: `run_cascade` raises on `training=True` with `n_patches>1`, and the
+  multi path also asserts against `gpu_realize_crop=true`, `cascade_query_prior_hard=true`
+  and `eval.cascade_figures=true` rather than silently diverging from the `n=1` arm.
+- `data.cascade_n_patches` is a NEW key not declared in any config YAML, so under Hydra
+  struct mode it needs the `+` prefix: `+data.cascade_n_patches=2`.
+
+The final whole-branch review caught two critical cross-task bugs no single task could see,
+both fixed here: (1) `PatchSet3D._rope` was never generalized for M query volumes, so its
+position table was short by `(M-1)*N` rows and `transformer_rope=true` (which the checkpoint
+under test has) hard-crashed at the first multi-window level; (2) within-level stitching
+pasted each window by plain overwrite, so a later peer window's background erased an earlier
+one's foreground wherever they overlapped (two windows each finding one of two foci scored
+dice 0.667 instead of 1.0) — it now UNIONs peers within a level while keeping the
+coarse->fine overwrite rule across levels, via a new `_paste_union` + per-level `touched`
+mask. Also replaced `_prob_weighted_points_multi`'s `random.Random().choices()` over an
+`M*T^3` Python list with the spec's own `torch.multinomial` (~1213ms -> ~31ms per call at
+production T=128, B=4/n=4).
+
+Deliverable state: `experiments/3d/compare_multipatch_flare22.py` prints per-class Dice/NSD
+deltas for a `data.cascade_n_patches_sweep` (default `[1,2,4]`) against one checkpoint/eval
+seed, forcing `cascade_query_prior=pred` (the only mode the multi path supports, and exp168's
+own trained recipe) and `gpu_realize_crop=false` for both arms. It has NOT yet been run
+against a real checkpoint — that FLARE22 validation run is a follow-up manual GPU step, and
+its numbers belong in a later entry.
+
 ## 2026-09-23 (cont.) — target-vs-surrounding-tissue contrast measured on the 7 OOD sources; `host_anchored` redesigned as a ratio, not an absolute offset
 
 Session was restarted mid-training (killed `134`/`135` tmux sessions with no error in either
