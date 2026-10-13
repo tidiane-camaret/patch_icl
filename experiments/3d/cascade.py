@@ -77,6 +77,7 @@ def invert_geo_center(centroid_dhw, grid_row, flips_row, crop_geom_row, T):
 INT_OFFSET = 1_000_000  # keep intensity seeds clear of geo seeds across plausible step counts
 GOAL_OFFSET = 7_000_000  # goal-mask seed: constant across levels (clear of INT_OFFSET*(i+1))
 PERTURB_OFFSET = 13_000_000  # query-prior perturbation seed (per level; train-only)
+MFG_OFFSET = 19_000_000  # keep _prob_weighted_points_multi's RNG seeds clear of the other offset blocks
 
 
 @dataclass
@@ -185,10 +186,12 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
     Returns, per b, a list of n (window_idx, (d,h,w)) pairs, or n `None` entries when
     every field's total predicted probability mass is negligible on average (mean < 1e-4)
     -- a different mechanism than _random_fg_point's per-voxel threshold count, but the
-    same 'return None' fallback contract downstream code relies on. Seeded off
-    f"{seed}_{step}_{level}_{b}_mfg" via random.Random, the same string-seeding
-    convention _random_fg_point uses -- reproducible across runs/python-version-stable
-    (unlike builtin hash(), which is NOT process-stable under PYTHONHASHSEED randomization)."""
+    same 'return None' fallback contract downstream code relies on. Sampling is
+    torch.multinomial (the spec's own prescribed primitive -- ~40x faster than
+    random.Random().choices() over an M*T^3 Python list at production T=128), seeded via
+    this file's _gen off an ARITHMETIC mix of (seed, step, level, b) + MFG_OFFSET -- no
+    builtin hash() of a string anywhere (that is NOT process-stable under PYTHONHASHSEED
+    randomization), so draws are reproducible across runs."""
     probs = []
     for f in fields:
         p = f.float().clamp(0, 1) if is_prob else torch.sigmoid(f.float())
@@ -199,14 +202,15 @@ def _prob_weighted_points_multi(fields, T, is_prob, n, *, seed, step, level):
     B = flat.shape[0]
     out = []
     for b in range(B):
-        weights = flat[b].tolist()
-        if sum(weights) / len(weights) < 1e-4:
+        row = flat[b]
+        if float(row.mean()) < 1e-4:
             out.append([None] * n)
             continue
-        rng = random.Random(f"{seed}_{step}_{level}_{b}_mfg")
-        picks = rng.choices(range(len(weights)), weights=weights, k=n)
+        seed_int = (seed * 1_000_003 + step) * 1_000_003 + level * 1009 + b + MFG_OFFSET
+        g = _gen(seed_int, row.device)
+        picks = torch.multinomial(row, n, replacement=True, generator=g)
         pts = []
-        for idx in picks:
+        for idx in picks.tolist():
             w_idx, local = divmod(idx, T ** 3)
             d, h, w = np.unravel_index(local, (T, T, T))
             pts.append((w_idx, (int(d), int(h), int(w))))
@@ -467,6 +471,10 @@ def _recrop_level_multi(provider, batch, target_points, spacing, *, step, seed, 
             "label_name": clss[b], "spacing": tgt_slots[b][0].spacing,
             "crop_geom": torch.stack([tgt_slots[b][j].crop_geom for j in range(n)]),
         })
+    # Hand-built (not routed through incontext_collate_fn like _recrop_level): this dict omits
+    # the "spacing"/modality keys the collate would produce -- harmless today since
+    # _forward_level takes spacing as its own argument and modality is re-read from the level-0
+    # batch, but a latent divergence worth knowing about if either assumption changes.
     return {
         "image": torch.stack([it["image"] for it in items]),
         "label": torch.stack([it["label"] for it in items]),
@@ -994,6 +1002,12 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
     order = []                                       # per-occurrence (key, ctx_mod, ctx_subjs)
                                                      # key = (modality, subj, cls), loader order
     times = {}                                       # (modality,subj,cls) -> per-sample cascade ms
+    n_patches = int(cfg.data.get("cascade_n_patches", 1))
+    # Figure rendering is only half-generalized for n_patches>1 (the "gt" array still carries
+    # the extra n axis downstream figure code doesn't expect) -- fail loudly up front rather
+    # than crashing inside F.interpolate mid-eval.
+    assert not (n_patches > 1 and cascade_figures), (
+        "eval.cascade_figures=true is not supported with data.cascade_n_patches>1 yet")
     want_figs = bool(cascade_figures and fig_dir is not None)
     fig_want = set(classes) if want_figs else set()  # classes still needing a panel
     fig_cache = [dict() for _ in range(N)]           # level -> {(subj,cls): arrays} for figures
@@ -1032,7 +1046,7 @@ def evaluate_cascade(model, cfg, classes, *, loader, seed, is_prob,
                               ct_spec=resolve_ct_norm(cfg.data.get("ct_norm")),
                               center_mode=cfg.data.get("cascade_center_mode", "com"),
                               center_fg_thr=float(cfg.data.get("cascade_center_fg_thr", 0.5)),
-                              n_patches=int(cfg.data.get("cascade_n_patches", 1)),
+                              n_patches=n_patches,
                               want_figure_arrays=bool(fig_want))
         if dev.type == "cuda":
             torch.cuda.synchronize()

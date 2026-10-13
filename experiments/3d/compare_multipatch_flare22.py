@@ -3,16 +3,21 @@
 Zero-shot probe (docs/superpowers/specs/2026-10-13-multipatch-cascade-design.md):
 no training change, just whether sampling N windows per role from a continuous
 probability field helps or hurts FLARE22's 13 abdominal organs under the existing
-best cascade checkpoint. Forces data.cascade_query_prior="none" for n_patches>1
-(the only prior mode Task 5's _build_query_prior_multi supports today) and ALSO for
-the n_patches=1 baseline run, so the comparison isolates the n-patch effect alone --
-NOT a comparison against the checkpoint's own best-published query_prior="pred" n=1
-number (see memory project_gnc_kidney_lesions / docs/logs.md for that reference point).
+best cascade checkpoint. Forces data.cascade_query_prior="pred" for n_patches>1 (the
+only prior mode _build_query_prior_multi supports -- it asserts on anything else) and
+ALSO for the n_patches=1 baseline run, matching the checkpoint's own trained recipe
+(`cascade_query_prior: pred` in configs/experiment/3d/experiment/
+168_cascade_real_host_all_shapes.yaml), so the comparison isolates the n-patch effect
+alone under the SAME prior regime the checkpoint was trained with -- not a comparison
+against some other unrelated baseline.
 
 Usage:
     cd experiments/3d
     python compare_multipatch_flare22.py \
         eval.checkpoint=/path/to/best.pt \
+        eval.model=patchset3d \
+        dataset=flare22 \
+        data.cascade_spacings=[4,1.5] \
         data.cascade_n_patches_sweep=[1,2,4]
 """
 import sys
@@ -34,11 +39,13 @@ from src.providers.flare22 import resolve_flare22_classes
 def main(cfg):
     OmegaConf.set_struct(cfg, False)
     cfg.data.source = "flare22"
-    cfg.data.cascade_query_prior = "none"
+    cfg.data.cascade_query_prior = "pred"
     # gpu_realize_crop=True is unsupported for n_patches>1; force it off
-    # to keep the script self-contained and runnable without extra CLI overrides
+    # to keep the script self-contained and runnable without extra CLI overrides.
+    # Like the forced prior mode, this means the numbers printed here are NOT directly
+    # comparable to any externally-published number produced with gpu_realize_crop=true.
     cfg.data.gpu_realize_crop = False
-    sweep = list(cfg.data.get("cascade_n_patches_sweep", [1, 2, 4]))
+    sweep = [int(n) for n in cfg.data.get("cascade_n_patches_sweep", [1, 2, 4])]
     assert sweep[0] == 1, "the first sweep value must be 1 (the baseline)"
 
     model = _build_model(cfg)

@@ -1492,13 +1492,11 @@ def test_stitched_native_metrics_accepts_single_tuple_unchanged(tmp_path):
 def test_stitched_native_metrics_accepts_list_of_windows(tmp_path):
     """n_patches>1: pg_levels[li][key] is a LIST of (packed,shape,geom) -- two windows,
     each covering a DIFFERENT, DISJOINT native half (own geom/starts, matching how real
-    n>1 windows land at different sampled locations), must stitch to full coverage
-    (overwrite-paste, same semantics as across-level stitching). NOTE: this uses two
-    distinct geoms rather than one shared full-volume geom for both windows -- with a
-    single shared full-volume geom, "later paste wins" would make the second window's
-    paste wholesale replace the first everywhere (same region), which cannot union to
-    full coverage; disjoint geoms are what overwrite-paste is actually designed for, and
-    is what real sampled windows at different locations give you."""
+    n>1 windows land at different sampled locations), must stitch to full coverage.
+    NOTE: disjoint geoms is the easy case -- union and overwrite agree when windows
+    don't overlap, so this is NOT a guard for the within-level union semantics; see
+    test_stitched_native_metrics_unions_overlapping_windows_within_a_level below for
+    the overlapping case that actually distinguishes them."""
     subj_dir = tmp_path / "s0"
     subj_dir.mkdir()
     gt = np.ones((8, 8, 8), dtype=np.uint8)  # both halves foreground
@@ -1512,3 +1510,72 @@ def test_stitched_native_metrics_accepts_list_of_windows(tmp_path):
         [{("s0", "organ"): [_packed(pred_a, geom_a), _packed(pred_b, geom_b)]}],
         tmp_path, class_idx=class_idx)
     assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+def test_stitched_native_metrics_unions_overlapping_windows_within_a_level(tmp_path):
+    """Two windows with IDENTICAL (fully overlapping) native footprints, each correctly
+    predicting a DIFFERENT half of the true positive region -- the realistic case for
+    probability-weighted multi-window sampling from one concentrated field. Overwrite
+    ('later paste wins') would make the second window's background erase the first
+    window's foreground wherever they overlap (dice=0.667, measured); union must recover
+    the full positive region (dice=1.0)."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.ones((8, 8, 8), dtype=np.uint8)              # whole volume is foreground
+    np.save(subj_dir / "label.npy", gt)
+    geom = np.array([[0, 0, 0], [8, 8, 8], [8, 8, 8], [0, 0, 0]])   # SAME footprint, both windows
+    pred_a = np.zeros((8, 8, 8), dtype=bool)
+    pred_a[0:4, :, :] = True                              # window A finds the top half only
+    pred_b = np.zeros((8, 8, 8), dtype=bool)
+    pred_b[4:8, :, :] = True                              # window B finds the bottom half only
+    class_idx = {"organ": 1}
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): [_packed(pred_a, geom), _packed(pred_b, geom)]}],
+        tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+
+def test_evaluate_cascade_n_patches_greater_than_one_end_to_end(tmp_path, monkeypatch):
+    """Smoke test for the run_cascade -> evaluate_cascade handoff at n_patches>1 (Task 5's
+    CascadeResult shapes feeding Task 6's list-of-windows scoring) -- nothing else tests
+    this seam directly. Rope (tests/test_patchset3d.py) and within-level union stitching
+    (test_stitched_native_metrics_unions_overlapping_windows_within_a_level) have their own
+    dedicated guards; this one only checks the wiring doesn't crash and scores sanely."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, K, T = 2, 3, 8
+    idx = _ALL_CLASSES_IDX["liver"]
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = idx
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    model = _TwoBlobMultiQueryModel(4, ((1, 1, 1), (2, 2, 2)))
+    prov = _FakeProvider(T=T)
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self):
+            return iter([_named_batch(["liver"] * B, B=B, K=K, T=T)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False,
+                                     "cascade_n_patches": 2}})
+    rows, cases = evaluate_cascade(model, cfg, ["liver"], loader=_Loader(),
+                                   seed=0, is_prob=False)
+
+    row = {r["class"]: r for r in rows}["liver"]
+    assert "error" not in row, row
+    assert np.isfinite(row["mean_dice"])
+    assert len(cases) == B
+    for c in cases:
+        assert np.isfinite(c["dice"]) and np.isfinite(c["dice_r1.5"])
+    # level 1 really built n=2 windows per role: B*(K+1)*n provider loads (level 0 reuses
+    # the given batch and loads nothing), of which B*K*n are the context (center=None) ones.
+    assert len(prov.calls) == B * (K + 1) * 2
+    assert len([c for c in prov.calls if c["center"] is None]) == B * K * 2
