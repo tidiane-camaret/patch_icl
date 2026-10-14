@@ -238,6 +238,49 @@ def test_resolve_center_random_fg_never_scans_label_np_when_fg_samples_given(mon
                            fg_samples=fg_samples) == (2, 3, 4)
 
 
+# --- data.cascade_sample_mode="uncertainty" -> context center_mode="random_border" ----
+
+def test_resolve_center_random_border_lands_on_a_border_voxel_not_the_core():
+    """A solid 3x3x3 block of class 1 inside a 7^3 volume: the single interior voxel
+    (3,3,3) is NOT a border voxel (all 6 neighbors are also class 1) -- random_border
+    must never land there, only on the 26 shell voxels."""
+    lbl = np.zeros((7, 7, 7), dtype=np.uint8)
+    lbl[2:5, 2:5, 2:5] = 1                            # 3x3x3 block, centre (3,3,3)
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_border")
+    for seed in range(20):
+        req = LoadRequest(rng=random.Random(seed), crop_spacing_mm=1.5, center_mode="random_border")
+        got = _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0))
+        assert got != (3, 3, 3), f"seed={seed}: landed on the interior voxel, not a border voxel"
+        assert lbl[got] == 1
+
+
+def test_resolve_center_random_border_falls_back_to_random_fg_when_no_border():
+    """A single-voxel mask has no interior to erode away (erosion of a 1-voxel mask is
+    empty) -- random_border must still land ON that voxel (via its random_fg fallback),
+    not on `fallback`."""
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    lbl[2, 3, 4] = 1
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_border")
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(0, 0, 0)) == (2, 3, 4)
+
+
+def test_resolve_center_random_border_falls_back_when_class_absent():
+    lbl = np.zeros((6, 6, 6), dtype=np.uint8)
+    req = LoadRequest(rng=random.Random(0), crop_spacing_mm=1.5, center_mode="random_border")
+    assert _resolve_center(req, lbl, class_idx=1, fallback=(3, 3, 3)) == (3, 3, 3)
+    assert _resolve_center(req, lbl, class_idx=-1, fallback=(3, 3, 3)) == (3, 3, 3)
+
+
+def test_resolve_center_random_border_is_seeded_reproducibly():
+    lbl = np.zeros((7, 7, 7), dtype=np.uint8)
+    lbl[2:5, 2:5, 2:5] = 1
+    req_a = LoadRequest(rng=random.Random(7), crop_spacing_mm=1.5, center_mode="random_border")
+    req_b = LoadRequest(rng=random.Random(7), crop_spacing_mm=1.5, center_mode="random_border")
+    a = _resolve_center(req_a, lbl, class_idx=1, fallback=(0, 0, 0))
+    b = _resolve_center(req_b, lbl, class_idx=1, fallback=(0, 0, 0))
+    assert a == b
+
+
 def test_resolve_center_random_fg_empty_fg_samples_falls_back_to_live_scan():
     """An empty fg_samples (e.g. a class present in label_list but with zero stored
     samples -- shouldn't happen, but must not crash) behaves as if not given."""

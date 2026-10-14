@@ -276,6 +276,14 @@ def _assert_cascade_supported(cfg) -> None:
                          f"cascade-capable source ({sorted(_cascade_sources)}).")
     if len(spacings) < 2:
         raise ValueError(f"data.cascade_spacings needs at least 2 entries, got {list(spacings)}.")
+    n_patches = d.get("cascade_n_patches", 1)
+    if not isinstance(n_patches, int) or isinstance(n_patches, bool) or n_patches < 1:
+        raise ValueError(
+            f"data.cascade_n_patches={n_patches!r} must be a positive int (default 1).")
+    _sample_mode = d.get("cascade_sample_mode", "prob")
+    if _sample_mode not in ("prob", "uncertainty"):
+        raise ValueError(
+            f"data.cascade_sample_mode={_sample_mode!r} must be 'prob' or 'uncertainty'.")
     _cm = d.get("cascade_center_mode", "com")
     from cascade import _resolve_center_mode   # lazy: only when a cascade config is present
     try:

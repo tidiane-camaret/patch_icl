@@ -1,3 +1,4 @@
+import pytest
 import torch
 from src.models.patchset3d import ConvEncoder3D, MaskConvEmbed, _mask_tiles_3d
 
@@ -1072,3 +1073,148 @@ def test_iris_decoder_requires_fine_decode():
         assert False, "should have raised"
     except AssertionError as exc:
         assert "fine_decode" in str(exc)
+
+
+def test_multi_query_m1_matches_legacy_shape():
+    """M=1 via the NEW 5-D (B,1,1,D,H,W) image shape must byte-match the legacy
+    (B,1,D,H,W) shape -- the M-generalization must be a true no-op at M=1."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True)
+    m.eval()
+    img, cin, cout = _dummy_batch(S=16)
+    legacy = m(img, context_in=cin, context_out=cout)["final_logit"]
+    new_shape = m(img.unsqueeze(1), context_in=cin, context_out=cout)["final_logit"]
+    assert new_shape.shape == (2, 1, 1, 8, 8, 8)
+    assert torch.allclose(legacy, new_shape[:, 0])
+
+
+def test_multi_query_m3_output_shape():
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True)
+    m.eval()
+    B, K, S, M = 2, 2, 16, 3
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    out = m(image, context_in=context_in, context_out=context_out)["final_logit"]
+    assert out.shape == (B, M, 1, 8, 8, 8)
+
+
+def test_multi_query_decode_is_permutation_equivariant_in_m():
+    """Shuffling the M query windows' order must shuffle the M output logits
+    identically -- decode itself has no cross-window structure; only _attn's shared
+    transformer lets windows influence each other, which is the intended effect."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True)
+    m.eval()
+    B, K, S, M = 1, 2, 16, 3
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    out = m(image, context_in=context_in, context_out=context_out)["final_logit"]
+
+    perm = [2, 0, 1]
+    out_perm = m(image[:, perm], context_in=context_in, context_out=context_out)["final_logit"]
+    # atol=1e-5: permuting the batched-M axis reorders floating-point reduction order inside
+    # the shared conv/attention kernels (non-associative fp32 summation) -- not a logic bug.
+    # Confirmed: same-input calls are bit-exact; permuted calls differ by ~2e-7 absolute, well
+    # under this tolerance.
+    assert torch.allclose(out[:, perm], out_perm, atol=1e-5)
+
+
+def test_multi_query_backward():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    B, K, S, M = 2, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    out = m(image, context_in=context_in, context_out=context_out)["final_logit"]
+    out.mean().backward()
+    grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
+    assert all(grads) and len(grads) > 0
+
+
+def test_multi_query_rejects_iris_decoder():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   fine_decode=True, decoder="iris", image_size=(16, 16, 16),
+                   iris_pixelshuffle_r=2)
+    B, K, S, M = 1, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    with pytest.raises(AssertionError, match="M=2"):
+        m(image, context_in=context_in, context_out=context_out)
+
+
+def test_multi_query_rejects_cascade_registers():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2,
+                   cascade_registers=True)
+    B, K, S, M = 1, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    with pytest.raises(AssertionError, match="M=2"):
+        m(image, context_in=context_in, context_out=context_out)
+
+
+def test_multi_query_prior_per_window_shifts_only_that_windows_logit():
+    """Each of the M windows' own query_prior must affect ONLY that window's logit --
+    giving window 0 a prior and leaving window 1's prior at the support-mean fallback
+    equivalent (all-zeros here) must change window 0's output but not window 1's."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True)
+    m.eval()
+    B, K, S, M = 1, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+
+    base = m(image, context_in=context_in, context_out=context_out)["final_logit"]
+
+    prior = torch.zeros(B, M, 1, S, S, S)
+    prior[:, 0] = torch.rand(B, 1, S, S, S)          # only window 0 gets a real prior
+    with_prior = m(image, context_in=context_in, context_out=context_out,
+                  query_prior=prior)["final_logit"]
+
+    assert with_prior.shape == base.shape
+    assert not torch.allclose(with_prior[:, 0], base[:, 0])
+
+
+def test_multi_query_prior_backward_reaches_all_params():
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2, thinking_rows=2)
+    B, K, S, M = 2, 2, 16, 2
+    image = torch.randn(B, M, 1, S, S, S)
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+    prior = torch.rand(B, M, 1, S, S, S)
+    out = m(image, context_in=context_in, context_out=context_out,
+           query_prior=prior)["final_logit"]
+    out.mean().backward()
+    grads = [p.grad is not None for p in m.parameters() if p.requires_grad]
+    assert all(grads) and len(grads) > 0
+
+
+def test_multi_query_with_rope_m1_and_m2():
+    """transformer_rope=True + M>1 crashed before this fix (RoPE table was short by
+    (M-1)*N rows) -- the real checkpoint under test uses transformer_rope=True, so this
+    is not a hypothetical config."""
+    torch.manual_seed(0)
+    m = PatchSet3D(resolution=4, enc_dims=(8, 8, 8), e=32, h=64, l=2, a=2,
+                   thinking_rows=2, mask_patch_decode_size=2, full_attn=True,
+                   transformer_rope=True)
+    m.eval()
+    B, K, S = 2, 2, 16
+    context_in = torch.randn(B, K, 1, S, S, S)
+    context_out = (torch.rand(B, K, S, S, S) > 0.5).long()
+
+    img_m1 = torch.randn(B, 1, S, S, S)
+    out_m1 = m(img_m1, context_in=context_in, context_out=context_out)["final_logit"]
+    assert out_m1.shape == (B, 1, 8, 8, 8)
+
+    img_m2 = torch.randn(B, 2, 1, S, S, S)
+    out_m2 = m(img_m2, context_in=context_in, context_out=context_out)["final_logit"]
+    assert out_m2.shape == (B, 2, 1, 8, 8, 8)

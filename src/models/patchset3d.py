@@ -664,10 +664,12 @@ class PatchSet3D(nn.Module):
         return self.resolution * self.mask_patch_decode_size
 
     def _grid_tokens(self, feat_map, B, T, K):
-        """(B*T,Cf,R,R,R) -> (support (B,K·N,Cf), query (B,N,Cf)), image-major, row-major cells."""
+        """(B*T,Cf,R,R,R) -> (support (B,K·N,Cf), query (B,(T-K)·N,Cf)), image-major,
+        row-major cells. T-K is the query VOLUME count (M, generalized from always-1)."""
         Cf = feat_map.shape[1]
         feat = feat_map.flatten(2).transpose(1, 2).reshape(B, T, self.N, Cf)
-        return (feat[:, :K].reshape(B, K * self.N, Cf), feat[:, K:].reshape(B, self.N, Cf))
+        return (feat[:, :K].reshape(B, K * self.N, Cf),
+               feat[:, K:].reshape(B, (T - K) * self.N, Cf))
 
     def _occupancy(self, context_out):
         """context_out (B,K,D,H,W) -> support mask-token input (B, K·N, p³)."""
@@ -778,20 +780,23 @@ class PatchSet3D(nn.Module):
                    .reshape(B, r * d, r * d, r * d)
                    .unsqueeze(1))
 
-    def _rope(self, K, spacing, device, n_extra=0):
+    def _rope(self, K, spacing, device, n_extra=0, M=1):
         """3D axial RoPE cos/sin for the row sequence [thinking, (cascade memory,) K·N
-        support, N query].
+        support, M·N query].
 
         Thinking rows get position (0,0,0) (no rotation); support/query use the (i,j,k)
         lattice. Positions are scaled by spacing/rope_train_mm when a spacing is given, so
         adjacent cells sit `spacing/train` apart in physical units — the encoder's scheme.
         n_extra: cascade-memory and/or pool-token rows prepended ahead of thinking
         (arch.cascade_registers / arch.pool_token) — non-spatial like thinking rows, so they
-        get the same (0,0,0) no-rotation treatment."""
+        get the same (0,0,0) no-rotation treatment.
+        M: query VOLUME count (1 legacy, M when multiple query windows are forwarded
+        jointly) — each window re-uses the same per-volume-local ijk lattice, mirroring
+        _attn's own qry_ijk construction."""
         n_think = self.thinking.n
         pos = torch.cat([torch.zeros(n_think + n_extra, 3, device=device),
                          self.ijk_base.repeat(K, 1).float(),
-                         self.ijk_base.float()], dim=0)               # (R,3)
+                         self.ijk_base.repeat(M, 1).float()], dim=0)  # (R,3)
         if spacing is not None:
             pos = pos * (float(spacing) / self.rope_train_mm)
         return build_3d_rope_freqs_from_positions(self.head_dim, pos, self.rope_theta)
@@ -855,8 +860,8 @@ class PatchSet3D(nn.Module):
         then concatenated along the channel dim -- mirrors _decode's fine_filter path, which
         also reads every self.fine_stage entry (there: projected + summed at the finest grid;
         here: concatenated, since this produces one vector per volume, not a spatial map).
-        Returns (B, K+1, sum(Cf_st)): support-major (index 0..K-1) then query (index K), raw
-        foreground-masked-average feature vectors -- NOT yet projected to e (projection +
+        Returns (B, K+M, sum(Cf_st)): support-major (index 0..K-1) then query (index K..K+M-1),
+        raw foreground-masked-average feature vectors -- NOT yet projected to e (projection +
         tagging happens in _attn, mirroring how cascade_regs is projected there via
         cascade_proj). See docs/superpowers/specs/2026-09-14-patchset3d-pool-token-design.md."""
         def masked_avg(f, m):
@@ -882,20 +887,27 @@ class PatchSet3D(nn.Module):
             S = fine_st.shape[-1]
             Cf = fine_st.shape[1]
             feat = fine_st.reshape(B, T, Cf, S, S, S)
-            sup_feat, qry_feat = feat[:, :K], feat[:, K:K + 1]      # (B,K,Cf,...), (B,1,Cf,...)
+            sup_feat, qry_feat = feat[:, :K], feat[:, K:]           # (B,K,...), (B,M,...)
 
             sup_mask = F.interpolate(
                 context_out.reshape(B * K, 1, *context_out.shape[-3:]).float(),
                 size=(S, S, S), mode="trilinear", align_corners=False).reshape(B, K, S, S, S)
             if query_prior is not None:
-                qry_mask = F.interpolate(query_prior.float(), size=(S, S, S), mode="trilinear",
-                                         align_corners=False)               # (B,1,S,S,S)
+                if query_prior.dim() == 6:                    # (B,M,1,D,H,W)
+                    Bq, Mq = query_prior.shape[0], query_prior.shape[1]
+                    qry_mask = F.interpolate(
+                        query_prior.reshape(Bq * Mq, 1, *query_prior.shape[-3:]).float(),
+                        size=(S, S, S), mode="trilinear", align_corners=False
+                    ).reshape(Bq, Mq, S, S, S)
+                else:                                          # legacy (B,1,D,H,W)
+                    qry_mask = F.interpolate(query_prior.float(), size=(S, S, S),
+                                             mode="trilinear", align_corners=False)
             else:
-                qry_mask = sup_mask.mean(dim=1, keepdim=True)              # (B,1,S,S,S)
+                qry_mask = sup_mask.mean(dim=1, keepdim=True).expand(-1, qry_feat.shape[1], -1, -1, -1)
 
             stage_vecs.append(torch.cat(
                 [masked_avg(sup_feat, sup_mask), masked_avg(qry_feat, qry_mask)], dim=1))
-        return torch.cat(stage_vecs, dim=-1)      # (B, K+1, sum(Cf_st))
+        return torch.cat(stage_vecs, dim=-1)      # (B, K+M, sum(Cf_st))
 
     def _pool_tokens_coarse(self, sup_feat, qry_feat, sup_occ, qry_occ):
         """arch.pool_source='coarse' variant of _pool_tokens: pools the SAME R^3-grid per-cell
@@ -928,15 +940,27 @@ class PatchSet3D(nn.Module):
     def _attn(self, sup_feat, qry_feat, sup_occ, K, spacing=None, query_prior=None,
              cascade_regs=None, pool_feat=None):
         B, N = sup_feat.shape[0], self.N
+        M = qry_feat.shape[1] // N                   # query VOLUME count (1 legacy, M new)
+        assert not (M > 1 and (self.decoder_kind == "iris" or self.seq_compress
+                               or self.cascade_registers or self.register_routed)), (
+            f"PatchSet3D: M={M} query volumes requires decoder_kind != 'iris', "
+            f"seq_compress=False, cascade_registers=False, register_routed=False "
+            f"(not generalized -- see docs/superpowers/specs/"
+            f"2026-10-13-multipatch-cascade-design.md)")
         dev = sup_feat.device
         mask_support = self._sample_mask(B, K * N, self.token_mask_ratio_support, dev)
-        mask_query = self._sample_mask(B, N, self.token_mask_ratio_query, dev)
+        mask_query = self._sample_mask(B, M * N, self.token_mask_ratio_query, dev)
         if query_prior is not None:                          # cascade: coarse-level prediction
-            qry_occ = self._prior_occupancy(query_prior).to(sup_occ.dtype)
+            if query_prior.dim() == 6:                        # (B,M,1,D,H,W) -- per-window priors
+                qry_occ = torch.cat(
+                    [self._prior_occupancy(query_prior[:, m]) for m in range(query_prior.shape[1])],
+                    dim=1).to(sup_occ.dtype)
+            else:                                             # legacy (B,1,D,H,W)
+                qry_occ = self._prior_occupancy(query_prior).to(sup_occ.dtype)
         else:
-            qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, N, sup_occ.shape[-1])  # support-mean prior
+            qry_occ = sup_occ.mean(dim=1, keepdim=True).expand(B, M * N, sup_occ.shape[-1])  # support-mean prior
         sup_ijk = self.ijk_base.repeat(K, 1).unsqueeze(0).expand(B, K * N, 3)
-        qry_ijk = self.ijk_base.unsqueeze(0).expand(B, N, 3)
+        qry_ijk = self.ijk_base.repeat(M, 1).unsqueeze(0).expand(B, M * N, 3)
 
         # arch.pool_source='coarse': unlike 'fine' (computed in forward(), threaded in as the
         # `pool_feat` argument -- needs the widened fine-row extraction only forward() controls),
@@ -993,18 +1017,18 @@ class PatchSet3D(nn.Module):
             # rows CAN read the query's own pool row -- unlike real content, which is only kept
             # context-read-only under full_attn=False/query_self_attn masking. Harmless: the
             # query pool row is built from a soft prior/support-mean, never real GT.
-            pool = self.pool_proj(pool_feat) + self.pool_type       # (B,K+1,e)
+            pool = self.pool_proj(pool_feat) + self.pool_type       # (B,K+M,e)
             if self.context_id_embed:
                 ctx_tag = torch.cat([
                     self.ctx_id(torch.arange(K, device=pool.device)).unsqueeze(0).expand(B, -1, -1),
-                    self.qry_id.view(1, 1, -1).expand(B, 1, -1)], dim=1)   # (B,K+1,e)
+                    self.qry_id.view(1, 1, -1).expand(B, M, -1)], dim=1)   # (B,K+M,e)
                 pool = pool + ctx_tag
             if self.mask_slots >= 2:
                 gt_tag = self._slot_pos_vec(self._mask_content_index["gt"], pool.device, pool.dtype)
                 pred_tag = self._slot_pos_vec(self._mask_content_index["pred"], pool.device, pool.dtype)
-                pool = pool + torch.cat([gt_tag.expand(K, -1), pred_tag.unsqueeze(0)],
+                pool = pool + torch.cat([gt_tag.expand(K, -1), pred_tag.expand(M, -1)],
                                         dim=0).unsqueeze(0)
-            pool = pool.unsqueeze(2).expand(-1, -1, x.shape[2], -1)   # (B,K+1,c,e)
+            pool = pool.unsqueeze(2).expand(-1, -1, x.shape[2], -1)   # (B,K+M,c,e)
             x = torch.cat([pool, x], dim=1)
             n_extra += pool.shape[1]
             sep += pool.shape[1]
@@ -1033,7 +1057,7 @@ class PatchSet3D(nn.Module):
             attn_mask = torch.zeros(r, r, dtype=torch.bool, device=x.device)
             attn_mask[:, :sep_t] = True
             attn_mask[sep_t:, sep_t:] = True
-        rope = (self._rope(K, spacing, x.device, n_extra=n_extra)
+        rope = (self._rope(K, spacing, x.device, n_extra=n_extra, M=M)
                if self.transformer_rope else None)
         x = self.transformer(x, sep_t, attn_mask=attn_mask, full_attn=self.full_attn,
                              rope=rope, block_mask=block_mask)
@@ -1219,15 +1243,23 @@ class PatchSet3D(nn.Module):
         inside _attn from tensors already built there (see _pool_tokens_coarse); this method
         doesn't even need arch.fine_decode=True for that mode."""
         B, K = context_in.shape[0], context_in.shape[1]
+        assert image.dim() in (5, 6), (
+            f"PatchSet3D: image must be (B,1,D,H,W) [5-D] or (B,M,1,D,H,W) [6-D], "
+            f"got {image.dim()} dims")
+        legacy_image = image.dim() == 5           # (B,1,D,H,W) -- single query volume
+        if legacy_image:
+            image = image.unsqueeze(1)             # -> (B,1,1,D,H,W), M=1
+        M = image.shape[1]
         D, H, W = image.shape[-3:]
-        imgs = torch.cat([context_in, image.unsqueeze(1)], dim=1)     # (B,T,1,D,H,W)
+        imgs = torch.cat([context_in, image], dim=1)     # (B,T,1,D,H,W), T = K + M
         T = imgs.shape[1]
         x = imgs.reshape(B * T, 1, D, H, W)
         fine = None
         pool_feat = None
         iris_fine_finest = None
         if self.fine_decode:
-            qidx = torch.arange(B, device=x.device) * T + K
+            qidx = (torch.arange(B, device=x.device).unsqueeze(1) * T
+                   + K + torch.arange(M, device=x.device).unsqueeze(0)).reshape(-1)   # (B*M,)
             # arch.pool_token (pool_source='fine' only) AND decoder=iris both need every
             # volume's (support + query, or support-only for iris) unpooled fine map, not just
             # the query's -- widen rows for either, re-slice back to query-only below before
@@ -1238,8 +1270,9 @@ class PatchSet3D(nn.Module):
             if need_all_rows:
                 rows = torch.arange(B * T, device=x.device)   # every volume (support + query)
             else:
-                # The query volume is the last of T, so its flat rows are b*T + K; only those
-                # keep an unpooled map (one encoder pass, the rest freed with the stage list).
+                # The M query volumes are the last of T, so their flat rows are
+                # b*T + K .. b*T + K + M - 1; only those keep an unpooled map (one encoder
+                # pass, the rest freed with the stage list).
                 rows = qidx
             feat_map, fine = self._encode(x, spacing, fine_rows=rows)
             if pool_fine:
@@ -1262,8 +1295,10 @@ class PatchSet3D(nn.Module):
         # train.py) and regs is None regardless. Skip _attn entirely in that case rather than
         # just leaving its (large: ~(thinking_rows+K*N+N) rows x 2 cols, l layers, dense
         # bi-axis attention) output unused -- cascade_registers=True still needs `regs`, so
-        # only skip when nothing downstream needs any of _attn's four return values.
-        if self.decoder_kind == "iris" and not self.cascade_registers:
+        # only skip when nothing downstream needs any of _attn's four return values. M>1 is
+        # NOT skipped even here: decoder_kind='iris' isn't generalized to M>1 (see _attn), so
+        # M>1 must still reach _attn's own assert rather than silently mis-decoding.
+        if self.decoder_kind == "iris" and not self.cascade_registers and M == 1:
             q = mask_support = mask_query = regs = None
         else:
             q, mask_support, mask_query, regs = self._attn(
@@ -1282,7 +1317,13 @@ class PatchSet3D(nn.Module):
             qry_img_pre = self.img_embed(norm_qry)
             logit = self._decode_iris(qry_img_pre, task_tokens, fine)
         else:
-            logit = self._decode(q, fine)
+            N = self.N
+            q_flat = q.reshape(B * M, N, -1)
+            fine_flat = tuple(f for f in fine) if fine is not None else None  # already (B*M,...)
+            logit = self._decode(q_flat, fine_flat)
+            logit = logit.reshape(B, M, *logit.shape[1:])         # (B,M,1,G,G,G)
+            if legacy_image:
+                logit = logit[:, 0]                                # (B,1,G,G,G)
         return {"final_logit": logit, "mask_support": mask_support, "mask_query": mask_query,
                "registers": regs}
 

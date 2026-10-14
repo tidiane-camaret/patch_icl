@@ -919,6 +919,20 @@ def _paste(native, d0, h0, w0, small):
     native[d0:de, h0:he, w0:we] = small[:de - d0, :he - h0, :we - w0]
 
 
+def _paste_union(value_arr, touched_arr, d0, h0, w0, small):
+    """Like _paste, but OR's `small` into `value_arr` instead of overwriting (so multiple
+    overlapping windows at the SAME level accumulate agreement instead of the later one
+    erasing the earlier one's foreground), and marks which native voxels this call actually
+    touched in `touched_arr` — used by the caller to then overwrite the running cross-level
+    composite ONLY where this level had a window covering that voxel, leaving voxels this
+    level's windows never reached untouched (so a coarser PRIOR level's prediction survives
+    there, exactly matching the single-window case's existing cross-level overwrite rule)."""
+    D, H, W = value_arr.shape
+    de, he, we = min(d0 + small.shape[0], D), min(h0 + small.shape[1], H), min(w0 + small.shape[2], W)
+    value_arr[d0:de, h0:he, w0:we] |= small[:de - d0, :he - h0, :we - w0]
+    touched_arr[d0:de, h0:he, w0:we] = True
+
+
 def _write_native(native, pred, geom):
     """Composite a crop-grid prediction into the native volume at its crop location.
 
@@ -1071,13 +1085,33 @@ def _stitched_native_metrics_and_levels(pg_levels, root, tol_mm: float | None = 
             gt = np.asarray(np.load(Path(root) / subj / "label.npy", mmap_mode="r")) == idx
         composite = np.zeros(gt.shape, dtype=bool) if want_full else None
         for li in present:
-            p, geom = _unpack_pred(pg_levels[li][key])
-            placed = _place_patch(p, geom)
+            entries = pg_levels[li][key]
+            if not isinstance(entries, list):
+                entries = [entries]
             solo = np.zeros(gt.shape, dtype=bool)
-            if placed is not None:
+            if len(entries) == 1:
+                # Fast path (every n_patches<=1 level, i.e. every pre-existing caller): a
+                # single window needs no union/touched bookkeeping -- plain slice-assign
+                # pastes, byte-identical to the union path here but ~160x cheaper at native
+                # volume size (0.14ms vs 22.8ms per (case,level) at 300x512x512, measured),
+                # because composite[touched]=solo[touched] fancy-indexes the WHOLE volume.
+                p, geom = _unpack_pred(entries[0])
+                placed = _place_patch(p, geom)
+                if placed is not None:
+                    if want_full:
+                        _paste(composite, *placed)
+                    _paste(solo, *placed)
+            else:
+                # n_patches>1: the level's windows are peers, so union them into `solo` and
+                # overwrite the cross-level composite only where this level reached.
+                touched = np.zeros(gt.shape, dtype=bool)
+                for entry in entries:
+                    p, geom = _unpack_pred(entry)
+                    placed = _place_patch(p, geom)
+                    if placed is not None:
+                        _paste_union(solo, touched, *placed)
                 if want_full:
-                    _paste(composite, *placed)
-                _paste(solo, *placed)
+                    composite[touched] = solo[touched]
             inter = 2.0 * np.logical_and(solo, gt).sum()
             denom = int(solo.sum()) + int(gt.sum())
             per_level[li][key] = inter / denom if denom > 0 else 1.0

@@ -1,5 +1,196 @@
 # Change log
 
+## 2026-10-14 — multi-patch cascade: ran the real FLARE22 validation (zero-shot hurts, monotonically worse with N) — pivoting to a training pipeline
+
+Continuation of 2026-10-13's entry below. Branch `multipatch-cascade` still. The
+deliverable script had never actually been run against a real checkpoint; this entry
+is that run, plus two follow-up directions added at the user's direction (uncertainty/
+border sampling, and a "smaller input size" compute/accuracy probe), plus the
+conclusion: zero-shot multi-window sampling does not help on this checkpoint, so the
+next step is a training-recipe change, not further zero-shot probing.
+
+**Checkpoint used**: `168_cascade_real_host_all_shapes`'s OWN `best.pt`
+(`.../2026-09-28_168_cascade_real_host_all_shapes/best.pt`, resumed from 167 and
+trained further under cascade+real-host) — not 167's, which an earlier entry/the spec
+named by mistake. GPU: single RTX A4000 (16GB), host `nero`, env `.venv_thor`.
+
+**Fixed before the run could happen at all**: `compare_multipatch_flare22.py`'s
+`@hydra.main` pointed at the train root config (`configs/config.yaml`), which has no
+`eval:` section — every `eval.*` override in the script's own documented Usage command
+failed at composition. Pointed it at the same entry point `eval.py` uses
+(`configs/experiment/3d`, `config_name=eval`); must be run from the REPO ROOT (its
+hydra searchpath resolves off `$PWD`). Other overrides needed, none documented
+anywhere beforehand: `augmentations.enabled=false` (the cascade+aug guard rejects
+`cascade_spacings` without `augmentations.gpu=true`), `data.crop_spacing_mm` must equal
+`cascade_spacings[0]`, `eval.batch_size=1` (default 8 OOMs this 16GB card — the conv
+decoder's FiLM/skip-fusion path is memory-heavy), and `+` prefixes on every new
+`data.cascade_*` key under Hydra struct mode.
+
+**Added `data.cascade_sample_mode="uncertainty"`** (border sampling), per direct
+request: generalizes `_prob_weighted_points_multi` from weighting by raw predicted
+probability (`sample_mode="prob"`, peaked at confident foreground, the only mode that
+existed before) to weighting by `1-|2p-1|` (peaked at the model's own decision
+boundary, p~0.5). Context/support windows have no soft probability to be uncertain
+FROM, so they get the GT-appropriate analogue: a new
+`src/providers/totalseg.py::_resolve_center` mode, `"random_border"` (uniform on the
+GT mask's own boundary shell via `scipy.ndimage.binary_erosion`, shared by
+`NativeGridProvider`/FLARE22 through its existing import). 7 new tests; full
+`experiments/3d/tests/` suite 259/259 + the 3 already-ledgered pre-existing failures.
+
+**Generalized the comparison script** to any `cfg.data.source` (was hardcoded to
+`flare22`) so the same script also runs on `dataset=multisource_ct_mri` (totalseg
+CT+MRI — the checkpoint's OWN training distribution, per direct request, as a
+complement to FLARE22's domain-shift probe), added a `cascade_sample_mode_sweep`
+alongside `cascade_n_patches_sweep`, and switched from print-only to incremental JSON
+output (`results/experiments/3d/multipatch_cascade_probe/*.json`, one file per run,
+written after every sweep point) — the reason phase 1's data below survived an
+unrelated infrastructure failure instead of being lost.
+
+**"Smaller input size" probe** (user direction: T=64/32 impact on compute and
+accuracy). Two variants, because they're not the same question: (A) hold
+`data.image_size=128` fixed and only coarsen the FINE level's `crop_spacing_mm` (e.g.
+`cascade_spacings=[4,3]` or `[4,6]` instead of `[4,1.5]`) — FOV-preserving, isolates
+resolution from field-of-view. (B) the literal ask, `data.image_size=[64,64,64]` /
+`[32,32,32]` — confirmed EMPIRICALLY to run without crashing against the frozen
+checkpoint, contradicting my own pre-run theoretical worry that the decode head's
+`fine_m`/`grid_size` (computed once at construction from the ORIGINAL `image_size=128`)
+would shape-mismatch a smaller runtime input: `_decode`'s fine-filter path already has
+an `F.interpolate` fallback for exactly this case (each fine stage is projected at its
+own native resolution, then resized to the expected decode size if they differ), so the
+ENCODER genuinely does less work while the DECODE resolution stays fixed. Caveat: (B)
+shrinks the COARSE level's FOV too (`4mm*128=512mm -> 4mm*64=256mm`), confounding
+"cheaper/coarser encoder" with "sees less of the body at localization" — which is why
+(A) exists as the clean version of the same question. Liver-only spot-check (50 FLARE22
+subjects, n_patches=1): T=128 dice=0.9406, T=64 dice=0.8769 — a real but not
+catastrophic drop, and ~4x faster per sample (271ms vs ~1000ms).
+
+**Headline result — phase 1 of an 8-phase sweep, FLARE22, 13 classes, macro Dice**
+(`results/experiments/3d/multipatch_cascade_probe/20261013_235557_flare22.json`):
+
+| n_patches | mode=prob | mode=uncertainty |
+|---|---|---|
+| 1 (baseline) | 0.7668 | — (same point, prior-independent) |
+| 2 | 0.7461 (Δ-0.0207) | 0.7449 (Δ-0.0219) |
+| 4 | 0.7245 (Δ-0.0423) | 0.7199 (Δ-0.0469) |
+
+Multi-patch sampling **consistently hurts, monotonically worse with more windows**, and
+uncertainty/border sampling does **not** rescue it (same or very slightly worse than
+`prob` at every n). Per-class: small/ambiguous organs degrade the most
+(`adrenal_gland_left` dice -0.258 at n=4); the two kidneys are the only classes with a
+small, consistent IMPROVEMENT (+0.002 to +0.004) at every n; most large solid organs
+(liver, spleen, stomach, IVC) show small-to-moderate degradation.
+
+**Read with the right caveat, not as a verdict on the original hypothesis**: FLARE22's
+13 organs are mostly solid single-focus structures — per the design spec's own framing
+this was always an "unseen-acquisition-centre generalization check," not the
+diffuse/multi-focal-ROI stress test (ISLES22 stroke lesions, GNC kidney cysts) that
+originally motivated multi-window sampling. This result says "zero-shot multi-window
+attention doesn't help on ordinary solid organs under domain shift" — consistent with
+the spec's own flagged risk that the checkpoint was never trained for multi-window
+attention — not that the core idea is wrong on the targets it was actually designed for.
+
+**Infrastructure note**: the sandbox environment was torn down and recreated mid-sweep
+(~03:04, between phases 1 and 2) — clean process death, no Python traceback anywhere,
+`nvidia-smi` fully released (0%/15MB, not an OOM-kill signature), every PID from the
+original launch gone with no orphans. Phase 1's JSON survived specifically because it
+was flushed incrementally. Relaunched the remaining phases from a `_part2.sh` script
+that just skips the already-done phase; same recovery recipe if it happens again
+(check which JSONs exist, skip those phases, relaunch).
+
+**Decision (user, mid-sweep): stop the zero-shot exploration here.** Phase 1's result
+is clear enough on its own terms (consistent, monotonic, not noise) that further
+zero-shot sweeping (the remaining 7 phases — size variants, totalseg CT+MRI) is lower
+value than moving straight to the real next step: **a training recipe that teaches the
+model to expect N-window context directly**, instead of relying on zero-shot
+generalization of attention the checkpoint was never trained with. This matches the
+original design spec's own stated fallback ("if this validates... a training-recipe
+follow-up teaches the model to expect N-window context directly") — except the finding
+here is negative, which makes that follow-up necessary rather than a nice-to-have.
+Remaining sweep phases 2-8 (size variants, totalseg CT+MRI) were killed, not completed;
+their scripts (`run_multipatch_overnight.sh` / `_part2.sh`) and the generalized
+comparison script stay on the branch for whenever a zero-shot re-check is useful again
+(e.g. once a trained checkpoint exists, to compare zero-shot vs trained multi-window
+behavior). Full narrative, exact commands, and the complete status log:
+`experiments/3d/OVERNIGHT_PROGRESS.md`.
+
+**Pure compute/memory benchmark** (new `experiments/3d/bench_multipatch_cost.py`,
+synthetic tensors, no dataset — seconds per point instead of minutes), requested before
+stopping: a real gotcha surfaced and got fixed while building it — the model's
+`_decode_conv` skip-fusion stage sizes are derived from `cfg.data.image_size` at
+CONSTRUCTION time (`train.py::build_model`'s `"image_size": list(cfg.data.image_size)`
+— the one arch field NOT restored from the checkpoint's own stored arch), so measuring
+"cost at T=64" needs the model REBUILT with `data.image_size=[64,64,64]`, not a 64-sized
+tensor fed into a model built for T=128 (a genuine, separate, now-understood crash: one
+built-for-T model cannot forward a different T, full stop — this is why the cascade
+itself always re-crops to a fixed T and only varies spacing). Headline numbers (K=1,
+RTX A4000 16GB, bf16, median of 5 reps):
+
+| T | n=1 | n=2 | n=4 | n=8 |
+|---|---|---|---|---|
+| 128 | 184ms / 2.5GB | 427ms / 4.7GB | 1076ms / 9.1GB | OOM |
+| 64  | 105ms / 1.1GB | 263ms / 1.9GB | 750ms / 3.4GB  | 2428ms / 6.6GB |
+| 32  | 96ms  / 1.0GB | 247ms / 1.8GB | 721ms / 3.3GB  | 2395ms / 6.4GB |
+
+Cost grows super-linearly in n at every T (ms/window rises with n — dense
+`(K+n)*N`-row attention dominates, not just the per-window encoder forward, matching
+the spec's own flagged risk). T=128→64 roughly halves both time and memory; T=64→32
+buys almost nothing further (the fixed-size `resolution=16` bottleneck transformer
+dominates once the encoder input is already small) — so T=64, not T=32, is the useful
+lever: it doubles the n budget that fits in 16GB (n=8 OOMs at T=128, fits comfortably at
+T=64/32) for a measured-zero-shot accuracy cost (~0.06 Dice on one spot-checked class)
+that a real training recipe at that resolution would likely do better than.
+
+## 2026-10-13 — multi-patch cascade re-crop: N windows per role instead of 1 (`data.cascade_n_patches`)
+
+Branch `multipatch-cascade` (spec `docs/superpowers/specs/2026-10-13-multipatch-cascade-design.md`,
+plan `docs/superpowers/plans/2026-10-13-multipatch-cascade.md`, ledger
+`.superpowers/sdd/2026-10-13-multipatch-cascade/progress.md`). Generalizes the cascade's
+level-`i>=1` re-crop from "1 window per role" to "N windows per role", all processed in one
+joint forward pass, as a zero-shot (inference-only, no training change) probe of whether
+sampling several windows from a continuous probability field beats a single COM/`random_fg`
+point on diffuse, multi-focal or elongated ROIs.
+
+- `experiments/3d/cascade.py`: new `_prob_weighted_points_multi` sampler (per batch row, a
+  probability-weighted multinomial over the CONCATENATION of the previous level's M windows,
+  decoding each draw to `(window_idx, (d,h,w))` so every point inverts through its own
+  originating window's aug grid + crop geom); `_points_for_level_multi`,
+  `_recrop_level_multi` (n target windows + n independently-seeded `random_fg` windows per
+  context subject, so support grows K -> K*n rows), `_build_query_prior_multi` (per-window
+  `pred` prior, fp32/no-autocast like the single-window path); `run_cascade(..., n_patches=)`
+  with `CascadeResult.n_patches` per level. `n_patches=1` keeps today's code path untouched.
+- `src/models/patchset3d.py`: query axis generalized from exactly 1 volume to M
+  (`image` accepts `(B,1,D,H,W)` legacy or `(B,M,1,D,H,W)`; `query_prior` likewise carries M
+  per-window priors), asserting against the combinations deliberately not generalized
+  (`decoder=iris`, `seq_compress`, `cascade_registers`, `register_routed`).
+- `experiments/3d/common.py`: `_assert_cascade_supported` validates
+  `data.cascade_n_patches` (positive int, default 1).
+- `experiments/3d/evaluate.py`: `_stitched_native_metrics_and_levels` scores a LIST of
+  windows per (subject, class) per level.
+- Eval-only for now: `run_cascade` raises on `training=True` with `n_patches>1`, and the
+  multi path also asserts against `gpu_realize_crop=true`, `cascade_query_prior_hard=true`
+  and `eval.cascade_figures=true` rather than silently diverging from the `n=1` arm.
+- `data.cascade_n_patches` is a NEW key not declared in any config YAML, so under Hydra
+  struct mode it needs the `+` prefix: `+data.cascade_n_patches=2`.
+
+The final whole-branch review caught two critical cross-task bugs no single task could see,
+both fixed here: (1) `PatchSet3D._rope` was never generalized for M query volumes, so its
+position table was short by `(M-1)*N` rows and `transformer_rope=true` (which the checkpoint
+under test has) hard-crashed at the first multi-window level; (2) within-level stitching
+pasted each window by plain overwrite, so a later peer window's background erased an earlier
+one's foreground wherever they overlapped (two windows each finding one of two foci scored
+dice 0.667 instead of 1.0) — it now UNIONs peers within a level while keeping the
+coarse->fine overwrite rule across levels, via a new `_paste_union` + per-level `touched`
+mask. Also replaced `_prob_weighted_points_multi`'s `random.Random().choices()` over an
+`M*T^3` Python list with the spec's own `torch.multinomial` (~1213ms -> ~31ms per call at
+production T=128, B=4/n=4).
+
+Deliverable state: `experiments/3d/compare_multipatch_flare22.py` prints per-class Dice/NSD
+deltas for a `data.cascade_n_patches_sweep` (default `[1,2,4]`) against one checkpoint/eval
+seed, forcing `cascade_query_prior=pred` (the only mode the multi path supports, and exp168's
+own trained recipe) and `gpu_realize_crop=false` for both arms. It has NOT yet been run
+against a real checkpoint — that FLARE22 validation run is a follow-up manual GPU step, and
+its numbers belong in a later entry.
+
 ## 2026-09-23 (cont.) — target-vs-surrounding-tissue contrast measured on the 7 OOD sources; `host_anchored` redesigned as a ratio, not an absolute offset
 
 Session was restarted mid-training (killed `134`/`135` tmux sessions with no error in either

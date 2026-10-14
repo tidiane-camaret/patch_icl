@@ -1101,6 +1101,116 @@ def test_random_fg_point_is_seeded_reproducibly():
     assert tuple(a[0].tolist()) == tuple(b[0].tolist())
 
 
+# ---------------------------------------------------------------------------
+# Multi-window probability-weighted point sampler
+# ---------------------------------------------------------------------------
+from cascade import _prob_weighted_points_multi
+
+
+def test_prob_weighted_points_multi_single_window_single_voxel():
+    """M=1 field, one hot voxel: every one of n draws must land on that voxel."""
+    T = 6
+    field = torch.full((1, 1, T, T, T), -10.0)
+    field[0, 0, 2, 3, 4] = 10.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=3,
+                                      seed=0, step=0, level=0)
+    assert len(out) == 1 and len(out[0]) == 3
+    for window_idx, (d, h, w) in out[0]:
+        assert window_idx == 0
+        assert (d, h, w) == (2, 3, 4)
+
+
+def test_prob_weighted_points_multi_covers_both_windows():
+    """Two windows, each with ALL its mass on a different voxel: with n=8 draws from a
+    concatenated multinomial, both windows' voxels must appear at least once (this is
+    exactly the failure mode a single-point re-crop can't express -- both windows'
+    content gets a chance to be sampled, not just one)."""
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f0[0, 0, 1, 1, 1] = 10.0
+    f1 = torch.full((1, 1, T, T, T), -10.0)
+    f1[0, 0, 4, 4, 4] = 10.0
+    out = _prob_weighted_points_multi([f0, f1], T, is_prob=False, n=8,
+                                      seed=0, step=0, level=0)
+    picks = {(w, pt) for w, pt in out[0]}
+    assert (0, (1, 1, 1)) in picks
+    assert (1, (4, 4, 4)) in picks
+
+
+def test_prob_weighted_points_multi_empty_returns_none():
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f1 = torch.full((1, 1, T, T, T), -10.0)
+    out = _prob_weighted_points_multi([f0, f1], T, is_prob=False, n=3,
+                                      seed=0, step=0, level=0)
+    assert out == [[None, None, None]]
+
+
+def test_prob_weighted_points_multi_uncertainty_mode_favors_the_boundary():
+    """sample_mode="uncertainty": a field that is confidently foreground on one side
+    (p~1), confidently background on the other (p~0), and near the decision boundary
+    (p~0.5) in a thin middle band -- uncertainty weighting must concentrate draws on
+    the middle band, never on the confident p~1 or p~0 interiors (sample_mode="prob"
+    would instead concentrate on the p~1 side)."""
+    T = 9
+    field = torch.full((1, 1, T, T, T), -10.0)       # p~0 everywhere by default
+    field[0, 0, 0:3, :, :] = 10.0                    # confident foreground slab (p~1)
+    field[0, 0, 3:6, :, :] = 0.0                     # the boundary band (sigmoid(0)=0.5)
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=50,
+                                      seed=0, step=0, level=0, sample_mode="uncertainty")
+    for _w_idx, (d, h, w) in out[0]:
+        assert 3 <= d < 6, f"uncertainty draw {(d, h, w)} fell outside the boundary band"
+
+
+def test_prob_weighted_points_multi_prob_mode_favors_confident_foreground():
+    """Same field as above, sample_mode="prob" (default): the p~1 confident slab carries
+    roughly 2x the p~0.5 boundary band's total probability mass (same voxel count, p~1
+    vs p~0.5), so draws should be a clear MAJORITY in the confident slab -- not the
+    near-exclusive concentration uncertainty mode produces (p~1 isn't infinitely more
+    likely than p~0.5, just more likely), so this checks a statistical majority rather
+    than every single draw. The point is the two modes are genuinely different, not
+    accidentally the same weighting -- contrast against the uncertainty-mode test above,
+    which DOES see every draw land in the boundary band."""
+    T = 9
+    field = torch.full((1, 1, T, T, T), -10.0)
+    field[0, 0, 0:3, :, :] = 10.0
+    field[0, 0, 3:6, :, :] = 0.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=200,
+                                      seed=0, step=0, level=0, sample_mode="prob")
+    in_slab = sum(1 for _w_idx, (d, h, w) in out[0] if 0 <= d < 3)
+    in_band = sum(1 for _w_idx, (d, h, w) in out[0] if 3 <= d < 6)
+    assert in_slab > in_band, f"expected a confident-slab majority, got slab={in_slab} band={in_band}"
+
+
+def test_prob_weighted_points_multi_rejects_bad_sample_mode():
+    T = 6
+    field = torch.full((1, 1, T, T, T), 10.0)
+    with pytest.raises(AssertionError, match="sample_mode"):
+        _prob_weighted_points_multi([field], T, is_prob=False, n=1,
+                                    seed=0, step=0, level=0, sample_mode="bogus")
+
+
+def test_prob_weighted_points_multi_is_seeded_reproducibly():
+    T = 6
+    f0 = torch.full((1, 1, T, T, T), -10.0)
+    f0[0, 0, 1, 1, 1] = 10.0
+    f0[0, 0, 4, 4, 4] = 10.0
+    a = _prob_weighted_points_multi([f0], T, is_prob=False, n=4, seed=7, step=3, level=1)
+    b = _prob_weighted_points_multi([f0], T, is_prob=False, n=4, seed=7, step=3, level=1)
+    assert a == b
+
+
+def test_prob_weighted_points_multi_batch_rows_independent():
+    T = 6
+    field = torch.full((2, 1, T, T, T), -10.0)
+    field[0, 0, 1, 1, 1] = 10.0
+    field[1, 0, 5, 5, 5] = 10.0
+    out = _prob_weighted_points_multi([field], T, is_prob=False, n=2,
+                                      seed=0, step=0, level=0)
+    assert all(pt == (1, 1, 1) for _, pt in out[0])
+    assert all(pt == (5, 5, 5) for _, pt in out[1])
+
+
 class _TwoBlobModel(torch.nn.Module):
     """Two disjoint one-hot cells at logit resolution == T (no upsample blur): a
     'non-convex' mask whose COM (their midpoint) is NOT itself a foreground voxel."""
@@ -1137,6 +1247,158 @@ def test_run_cascade_center_mode_random_fg_lands_on_a_masked_voxel():
     # every level>0 LoadRequest (target AND context) carried center_mode through
     tgt_calls = [c for c in prov.calls if c["center"] is not None]
     assert len(tgt_calls) == B
+
+
+# --- Task 5: data.cascade_n_patches -- N-patch re-crop branch ----------------------------
+
+def test_run_cascade_n_patches_default_is_byte_identical_to_main():
+    """n_patches unset (defaults to 1) must take the EXACT existing single-point code
+    path -- same centers, same logits -- as a regression guard that the generalization
+    is additive, not a behavior change at the default."""
+    B, T, G = 2, 8, 4
+    model, prov = _FakeModel(G=G, hot=(1, 1, 1)), _FakeProvider(T=T)
+    res_default = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                              spacings=[3.0, 1.5], device=torch.device("cpu"),
+                              training=True, step=0, seed=0, jitter=0)
+    model2, prov2 = _FakeModel(G=G, hot=(1, 1, 1)), _FakeProvider(T=T)
+    res_explicit = run_cascade(model2, prov2, _v2_batch(B=B, T=T), augmentor=None,
+                               spacings=[3.0, 1.5], device=torch.device("cpu"),
+                               training=True, step=0, seed=0, jitter=0, n_patches=1)
+    assert res_default.n_patches == [1, 1]
+    assert res_explicit.n_patches == [1, 1]
+    for a, b in zip(res_default.logits, res_explicit.logits):
+        assert torch.equal(a, b)
+    assert res_default.centers == res_explicit.centers
+
+
+def test_run_cascade_n_patches_training_raises():
+    with pytest.raises(AssertionError, match="cascade_n_patches"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=True, step=0, seed=0, n_patches=2)
+
+
+def test_run_cascade_n_patches_realize_crop_raises():
+    with pytest.raises(AssertionError, match="gpu_realize_crop"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=False, step=0, seed=0, n_patches=2, realize_crop=True)
+
+
+def test_run_cascade_n_patches_query_prior_hard_raises():
+    with pytest.raises(AssertionError, match="cascade_query_prior_hard"):
+        run_cascade(_FakeModel(), _FakeProvider(), _v2_batch(), augmentor=None,
+                    spacings=[3.0, 1.5], device=torch.device("cpu"),
+                    training=False, step=0, seed=0, n_patches=2, query_prior_hard=True)
+
+
+class _TwoBlobMultiQueryModel(torch.nn.Module):
+    """Echoes back M one-hot blobs (one per query window) so the test can assert BOTH
+    level-0 blobs get covered by level 1's n=2 windows -- the exact failure mode a
+    single-point re-crop can't express. Accepts the model's new (B,M,1,D,H,W) image
+    shape and returns (B,M,1,G,G,G)."""
+    spacing_aware = False
+
+    def __init__(self, G, blobs):
+        super().__init__()
+        self.G, self.blobs = G, blobs
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        # legacy single-query shape is (B,1,D,H,W) -- 5 dims, matching
+        # PatchSet3D.forward's own `legacy_image = image.dim() == 5` (src/models/
+        # patchset3d.py); the new (B,M,1,D,H,W) multi-query shape is 6 dims.
+        legacy = image.dim() == 5
+        M = 1 if legacy else image.shape[1]
+        B = image.shape[0]
+        lg = torch.full((B, M, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        for m in range(M):
+            c = self.blobs[m % len(self.blobs)]
+            lg[:, m, :, c[0], c[1], c[2]] = 10.0
+        lg = lg + self.p.to(image.device)
+        if legacy:
+            lg = lg[:, 0]
+        return {"final_logit": lg}
+
+
+def test_run_cascade_n_patches_two_covers_two_disjoint_blobs():
+    """At level 0 a single FakeProvider crop is loaded (M=1, as always); level 1 asks
+    for n_patches=2 windows. The model always predicts two disjoint one-hot blobs
+    regardless of M, so level 1's sampler (fed level 0's single M=1 field) must still
+    land its 2 drawn points on voxels that are plausible under level 0's own prediction
+    -- this test's real purpose is exercising the n_patches>1 PLUMBING end-to-end
+    (shapes, no crash, n_patches recorded) rather than re-proving the sampler's own
+    coverage math (already covered by Task 1's unit tests)."""
+    B, T, G = 2, 8, 4
+    blobs = ((1, 1, 1), (2, 2, 2))
+    model, prov = _TwoBlobMultiQueryModel(G, blobs), _FakeProvider(T=T)
+    res = run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+                      spacings=[3.0, 1.5], device=torch.device("cpu"),
+                      training=False, step=0, seed=0, jitter=0, n_patches=2)
+    assert res.n_patches == [1, 2]
+    assert res.logits[1].shape == (B, 2, 1, G, G, G)
+    assert res.geoms[1].shape == (B, 2, 4, 3)   # one geom per sampled window
+
+
+def test_run_cascade_n_patches_context_tasks_scale_with_n():
+    """Each of K context subjects contributes n independently-centred windows per level,
+    so the provider sees K*n context loads per b at level>0 (was K)."""
+    B, K, T = 2, 3, 8
+    model, prov = _TwoBlobMultiQueryModel(4, ((1, 1, 1), (2, 2, 2))), _FakeProvider(T=T)
+    run_cascade(model, prov, _v2_batch(B=B, K=K, T=T), augmentor=None,
+               spacings=[3.0, 1.5], device=torch.device("cpu"),
+               training=False, step=0, seed=0, jitter=0, n_patches=2)
+    ctx_calls = [c for c in prov.calls if c["center"] is None]
+    assert len(ctx_calls) == B * K * 2
+
+
+class _MultiPriorSpyModel(torch.nn.Module):
+    """Like _PriorSpyModel but supports the (B,M,1,D,H,W) multi-query image shape (Task
+    2/3) and records the query_prior tensor it receives at every level, including when
+    it carries the (B,n,1,T,T,T) multi-window shape (Task 3). Echoes blobs like
+    _TwoBlobMultiQueryModel so the n_patches>1 re-crop sampler has something to sample."""
+    spacing_aware = False
+
+    def __init__(self, G, blobs):
+        super().__init__()
+        self.G, self.blobs, self.priors = G, blobs, []
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, context_in, context_out, mode="train", spacing=None,
+               query_prior=None, cascade_regs=None):
+        self.priors.append(None if query_prior is None else query_prior.detach().clone())
+        legacy = image.dim() == 5           # (B,1,D,H,W); matches PatchSet3D.forward
+        M = 1 if legacy else image.shape[1]
+        B = image.shape[0]
+        lg = torch.full((B, M, 1, self.G, self.G, self.G), -10.0, device=image.device)
+        for m in range(M):
+            c = self.blobs[m % len(self.blobs)]
+            lg[:, m, :, c[0], c[1], c[2]] = 10.0
+        lg = lg + self.p.to(image.device)
+        if legacy:
+            lg = lg[:, 0]
+        return {"final_logit": lg}
+
+
+def test_run_cascade_n_patches_query_prior_tracks_through_levels():
+    """Regression guard for the bug where the prior-build gate checked `prev_logit`
+    (only set right after a this_n==1 level) instead of `prev_fields` (set after every
+    level): with a 3-level cascade and n_patches=2, level 2's query_prior would silently
+    never build once level 1 went multi-window, even though prior_modes_used recorded
+    'pred' as if it had. Asserts BOTH level 1's and level 2's query_prior are real,
+    full (B,n,1,T,T,T) tensors -- not None."""
+    B, T = 2, 8
+    blobs = ((1, 1, 1), (2, 2, 2))
+    model = _MultiPriorSpyModel(4, blobs)
+    prov = _FakeProvider(T=T)
+    run_cascade(model, prov, _v2_batch(B=B, T=T), augmentor=None,
+               spacings=[3.0, 1.5, 0.75], device=torch.device("cpu"),
+               training=False, step=0, seed=0, jitter=0, n_patches=2,
+               query_prior="pred")
+    assert model.priors[0] is None                       # level 0 never gets a prior
+    assert model.priors[1] is not None and model.priors[1].shape == (B, 2, 1, T, T, T)
+    assert model.priors[2] is not None and model.priors[2].shape == (B, 2, 1, T, T, T)
 
 
 def test_run_cascade_center_mode_invalid_raises():
@@ -1238,3 +1500,126 @@ def test_run_cascade_registers_inert_for_models_without_support():
                       spacings=[3.0, 1.5], device=torch.device("cpu"),
                       training=True, step=0, seed=0)
     assert len(res.logits) == 2   # no crash
+
+
+# --- Task 6: evaluate_cascade / _stitched_native_metrics_and_levels with n_patches>1 -----
+
+from evaluate import _stitched_native_metrics_and_levels
+
+
+def _packed(mask, geom):
+    return (np.packbits(mask), mask.shape, geom)
+
+
+def test_stitched_native_metrics_accepts_single_tuple_unchanged(tmp_path):
+    """Regression: the pre-existing single-(packed,shape,geom)-tuple contract (n=1
+    levels) must still work byte-identically."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.zeros((8, 8, 8), dtype=bool)
+    gt[2:5, 2:5, 2:5] = True
+    np.save(subj_dir / "label.npy", gt.astype(np.uint8))
+    geom = np.array([[0, 0, 0], [8, 8, 8], [8, 8, 8], [0, 0, 0]])
+    pred = np.zeros((8, 8, 8), dtype=bool)
+    pred[2:5, 2:5, 2:5] = True
+    class_idx = {"organ": 1}
+    gt_u8 = np.load(subj_dir / "label.npy")
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): _packed(pred, geom)}], tmp_path, class_idx=class_idx)
+    # class_idx path reads label.npy == idx; write it with the real class value (1)
+    np.save(subj_dir / "label.npy", (gt_u8 * 1))
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): _packed(pred, geom)}], tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+
+def test_stitched_native_metrics_accepts_list_of_windows(tmp_path):
+    """n_patches>1: pg_levels[li][key] is a LIST of (packed,shape,geom) -- two windows,
+    each covering a DIFFERENT, DISJOINT native half (own geom/starts, matching how real
+    n>1 windows land at different sampled locations), must stitch to full coverage.
+    NOTE: disjoint geoms is the easy case -- union and overwrite agree when windows
+    don't overlap, so this is NOT a guard for the within-level union semantics; see
+    test_stitched_native_metrics_unions_overlapping_windows_within_a_level below for
+    the overlapping case that actually distinguishes them."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.ones((8, 8, 8), dtype=np.uint8)  # both halves foreground
+    np.save(subj_dir / "label.npy", gt)
+    geom_a = np.array([[0, 0, 0], [4, 8, 8], [4, 8, 8], [0, 0, 0]])  # native rows 0:4
+    geom_b = np.array([[4, 0, 0], [4, 8, 8], [4, 8, 8], [0, 0, 0]])  # native rows 4:8
+    pred_a = np.ones((4, 8, 8), dtype=bool)  # window A covers the top half
+    pred_b = np.ones((4, 8, 8), dtype=bool)  # window B covers the bottom half
+    class_idx = {"organ": 1}
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): [_packed(pred_a, geom_a), _packed(pred_b, geom_b)]}],
+        tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+def test_stitched_native_metrics_unions_overlapping_windows_within_a_level(tmp_path):
+    """Two windows with IDENTICAL (fully overlapping) native footprints, each correctly
+    predicting a DIFFERENT half of the true positive region -- the realistic case for
+    probability-weighted multi-window sampling from one concentrated field. Overwrite
+    ('later paste wins') would make the second window's background erase the first
+    window's foreground wherever they overlap (dice=0.667, measured); union must recover
+    the full positive region (dice=1.0)."""
+    subj_dir = tmp_path / "s0"
+    subj_dir.mkdir()
+    gt = np.ones((8, 8, 8), dtype=np.uint8)              # whole volume is foreground
+    np.save(subj_dir / "label.npy", gt)
+    geom = np.array([[0, 0, 0], [8, 8, 8], [8, 8, 8], [0, 0, 0]])   # SAME footprint, both windows
+    pred_a = np.zeros((8, 8, 8), dtype=bool)
+    pred_a[0:4, :, :] = True                              # window A finds the top half only
+    pred_b = np.zeros((8, 8, 8), dtype=bool)
+    pred_b[4:8, :, :] = True                              # window B finds the bottom half only
+    class_idx = {"organ": 1}
+    full, per_level = _stitched_native_metrics_and_levels(
+        [{("s0", "organ"): [_packed(pred_a, geom), _packed(pred_b, geom)]}],
+        tmp_path, class_idx=class_idx)
+    assert full[("s0", "organ")][0] == pytest.approx(1.0)
+
+
+def test_evaluate_cascade_n_patches_greater_than_one_end_to_end(tmp_path, monkeypatch):
+    """Smoke test for the run_cascade -> evaluate_cascade handoff at n_patches>1 (Task 5's
+    CascadeResult shapes feeding Task 6's list-of-windows scoring) -- nothing else tests
+    this seam directly. Rope (tests/test_patchset3d.py) and within-level union stitching
+    (test_stitched_native_metrics_unions_overlapping_windows_within_a_level) have their own
+    dedicated guards; this one only checks the wiring doesn't crash and scores sanely."""
+    import common
+    from src.totalseg_dataloader_incontext import _ALL_CLASSES_IDX
+
+    B, K, T = 2, 3, 8
+    idx = _ALL_CLASSES_IDX["liver"]
+    lbl = np.zeros((T, T, T), dtype=np.uint8)
+    lbl[1:4, 1:4, 1:4] = idx
+    for b in range(B):
+        (tmp_path / f"s{b}").mkdir()
+        np.save(tmp_path / f"s{b}" / "label.npy", lbl)
+
+    monkeypatch.setattr(common, "_source_root",
+                        lambda cfg: (None, str(tmp_path), False), raising=False)
+
+    model = _TwoBlobMultiQueryModel(4, ((1, 1, 1), (2, 2, 2)))
+    prov = _FakeProvider(T=T)
+
+    class _Loader:
+        dataset = __import__("types").SimpleNamespace(provider=prov)
+        def __iter__(self):
+            return iter([_named_batch(["liver"] * B, B=B, K=K, T=T)])
+        def __len__(self): return 1
+
+    cfg = OmegaConf.create({"data": {"cascade_spacings": [3.0, 1.5],
+                                     "gpu_realize_crop": False,
+                                     "cascade_n_patches": 2}})
+    rows, cases = evaluate_cascade(model, cfg, ["liver"], loader=_Loader(),
+                                   seed=0, is_prob=False)
+
+    row = {r["class"]: r for r in rows}["liver"]
+    assert "error" not in row, row
+    assert np.isfinite(row["mean_dice"])
+    assert len(cases) == B
+    for c in cases:
+        assert np.isfinite(c["dice"]) and np.isfinite(c["dice_r1.5"])
+    # level 1 really built n=2 windows per role: B*(K+1)*n provider loads (level 0 reuses
+    # the given batch and loads nothing), of which B*K*n are the context (center=None) ones.
+    assert len(prov.calls) == B * (K + 1) * 2
+    assert len([c for c in prov.calls if c["center"] is None]) == B * K * 2

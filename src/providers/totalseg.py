@@ -197,15 +197,35 @@ def _resolve_center(req: LoadRequest, label_np, class_idx: int, fallback, fg_sam
     is); falls back to `fallback` if the class has no voxels for this subject/label array
     (e.g. a synth/goal-mask edit emptied it) or `class_idx < 0` (unknown class).
 
-    Cost note: "random_fg" scans the full (already-loaded-for-the-crop) label array —
-    cheap when label_np is RAM-resident (the real CT/MRI providers), but O(native voxels)
-    of disk/page-cache traffic against an mmap'd, uncached array (the synth_gmm provider) —
-    see docs/logs.md. `fg_samples`, when given (a precomputed (n,3) array of foreground
-    voxel coords for this exact class, e.g. from build_gmm_mask_bank's
-    add_fg_samples_to_bank.py), draws from that bounded set instead — O(1), no scan at
-    all. Falls through to the live scan if `fg_samples` is None or empty."""
+    "random_border": like "random_fg", but drawn only from the mask's own BORDER shell
+    (foreground voxels touching a background neighbor, via scipy.ndimage.binary_erosion)
+    instead of uniformly over the whole mask interior — a GT-appropriate stand-in for
+    cascade.py's data.cascade_sample_mode="uncertainty" (GT has no soft probability to be
+    uncertain FROM, so "near the boundary" plays that role for context crops). Falls back
+    to "random_fg" behavior (then to `fallback`) if the mask has no border voxels (e.g. a
+    single-voxel mask with no interior to erode away).
+
+    Cost note: "random_fg"/"random_border" scan the full (already-loaded-for-the-crop)
+    label array — cheap when label_np is RAM-resident (the real CT/MRI providers), but
+    O(native voxels) of disk/page-cache traffic against an mmap'd, uncached array (the
+    synth_gmm provider) — see docs/logs.md. `fg_samples`, when given (a precomputed
+    (n,3) array of foreground voxel coords for this exact class, e.g. from
+    build_gmm_mask_bank's add_fg_samples_to_bank.py), draws from that bounded set instead
+    for "random_fg" only — O(1), no scan at all ("random_border" always scans). Falls
+    through to the live scan if `fg_samples` is None or empty."""
     if req.center is not None:
         return req.center
+    if req.center_mode == "random_border" and class_idx >= 0:
+        mask = label_np == class_idx
+        if mask.any():
+            from scipy.ndimage import binary_erosion
+            border = mask & ~binary_erosion(mask)
+            coords = np.argwhere(border)
+            if coords.shape[0] == 0:                    # no border (e.g. 1-voxel mask)
+                coords = np.argwhere(mask)
+            if coords.shape[0] > 0:
+                return tuple(int(v) for v in coords[req.rng.randrange(coords.shape[0])])
+        return fallback
     if req.center_mode == "random_fg" and class_idx >= 0:
         if fg_samples is not None and len(fg_samples) > 0:
             return tuple(int(v) for v in fg_samples[req.rng.randrange(len(fg_samples))])
