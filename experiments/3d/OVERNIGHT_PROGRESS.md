@@ -162,3 +162,81 @@ which is NOT in the current queue (user's own 3 directives were input-size,
 uncertainty-sampling, and totalseg CT+MRI -- not a request to add a new eval
 source) -- flagging this as a good candidate for a FOLLOW-UP sweep if time
 remains after the current 8 phases, not assumed/added unilaterally.
+
+## STOPPED HERE (user decision, 2026-10-14)
+
+Phase 1's result was clear and consistent enough on its own (monotonic, not
+noise) that the user decided to stop the zero-shot sweep rather than run the
+remaining 7 phases (size variants on FLARE22, totalseg CT+MRI headline +
+size variant). Killed pids 4819/4822 (the relaunched phase-2-8 driver, which
+had gotten to phase 2's n=1 point, ~154/650 samples in -- that partial run's
+data was NOT saved, no JSON was written for it since the script only writes
+after a full sweep point completes).
+
+Next step is a TRAINING pipeline for the multi-patch case, not more zero-shot
+probing -- see docs/logs.md 2026-10-14 entry for the full reasoning. This
+file, the two runner scripts (`run_multipatch_overnight.sh` / `_part2.sh`),
+and the generalized `compare_multipatch_flare22.py` all stay on the branch
+for whenever a zero-shot re-check becomes useful again (e.g. comparing a
+FUTURE trained-for-multi-window checkpoint's zero-shot-vs-trained behavior
+would reuse this exact infrastructure unchanged).
+
+## Pure compute/memory benchmark (requested before compacting)
+
+New `experiments/3d/bench_multipatch_cost.py` -- isolates the MODEL's own
+forward-pass cost from data loading / native-GT scoring (synthetic random
+tensors, no dataset/provider at all), so each point takes seconds not
+minutes. One real gotcha found and fixed while building it: the model's
+decode-stage sizes (`_dec_sides` in `_decode_conv`) are derived from
+`cfg.data.image_size` at CONSTRUCTION time (`train.py::build_model`:
+`"image_size": list(cfg.data.image_size)` -- the one arch field NOT restored
+from the checkpoint's own stored arch), not from whatever tensor shape is
+fed in at forward time -- so benchmarking "cost at T=64" requires REBUILDING
+the model with `data.image_size=[64,64,64]`, not just feeding a 64-sized
+tensor into a model built for T=128 (which crashes in `_decode_conv`'s
+skip-fusion with a real, separate shape-mismatch bug, now understood: a
+model built for one T cannot forward a DIFFERENT runtime T, full stop --
+this is NOT the same as the "cascade re-crops to T=128 always, only spacing
+varies" design the cascade itself uses, and explains why the earlier
+`data.image_size` eval runs worked -- `_build_model` rebuilds the model
+fresh from `cfg.data.image_size` every time).
+
+**Result** (K=1 context, RTX A4000 16GB, bf16 autocast, median of 5 reps
+after 2 warmup):
+
+| T   | n | ms/fwd | ms/window | peak mem (GB) |
+|-----|---|--------|-----------|----------------|
+| 128 | 1 | 183.6  | 183.6     | 2.47 |
+| 128 | 2 | 426.9  | 213.4     | 4.68 |
+| 128 | 4 | 1076.4 | 269.1     | 9.06 |
+| 128 | 8 | OOM    | -         | - |
+| 64  | 1 | 105.1  | 105.1     | 1.06 |
+| 64  | 2 | 262.8  | 131.4     | 1.86 |
+| 64  | 4 | 750.2  | 187.6     | 3.43 |
+| 64  | 8 | 2427.8 | 303.5     | 6.57 |
+| 32  | 1 | 95.9   | 95.9      | 1.04 |
+| 32  | 2 | 246.6  | 123.3     | 1.82 |
+| 32  | 4 | 721.0  | 180.2     | 3.34 |
+| 32  | 8 | 2394.7 | 299.3     | 6.39 |
+
+**Reading it:**
+- **Cost grows super-linearly in n at every T** (ms/window rises with n: at
+  T=128, 184 -> 213 -> 269 ms/window for n=1/2/4 -- consistent with the
+  spec's own flagged risk that dense (K+n)*N-row attention, not just the
+  per-window encoder forward, dominates as n grows). n=8 OOMs at T=128 on
+  this 16GB card; n=4 is close to the practical ceiling there (9GB already).
+- **T buys real headroom, with fast-saturating returns below 64.** T=128->64
+  roughly HALVES both time (184->105ms at n=1) and memory (2.47->1.06GB) --
+  a genuinely good trade if T=64's ~0.06 Dice cost (per the earlier liver
+  spot-check) is acceptable. T=64->32 is nearly FREE in both directions
+  (105->96ms, 1.06->1.04GB) -- at this point the FIXED-size R=16 bottleneck
+  transformer (resolution=16, independent of T) dominates, not the encoder,
+  so shrinking the encoder input further buys almost nothing. This matches
+  n=8 fitting comfortably at T=64/32 (6.4-6.6GB) where it OOMs at T=128.
+- **Practical implication for a future training recipe**: if multi-window
+  training turns out to need larger n (4+) to show a real benefit, T=64 (not
+  T=128) is the resolution to train it at on a 16GB-class card -- it roughly
+  doubles the n budget for the same memory, and the accuracy cost of T=64
+  alone (measured zero-shot, so likely an OVERESTIMATE of the cost once the
+  model is actually trained at that resolution) was real but not
+  prohibitive on the one spot-checked class.
