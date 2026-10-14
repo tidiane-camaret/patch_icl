@@ -1,9 +1,36 @@
-## patch_icl
+## PatchICL
 
 In-context 3D medical image segmentation: given a target CT/MRI volume and K context
 (image, mask) pairs for the same organ, predict a mask for the target. Primary dataset is
 TotalSegmentator (CT + MRI); also trains/evals on several OOD sources (ISLES22, Shifts-MS,
 ATLAS v2, GNC_705, NasalSeg, ...).
+
+## Results
+
+Coarse-to-fine cascade vs. Medverse (matched refinement steps, 6 non-lesion held-out
+datasets): **~17x faster** (206ms vs. 3491ms/sample, sample-weighted) and **more
+accurate on average** (Dice 0.526 vs. 0.393), winning 4/6 datasets. Lesion
+segmentation remains below 0.1 Dice for both models on all 4 lesion datasets tested.
+Full writeup in `results/publications/thesis/ics_3d_medical/`.
+
+| Dataset | Spacings (mm) | Dice (ours) | Dice (Medverse) | Latency (ours) | Latency (Medverse) |
+|---|---|---|---|---|---|
+| FLARE22 | 6, 3, 2.5 | **0.751** | 0.359 | 311ms | 4894ms |
+| MSD Prostate | 3, 1.5, 0.75 | **0.375** | 0.357 | 279ms | 5006ms |
+| MSD Hippocampus | 0.5 | 0.303 | **0.686** | 99ms | 50ms |
+| HU_LWK1 | 6, 3, 1 | **0.152** | 0.020 | 439ms | 5336ms |
+| TotalSeg MRI | 6, 3, 1.5 | **0.503** | 0.055 | 194ms | 5188ms |
+| NasalSeg | 1.5, 0.8 | 0.547 | **0.737** | 161ms | 1886ms |
+| **Mean (sample-weighted)** | | **0.526** | 0.393 | **206ms** | 3491ms |
+
+Crop placement across cascade levels, ours vs. Medverse (FLARE22 spleen):
+
+![FLARE22 cascade crop placement](results/publications/thesis/ics_3d_medical/imgs/qualitative/c2f_flare22.png)
+
+Qualitative win on MSD Hippocampus, hippocampus_anterior (top: ours, Dice 0.70;
+bottom: Medverse, Dice 0.00):
+
+![MSD Hippocampus qualitative example](results/publications/thesis/ics_3d_medical/imgs/qualitative/candidates/msd_hippocampus_1.png)
 
 ## Inference
 
@@ -18,28 +45,19 @@ patchset-infer \
   --context ctx_ct.nii.gz ctx_mask.nii.gz \
   --checkpoint /nfs/.../best.pt \
   --out pred.nii.gz [--gt gt_mask.nii.gz]
+  --labels 1,5,13 # default : all 
+  --batch-size 4
 
-# many targets, one checkpoint load instead of one process per target
+# multiple targets, one checkpoint load 
 # (JSON-Lines manifest, see docs/inference_cli.md)
 patchset-infer --manifest tasks.jsonl --checkpoint /nfs/.../best.pt --out-dir preds/
 
-# multi-label (one id-valued context mask -> many organs in one run)
-patchset-infer ... --labels 1,5,13 --batch-size 4
-
-# match the checkpoint's own training config -- getting these wrong doesn't error,
-# it silently changes what the model sees (the CLI prints a drift warning either way)
+# additional flags
 #   --crop-spacings S0,S1   coarse->fine FOV schedule in mm/voxel (default 4,1.5)
-#   --query-prior pred|none v2 cascade query-mask prior mode (default pred)
-#   --mask-downsample occupancy|soft   context-mask downsample (default occupancy)
-#   --mask-occupancy-thr    omit it -- auto-inherits the checkpoint's own training value
-
-# perf flags (off by default, try both -- they don't clearly stack):
 #   --gpu-realize-crop     GPU-side crop resample, ~25-35% faster on multi-label runs
 #   --recrop-workers N     thread fan-out for crop loading, ~2x faster on the plain CPU path
 ```
 
-After changing code either CLI depends on, re-sync the vendored env copy:
-`bash scripts/sync_patchset_env.sh`.
 
 ### Add nifti files to a nora project 
 
@@ -57,9 +75,7 @@ nora -p camaret___in_context_segmentation --importfiles \
 ### Creating the `patchset` env
 
 Ampere nodes only (nero, thor, loki — see `requirements-patchset-infer.txt`). **Install
-torch first, then `dynamic_network_architectures` with `--no-deps`** — a bare install pulls
-a newer torch + a cu13 cuDNN wheel that silently breaks the primus encoder's first conv3d
-(`CUDNN_STATUS_NOT_INITIALIZED`, looks intermittent since small convs still work):
+torch first, then `dynamic_network_architectures` with `--no-deps`**
 
 ```bash
 conda create -n patchset python=3.11 -y
@@ -73,22 +89,18 @@ python -c "import torch; assert torch.backends.cudnn.version() == 90100"  # sani
 bash scripts/sync_patchset_env.sh   # populate code + create the patchset-infer launchers
 ```
 
-## Environment
-
-uv-managed, **node-specific** (`.venv` itself is stale/corrupted — don't use it):
+## Training/eval environment
 
 ```bash
 # Ampere nodes (nero, thor, loki) -- cu124
-UV_PROJECT_ENVIRONMENT=.venv_nero uv sync --extra cu124
+UV_PROJECT_ENVIRONMENT=.venv_thor uv sync --extra cu124
 
 # Blackwell (odin, sm_120) -- needs cu128
 UV_PROJECT_ENVIRONMENT=.venv_blackwell uv sync --extra cu128
 ```
 
-Nifti CLI inference (above) only needs the separate shared `patchset` conda env — no uv
-env or repo checkout required for that path.
 
-## Data prep (run once before training)
+## Data prep
 
 ```bash
 python scripts/convert_to_npy.py --size 128 128 128        # nii.gz -> pre-resized .npy per subject
@@ -97,19 +109,13 @@ python scripts/synth_labels/generate.py --method slic --union --overwrite --size
 
 ## Training
 
-`experiments/3d/train.py`, Hydra-configured, overrides via dot-notation. **Default model
-is medverse** — the cascade/patchset3d architecture (the one actually used for inference,
-above) is reached via `experiment=<preset>`, not the bare command:
+`experiments/3d/train.py`, Hydra-configured
 
 ```bash
 python experiments/3d/train.py                                    # medverse on totalseg (default)
 python experiments/3d/train.py dataset=omnisynth3d                # train on omniSynth-3D
 python experiments/3d/train.py train.epochs=10 data.max_train_subjects=50   # quick debug run
 python experiments/3d/train.py train.checkpoint=results/checkpoints/best.pt # resume
-
-# patchset3d + v2 cascade (coarse->fine), via a numbered experiment preset --
-# see configs/experiment/3d/experiment/ for the full catalog, each with a header
-# comment explaining what it changes and why
 python experiments/3d/train.py experiment=168_cascade_real_host_all_shapes
 ```
 
@@ -120,23 +126,9 @@ python experiments/3d/eval.py                                      # medverse on
 python experiments/3d/eval.py eval.model=patchset3d eval.checkpoint=/nfs/.../best.pt
 python experiments/3d/eval.py dataset=omnisynth3d eval.split=val    # eval on omniSynth-3D
 
-# cross-model comparison on a held-out OOD source
-python experiments/3d/eval.py dataset=shifts_ms eval.model=medverse \
-  eval.checkpoint=/nfs/.../best.pt data.crop_spacing_mm=3 eval.split=test eval.n_subjects=null
 ```
 
-## Known gotchas
-
-- **Eval DataLoader CUDA crash** (`CUDA error: initialization error` on the first eval
-  batch): fork-after-CUDA-init. Workaround: `eval.workers=0`.
-- **`git commit` hangs (D-state)** on this NFS mount, occasionally with a stale
-  `index.lock` left behind — don't retry blindly from a subagent; investigate the lock
-  before deleting it.
-- **No GPU on the dev/login node** — varies by session, check `nvidia-smi` before assuming;
-  when there's none, verify by resolving configs / reading `plans.json`/checkpoints rather
-  than forwarding a model.
-
-## More detail
+## More details
 
 - `docs/inference_cli.md` — full inference CLI reference
 - `docs/logs.md` — dev log, the actual source of truth for "how was X done / what command
